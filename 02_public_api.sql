@@ -162,19 +162,148 @@ BEGIN
     -------------------------------------------------------------------------
     v_step := 'tmp_matches_create';
 
+    -- Algorithm:
+    --  - If raw value is known for this concept, group by the alias of the highest-confidence matching raw variant.
+    --  - Else "normalize" (currently no-op) and try to find the normalized value; if found, pick the alias of the
+    --    highest-confidence raw variant associated to that normalized value.
+    --  - Else leave it ungrouped (handled after inserting grouped RUN_ITEMS).
     CREATE OR REPLACE TEMP TABLE TMP_MATCHES AS
-    SELECT
-        sv.raw_value                         AS raw_value,
-        sv.raw_value                         AS normalized_raw_value,  -- placeholder normalization
-        ca.alias_id                          AS alias_id,
-        ca.alias_name                        AS alias_name
-    FROM TMP_SOURCE_VALUES sv
-    JOIN STAND_DB.STAND_INTERNAL.NORMALIZED_VALUES_ALIAS_VARIANTS nvav
-      ON nvav.normalized_raw_value = sv.raw_value
-    JOIN STAND_DB.STAND_INTERNAL.CONCEPT_ALIASES ca
-      ON ca.alias_id = nvav.alias_id
-    WHERE ca.concept_id = :p_concept_id
-      AND ca.status = 'active';
+    WITH
+    normalized_stats AS (
+        SELECT
+            rvnv.normalized_raw_value_id AS normalized_raw_value_id,
+            COUNT(DISTINCT rvnv.alias_id) AS alias_cnt,
+            AVG(
+              CASE
+                WHEN rvnv.confidence IS NULL THEN NULL
+                WHEN rvnv.confidence > 1 THEN rvnv.confidence / 100.0
+                ELSE rvnv.confidence
+              END
+            ) AS avg_confidence_score
+        FROM STAND_DB.STAND_INTERNAL.RAW_VALUE_NORMALIZED_VARIANTS rvnv
+        JOIN STAND_DB.STAND_INTERNAL.CONCEPT_ALIASES ca
+          ON ca.alias_id = rvnv.alias_id
+         AND ca.concept_id = :p_concept_id
+         AND ca.status = 'active'
+        GROUP BY rvnv.normalized_raw_value_id
+    ),
+    -- 7a) Direct raw_value -> alias mapping for this concept
+    direct_candidates AS (
+        SELECT
+            sv.raw_value AS raw_value,
+            sv.raw_value AS normalized_raw_value,
+            ca.alias_id  AS alias_id,
+            ca.alias_name AS alias_name,
+            CASE
+              WHEN rvnv.confidence IS NULL THEN NULL
+              WHEN rvnv.confidence > 1 THEN rvnv.confidence / 100.0
+              ELSE rvnv.confidence
+            END AS confidence_score,
+            1 AS alias_cnt,
+            'direct' AS match_type,
+            ROW_NUMBER() OVER (
+                PARTITION BY sv.raw_value
+                ORDER BY
+                  (CASE
+                    WHEN rvnv.confidence IS NULL THEN NULL
+                    WHEN rvnv.confidence > 1 THEN rvnv.confidence / 100.0
+                    ELSE rvnv.confidence
+                  END) DESC NULLS LAST,
+                  rvnv.raw_value_id ASC
+            ) AS rn
+        FROM TMP_SOURCE_VALUES sv
+        JOIN STAND_DB.STAND_INTERNAL.RAW_VALUE_NORMALIZED_VARIANTS rvnv
+          ON rvnv.raw_value = sv.raw_value
+        JOIN STAND_DB.STAND_INTERNAL.CONCEPT_ALIASES ca
+          ON ca.alias_id = rvnv.alias_id
+        WHERE ca.concept_id = :p_concept_id
+          AND ca.status = 'active'
+    ),
+    direct_matches AS (
+        SELECT
+            raw_value,
+            normalized_raw_value,
+            alias_id,
+            alias_name,
+            confidence_score,
+            alias_cnt,
+            match_type
+        FROM direct_candidates
+        WHERE rn = 1
+    ),
+    -- 7b) For values not directly known, normalize (remove whitespace) and look up the normalized value
+    normalized_lookup AS (
+        SELECT
+            sv.raw_value AS raw_value,
+            -- Normalization (for now): remove whitespace so e.g. "Metro PCS" -> "MetroPCS"
+            REGEXP_REPLACE(sv.raw_value, '\\s+', '') AS normalized_value
+        FROM TMP_SOURCE_VALUES sv
+        LEFT JOIN direct_matches dm
+          ON dm.raw_value = sv.raw_value
+        WHERE dm.raw_value IS NULL
+    ),
+    normalized_hits AS (
+        SELECT
+            nl.raw_value AS raw_value,
+            nl.normalized_value AS normalized_raw_value,
+            nvav.normalized_raw_value_id AS normalized_raw_value_id
+        FROM normalized_lookup nl
+        JOIN STAND_DB.STAND_INTERNAL.NORMALIZED_VALUES_ALIAS_VARIANTS nvav
+          ON nvav.normalized_raw_value = nl.normalized_value
+    ),
+    fuzzy_candidates AS (
+        SELECT
+            nh.raw_value AS raw_value,
+            nh.normalized_raw_value AS normalized_raw_value,
+            ca.alias_id AS alias_id,
+            ca.alias_name AS alias_name,
+            CASE
+              WHEN rvnv.confidence IS NULL THEN NULL
+              WHEN rvnv.confidence > 1 THEN rvnv.confidence / 100.0
+              ELSE rvnv.confidence
+            END AS rvnv_confidence_score,
+            COALESCE(ns.alias_cnt, 1) AS alias_cnt,
+            'normalized' AS match_type,
+            CASE
+              -- If the normalized value maps to multiple aliases, confidence is ambiguous.
+              WHEN COALESCE(ns.alias_cnt, 1) > 1 THEN 0.5
+              ELSE ns.avg_confidence_score
+            END AS confidence_score,
+            ROW_NUMBER() OVER (
+                PARTITION BY nh.raw_value
+                ORDER BY
+                  (CASE
+                    WHEN rvnv.confidence IS NULL THEN NULL
+                    WHEN rvnv.confidence > 1 THEN rvnv.confidence / 100.0
+                    ELSE rvnv.confidence
+                  END) DESC NULLS LAST,
+                  rvnv.raw_value_id ASC
+            ) AS rn
+        FROM normalized_hits nh
+        JOIN STAND_DB.STAND_INTERNAL.RAW_VALUE_NORMALIZED_VARIANTS rvnv
+          ON rvnv.normalized_raw_value_id = nh.normalized_raw_value_id
+        LEFT JOIN normalized_stats ns
+          ON ns.normalized_raw_value_id = nh.normalized_raw_value_id
+        JOIN STAND_DB.STAND_INTERNAL.CONCEPT_ALIASES ca
+          ON ca.alias_id = rvnv.alias_id
+        WHERE ca.concept_id = :p_concept_id
+          AND ca.status = 'active'
+    ),
+    fuzzy_matches AS (
+        SELECT
+            raw_value,
+            normalized_raw_value,
+            alias_id,
+            alias_name,
+            confidence_score,
+            alias_cnt,
+            match_type
+        FROM fuzzy_candidates
+        WHERE rn = 1
+    )
+    SELECT * FROM direct_matches
+    UNION ALL
+    SELECT * FROM fuzzy_matches;
 
     -------------------------------------------------------------------------
     -- 8) Insert RUN_GROUPS (one per alias in TMP_MATCHES)
@@ -204,23 +333,34 @@ BEGIN
     -------------------------------------------------------------------------
     v_step := 'insert_run_items';
 
+    -- Always insert one RUN_ITEMS row per source value. Unmatched values remain ungrouped (group_id NULL).
     INSERT INTO STAND_DB.STAND_INTERNAL.RUN_ITEMS (
         run_id, group_id, raw_value, normalized_raw_value,
         confidence_score, decision_status, created_at, updated_at
     )
     SELECT
         :v_run_id,
-        rg.group_id,
-        m.raw_value,
-        m.normalized_raw_value,
-        1.0,
+        NULL,
+        sv.raw_value,
+        sv.raw_value,
+        0.25,
         'pending',
         CURRENT_TIMESTAMP(),
         CURRENT_TIMESTAMP()
+    FROM TMP_SOURCE_VALUES sv;
+
+    -- Assign group_id to matched values (highest-confidence mapping per raw_value / normalized fallback).
+    UPDATE STAND_DB.STAND_INTERNAL.RUN_ITEMS ri
+    SET
+        group_id = rg.group_id,
+        normalized_raw_value = m.normalized_raw_value,
+        confidence_score = m.confidence_score
     FROM TMP_MATCHES m
     JOIN STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
       ON rg.run_id = :v_run_id
-     AND rg.final_alias_id = m.alias_id;
+     AND rg.final_alias_id = m.alias_id
+    WHERE ri.run_id = :v_run_id
+      AND ri.raw_value = m.raw_value;
 
     -------------------------------------------------------------------------
     -- 10) Stats for review mode

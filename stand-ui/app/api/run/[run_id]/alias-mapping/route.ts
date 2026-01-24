@@ -15,10 +15,16 @@ function createConnection() {
 type AliasMap = Record<
   string,
   {
-    group_id: number;
-    items: Array<{ run_item_id: number; raw_value: string }>;
+    group_id: number | null;
+    items: Array<{
+      run_item_id: number;
+      raw_value: string;
+      confidence_score: number | null;
+    }>;
   }
 >;
+
+const UNGROUPED_KEY = '__UNGROUPED__';
 
 export async function GET(
   request: NextRequest,
@@ -56,14 +62,22 @@ export async function GET(
       }
     );
 
-    const items = await new Promise<Array<{ RUN_ITEM_ID: number; GROUP_ID: number; RAW_VALUE: string }>>(
+    const items = await new Promise<
+      Array<{
+        RUN_ITEM_ID: number;
+        GROUP_ID: number;
+        RAW_VALUE: string;
+        CONFIDENCE_SCORE: number | null;
+      }>
+    >(
       (resolve, reject) => {
         connection.execute({
           sqlText: `
             SELECT
               run_item_id,
               group_id,
-              raw_value
+              raw_value,
+              confidence_score
             FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS
             WHERE run_id = ?
             ORDER BY group_id, run_item_id
@@ -87,14 +101,47 @@ export async function GET(
     }
 
     for (const it of items) {
-      const key = groupKeyById.get(it.GROUP_ID) ?? `group_${it.GROUP_ID}`;
-      if (!aliasMap[key]) {
-        aliasMap[key] = { group_id: it.GROUP_ID, items: [] };
+      const rawGroupId = (it as any).GROUP_ID;
+      const groupIdNum =
+        rawGroupId === null || rawGroupId === undefined
+          ? null
+          : Number(rawGroupId);
+
+      if (typeof groupIdNum === 'number' && Number.isFinite(groupIdNum)) {
+        const key = groupKeyById.get(groupIdNum) ?? `group_${groupIdNum}`;
+        if (!aliasMap[key]) {
+          aliasMap[key] = { group_id: groupIdNum, items: [] };
+        }
+        aliasMap[key].items.push({
+          run_item_id: it.RUN_ITEM_ID,
+          raw_value: it.RAW_VALUE,
+          confidence_score:
+            (it as any).CONFIDENCE_SCORE === null ||
+            (it as any).CONFIDENCE_SCORE === undefined
+              ? null
+              : Number((it as any).CONFIDENCE_SCORE),
+        });
+        continue;
       }
-      aliasMap[key].items.push({
+
+      // Ungrouped (group_id NULL)
+      if (!aliasMap[UNGROUPED_KEY]) {
+        aliasMap[UNGROUPED_KEY] = { group_id: null, items: [] };
+      }
+      aliasMap[UNGROUPED_KEY].items.push({
         run_item_id: it.RUN_ITEM_ID,
         raw_value: it.RAW_VALUE,
+        confidence_score:
+          (it as any).CONFIDENCE_SCORE === null ||
+          (it as any).CONFIDENCE_SCORE === undefined
+            ? null
+            : Number((it as any).CONFIDENCE_SCORE),
       });
+    }
+
+    // Always include the ungrouped bucket so the UI has a stable drop target.
+    if (!aliasMap[UNGROUPED_KEY]) {
+      aliasMap[UNGROUPED_KEY] = { group_id: null, items: [] };
     }
 
     return Response.json(
