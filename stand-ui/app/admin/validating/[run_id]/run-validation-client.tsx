@@ -24,27 +24,24 @@ type DragPayload = {
 
 function formatConfidence(score: number) {
   if (!Number.isFinite(score)) return '';
-  // Most of our pipeline uses 0..1, but be resilient.
   if (score >= 0 && score <= 1) return `${Math.round(score * 100)}%`;
   return String(score);
 }
 
-export default function RunReviewClient({ runId }: { runId: string }) {
+export default function RunValidationClient({ runId }: { runId: string }) {
   const [aliasMap, setAliasMap] = useState<AliasMap | null>(null);
   const [uiAliasMap, setUiAliasMap] = useState<AliasMap | null>(null);
-  const [confidenceDetails, setConfidenceDetails] = useState<any[]>([]);
   const [aliasMapError, setAliasMapError] = useState<string | null>(null);
   const [loadingAliasMap, setLoadingAliasMap] = useState(true);
 
   const [checkedAliases, setCheckedAliases] = useState<Set<string>>(new Set());
-  const [sendForApproval, setSendForApproval] = useState(false);
-  // Client-only temporary group ids for user-created groups (negative so they never collide with DB ids).
   const [nextTempGroupId, setNextTempGroupId] = useState(-1);
-  // UI-only until export: run_item_id -> new group_id (overwrites on subsequent moves)
-  const [pendingMoves, setPendingMoves] = useState<
-    Record<number, number | null>
-  >({});
-  // UI-only until export: group_id -> new alias_name (overwrites on subsequent edits)
+  const [userUngroupedGroupIds, setUserUngroupedGroupIds] = useState<Set<number>>(
+    new Set()
+  );
+  const [pendingMoves, setPendingMoves] = useState<Record<number, number | null>>(
+    {}
+  );
   const [pendingAliasNames, setPendingAliasNames] = useState<
     Record<number, string>
   >({});
@@ -52,10 +49,9 @@ export default function RunReviewClient({ runId }: { runId: string }) {
   const [editingAliasValue, setEditingAliasValue] = useState<string>('');
   const [renameError, setRenameError] = useState<string | null>(null);
 
-  const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
-  const [exportResult, setExportResult] = useState<any>(null);
-  const [copiedSql, setCopiedSql] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [approveError, setApproveError] = useState<string | null>(null);
+  const [approveSuccess, setApproveSuccess] = useState(false);
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [dragOverAliasName, setDragOverAliasName] = useState<string | null>(
@@ -65,32 +61,85 @@ export default function RunReviewClient({ runId }: { runId: string }) {
     string | null
   >(null);
 
+  function makeUniqueGroupNameForMap(
+    map: AliasMap,
+    base: string,
+    excludeKey?: string
+  ) {
+    const trimmed = String(base || '').trim() || 'Unnamed Group';
+    if (!map[trimmed] || trimmed === excludeKey) return trimmed;
+    let i = 2;
+    while (map[`${trimmed} (${i})`] && `${trimmed} (${i})` !== excludeKey) i += 1;
+    return `${trimmed} (${i})`;
+  }
+
+  function applyUserUngroupedItemsTransform(data: AliasMap) {
+    // Convert the "Ungrouped" bucket into one client-only group per item.
+    // These groups behave exactly like user-added groups: group_id is negative and will be created on approve.
+    const nextData: AliasMap = structuredClone(data || ({} as any));
+    const ungroupedItems = nextData[UNGROUPED_KEY]?.items || [];
+    delete nextData[UNGROUPED_KEY];
+
+    const moves: Record<number, number | null> = {};
+    const userUngroupedIds: number[] = [];
+    let tempId = -1;
+
+    for (const it of ungroupedItems) {
+      const raw = String(it.raw_value ?? '').trim();
+      const baseName = `${raw || 'Unnamed'} group`;
+      const name = makeUniqueGroupNameForMap(nextData, baseName);
+
+      const gid = tempId;
+      tempId -= 1;
+      userUngroupedIds.push(gid);
+      nextData[name] = {
+        group_id: gid,
+        items: [
+          {
+            run_item_id: it.run_item_id,
+            raw_value: String(it.raw_value),
+            confidence_score: it.confidence_score ?? null,
+          },
+        ],
+      };
+      moves[it.run_item_id] = gid;
+    }
+
+    return { nextData, moves, nextTempGroupId: tempId, userUngroupedIds };
+  }
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setLoadingAliasMap(true);
       setAliasMapError(null);
+      setApproveError(null);
+      setApproveSuccess(false);
 
       try {
         const res = await fetch(`/api/run/${runId}/alias-mapping`, {
           cache: 'no-store',
         });
         const body = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          throw new Error(body?.error || 'Failed to load alias mapping');
-        }
+        if (!res.ok) throw new Error(body?.error || 'Failed to load alias mapping');
 
         if (!cancelled) {
           const data = (body?.data || {}) as AliasMap;
           setAliasMap(data);
-          setConfidenceDetails(Array.isArray(body?.confidence_details) ? body.confidence_details : []);
-          // UI copy (this is what drag/drop mutates; does NOT persist)
-          setUiAliasMap(structuredClone(data));
-          setPendingMoves({});
+
+          // Validation UX: no shared "Ungrouped" bucket.
+          // Instead, each ungrouped item gets its own user-created group named "<raw_value> group".
+          const { nextData, moves, nextTempGroupId, userUngroupedIds } =
+            applyUserUngroupedItemsTransform(
+            structuredClone(data)
+          );
+
+          setUiAliasMap(nextData);
+          setPendingMoves(moves);
+          setNextTempGroupId(nextTempGroupId);
+          setUserUngroupedGroupIds(new Set(userUngroupedIds));
           setPendingAliasNames({});
           setCheckedAliases(new Set());
-          setSendForApproval(false);
           setEditingAliasKey(null);
           setRenameError(null);
         }
@@ -98,14 +147,12 @@ export default function RunReviewClient({ runId }: { runId: string }) {
         if (!cancelled) {
           setAliasMap(null);
           setUiAliasMap(null);
-          setConfidenceDetails([]);
           setAliasMapError(e instanceof Error ? e.message : 'Failed to load alias mapping');
         }
       } finally {
         if (!cancelled) setLoadingAliasMap(false);
       }
     }
-
     load();
     return () => {
       cancelled = true;
@@ -113,16 +160,13 @@ export default function RunReviewClient({ runId }: { runId: string }) {
   }, [runId]);
 
   const entries = useMemo(() => {
-    const e = Object.entries(uiAliasMap || {}) as Array<
-      [string, AliasMap[string]]
-    >;
+    const e = Object.entries(uiAliasMap || {}) as Array<[string, AliasMap[string]]>;
     e.sort((a, b) => {
       const ag = a[1]?.group_id;
       const bg = b[1]?.group_id;
       if (ag == null && bg == null) return 0;
-      if (ag == null) return 1; // null (ungrouped) last
+      if (ag == null) return 1;
       if (bg == null) return -1;
-      // Place client-only groups (negative ids) after DB groups (positive ids)
       if (ag < 0 && bg >= 0) return 1;
       if (bg < 0 && ag >= 0) return -1;
       return ag - bg;
@@ -134,9 +178,21 @@ export default function RunReviewClient({ runId }: { runId: string }) {
     () => entries.filter(([aliasName]) => aliasName !== UNGROUPED_KEY),
     [entries]
   );
-  const ungrouped = uiAliasMap?.[UNGROUPED_KEY] || null;
 
-  // Snapshot of initial grouping + score from the DB load (before any UI moves).
+  const normalGroupEntries = useMemo(() => {
+    return groupEntries.filter(([, group]) => {
+      const gid = group?.group_id;
+      return !(typeof gid === 'number' && userUngroupedGroupIds.has(gid));
+    });
+  }, [groupEntries, userUngroupedGroupIds]);
+
+  const userUngroupedEntries = useMemo(() => {
+    return groupEntries.filter(([, group]) => {
+      const gid = group?.group_id;
+      return typeof gid === 'number' && userUngroupedGroupIds.has(gid);
+    });
+  }, [groupEntries, userUngroupedGroupIds]);
+
   const initialItemMeta = useMemo(() => {
     const meta = new Map<
       number,
@@ -158,7 +214,6 @@ export default function RunReviewClient({ runId }: { runId: string }) {
   const uncheckedCount = totalGroups - checkedAliases.size;
 
   function toggle(aliasName: string) {
-    if (aliasName === UNGROUPED_KEY) return;
     setCheckedAliases((prev) => {
       const next = new Set(prev);
       if (next.has(aliasName)) next.delete(aliasName);
@@ -190,69 +245,9 @@ export default function RunReviewClient({ runId }: { runId: string }) {
       return next;
     });
 
-    // Immediately open rename
     setRenameError(null);
     setEditingAliasKey(name);
     setEditingAliasValue('');
-  }
-
-  function onDragStart(
-    e: React.DragEvent,
-    payload: DragPayload
-  ) {
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('application/json', JSON.stringify(payload));
-  }
-
-  function onDropOnAlias(e: React.DragEvent, toAliasName: string) {
-    e.preventDefault();
-    setDragOverAliasName(null);
-
-    let payload: DragPayload | null = null;
-    try {
-      payload = JSON.parse(e.dataTransfer.getData('application/json'));
-    } catch {
-      payload = null;
-    }
-    if (!payload) return;
-
-    const { fromAliasName, run_item_id, raw_value } = payload;
-    if (fromAliasName === toAliasName) return;
-
-    // record the new group_id (overwrite if moved multiple times)
-    setPendingMoves((prev) => {
-      const toGroupId = uiAliasMap?.[toAliasName]?.group_id;
-      if (typeof toGroupId !== 'number' && toGroupId !== null) return prev;
-      return { ...prev, [run_item_id]: toGroupId };
-    });
-
-    setUiAliasMap((prev) => {
-      if (!prev) return prev;
-      const next: AliasMap = structuredClone(prev);
-      const from = next[fromAliasName];
-      if (!from) return prev;
-      let to = next[toAliasName];
-      if (!to) {
-        if (toAliasName === UNGROUPED_KEY) {
-          to = { group_id: null, items: [] };
-          next[toAliasName] = to;
-        } else {
-          return prev;
-        }
-      }
-
-      const dragged = (from.items || []).find((it) => it.run_item_id === run_item_id);
-      from.items = (from.items || []).filter((it) => it.run_item_id !== run_item_id);
-      to.items = [
-        ...(to.items || []),
-        {
-          run_item_id,
-          raw_value,
-          confidence_score: dragged?.confidence_score ?? null,
-        },
-      ];
-      return next;
-    });
   }
 
   function startRename(aliasName: string) {
@@ -278,7 +273,6 @@ export default function RunReviewClient({ runId }: { runId: string }) {
     setUiAliasMap((prev) => {
       if (!prev) return prev;
       if (prev[newAliasName] && newAliasName !== oldAliasName) {
-        // Auto de-dupe rather than erroring.
         newAliasName = makeUniqueGroupName(newAliasName, oldAliasName);
       }
 
@@ -292,13 +286,11 @@ export default function RunReviewClient({ runId }: { runId: string }) {
       delete next[oldAliasName];
       next[newAliasName] = group;
 
-      // Track pending rename by group_id
       const gid = group.group_id;
       if (typeof gid === 'number') {
         setPendingAliasNames((p) => ({ ...p, [gid]: newAliasName }));
       }
 
-      // Preserve checked state across rename
       setCheckedAliases((p) => {
         const s = new Set(p);
         if (s.has(oldAliasName)) {
@@ -309,6 +301,59 @@ export default function RunReviewClient({ runId }: { runId: string }) {
       });
 
       cancelRename();
+      return next;
+    });
+  }
+
+  function onDragStart(e: React.DragEvent, payload: DragPayload) {
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/json', JSON.stringify(payload));
+  }
+
+  function onDropOnAlias(e: React.DragEvent, toAliasName: string) {
+    e.preventDefault();
+    setDragOverAliasName(null);
+
+    // No shared "Ungrouped" drop zone in validation.
+    if (toAliasName === UNGROUPED_KEY) return;
+
+    let payload: DragPayload | null = null;
+    try {
+      payload = JSON.parse(e.dataTransfer.getData('application/json'));
+    } catch {
+      payload = null;
+    }
+    if (!payload) return;
+
+    const { fromAliasName, run_item_id, raw_value } = payload;
+    if (fromAliasName === toAliasName) return;
+
+    setPendingMoves((prev) => {
+      const toGroupId = uiAliasMap?.[toAliasName]?.group_id;
+      if (typeof toGroupId !== 'number' && toGroupId !== null) return prev;
+      return { ...prev, [run_item_id]: toGroupId };
+    });
+
+    setUiAliasMap((prev) => {
+      if (!prev) return prev;
+      const next: AliasMap = structuredClone(prev);
+      const from = next[fromAliasName];
+      if (!from) return prev;
+      let to = next[toAliasName];
+      if (!to) {
+        return prev;
+      }
+
+      const dragged = (from.items || []).find((it) => it.run_item_id === run_item_id);
+      from.items = (from.items || []).filter((it) => it.run_item_id !== run_item_id);
+      to.items = [
+        ...(to.items || []),
+        {
+          run_item_id,
+          raw_value,
+          confidence_score: dragged?.confidence_score ?? null,
+        },
+      ];
       return next;
     });
   }
@@ -334,37 +379,52 @@ export default function RunReviewClient({ runId }: { runId: string }) {
       confidence_score: it.confidence_score ?? null,
     }));
 
+    const movedToNewGroups: Array<{ run_item_id: number; group_id: number }> = [];
+    let tempId = nextTempGroupId;
+
     setUiAliasMap((prev) => {
       if (!prev) return prev;
       const next: AliasMap = structuredClone(prev);
-      const existingUngrouped = next[UNGROUPED_KEY]?.items || [];
-
-      const existingIds = new Set<number>(
-        existingUngrouped.map((it) => Number(it.run_item_id))
-      );
-      const mergedUngrouped = [
-        ...existingUngrouped,
-        ...itemsToMove.filter((it) => !existingIds.has(it.run_item_id)),
-      ];
-
-      // ensure ungrouped bucket exists
-      next[UNGROUPED_KEY] = {
-        group_id: null,
-        items: mergedUngrouped,
-      };
-
       delete next[aliasName];
+
+      // Convert moved items into their own client-only groups (same behavior as if user added them).
+      for (const it of itemsToMove) {
+        const raw = String(it.raw_value ?? '').trim();
+        const baseName = `${raw || 'Unnamed'} group`;
+        const name = makeUniqueGroupNameForMap(next, baseName);
+        const gid = tempId;
+        tempId -= 1;
+        movedToNewGroups.push({ run_item_id: it.run_item_id, group_id: gid });
+        next[name] = {
+          group_id: gid,
+          items: [
+            {
+              run_item_id: it.run_item_id,
+              raw_value: String(it.raw_value),
+              confidence_score: it.confidence_score ?? null,
+            },
+          ],
+        };
+      }
       return next;
     });
 
-    // Mark all those items as ungrouped for export
     setPendingMoves((prev) => {
       const next = { ...prev };
-      for (const it of itemsToMove) next[it.run_item_id] = null;
+      for (const it of itemsToMove) delete next[it.run_item_id];
+      for (const m of movedToNewGroups) next[m.run_item_id] = m.group_id;
       return next;
     });
 
-    // If there was a pending rename for this group_id, remove it
+    setNextTempGroupId(tempId);
+    setUserUngroupedGroupIds((prev) => {
+      const next = new Set(prev);
+      const gid = group.group_id;
+      if (typeof gid === 'number') next.delete(gid);
+      for (const m of movedToNewGroups) next.add(m.group_id);
+      return next;
+    });
+
     const gid = group.group_id;
     if (typeof gid === 'number') {
       setPendingAliasNames((prev) => {
@@ -374,7 +434,6 @@ export default function RunReviewClient({ runId }: { runId: string }) {
       });
     }
 
-    // Remove from checked set so it doesn't count anymore
     setCheckedAliases((prev) => {
       const next = new Set(prev);
       next.delete(aliasName);
@@ -386,18 +445,16 @@ export default function RunReviewClient({ runId }: { runId: string }) {
     if (openMenuForAliasName === aliasName) setOpenMenuForAliasName(null);
   }
 
-  async function doExport() {
-    setExporting(true);
-    setExportError(null);
-    setExportResult(null);
-    setCopiedSql(false);
+  async function doApprove() {
+    setApproving(true);
+    setApproveError(null);
+    setApproveSuccess(false);
 
     try {
-      const res = await fetch(`/api/run/${runId}/export-to-snowflake`, {
+      const res = await fetch(`/api/run/${runId}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          send_for_approval: sendForApproval,
           new_groups: Object.entries(uiAliasMap || {})
             .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
             .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
@@ -417,85 +474,40 @@ export default function RunReviewClient({ runId }: { runId: string }) {
           ),
         }),
       });
+
       const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Approve failed');
 
-      if (!res.ok) {
-        throw new Error(body?.error || 'Export failed');
-      }
-
-      setExportResult(body?.data || null);
-
-      // Moves are now persisted (we applied them just before export); clear the pending map
+      setApproveSuccess(true);
       setPendingMoves({});
       setPendingAliasNames({});
-
-      // Reload mapping so the UI reflects the DB after updates
-      const refreshed = await fetch(`/api/run/${runId}/alias-mapping`, {
-        cache: 'no-store',
-      });
-      const refreshedBody = await refreshed.json().catch(() => ({}));
-      if (refreshed.ok) {
-        const data = (refreshedBody?.data || {}) as AliasMap;
-        setAliasMap(data);
-        setConfidenceDetails(
-          Array.isArray(refreshedBody?.confidence_details) ? refreshedBody.confidence_details : []
-        );
-        setUiAliasMap(structuredClone(data));
-      }
     } catch (e) {
-      setExportError(e instanceof Error ? e.message : 'Export failed');
+      setApproveError(e instanceof Error ? e.message : 'Approve failed');
     } finally {
-      setExporting(false);
+      setApproving(false);
     }
   }
 
-  function onExportClick() {
+  function onApproveClick() {
     if (uncheckedCount > 0) {
       setConfirmOpen(true);
       return;
     }
-    void doExport();
+    void doApprove();
   }
 
-  function acceptAllAndExport() {
+  function acceptAllAndApprove() {
     checkAll();
     setConfirmOpen(false);
-    void doExport();
-  }
-
-  const viewFqn = exportResult?.view_fqn ? String(exportResult.view_fqn) : '';
-  const viewSql = viewFqn ? `SELECT * FROM ${viewFqn};` : '';
-
-  async function copyViewSql() {
-    if (!viewSql) return;
-    try {
-      await navigator.clipboard.writeText(viewSql);
-      setCopiedSql(true);
-      window.setTimeout(() => setCopiedSql(false), 1200);
-    } catch {
-      // Fallback for older browsers / restricted clipboard contexts
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = viewSql;
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        setCopiedSql(true);
-        window.setTimeout(() => setCopiedSql(false), 1200);
-      } catch {
-        // ignore
-      }
-    }
+    void doApprove();
   }
 
   return (
     <div onClick={() => setOpenMenuForAliasName(null)}>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-semibold text-gray-800">Run Review Interface</h2>
+        <h2 className="text-2xl font-semibold text-gray-800">
+          Run <span className="font-mono">{runId}</span>
+        </h2>
 
         <div className="flex items-center gap-3">
           <div className="text-sm text-gray-600">
@@ -505,50 +517,24 @@ export default function RunReviewClient({ runId }: { runId: string }) {
 
           <button
             type="button"
-            onClick={onExportClick}
-            disabled={exporting || loadingAliasMap || !!aliasMapError}
-            className={[
-              'px-4 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-60 disabled:cursor-not-allowed',
-              uncheckedCount === 0 ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700',
-            ].join(' ')}
+            onClick={onApproveClick}
+            disabled={approving || loadingAliasMap || !!aliasMapError}
+            className="px-4 py-2 rounded-md bg-green-600 text-white text-sm font-semibold hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            {exporting ? 'Exporting…' : 'Export to Snowflake'}
+            {approving ? 'Approving…' : 'Approve'}
           </button>
         </div>
       </div>
 
-      <label className="flex items-center gap-2 text-sm text-gray-700 mb-4 select-none">
-        <input
-          type="checkbox"
-          checked={sendForApproval}
-          onChange={(e) => setSendForApproval(e.target.checked)}
-          disabled={exporting || loadingAliasMap || !!aliasMapError}
-          className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-600"
-        />
-        <span>Send for approval for global standardization</span>
-      </label>
-
-      {exportError && (
+      {approveError && (
         <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded mb-4">
-          {exportError}
+          {approveError}
         </div>
       )}
 
-      {exportResult?.view_fqn && (
+      {approveSuccess && (
         <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded mb-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <span>Created view:</span>
-            <span className="font-mono text-sm bg-white/60 border border-green-200 rounded px-2 py-1">
-              {viewSql}
-            </span>
-            <button
-              type="button"
-              onClick={() => void copyViewSql()}
-              className="px-3 py-1.5 rounded-md border border-green-300 bg-white text-green-900 text-sm font-semibold hover:bg-green-50"
-            >
-              {copiedSql ? 'Copied' : 'Copy'}
-            </button>
-          </div>
+          Approved.
         </div>
       )}
 
@@ -587,7 +573,7 @@ export default function RunReviewClient({ runId }: { runId: string }) {
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
-                {groupEntries.map(([aliasName, group]) => {
+                {normalGroupEntries.map(([aliasName, group]) => {
                   const isChecked = checkedAliases.has(aliasName);
 
                   const seen = new Set<string>();
@@ -614,7 +600,9 @@ export default function RunReviewClient({ runId }: { runId: string }) {
                           onClick={() => toggle(aliasName)}
                           className={[
                             'w-8 h-8 rounded-full flex items-center justify-center text-white font-bold',
-                            isChecked ? 'bg-green-600 hover:bg-green-700' : 'bg-yellow-500 hover:bg-yellow-600',
+                            isChecked
+                              ? 'bg-green-600 hover:bg-green-700'
+                              : 'bg-yellow-500 hover:bg-yellow-600',
                           ].join(' ')}
                           aria-label={isChecked ? 'Checked' : 'Unchecked'}
                           title={isChecked ? 'Checked' : 'Unchecked'}
@@ -664,25 +652,25 @@ export default function RunReviewClient({ runId }: { runId: string }) {
                                 (pending === undefined || pending === initialGroupId);
 
                               return (
-                              <span
-                                key={it.run_item_id}
-                                draggable
-                                onDragStart={(e) =>
-                                  onDragStart(e, {
-                                    fromAliasName: aliasName,
-                                    run_item_id: it.run_item_id,
-                                    raw_value: String(it.raw_value),
-                                  })
-                                }
-                                className="inline-flex items-center rounded-md bg-gray-100 px-2 py-1 text-xs font-medium text-gray-900 cursor-move"
-                              >
-                                {String(it.raw_value)}
-                                {showScore && (
-                                  <span className="ml-1 text-[10px] font-semibold text-gray-500">
-                                    {formatConfidence(initialScore)}
-                                  </span>
-                                )}
-                              </span>
+                                <span
+                                  key={it.run_item_id}
+                                  draggable
+                                  onDragStart={(e) =>
+                                    onDragStart(e, {
+                                      fromAliasName: aliasName,
+                                      run_item_id: it.run_item_id,
+                                      raw_value: String(it.raw_value),
+                                    })
+                                  }
+                                  className="inline-flex items-center rounded-md bg-gray-100 px-2 py-1 text-xs font-medium text-gray-900 cursor-move"
+                                >
+                                  {String(it.raw_value)}
+                                  {showScore && (
+                                    <span className="ml-1 text-[10px] font-semibold text-gray-500">
+                                      {formatConfidence(initialScore)}
+                                    </span>
+                                  )}
+                                </span>
                               );
                             })}
                           </div>
@@ -746,83 +734,147 @@ export default function RunReviewClient({ runId }: { runId: string }) {
 
           <div className="mt-6">
             <h4 className="text-md font-semibold text-gray-800 mb-2">
-              Ungrouped items
+              User Ungrouped Items
             </h4>
-            <div
-              className={[
-                'rounded-md border border-dashed px-3 py-3',
-                dragOverAliasName === UNGROUPED_KEY
-                  ? 'bg-blue-50 border-blue-300'
-                  : 'bg-gray-50 border-gray-300',
-              ].join(' ')}
-              onDragOver={(e) => onDragOverAlias(e, UNGROUPED_KEY)}
-              onDrop={(e) => onDropOnAlias(e, UNGROUPED_KEY)}
-              onDragLeave={(e) => onDragLeaveAlias(e, UNGROUPED_KEY)}
-            >
-              {(ungrouped?.items || []).length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {(ungrouped?.items || []).map((it) => {
-                    const meta = initialItemMeta.get(it.run_item_id);
-                    const initialGroupId = meta?.initial_group_id ?? null;
-                    const initialScore = meta?.confidence_score ?? null;
-                    const pending = pendingMoves[it.run_item_id];
-
-                    // Only show score in Ungrouped if the item started ungrouped (i.e. it wasn't moved here).
-                    const showScore =
-                      initialGroupId === null &&
-                      typeof initialScore === 'number' &&
-                      Number.isFinite(initialScore) &&
-                      (pending === undefined || pending === null);
-
-                    return (
-                    <span
-                      key={it.run_item_id}
-                      draggable
-                      onDragStart={(e) =>
-                        onDragStart(e, {
-                          fromAliasName: UNGROUPED_KEY,
-                          run_item_id: it.run_item_id,
-                          raw_value: String(it.raw_value),
-                        })
-                      }
-                      className="inline-flex items-center rounded-md bg-white px-2 py-1 text-xs font-medium text-gray-900 cursor-move border border-gray-200"
-                    >
-                      {String(it.raw_value)}
-                      {showScore && (
-                        <span className="ml-1 text-[10px] font-semibold text-gray-500">
-                          {formatConfidence(initialScore)}
-                        </span>
-                      )}
-                    </span>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="text-sm text-gray-600">
-                  Drag items here to leave them ungrouped (export will set{' '}
-                  <span className="font-mono">group_id</span> to{' '}
-                  <span className="font-mono">NULL</span>).
-                </div>
-              )}
+            <div className="text-sm text-gray-700">
+              Each ungrouped item is automatically placed into its own user-created group named{' '}
+              <span className="font-mono">&quot;&lt;raw_value&gt; group&quot;</span>. These behave
+              the same as groups you add manually.
             </div>
-          </div>
 
-          <div className="mt-6">
-            <h2 className="text-2xl font-semibold mb-4 text-gray-800">
-              Alias → Raw Values Map (JSON)
-            </h2>
-            <pre className="text-xs text-black bg-gray-50 border border-gray-200 rounded p-4 overflow-auto whitespace-pre-wrap">
-              {JSON.stringify(uiAliasMap, null, 2)}
-            </pre>
-          </div>
+            <div className="mt-3 overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-12">
+                      ✓
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Group Name
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Item
+                    </th>
+                    <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider w-12">
+                      {/* actions */}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {userUngroupedEntries.length === 0 ? (
+                    <tr>
+                      <td
+                        colSpan={4}
+                        className="px-4 py-3 text-sm text-gray-600 italic"
+                      >
+                        No ungrouped items.
+                      </td>
+                    </tr>
+                  ) : (
+                    userUngroupedEntries.map(([aliasName, group]) => {
+                      const isChecked = checkedAliases.has(aliasName);
+                      const item = (group.items || [])[0];
+                      return (
+                        <tr key={aliasName} className="hover:bg-gray-50 align-top">
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => toggle(aliasName)}
+                              className={[
+                                'w-8 h-8 rounded-full flex items-center justify-center text-white font-bold',
+                                isChecked
+                                  ? 'bg-green-600 hover:bg-green-700'
+                                  : 'bg-yellow-500 hover:bg-yellow-600',
+                              ].join(' ')}
+                              aria-label={isChecked ? 'Checked' : 'Unchecked'}
+                              title={isChecked ? 'Checked' : 'Unchecked'}
+                            >
+                              ✓
+                            </button>
+                          </td>
+                          <td
+                            className="px-4 py-3 text-sm font-medium text-gray-900 whitespace-nowrap"
+                            onDoubleClick={() => startRename(aliasName)}
+                            title="Double-click to rename"
+                          >
+                            {editingAliasKey === aliasName ? (
+                              <input
+                                autoFocus
+                                value={editingAliasValue}
+                                onChange={(e) => setEditingAliasValue(e.target.value)}
+                                onBlur={() => commitRename(aliasName)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') commitRename(aliasName);
+                                  if (e.key === 'Escape') cancelRename();
+                                }}
+                                className="w-full max-w-xs px-2 py-1 border border-gray-300 rounded text-sm text-gray-900"
+                              />
+                            ) : (
+                              aliasName
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-gray-900">
+                            {item ? (
+                              <span
+                                key={item.run_item_id}
+                                draggable
+                                onDragStart={(e) =>
+                                  onDragStart(e, {
+                                    fromAliasName: aliasName,
+                                    run_item_id: item.run_item_id,
+                                    raw_value: String(item.raw_value),
+                                  })
+                                }
+                                className="inline-flex items-center rounded-md bg-gray-100 px-2 py-1 text-xs font-medium text-gray-900 cursor-move"
+                              >
+                                {String(item.raw_value)}
+                              </span>
+                            ) : (
+                              <span className="text-gray-500 italic">No items</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right align-top">
+                            {editingAliasKey !== aliasName && (
+                              <div className="relative inline-block text-left">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setOpenMenuForAliasName((prev) =>
+                                      prev === aliasName ? null : aliasName
+                                    );
+                                  }}
+                                  className="w-8 h-8 rounded-md border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+                                  title="Group actions"
+                                  aria-label="Group actions"
+                                >
+                                  ⋯
+                                </button>
 
-          <div className="mt-6">
-            <h2 className="text-2xl font-semibold mb-4 text-gray-800">
-              Confidence Calculation Steps (JSON)
-            </h2>
-            <pre className="text-xs text-black bg-gray-50 border border-gray-200 rounded p-4 overflow-auto whitespace-pre-wrap">
-              {JSON.stringify(confidenceDetails, null, 2)}
-            </pre>
+                                {openMenuForAliasName === aliasName && (
+                                  <div
+                                    className="absolute right-0 mt-1 w-36 rounded-md bg-white shadow-lg border border-gray-200 z-10"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() => deleteGroup(aliasName)}
+                                      className="w-full text-left px-3 py-2 text-sm font-semibold text-red-700 hover:bg-red-50"
+                                    >
+                                      Delete
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -831,9 +883,12 @@ export default function RunReviewClient({ runId }: { runId: string }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-lg bg-white shadow-xl border border-gray-200">
             <div className="p-5">
-              <h3 className="text-lg font-semibold text-gray-900 mb-2">Unreviewed groups</h3>
+              <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                Unreviewed groups
+              </h3>
               <p className="text-sm text-gray-700">
-                You have <span className="font-semibold">{uncheckedCount}</span> groups unchecked.
+                You have <span className="font-semibold">{uncheckedCount}</span>{' '}
+                groups unchecked.
               </p>
             </div>
             <div className="px-5 pb-5 flex items-center justify-end gap-3">
@@ -846,10 +901,10 @@ export default function RunReviewClient({ runId }: { runId: string }) {
               </button>
               <button
                 type="button"
-                onClick={acceptAllAndExport}
-                className="px-4 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
+                onClick={acceptAllAndApprove}
+                className="px-4 py-2 rounded-md bg-green-600 text-white text-sm font-semibold hover:bg-green-700"
               >
-                Accept all &amp; export
+                Accept all &amp; approve
               </button>
             </div>
           </div>

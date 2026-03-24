@@ -38,6 +38,25 @@ SNOWFLAKE_PASSWORD=your_secure_password
 SNOWFLAKE_WAREHOUSE=COMPUTE_WH
 ```
 
+#### If your Snowflake user requires MFA (TOTP)
+The UI makes server-side API calls to Snowflake; **password + interactive MFA won’t work**.
+
+Recommended options:
+
+- **Key-pair auth (recommended)**:
+
+```bash
+# Use ONE of the following:
+SNOWFLAKE_PRIVATE_KEY_PATH=/absolute/path/to/rsa_key.p8
+# or inline (escape newlines):
+SNOWFLAKE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+# If encrypted:
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=your_passphrase
+```
+
+- **Use a Snowflake user exempt from MFA for API access** (service account), if your org allows it.
+
 ### 3. Deploy SQL Procedures
 
 Before running the UI, ensure the SQL procedures are deployed to Snowflake:
@@ -76,7 +95,8 @@ The new grouping system uses:
 
 1. **RUN_GROUPS**: Stores groups with their alias names (user-editable)
 2. **RUN_ITEMS**: Individual raw values assigned to groups via `group_id`
-3. **CONCEPT_ALIASES**: Master list of standardized alias names
+3. **CLASSIFICATION_METADATA_PROFILES**: Ordered pipelines for generating classification metadata (per-concept)
+4. **ALIASES**: Master list of standardized alias names
 
 Each run creates groups that organize similar raw values together. Users can review, rename groups, merge groups, and approve changes before applying them.
 
@@ -88,7 +108,8 @@ The UI interacts with these Snowflake objects:
   - `STAND_DB.STAND_INTERNAL.RUNS`
   - `STAND_DB.STAND_INTERNAL.RUN_GROUPS`
   - `STAND_DB.STAND_INTERNAL.RUN_ITEMS`
-  - `STAND_DB.STAND_INTERNAL.CONCEPT_ALIASES`
+  - `STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES`
+  - `STAND_DB.STAND_INTERNAL.ALIASES`
 
 ## Troubleshooting
 

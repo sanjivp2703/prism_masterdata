@@ -49,6 +49,12 @@ SNOWFLAKE_ACCOUNT=your_account.region
 SNOWFLAKE_USER=your_username
 SNOWFLAKE_PASSWORD=your_password
 SNOWFLAKE_WAREHOUSE=your_warehouse
+
+# If your user requires MFA (TOTP), prefer key-pair auth instead of password:
+# SNOWFLAKE_PRIVATE_KEY_PATH=/absolute/path/to/rsa_key.p8
+# or inline (escape newlines):
+# SNOWFLAKE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=your_passphrase
 EOL
     echo "✓ Created .env.local template"
     echo ""

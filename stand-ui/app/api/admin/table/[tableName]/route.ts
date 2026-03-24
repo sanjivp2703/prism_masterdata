@@ -1,11 +1,13 @@
 import { NextRequest } from 'next/server';
-import snowflake from 'snowflake-sdk';
+import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
 
 const ALLOWED_TABLES = [
-  'SEMANTIC_CONCEPTS',
-  'CONCEPT_ALIASES',
-  'NORMALIZED_VALUES_ALIAS_VARIANTS',
-  'RAW_VALUE_NORMALIZED_VARIANTS',
+  'CLASSIFICATION_METADATA_PROFILES',
+  'CONCEPTS',
+  'ALIASES',
+  'ALIAS_SUMMARY',
+  'TOKENS_SUMMARY',
+  'RAW_VALUES',
   'USERS',
   'RUNS',
   'RUN_GROUPS',
@@ -13,17 +15,6 @@ const ALLOWED_TABLES = [
   'RUN_APPLIED_TARGETS',
   'AUDIT_LOG',
 ];
-
-function createConnection() {
-  return snowflake.createConnection({
-    account: process.env.SNOWFLAKE_ACCOUNT || '',
-    username: process.env.SNOWFLAKE_USER || '',
-    password: process.env.SNOWFLAKE_PASSWORD || '',
-    warehouse: process.env.SNOWFLAKE_WAREHOUSE || '',
-    database: process.env.SNOWFLAKE_DATABASE || 'STAND_DB',
-    schema: process.env.SNOWFLAKE_SCHEMA || 'STAND_INTERNAL',
-  });
-}
 
 export async function GET(
   request: NextRequest,
@@ -38,48 +29,57 @@ export async function GET(
     );
   }
 
-  const connection = createConnection();
+  const sqlText = `SELECT * FROM STAND_DB.STAND_INTERNAL.${tableName} LIMIT 1000`;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      connection.connect((err) => {
-        if (err) reject(err);
-        else resolve();
+    return await withSnowflake(async (connection) => {
+      const rows = await new Promise<any[]>((resolve, reject) => {
+        connection.execute({
+          sqlText,
+          complete: (err, stmt, rows) => {
+            if (err) reject(err);
+            else resolve(rows || []);
+          },
+        });
       });
-    });
 
-    const rows = await new Promise<any[]>((resolve, reject) => {
-      connection.execute({
-        sqlText: `SELECT * FROM STAND_DB.STAND_INTERNAL.${tableName} LIMIT 1000`,
-        complete: (err, stmt, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      });
-    });
+      // Backward-compatible admin projection for TOKENS_SUMMARY:
+      // - If DB still has IS_NORMALIZED, expose TOKEN_TYPE derived from it.
+      // - Hide IS_NORMALIZED in API output so UI consistently shows TOKEN_TYPE.
+      const data =
+        tableName === 'TOKENS_SUMMARY'
+          ? rows.map((row: any) => {
+              const hasTokenType = row.TOKEN_TYPE !== undefined && row.TOKEN_TYPE !== null;
+              const tokenType = hasTokenType
+                ? String(row.TOKEN_TYPE)
+                : row.IS_NORMALIZED === true || row.IS_NORMALIZED === 'true'
+                  ? 'normalized'
+                  : row.IS_NORMALIZED === false || row.IS_NORMALIZED === 'false'
+                    ? 'standard'
+                    : null;
 
-    return Response.json({ data: rows }, {
-      headers: {
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        'Pragma': 'no-cache',
-        'Expires': '0',
-      },
+              const { IS_NORMALIZED, ...rest } = row;
+              return {
+                ...rest,
+                TOKEN_TYPE: tokenType,
+              };
+            })
+          : rows;
+
+      return Response.json(
+        { data },
+        {
+          headers: {
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            Pragma: 'no-cache',
+            Expires: '0',
+          },
+        }
+      );
     });
   } catch (error) {
     console.error('Database error:', error);
-    return Response.json(
-      { error: 'Failed to fetch data' },
-      { 
-        status: 500,
-        headers: {
-          'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        },
-      }
-    );
-  } finally {
-    connection.destroy((err) => {
-      if (err) console.error('Error closing connection:', err);
-    });
+    return snowflakeErrorResponse(error, 'Failed to fetch data');
   }
 }
 
