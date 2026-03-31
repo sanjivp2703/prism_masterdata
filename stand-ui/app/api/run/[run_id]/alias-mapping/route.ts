@@ -521,7 +521,7 @@ export async function GET(
           sqlText: `
             SELECT
               run_item_id,
-              normalization_value AS normalized_value,
+              normalization_value,
               tokens,
               normalized_tokens,
               IFF(
@@ -539,6 +539,27 @@ export async function GET(
           `,
           binds: [run_id],
           complete: (err, stmt, rows) => {
+            if (err) reject(err);
+            else resolve(rows || []);
+          },
+        });
+      });
+
+      const aliasNormalizationRows = await new Promise<any[]>((resolve, reject) => {
+        connection.execute({
+          sqlText: `
+            SELECT
+              rv.alias_id,
+              rv.raw_value_id,
+              rv.normalization_value
+            FROM STAND_DB.STAND_INTERNAL.RAW_VALUES rv
+            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
+              ON a.alias_id = rv.alias_id
+            WHERE a.concept_id = ?
+              AND rv.normalization_value IS NOT NULL
+          `,
+          binds: [conceptId],
+          complete: (err, _stmt, rows) => {
             if (err) reject(err);
             else resolve(rows || []);
           },
@@ -582,7 +603,6 @@ export async function GET(
             SELECT
               rv.alias_id,
               ts.raw_value_id,
-              rv.normalization_value AS normalized_value,
               ts.token_type,
               LISTAGG(ts.token, '|') WITHIN GROUP (ORDER BY ts.position_in_signature) AS token_signature_pipe
             FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
@@ -593,7 +613,7 @@ export async function GET(
             WHERE a.concept_id = ?
               AND ts.token_type IN ('standard', 'normalized')
               AND ts.raw_value_id IS NOT NULL
-            GROUP BY rv.alias_id, ts.raw_value_id, rv.normalization_value, ts.token_type
+            GROUP BY rv.alias_id, ts.raw_value_id, ts.token_type
           `,
           binds: [conceptId],
           complete: (err, _stmt, rows) => {
@@ -603,16 +623,55 @@ export async function GET(
         });
       });
 
-      const aliasValueRows = await new Promise<any[]>((resolve, reject) => {
+      // Per-token importance scores for all raw-value tokens in this concept
+      const tokenImportanceRows = await new Promise<any[]>((resolve, reject) => {
         connection.execute({
           sqlText: `
             SELECT
-              rv.alias_id,
+              ts.raw_value_id,
+              ts.token_type,
+              ts.token,
+              ts.position_in_signature,
+              ts.importance_score
+            FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
+            INNER JOIN STAND_DB.STAND_INTERNAL.RAW_VALUES rv
+              ON rv.raw_value_id = ts.raw_value_id
+            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
+              ON a.alias_id = rv.alias_id
+            WHERE a.concept_id = ?
+              AND ts.token_type IN ('standard', 'normalized')
+              AND ts.raw_value_id IS NOT NULL
+            ORDER BY ts.raw_value_id, ts.token_type, ts.position_in_signature
+          `,
+          binds: [conceptId],
+          complete: (err, _stmt, rows) => {
+            if (err) reject(err);
+            else resolve(rows || []);
+          },
+        });
+      });
+
+      // Per-raw-value signature importance scores from ALIAS_SUMMARY
+      const rawValueSigScoreRows = await new Promise<any[]>((resolve, reject) => {
+        connection.execute({
+          sqlText: `
+            SELECT
               rv.raw_value_id,
-              rv.normalization_value AS normalized_value
+              COALESCE(s_std.importance_score,  0) AS standard_sig_score,
+              COALESCE(s_norm.importance_score, 0) AS normalized_sig_score
             FROM STAND_DB.STAND_INTERNAL.RAW_VALUES rv
             INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
               ON a.alias_id = rv.alias_id
+            LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_std
+              ON s_std.alias_id  = rv.alias_id
+             AND s_std.key_type  = 'token signature'
+             AND rv.tokens IS NOT NULL
+             AND s_std.key_value = ARRAY_TO_STRING(rv.tokens::ARRAY, '|')
+            LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_norm
+              ON s_norm.alias_id  = rv.alias_id
+             AND s_norm.key_type  = 'normalized token signature'
+             AND rv.normalized_tokens IS NOT NULL
+             AND s_norm.key_value = ARRAY_TO_STRING(rv.normalized_tokens::ARRAY, '|')
             WHERE a.concept_id = ?
           `,
           binds: [conceptId],
@@ -646,7 +705,7 @@ export async function GET(
         {
           std: string[];
           norm: string[];
-          normalized_value: string | null;
+          normalization_value: string | null;
           new_token_signature: string | null;
           new_normalized_token_signature: string | null;
         }
@@ -658,10 +717,11 @@ export async function GET(
         runItemTokensById.set(id, {
           std,
           norm,
-          normalized_value:
-            (row as any).NORMALIZED_VALUE === null || (row as any).NORMALIZED_VALUE === undefined
+          normalization_value:
+            (row as any).NORMALIZATION_VALUE === null ||
+            (row as any).NORMALIZATION_VALUE === undefined
               ? null
-              : String((row as any).NORMALIZED_VALUE),
+              : String((row as any).NORMALIZATION_VALUE),
           new_token_signature:
             (row as any).NEW_TOKEN_SIGNATURE === null || (row as any).NEW_TOKEN_SIGNATURE === undefined
               ? null
@@ -681,11 +741,12 @@ export async function GET(
           .filter((t) => t.length > 0);
 
       const aliasTokensById = new Map<number, string[]>();
+      const aliasNameById = new Map<number, string>();
       for (const row of aliasTokenRows) {
-        aliasTokensById.set(
-          Number((row as any).ALIAS_ID),
-          parsePipeTokens((row as any).TOKEN_SIGNATURE_PIPE as string)
-        );
+        const aliasId = Number((row as any).ALIAS_ID);
+        aliasTokensById.set(aliasId, parsePipeTokens((row as any).TOKEN_SIGNATURE_PIPE as string));
+        const aliasName = String((row as any).ALIAS_NAME ?? '').trim();
+        if (aliasName) aliasNameById.set(aliasId, aliasName);
       }
 
       type RawSigEntry = { raw_value_id: number; tokens: string[] };
@@ -693,22 +754,6 @@ export async function GET(
         number,
         { standard: RawSigEntry[]; normalized: RawSigEntry[] }
       >();
-      const aliasNormalizedValuesById = new Map<number, Array<{ raw_value_id: number; normalized_value: string }>>();
-      for (const row of aliasValueRows) {
-        const aliasId = Number((row as any).ALIAS_ID);
-        const rawValueId = Number((row as any).RAW_VALUE_ID);
-        const normalizedValue =
-          (row as any).NORMALIZED_VALUE === null || (row as any).NORMALIZED_VALUE === undefined
-            ? ''
-            : String((row as any).NORMALIZED_VALUE);
-        if (!aliasNormalizedValuesById.has(aliasId)) {
-          aliasNormalizedValuesById.set(aliasId, []);
-        }
-        aliasNormalizedValuesById.get(aliasId)!.push({
-          raw_value_id: rawValueId,
-          normalized_value: normalizedValue,
-        });
-      }
       for (const row of rawValueSigRows) {
         const aliasId = Number((row as any).ALIAS_ID);
         const rawValueId = Number((row as any).RAW_VALUE_ID);
@@ -725,6 +770,41 @@ export async function GET(
         }
       }
 
+      // Per-token importance scores keyed by raw_value_id
+      type TokenImportanceEntry = { token: string; score: number };
+      const tokenImportanceByRawValueId = new Map<
+        number,
+        { standard: TokenImportanceEntry[]; normalized: TokenImportanceEntry[] }
+      >();
+      for (const row of tokenImportanceRows) {
+        const rawValueId = Number((row as any).RAW_VALUE_ID);
+        const tokenType = String((row as any).TOKEN_TYPE ?? '').toLowerCase();
+        const token = String((row as any).TOKEN ?? '');
+        const score = Number((row as any).IMPORTANCE_SCORE ?? 0);
+        if (!tokenImportanceByRawValueId.has(rawValueId)) {
+          tokenImportanceByRawValueId.set(rawValueId, { standard: [], normalized: [] });
+        }
+        const imp = tokenImportanceByRawValueId.get(rawValueId)!;
+        if (tokenType === 'standard') {
+          imp.standard.push({ token, score });
+        } else if (tokenType === 'normalized') {
+          imp.normalized.push({ token, score });
+        }
+      }
+
+      // Per-raw-value signature importance scores
+      const rawValueSigScoreById = new Map<
+        number,
+        { standard_sig_score: number; normalized_sig_score: number }
+      >();
+      for (const row of rawValueSigScoreRows) {
+        const rawValueId = Number((row as any).RAW_VALUE_ID);
+        rawValueSigScoreById.set(rawValueId, {
+          standard_sig_score: Number((row as any).STANDARD_SIG_SCORE ?? 0),
+          normalized_sig_score: Number((row as any).NORMALIZED_SIG_SCORE ?? 0),
+        });
+      }
+
       type AliasSigComparison = {
         comparison_kind: string;
         existing_signature: string;
@@ -735,36 +815,63 @@ export async function GET(
         is_subset_old_to_new: boolean;
         longest_matching_subsequence_length: number;
       };
-      type ValueComparison = {
-        comparison_kind: string;
-        existing_raw_value_id: number;
-        run_item_normalized_value: string;
-        alias_value_normalized_value: string;
-        jaro_winkler_score: number;
+      type NormalizedAliasSigComparison = AliasSigComparison & {
+        acronym: boolean;
+        run_normalized_token_signature_sorted: string;
+        existing_normalized_token_signature_sorted: string;
+        levenshtein_score: number;
+      };
+      type StandardAliasSigComparison = AliasSigComparison & {
+        acronym: boolean;
+      };
+      type NormalizedToAliasSigComparison = AliasSigComparison & {
+        run_normalized_token_signature_sorted: string;
+        alias_normalized_token_signature_sorted: string;
+        levenshtein_score: number;
       };
       type TokenSimilarityResult = {
         overlap_score_alias: number;
-        jaro_winkler_score_total: number;
+        levenshtein_score_total: number;
+        acronym_total: number;
         num_subsets: number;
         sum_subsequence_length: number;
-        run_item_normalized_value: string | null;
         new_token_signature: string | null;
         new_normalized_token_signature: string | null;
         token_signature_comparisons: Array<
-          AliasSigComparison & { existing_raw_value_id: number; jaro_winkler_score: number }
+          StandardAliasSigComparison & { existing_raw_value_id: number }
         >;
         normalized_token_signature_comparisons: Array<
-          AliasSigComparison & { existing_raw_value_id: number; jaro_winkler_score: number }
+          NormalizedAliasSigComparison & { existing_raw_value_id: number }
         >;
-        value_comparisons: ValueComparison[];
         alias_token_signature_comparison: {
           alias_id: number;
           alias_token_signature: string;
           standard_to_alias: AliasSigComparison;
-          normalized_to_alias: AliasSigComparison;
+          normalized_to_alias: NormalizedToAliasSigComparison;
         };
       };
       const tokenSimilarityByKey = new Map<string, TokenSimilarityResult>();
+      type AliasNormalizationEntry = { raw_value_id: number; normalization_value: string };
+      type StringSimilarityComparison = {
+        comparison_kind: string;
+        existing_raw_value_id: number;
+        run_item_normalization_value: string;
+        existing_normalization_value: string;
+        jaro_winkler_score: number;
+      };
+      type NormalizationValueToAliasNameComparison = {
+        comparison_kind: string;
+        run_item_normalization_value: string;
+        alias_name: string;
+        jaro_winkler_score: number;
+      };
+      type StringSimilarityResult = {
+        run_item_normalization_value: string | null;
+        normalization_value_comparisons: StringSimilarityComparison[];
+        normalization_value_to_alias_name_comparison: NormalizationValueToAliasNameComparison | null;
+        jaro_winkler_score_total: number;
+      };
+      const stringSimilarityByKey = new Map<string, StringSimilarityResult>();
 
       const isSubset = (subsetTokens: string[], supersetTokens: string[]): boolean => {
         if (subsetTokens.length === 0) return false;
@@ -794,12 +901,11 @@ export async function GET(
         return dp[m][n];
       };
 
-      const jaroWinklerScore = (leftRaw: string | null | undefined, rightRaw: string | null | undefined): number => {
-        const left = String(leftRaw ?? '').toLowerCase();
-        const right = String(rightRaw ?? '').toLowerCase();
-        if (left.length === 0 && right.length === 0) return 1;
-        if (left.length === 0 || right.length === 0) return 0;
+      const jaroWinklerScore = (leftInput: string, rightInput: string): number => {
+        const left = String(leftInput ?? '');
+        const right = String(rightInput ?? '');
         if (left === right) return 1;
+        if (left.length === 0 || right.length === 0) return 0;
 
         const matchDistance = Math.max(Math.floor(Math.max(left.length, right.length) / 2) - 1, 0);
         const leftMatches = new Array<boolean>(left.length).fill(false);
@@ -818,36 +924,91 @@ export async function GET(
             break;
           }
         }
-
         if (matches === 0) return 0;
 
-        let transpositionsHalf = 0;
-        let rightIndex = 0;
+        let transpositions = 0;
+        let rightIdx = 0;
         for (let i = 0; i < left.length; i++) {
           if (!leftMatches[i]) continue;
-          while (rightIndex < right.length && !rightMatches[rightIndex]) rightIndex++;
-          if (rightIndex < right.length && left[i] !== right[rightIndex]) {
-            transpositionsHalf++;
-          }
-          rightIndex++;
+          while (!rightMatches[rightIdx]) rightIdx++;
+          if (left[i] !== right[rightIdx]) transpositions++;
+          rightIdx++;
         }
-        const transpositions = transpositionsHalf / 2;
-        const m = matches;
-        const jaro = (m / left.length + m / right.length + (m - transpositions) / m) / 3;
+        transpositions /= 2;
+
+        const jaro =
+          (matches / left.length + matches / right.length + (matches - transpositions) / matches) / 3;
 
         let prefixLength = 0;
-        const maxPrefix = 4;
-        while (
-          prefixLength < maxPrefix &&
-          prefixLength < left.length &&
-          prefixLength < right.length &&
-          left[prefixLength] === right[prefixLength]
-        ) {
+        const maxPrefix = Math.min(4, left.length, right.length);
+        while (prefixLength < maxPrefix && left[prefixLength] === right[prefixLength]) {
           prefixLength++;
         }
 
         const scalingFactor = 0.1;
-        return jaro + prefixLength * scalingFactor * (1 - jaro);
+        const winkler = jaro + prefixLength * scalingFactor * (1 - jaro);
+        return Number(winkler.toFixed(6));
+      };
+
+      const sortedTokenSignature = (tokens: string[]): string =>
+        [...tokens].sort((a, b) => a.localeCompare(b)).join('|');
+
+      const levenshteinDistance = (leftInput: string, rightInput: string): number => {
+        const left = String(leftInput ?? '');
+        const right = String(rightInput ?? '');
+        const m = left.length;
+        const n = right.length;
+        if (m === 0) return n;
+        if (n === 0) return m;
+
+        const dp: number[][] = Array.from({ length: m + 1 }, () =>
+          new Array<number>(n + 1).fill(0)
+        );
+        for (let i = 0; i <= m; i++) dp[i][0] = i;
+        for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+        for (let i = 1; i <= m; i++) {
+          for (let j = 1; j <= n; j++) {
+            const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(
+              dp[i - 1][j] + 1,
+              dp[i][j - 1] + 1,
+              dp[i - 1][j - 1] + cost
+            );
+          }
+        }
+        return dp[m][n];
+      };
+
+      const normalizeComparableValue = (value: string | null | undefined): string =>
+        String(value ?? '')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, '');
+
+      const acronymFromTokens = (tokens: string[]): string =>
+        tokens
+          .map((token) => String(token ?? '').trim())
+          .filter((token) => token.length > 0)
+          .map((token) => token[0].toLowerCase())
+          .join('');
+
+      const isAcronymMatch = (
+        runTokens: string[],
+        existingTokens: string[],
+        runNormalizationValue: string,
+        existingNormalizationValue: string
+      ): boolean => {
+        if (runTokens.length === 0 || existingTokens.length === 0) return false;
+        if (runTokens.length === existingTokens.length) return false;
+
+        const runIsLonger = runTokens.length > existingTokens.length;
+        const longerTokens = runIsLonger ? runTokens : existingTokens;
+        const otherNormalizationValue = runIsLonger ? existingNormalizationValue : runNormalizationValue;
+
+        const acronym = acronymFromTokens(longerTokens);
+        const normalizedOther = normalizeComparableValue(otherNormalizationValue);
+        return acronym.length > 0 && normalizedOther.length > 0 && acronym === normalizedOther;
       };
 
       /** Overlap score: positions defined by the existing signature's token order; checks if run tokens contain each. */
@@ -873,32 +1034,40 @@ export async function GET(
         };
       };
 
+      const aliasNormalizationById = new Map<number, AliasNormalizationEntry[]>();
+      const aliasNormalizationByRawValueId = new Map<number, string>();
+      for (const row of aliasNormalizationRows) {
+        const aliasId = Number((row as any).ALIAS_ID);
+        const rawValueId = Number((row as any).RAW_VALUE_ID);
+        const normalizationValue = String((row as any).NORMALIZATION_VALUE ?? '').trim();
+        if (!normalizationValue) continue;
+        if (!aliasNormalizationById.has(aliasId)) {
+          aliasNormalizationById.set(aliasId, []);
+        }
+        aliasNormalizationById.get(aliasId)!.push({
+          raw_value_id: rawValueId,
+          normalization_value: normalizationValue,
+        });
+        aliasNormalizationByRawValueId.set(rawValueId, normalizationValue);
+      }
+
       const buildTokenSimilarity = (runItemId: number, aliasId: number): TokenSimilarityResult => {
         const ri = runItemTokensById.get(runItemId);
         const aliasToks = aliasTokensById.get(aliasId) ?? [];
         const std = ri?.std ?? [];
         const norm = ri?.norm ?? [];
-        const runItemNormalizedValue = ri?.normalized_value ?? null;
+        const runNormalizationValue = String(ri?.normalization_value ?? '');
+        const runNormSortedSignature = sortedTokenSignature(norm);
         const rawSigs = rawValueSigsById.get(aliasId) ?? { standard: [], normalized: [] };
-        const aliasNormalizedValues = aliasNormalizedValuesById.get(aliasId) ?? [];
-
-        const jaroWinklerByRawValueId = new Map<number, number>();
-        const value_comparisons = aliasNormalizedValues.map((entry) => {
-          const score = jaroWinklerScore(runItemNormalizedValue, entry.normalized_value);
-          jaroWinklerByRawValueId.set(entry.raw_value_id, score);
-          return {
-            comparison_kind: 'run_item_normalized_value_to_alias_value_normalized_value',
-            existing_raw_value_id: entry.raw_value_id,
-            run_item_normalized_value: String(runItemNormalizedValue ?? ''),
-            alias_value_normalized_value: String(entry.normalized_value ?? ''),
-            jaro_winkler_score: score,
-          };
-        });
 
         // --- Per-raw-value standard signature comparisons (run std tokens vs each existing std sig) ---
         const token_signature_comparisons = rawSigs.standard.map((entry) => {
           const overlap = overlapAgainstSignature(entry.tokens, std);
           const lcs = longestCommonSubsequenceLength(std, entry.tokens);
+          const existingNormalizationValue =
+            aliasNormalizationByRawValueId.get(entry.raw_value_id) ?? '';
+          const imp = tokenImportanceByRawValueId.get(entry.raw_value_id) ?? { standard: [], normalized: [] };
+          const sigScores = rawValueSigScoreById.get(entry.raw_value_id) ?? { standard_sig_score: 0, normalized_sig_score: 0 };
           return {
             comparison_kind: 'run_standard_tokens_to_raw_value_standard_tokens',
             existing_raw_value_id: entry.raw_value_id,
@@ -906,7 +1075,16 @@ export async function GET(
             is_subset_new_to_old: isSubset(std, entry.tokens),
             is_subset_old_to_new: isSubset(entry.tokens, std),
             longest_matching_subsequence_length: lcs,
-            jaro_winkler_score: jaroWinklerByRawValueId.get(entry.raw_value_id) ?? 0,
+            acronym: isAcronymMatch(
+              std,
+              entry.tokens,
+              runNormalizationValue,
+              existingNormalizationValue
+            ),
+            standard_tokens: imp.standard,
+            token_signature_score: sigScores.standard_sig_score,
+            normalized_tokens: imp.normalized,
+            normalized_token_signature_score: sigScores.normalized_sig_score,
           };
         });
 
@@ -914,6 +1092,15 @@ export async function GET(
         const normalized_token_signature_comparisons = rawSigs.normalized.map((entry) => {
           const overlap = overlapAgainstSignature(entry.tokens, norm);
           const lcs = longestCommonSubsequenceLength(norm, entry.tokens);
+          const existingNormSortedSignature = sortedTokenSignature(entry.tokens);
+          const levenshteinScore = levenshteinDistance(
+            runNormSortedSignature,
+            existingNormSortedSignature
+          );
+          const existingNormalizationValue =
+            aliasNormalizationByRawValueId.get(entry.raw_value_id) ?? '';
+          const imp = tokenImportanceByRawValueId.get(entry.raw_value_id) ?? { standard: [], normalized: [] };
+          const sigScores = rawValueSigScoreById.get(entry.raw_value_id) ?? { standard_sig_score: 0, normalized_sig_score: 0 };
           return {
             comparison_kind: 'run_normalized_tokens_to_raw_value_normalized_tokens',
             existing_raw_value_id: entry.raw_value_id,
@@ -921,7 +1108,19 @@ export async function GET(
             is_subset_new_to_old: isSubset(norm, entry.tokens),
             is_subset_old_to_new: isSubset(entry.tokens, norm),
             longest_matching_subsequence_length: lcs,
-            jaro_winkler_score: jaroWinklerByRawValueId.get(entry.raw_value_id) ?? 0,
+            acronym: isAcronymMatch(
+              norm,
+              entry.tokens,
+              runNormalizationValue,
+              existingNormalizationValue
+            ),
+            run_normalized_token_signature_sorted: runNormSortedSignature,
+            existing_normalized_token_signature_sorted: existingNormSortedSignature,
+            levenshtein_score: levenshteinScore,
+            standard_tokens: imp.standard,
+            token_signature_score: sigScores.standard_sig_score,
+            normalized_tokens: imp.normalized,
+            normalized_token_signature_score: sigScores.normalized_sig_score,
           };
         });
 
@@ -930,6 +1129,9 @@ export async function GET(
         const normAliasOverlap = overlapAgainstSignature(aliasToks, norm);
         const stdAliasLcs = longestCommonSubsequenceLength(std, aliasToks);
         const normAliasLcs = longestCommonSubsequenceLength(norm, aliasToks);
+
+        const aliasSortedNormSig = sortedTokenSignature(aliasToks);
+        const normToAliasLevenshteinScore = levenshteinDistance(runNormSortedSignature, aliasSortedNormSig);
 
         const alias_token_signature_comparison = {
           alias_id: aliasId,
@@ -947,6 +1149,9 @@ export async function GET(
             is_subset_new_to_old: isSubset(norm, aliasToks),
             is_subset_old_to_new: isSubset(aliasToks, norm),
             longest_matching_subsequence_length: normAliasLcs,
+            run_normalized_token_signature_sorted: runNormSortedSignature,
+            alias_normalized_token_signature_sorted: aliasSortedNormSig,
+            levenshtein_score: normToAliasLevenshteinScore,
           },
         };
 
@@ -956,9 +1161,12 @@ export async function GET(
           normalized_token_signature_comparisons.reduce((s, c) => s + c.overlap_score_signature, 0) +
           stdAliasOverlap.overlap_score_signature +
           normAliasOverlap.overlap_score_signature;
-        const jaroWinklerScoreTotal = value_comparisons.reduce((sum, comparison) => {
-          return sum + comparison.jaro_winkler_score;
-        }, 0);
+        const levenshteinScoreTotal =
+          normalized_token_signature_comparisons.reduce((s, c) => s + c.levenshtein_score, 0) +
+          normToAliasLevenshteinScore;
+        const acronymTotal =
+          token_signature_comparisons.reduce((s, c) => s + (c.acronym ? 1 : 0), 0) +
+          normalized_token_signature_comparisons.reduce((s, c) => s + (c.acronym ? 1 : 0), 0);
 
         const numSubsets =
           token_signature_comparisons.reduce(
@@ -985,16 +1193,67 @@ export async function GET(
 
         return {
           overlap_score_alias: overlapScoreAlias,
-          jaro_winkler_score_total: jaroWinklerScoreTotal,
+          levenshtein_score_total: levenshteinScoreTotal,
+          acronym_total: acronymTotal,
           num_subsets: numSubsets,
           sum_subsequence_length: sumSubsequenceLength,
-          run_item_normalized_value: runItemNormalizedValue,
           new_token_signature: ri?.new_token_signature ?? null,
           new_normalized_token_signature: ri?.new_normalized_token_signature ?? null,
           token_signature_comparisons,
           normalized_token_signature_comparisons,
-          value_comparisons,
           alias_token_signature_comparison,
+        };
+      };
+
+      const buildStringSimilarity = (runItemId: number, aliasId: number): StringSimilarityResult => {
+        const ri = runItemTokensById.get(runItemId);
+        const runNorm = String(ri?.normalization_value ?? '').trim();
+        const aliasNormEntries = aliasNormalizationById.get(aliasId) ?? [];
+        const aliasName = aliasNameById.get(aliasId) ?? null;
+
+        if (!runNorm || aliasNormEntries.length === 0) {
+          return {
+            run_item_normalization_value: runNorm || null,
+            normalization_value_comparisons: [],
+            normalization_value_to_alias_name_comparison: null,
+            jaro_winkler_score_total: 0,
+          };
+        }
+
+        const normalizationValueComparisons: StringSimilarityComparison[] = aliasNormEntries.map((entry) => {
+          const score = jaroWinklerScore(runNorm, entry.normalization_value);
+          return {
+            comparison_kind: 'run_item_normalization_value_to_alias_normalization_value',
+            existing_raw_value_id: entry.raw_value_id,
+            run_item_normalization_value: runNorm,
+            existing_normalization_value: entry.normalization_value,
+            jaro_winkler_score: score,
+          };
+        });
+
+        // normalization_value to alias name comparison
+        const normalizationValueToAliasNameComparison: NormalizationValueToAliasNameComparison | null =
+          runNorm && aliasName
+            ? {
+                comparison_kind: 'run_item_normalization_value_to_alias_name',
+                run_item_normalization_value: runNorm,
+                alias_name: aliasName,
+                jaro_winkler_score: jaroWinklerScore(runNorm, aliasName),
+              }
+            : null;
+
+        const jaroWinklerScoreTotal = Number(
+          (
+            normalizationValueComparisons.reduce((sum, comparison) => sum + comparison.jaro_winkler_score, 0) +
+            (normalizationValueToAliasNameComparison?.jaro_winkler_score ?? 0)
+          ).toFixed(6)
+        );
+
+        return {
+          run_item_normalization_value: runNorm,
+          normalization_value_comparisons: normalizationValueComparisons,
+          normalization_value_to_alias_name_comparison: normalizationValueToAliasNameComparison,
+          jaro_winkler_score_total: jaroWinklerScoreTotal,
         };
       };
 
@@ -1008,10 +1267,13 @@ export async function GET(
       }
       for (const key of similarityKeySet) {
         const [runItemIdStr, aliasIdStr] = key.split('::');
+        const runItemId = Number(runItemIdStr);
+        const aliasId = Number(aliasIdStr);
         tokenSimilarityByKey.set(
           key,
-          buildTokenSimilarity(Number(runItemIdStr), Number(aliasIdStr))
+          buildTokenSimilarity(runItemId, aliasId)
         );
+        stringSimilarityByKey.set(key, buildStringSimilarity(runItemId, aliasId));
       }
 
       const computedConfidenceRows = confidenceRows.map((r: any) => {
@@ -1023,13 +1285,21 @@ export async function GET(
             ? 0
             : Number(r.CONFIDENCE_SCORE);
         const similarity = tokenSimilarityByKey.get(`${runItemId}::${aliasId}`);
+        const stringSimilarity = stringSimilarityByKey.get(`${runItemId}::${aliasId}`);
         const overlapScoreAlias = similarity?.overlap_score_alias ?? 0;
+        const levenshteinScoreTotal = similarity?.levenshtein_score_total ?? 0;
         const numSubsets = similarity?.num_subsets ?? 0;
         const sumSubsequenceLength = similarity?.sum_subsequence_length ?? 0;
+        const jaroWinklerScoreTotal = stringSimilarity?.jaro_winkler_score_total ?? 0;
         const finalConfidence =
           matchSource === 'stored_raw_value'
             ? 100
-            : baseConfidence + overlapScoreAlias + numSubsets + sumSubsequenceLength;
+            : baseConfidence +
+              overlapScoreAlias +
+              levenshteinScoreTotal +
+              numSubsets +
+              sumSubsequenceLength +
+              jaroWinklerScoreTotal;
 
         return {
           ...r,
@@ -1038,14 +1308,18 @@ export async function GET(
           _aliasId: aliasId,
           _baseConfidence: baseConfidence,
           _overlapScoreAlias: overlapScoreAlias,
+          _levenshteinScoreTotal: levenshteinScoreTotal,
           _numSubsets: numSubsets,
           _sumSubsequenceLength: sumSubsequenceLength,
+          _jaroWinklerScoreTotal: jaroWinklerScoreTotal,
           _finalConfidence: finalConfidence,
           _tokenSimilarity: similarity ?? null,
+          _stringSimilarity: stringSimilarity ?? null,
         };
       });
 
-      // Recompute chosen alias using final confidence (base + overlap_score_alias + num_subsets + sum_subsequence_length).
+      // Recompute chosen alias using final confidence:
+      // base + overlap_score_alias + levenshtein_score_total + num_subsets + sum_subsequence_length + jaro_winkler_score_total.
       const topByRunItem = new Map<number, { aliasId: number; score: number }>();
       for (const r of computedConfidenceRows) {
         const runItemId = (r as any)._runItemId as number;
@@ -1062,6 +1336,7 @@ export async function GET(
         const runItemId = r._runItemId as number;
         const aliasId = r._aliasId as number;
         const similarity = r._tokenSimilarity as TokenSimilarityResult | null;
+        const stringSimilarity = r._stringSimilarity as StringSimilarityResult | null;
         const top = topByRunItem.get(runItemId);
         const isChosen = Boolean(top && top.aliasId === aliasId);
 
@@ -1073,20 +1348,27 @@ export async function GET(
           confidence_score: Number(r._finalConfidence ?? 0),
           chosen_alias: isChosen,
           match_source: matchSource,
-          value_to_alias_values_comparison: {
+          token_similarity: {
             overlap_score_alias: similarity?.overlap_score_alias ?? 0,
-            jaro_winkler_score_total: similarity?.jaro_winkler_score_total ?? 0,
+            levenshtein_score_total: similarity?.levenshtein_score_total ?? 0,
+            acronym_total: similarity?.acronym_total ?? 0,
             num_subsets: similarity?.num_subsets ?? 0,
             sum_subsequence_length: similarity?.sum_subsequence_length ?? 0,
-            run_item_normalized_value: similarity?.run_item_normalized_value ?? null,
             new_token_signature: similarity?.new_token_signature ?? null,
             new_normalized_token_signature: similarity?.new_normalized_token_signature ?? null,
             token_signature_comparisons: similarity?.token_signature_comparisons ?? [],
             normalized_token_signature_comparisons:
               similarity?.normalized_token_signature_comparisons ?? [],
-            value_comparisons: similarity?.value_comparisons ?? [],
             alias_token_signature_comparison:
               similarity?.alias_token_signature_comparison ?? null,
+          },
+          string_similarity: {
+            run_item_normalization_value: stringSimilarity?.run_item_normalization_value ?? null,
+            normalization_value_comparisons:
+              stringSimilarity?.normalization_value_comparisons ?? [],
+            normalization_value_to_alias_name_comparison:
+              stringSimilarity?.normalization_value_to_alias_name_comparison ?? null,
+            jaro_winkler_score_total: stringSimilarity?.jaro_winkler_score_total ?? 0,
           },
         };
 
@@ -1094,7 +1376,8 @@ export async function GET(
           return {
             ...base,
             exact_match: null,
-            value_to_alias_values_comparison: null,
+            token_similarity: null,
+            string_similarity: null,
             note: 'Matched from ALIAS_SUMMARY (key_type=raw value) for this concept; full step scoring skipped.',
           };
         }
@@ -1115,7 +1398,7 @@ export async function GET(
         };
       });
 
-      /** Best chosen confidence per run_item (100 = ALIAS_SUMMARY direct match; else base + overlap + subsets + sum_subsequence_length) */
+      /** Best chosen confidence per run_item (100 = ALIAS_SUMMARY direct match; else base + overlap + levenshtein + subsets + sum_subsequence_length + jaro_winkler_score_total) */
       const chosenConfidenceByRunItemId = new Map<number, number>();
       for (const detail of confidenceDetails) {
         if (detail.chosen_alias) {

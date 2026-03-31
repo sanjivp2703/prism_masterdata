@@ -45,6 +45,7 @@ export async function GET(
             SELECT
               a.alias_id,
               a.alias_name,
+              a.alias_subgroup_id,
               rv.raw_value,
               rv.confidence
             FROM STAND_DB.STAND_INTERNAL.ALIASES a
@@ -52,7 +53,7 @@ export async function GET(
               ON rv.alias_id = a.alias_id
             WHERE a.concept_id = ?
               AND a.status = 'active'
-            ORDER BY a.alias_name, rv.raw_value
+            ORDER BY a.alias_name, a.alias_subgroup_id, rv.raw_value
           `,
           binds: [conceptIdNum],
           complete: (err, stmt, rows) => {
@@ -62,29 +63,39 @@ export async function GET(
         });
       });
 
-      const aliasMap: Record<
-        string,
-        {
-          alias_id: number;
-          items: Array<{
-            raw_value: string;
-            confidence: number | null;
-          }>;
-        }
-      > = {};
+      type SubgroupEntry = {
+        alias_id: number;
+        alias_subgroup_id: number;
+        items: Array<{ raw_value: string; confidence: number | null }>;
+      };
+      const aliasMap: Record<string, { subgroups: SubgroupEntry[] }> = {};
+
+      // Track which alias_ids have already been opened so we don't duplicate the subgroup header.
+      const seenAliasIds = new Set<number>();
 
       for (const r of rows) {
         const aliasName = String(r.ALIAS_NAME ?? r.alias_name ?? '');
         const aliasId = Number(r.ALIAS_ID ?? r.alias_id);
+        const aliasSubgroupId = Number(r.ALIAS_SUBGROUP_ID ?? r.alias_subgroup_id ?? 0);
         if (!aliasName || !Number.isFinite(aliasId)) continue;
 
         if (!aliasMap[aliasName]) {
-          aliasMap[aliasName] = { alias_id: aliasId, items: [] };
+          aliasMap[aliasName] = { subgroups: [] };
+        }
+
+        if (!seenAliasIds.has(aliasId)) {
+          seenAliasIds.add(aliasId);
+          aliasMap[aliasName].subgroups.push({
+            alias_id: aliasId,
+            alias_subgroup_id: aliasSubgroupId,
+            items: [],
+          });
         }
 
         const rawValue = r.RAW_VALUE ?? r.raw_value;
         if (rawValue !== null && rawValue !== undefined) {
-          aliasMap[aliasName].items.push({
+          const subgroup = aliasMap[aliasName].subgroups.find((s) => s.alias_id === aliasId)!;
+          subgroup.items.push({
             raw_value: String(rawValue),
             confidence:
               r.CONFIDENCE === null || r.CONFIDENCE === undefined
@@ -100,11 +111,11 @@ export async function GET(
         const aliasRows = await new Promise<any[]>((resolve, reject) => {
           connection.execute({
             sqlText: `
-              SELECT alias_id, alias_name
+              SELECT alias_id, alias_name, alias_subgroup_id
               FROM STAND_DB.STAND_INTERNAL.ALIASES
               WHERE concept_id = ?
                 AND status = 'active'
-              ORDER BY alias_name
+              ORDER BY alias_name, alias_subgroup_id
             `,
             binds: [conceptIdNum],
             complete: (err, stmt, rows) => {
@@ -116,8 +127,13 @@ export async function GET(
         for (const a of aliasRows) {
           const aliasName = String(a.ALIAS_NAME ?? a.alias_name ?? '');
           const aliasId = Number(a.ALIAS_ID ?? a.alias_id);
+          const aliasSubgroupId = Number(a.ALIAS_SUBGROUP_ID ?? a.alias_subgroup_id ?? 0);
           if (!aliasName || !Number.isFinite(aliasId)) continue;
-          if (!aliasMap[aliasName]) aliasMap[aliasName] = { alias_id: aliasId, items: [] };
+          if (!aliasMap[aliasName]) aliasMap[aliasName] = { subgroups: [] };
+          if (!seenAliasIds.has(aliasId)) {
+            seenAliasIds.add(aliasId);
+            aliasMap[aliasName].subgroups.push({ alias_id: aliasId, alias_subgroup_id: aliasSubgroupId, items: [] });
+          }
         }
       }
 

@@ -117,10 +117,11 @@ export async function POST(
           const rows = await exec(
             connection,
             `
-              SELECT group_id
+              SELECT MAX(group_id) AS group_id
               FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS
               WHERE run_id = ?
                 AND alias_name = ?
+                AND is_user_created = TRUE
             `,
             [run_id, g.alias_name]
           );
@@ -257,6 +258,7 @@ export async function POST(
               FROM STAND_DB.STAND_INTERNAL.ALIASES a
               WHERE a.concept_id = r.concept_id
                 AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+                AND a.alias_subgroup_id = rg.group_id
             )
         `,
         [run_id]
@@ -277,12 +279,14 @@ export async function POST(
             AND rg.final_alias_id IS NULL
             AND rg.is_user_created = TRUE
             AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+            AND a.alias_subgroup_id = rg.group_id
         `,
         [run_id]
       );
 
-      // If a referenced alias is being renamed to a name that already exists for the same concept,
-      // UNIQUE(concept_id, alias_name) would be violated. In that case, merge the two aliases:
+      // If a referenced alias is being renamed to a name that already exists for the same concept
+      // AND the same alias_subgroup_id, UNIQUE(concept_id, alias_name, alias_subgroup_id) would be
+      // violated. In that case, merge the two aliases (within the same subgroup):
       // - Keep the existing alias row that already has the desired name
       // - Re-point all references from the "from" alias_id -> "to" alias_id
       // - Delete the "from" alias row
@@ -320,6 +324,7 @@ export async function POST(
           JOIN STAND_DB.STAND_INTERNAL.ALIASES a_keep
             ON a_keep.concept_id = a_from.concept_id
            AND a_keep.alias_name = d.desired_alias_name
+           AND a_keep.alias_subgroup_id = a_from.alias_subgroup_id
            AND a_keep.alias_id <> d.alias_id
           LEFT JOIN TMP_ALIAS_DESIRED d_keep
             ON d_keep.alias_id = a_keep.alias_id

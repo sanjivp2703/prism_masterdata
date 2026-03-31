@@ -280,7 +280,7 @@ CREATE OR REPLACE TABLE ALIASES (
     updated_at TIMESTAMP NOT NULL,
     CONSTRAINT fk_aliases_concept FOREIGN KEY (concept_id) REFERENCES CONCEPTS(concept_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_aliases_status FOREIGN KEY (status) REFERENCES LKP_ALIAS_STATUS(status),
-    CONSTRAINT unique_concept_alias UNIQUE (concept_id, alias_name)
+    CONSTRAINT unique_concept_alias UNIQUE (concept_id, alias_name, alias_subgroup_id)
 );
 
 -- ============================================================================
@@ -295,7 +295,7 @@ CREATE OR REPLACE TABLE ALIAS_SUMMARY (
     key_type VARCHAR NOT NULL,
     key_value VARCHAR NOT NULL,
     count NUMBER,
-    importance_score FLOAT NOT NULL,
+    importance_score FLOAT,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     CONSTRAINT fk_alias_summary_alias FOREIGN KEY (alias_id) REFERENCES ALIASES(alias_id) ON UPDATE RESTRICT ON DELETE CASCADE,
@@ -356,12 +356,50 @@ CREATE OR REPLACE TABLE TOKENS_SUMMARY (
     signature_length INTEGER NOT NULL,
     rarity FLOAT NOT NULL DEFAULT 0,
     token_type VARCHAR NOT NULL,
+    importance_score FLOAT,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     CONSTRAINT fk_tokens_summary_raw_value FOREIGN KEY (raw_value_id) REFERENCES RAW_VALUES(raw_value_id) ON UPDATE RESTRICT ON DELETE CASCADE,
     CONSTRAINT fk_tokens_summary_alias FOREIGN KEY (alias_id) REFERENCES ALIASES(alias_id) ON UPDATE RESTRICT ON DELETE CASCADE
     -- token_type values: 'standard' | 'normalized' (raw_value_id set, alias_id NULL)
     --                    'alias'                   (alias_id set, raw_value_id NULL)
+);
+
+-- ============================================================================
+-- ALIAS_TOKEN_COUNT
+-- One row per unique normalized token across all aliases.
+-- global_count = number of distinct aliases that contain this token,
+-- used as the IDF denominator when computing token importance scores.
+-- ============================================================================
+
+CREATE OR REPLACE TABLE ALIAS_TOKEN_COUNT (
+    alias_token_count_id INTEGER AUTOINCREMENT START 100 INCREMENT 1 PRIMARY KEY NOT NULL,
+    alias_id             INTEGER NOT NULL,
+    normalized_token     VARCHAR NOT NULL,
+    -- Number of distinct raw_values in this alias that contain this normalized token (TF component).
+    token_count          INTEGER NOT NULL DEFAULT 0,
+    created_at           TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_at           TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT unique_alias_token_count_alias_token UNIQUE (alias_id, normalized_token),
+    CONSTRAINT fk_alias_token_count_alias FOREIGN KEY (alias_id) REFERENCES ALIASES(alias_id) ON UPDATE RESTRICT ON DELETE CASCADE
+);
+
+-- ============================================================================
+-- GLOBAL_TOKEN_COUNT
+-- One row per unique normalized token across the entire system.
+-- alias_count = number of distinct aliases that contain this token.
+-- ============================================================================
+
+CREATE OR REPLACE TABLE GLOBAL_TOKEN_COUNT (
+    global_token_count_id INTEGER AUTOINCREMENT START 100 INCREMENT 1 PRIMARY KEY NOT NULL,
+    concept_id            INTEGER NOT NULL,
+    normalized_token      VARCHAR NOT NULL,
+    -- Number of distinct aliases in this concept that contain this normalized token (IDF component).
+    alias_token_count     INTEGER NOT NULL DEFAULT 0,
+    created_at            TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_at            TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT unique_global_token_count_concept_token UNIQUE (concept_id, normalized_token),
+    CONSTRAINT fk_global_token_count_concept FOREIGN KEY (concept_id) REFERENCES CONCEPTS(concept_id) ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 
 -- ============================================================================
@@ -427,7 +465,9 @@ CREATE OR REPLACE TABLE RUN_GROUPS (
     CONSTRAINT pk_run_groups PRIMARY KEY (run_id, group_id),
     CONSTRAINT fk_run_groups_run FOREIGN KEY (run_id) REFERENCES RUNS(run_id) ON UPDATE RESTRICT ON DELETE CASCADE,
     CONSTRAINT fk_run_groups_final_alias FOREIGN KEY (final_alias_id) REFERENCES ALIASES(alias_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT unique_run_alias_name UNIQUE (run_id, alias_name)
+    -- alias_name is no longer unique per run because multiple subgroups of the same alias may
+    -- appear as separate groups within a single run (same alias_name, different final_alias_id).
+    CONSTRAINT unique_run_final_alias UNIQUE (run_id, final_alias_id)
 );
 
 -- ============================================================================
@@ -531,15 +571,15 @@ VALUES (1, 'mobile_carrier', 'Mobile carrier/service provider names', 'string', 
 -- -- The sequence will be synchronized after all sample data is inserted
 INSERT INTO ALIASES (alias_id, concept_id, alias_name, alias_subgroup_id, status, created_at, updated_at)
 VALUES 
-    (1, 1, 'AT&T', 1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (2, 1, 'Verizon', 2, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (3, 1, 'T-Mobile', 3, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (4, 1, 'Sprint', 4, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (5, 1, 'Boost Mobile', 5, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (6, 1, 'Cricket Wireless', 6, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (7, 1, 'Metro by T-Mobile', 7, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (8, 1, 'US Cellular', 8, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    (9, 1, 'MetroPCS', 9, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+    (1, 1, 'AT&T',             1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (2, 1, 'Verizon',          1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (3, 1, 'T-Mobile',         1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (4, 1, 'Sprint',           1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (5, 1, 'Boost Mobile',     1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (6, 1, 'Cricket Wireless', 1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (7, 1, 'Metro by T-Mobile',1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (8, 1, 'US Cellular',      1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    (9, 1, 'MetroPCS',         1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- -- Insert classification metadata for AT&T (alias_id = 1)
 --  INSERT INTO CLASSIFICATION_METADATA (classification_metadata_id, profile_id, normalization_value, created_at, updated_at)
@@ -943,6 +983,349 @@ VALUES
   ('PCS', 2, NULL, 9, 2, 0, 'alias', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- Optional: keep TOKENS_SUMMARY in sync after pipeline edits via CALL STAND_DB.STAND.REFRESH_TOKENS_SUMMARY(NULL);
+
+-- ============================================================================
+-- GOOGLE / ALPHABET SUBGROUP EXAMPLE
+-- Demonstrates two alias_ids sharing the same alias_name ('Google') under
+-- concept_id=1 (mobile_carrier), separated by alias_subgroup_id:
+--   alias_id=10  alias_subgroup_id=1  representative raw value: 'Google'
+--   alias_id=11  alias_subgroup_id=2  representative raw value: 'Alphabet'
+-- A new item like 'Alphabet Inc' will score strongly against alias_id=11 and
+-- be correctly renamed to 'Google' via that subgroup.
+-- All data is fully manually specified — no SELECT-based inserts.
+-- ============================================================================
+
+-- ALIASES -----------------------------------------------------------------
+-- Two rows, same alias_name, different alias_subgroup_id (allowed by the new
+-- UNIQUE (concept_id, alias_name, alias_subgroup_id) constraint).
+INSERT INTO ALIASES (alias_id, concept_id, alias_name, alias_subgroup_id, status, created_at, updated_at)
+VALUES
+  (10, 1, 'Google', 1, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'Google', 2, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- RAW_VALUES --------------------------------------------------------------
+-- One representative raw value per subgroup, all pipeline fields included.
+--   raw_value_id=30  alias_id=10  raw_value='Google'
+--   raw_value_id=31  alias_id=11  raw_value='Alphabet'
+-- normalization_value: lowercased single word (pipeline strips punctuation/case)
+-- tokens / normalized_tokens: single-element arrays stored as pipe-joined strings
+--   in ALIAS_SUMMARY and split into rows in TOKENS_SUMMARY below.
+INSERT INTO RAW_VALUES (
+  raw_value_id, alias_id, profile_id,
+  raw_value,   normalization_value,
+  tokens_count, normalized_tokens_count,
+  confidence, source, approved, created_at, updated_at
+)
+VALUES
+  (30, 10, 1, 'Google',   'google',   1, 1, 95, 'manual_review', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (31, 11, 1, 'Alphabet', 'alphabet', 1, 1, 95, 'manual_review', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- ALIAS_SUMMARY -----------------------------------------------------------
+-- The existing DELETE FROM ALIAS_SUMMARY WHERE concept_id = 1 above already
+-- cleared concept_id=1 rows before inserting the carrier entries, so these
+-- must be inserted in a separate statement after that block.
+INSERT INTO ALIAS_SUMMARY (
+  alias_id, concept_id, key_type, key_value, count, importance_score, created_at, updated_at
+)
+VALUES
+  -- alias_id=10  (Google subgroup — 'google'-like raw values)
+  (10, 1, 'alias name',               'Google',  NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (10, 1, 'raw value',                'Google',  1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (10, 1, 'normalized value',         'google',  1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (10, 1, 'token signature',          'Google',  1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (10, 1, 'normalized token signature','google', 1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (10, 1, 'alias token signature',    'Google',  NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+  -- alias_id=11  (Google subgroup — 'alphabet'-like raw values)
+  (11, 1, 'alias name',               'Google',   NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'raw value',                'Alphabet', 1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'normalized value',         'alphabet', 1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'token signature',          'Alphabet', 1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'normalized token signature','alphabet',1,    1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  (11, 1, 'alias token signature',    'Google',   NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- TOKENS_SUMMARY ----------------------------------------------------------
+-- The existing DELETE covers raw_value_ids 1-25 and alias_ids 1-9, so
+-- ids 10, 11, 30, 31 are untouched. Add a targeted guard for idempotency.
+DELETE FROM TOKENS_SUMMARY
+WHERE raw_value_id IN (30, 31)
+   OR alias_id IN (10, 11);
+
+INSERT INTO TOKENS_SUMMARY (
+  token, position_in_signature, raw_value_id, alias_id,
+  signature_length, rarity, token_type, created_at, updated_at
+)
+VALUES
+  -- raw_value_id=30  'Google'  standard tokens
+  ('Google',   1, 30, NULL, 1, 0, 'standard',   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  -- raw_value_id=30  'Google'  normalized tokens
+  ('google',   1, 30, NULL, 1, 0, 'normalized', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+  -- raw_value_id=31  'Alphabet'  standard tokens
+  ('Alphabet', 1, 31, NULL, 1, 0, 'standard',   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  -- raw_value_id=31  'Alphabet'  normalized tokens
+  ('alphabet', 1, 31, NULL, 1, 0, 'normalized', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+  -- alias_id=10  alias_name='Google'  alias tokens (token_type='alias')
+  ('Google',   1, NULL, 10, 1, 0, 'alias',      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+  -- alias_id=11  alias_name='Google'  alias tokens (token_type='alias')
+  -- Both subgroups share the same alias_name, so their alias tokens are identical.
+  -- The scoring algorithm distinguishes them via their raw value tokens above.
+  ('Google',   1, NULL, 11, 1, 0, 'alias',      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- ============================================================================
+-- ONE-TIME SEED SCORES  (concept_id = 1, N = 11 aliases)
+--
+-- rarity (normalized-token formula):
+--   (token_count / alias_item_count) × (ln(N / df) / ln(N))
+-- where token_count      = distinct raw_values in the alias containing the token
+--       alias_item_count = total distinct raw_values in the alias
+--       N                = total distinct aliases in the concept  (= 11)
+--       df               = distinct aliases containing the token
+-- Standard-token rarity: mirror the normalized token at the same position
+--
+-- token importance_score formula:
+--   importance_score = rarity × ((1 − λ) + λ × pos_weight(p))
+--                    = rarity × (0.75 + 0.25 / p^0.4)
+-- where p = position_in_signature,  λ = 0.25,  α = 0.4
+--
+-- signature importance_score formula:
+--   raw  = Σ token_importance(t,p) for unique tokens / (1 + β × (n − 1))
+--   score = raw / (1 + raw)  =  s / (s + 1 + β × (n − 1))
+-- where n = number of unique tokens,  β = 0.2,  s = Σ token_importance
+-- Alias tokens and alias token signatures receive NULL (not TF-IDF weighted).
+--
+-- Key constants (N = 11)
+--   ln(11/1) / ln(11) = 1.000000   (df=1,  token unique to one alias)
+--   ln(11/2) / ln(11) = 0.710935   (df=2,  'mobile' shared by aliases 3 & 5)
+--   pos_weight(1) = 1.0 / 1^0.4  = 1.000000
+--   pos_weight(2) = 1.0 / 2^0.4  = 0.757858  →  (0.75 + 0.25×0.757858) = 0.939548
+-- ============================================================================
+
+-- ── ALIAS_SUMMARY: null out alias-name and alias-token-signature rows ────────
+UPDATE ALIAS_SUMMARY
+SET    importance_score = NULL,
+       updated_at       = CURRENT_TIMESTAMP
+WHERE  concept_id = 1
+  AND  key_type IN ('alias name', 'alias token signature');
+
+-- ── TOKENS_SUMMARY: normalized token rarity ──────────────────────────────────
+-- Formula: (token_count / alias_item_count) × (ln(N/df) / ln(N))
+-- alias 1: item_count=3   alias 2: item_count=3   alias 3: item_count=2
+-- alias 4: item_count=1   alias 5: item_count=1   alias 6: item_count=1
+-- alias 8: item_count=1   alias 9: item_count=2   alias 10/11: item_count=1
+--
+-- 'att'      alias 1  tc=3  items=3  df=1  → (3/3)×1.0 = 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id IN (1, 2, 3);
+-- 'verizon'  alias 2  tc=3  items=3  df=1  → (3/3)×1.0 = 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'verizon';
+-- 'wireless' alias 2  tc=1  items=3  df=1  → (1/3)×1.0 = 0.333333
+UPDATE TOKENS_SUMMARY SET rarity = 0.333333, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'wireless';
+-- 'wirless'  alias 2  tc=1  items=3  df=1  → (1/3)×1.0 = 0.333333
+UPDATE TOKENS_SUMMARY SET rarity = 0.333333, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'wirless';
+-- 't'        alias 3  tc=2  items=2  df=1  → (2/2)×1.0 = 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 't' AND raw_value_id IN (12, 13);
+-- 'mobile'   alias 3  tc=2  items=2  df=2  → (2/2)×0.710935 = 0.710935
+UPDATE TOKENS_SUMMARY SET rarity = 0.710935, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'mobile' AND raw_value_id IN (12, 13);
+-- 'sprint'   alias 4  tc=1  items=1  df=1  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id = 16;
+-- 'boost'    alias 5  tc=1  items=1  df=1  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'boost';
+-- 'mobile'   alias 5  tc=1  items=1  df=2  → (1/1)×0.710935 = 0.710935
+UPDATE TOKENS_SUMMARY SET rarity = 0.710935, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND token = 'mobile' AND raw_value_id = 18;
+-- 'cricket'  alias 6  tc=1  items=1  df=1  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id = 20;
+-- 'metropcs' alias 9  tc=2  items=2  df=1  → (2/2)×1.0 = 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id IN (22, 23);
+-- 'us'+'cellular' alias 8  tc=1  items=1  df=1  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id = 25;
+-- 'google'   alias 10  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id = 30;
+-- 'alphabet' alias 11  → 1.000000
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'normalized' AND raw_value_id = 31;
+
+-- ── TOKENS_SUMMARY: standard token rarity (mirror normalized at same position) ─
+-- raw_value_id=1  'AT&T'      → A(pos1)→1.0 ; T(pos2,3)→0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 1 AND position_in_signature = 1;
+-- raw_value_id=2  'ATT'       → ATT(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 2;
+-- raw_value_id=3  'A T & T'   → A(pos1)→1.0 ; T(pos2,3)→0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 3 AND position_in_signature = 1;
+-- raw_value_id=7  'Verizon'   → Verizon(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 7;
+-- raw_value_id=8  'Verizon Wireless' → Verizon(pos1)→1.0 ; Wireless(pos2)→0.333333
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 8 AND position_in_signature = 1;
+UPDATE TOKENS_SUMMARY SET rarity = 0.333333, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 8 AND position_in_signature = 2;
+-- raw_value_id=9  'Verizon Wirless'  → Verizon(pos1)→1.0 ; Wirless(pos2)→0.333333
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 9 AND position_in_signature = 1;
+UPDATE TOKENS_SUMMARY SET rarity = 0.333333, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 9 AND position_in_signature = 2;
+-- raw_value_id=12 'T-Mobile'  → T(pos1)→1.0 ; Mobile(pos2)→0.710935
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 12 AND position_in_signature = 1;
+UPDATE TOKENS_SUMMARY SET rarity = 0.710935, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 12 AND position_in_signature = 2;
+-- raw_value_id=13 'T Mobile'  → T(pos1)→1.0 ; Mobile(pos2)→0.710935
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 13 AND position_in_signature = 1;
+UPDATE TOKENS_SUMMARY SET rarity = 0.710935, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 13 AND position_in_signature = 2;
+-- raw_value_id=16 'Sprint'    → Sprint(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 16;
+-- raw_value_id=18 'Boost Mobile' → Boost(pos1)→1.0 ; Mobile(pos2)→0.710935
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 18 AND position_in_signature = 1;
+UPDATE TOKENS_SUMMARY SET rarity = 0.710935, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 18 AND position_in_signature = 2;
+-- raw_value_id=20 'Cricket'   → Cricket(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 20;
+-- raw_value_id=22 'MetroPCS'  → Metro(pos1)→1.0 ; PCS(pos2)→0 (no norm match)
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 22 AND position_in_signature = 1;
+-- raw_value_id=23 'Metro PCS' → Metro(pos1)→1.0 ; PCS(pos2)→0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 23 AND position_in_signature = 1;
+-- raw_value_id=25 'US Cellular' → US(pos1)→1.0 ; Cellular(pos2)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 25;
+-- raw_value_id=30 'Google'    → Google(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 30;
+-- raw_value_id=31 'Alphabet'  → Alphabet(pos1)→1.0
+UPDATE TOKENS_SUMMARY SET rarity = 1.000000, updated_at = CURRENT_TIMESTAMP
+WHERE token_type = 'standard' AND raw_value_id = 31;
+
+-- ── TOKENS_SUMMARY: importance_score = rarity × (0.75 + 0.25 / p^0.4) ────────
+UPDATE TOKENS_SUMMARY ts
+SET    importance_score = ts.rarity * (0.75 + 0.25 / POWER(ts.position_in_signature::FLOAT, 0.4)),
+       updated_at       = CURRENT_TIMESTAMP
+WHERE  ts.token_type IN ('standard', 'normalized')
+  AND  ts.raw_value_id IN (
+           SELECT rv.raw_value_id
+           FROM   RAW_VALUES rv
+           JOIN   ALIASES    a  ON a.alias_id = rv.alias_id
+           WHERE  a.concept_id = 1
+       );
+
+-- ── ALIAS_SUMMARY: token signatures ──────────────────────────────────────────
+-- raw  = Σ token_importance(unique tokens) / (1 + 0.2×(n−1))
+-- score = raw / (1 + raw)  =  s / (s + 1 + 0.2×(n−1))
+-- where s = Σ rarity×(0.75+0.25/p^0.4) for first occurrence of each unique token
+-- pos_weight: p=1→1.0, p=2→0.939548
+--
+-- alias 1  'A|T|T'   : A(p1,r=1)→1.0, T(p2,r=0)→0 ; n=2, s=1.0 → 1.0/(1.0+1.2)=0.454545
+UPDATE ALIAS_SUMMARY SET importance_score = 0.454545, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 1  AND key_type = 'token signature' AND key_value = 'A|T|T';
+-- alias 1  'ATT'     : ATT(p1,r=1)→1.0 ; n=1 → 1.0/2.0=0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 1  AND key_type = 'token signature' AND key_value = 'ATT';
+-- alias 2  'Verizon'          : n=1, s=1.0 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'token signature' AND key_value = 'Verizon';
+-- alias 2  'Verizon|Wireless' : Verizon(p1)→1.0, Wireless(p2,r=0.333333)→0.313183 ; n=2, s=1.313183 → 1.313183/2.513183=0.522449
+UPDATE ALIAS_SUMMARY SET importance_score = 0.522449, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'token signature' AND key_value = 'Verizon|Wireless';
+-- alias 2  'Verizon|Wirless'  : same → 0.522449
+UPDATE ALIAS_SUMMARY SET importance_score = 0.522449, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'token signature' AND key_value = 'Verizon|Wirless';
+-- alias 3  'T|Mobile' : T(p1,r=1)→1.0, Mobile(p2,r=0.710935)→0.667945 ; n=2, s=1.667945 → 1.667945/2.867945=0.581581
+UPDATE ALIAS_SUMMARY SET importance_score = 0.581581, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 3  AND key_type = 'token signature' AND key_value = 'T|Mobile';
+-- alias 4  'Sprint'   : n=1, s=1.0 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 4  AND key_type = 'token signature' AND key_value = 'Sprint';
+-- alias 5  'Boost|Mobile' : Boost(p1,r=1)→1.0, Mobile(p2,r=0.710935)→0.667945 ; n=2 → 0.581581
+UPDATE ALIAS_SUMMARY SET importance_score = 0.581581, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 5  AND key_type = 'token signature' AND key_value = 'Boost|Mobile';
+-- alias 6  'Cricket'  : n=1, s=1.0 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 6  AND key_type = 'token signature' AND key_value = 'Cricket';
+-- alias 8  'US|Cellular' : US(p1,r=1)→1.0, Cellular(p2,r=1.0)→0.939548 ; n=2, s=1.939548 → 1.939548/3.139548=0.617763
+UPDATE ALIAS_SUMMARY SET importance_score = 0.617763, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 8  AND key_type = 'token signature' AND key_value = 'US|Cellular';
+-- alias 9  'Metro|PCS' : Metro(p1,r=1)→1.0, PCS(p2,r=0)→0 ; n=2, s=1.0 → 1.0/2.2=0.454545
+UPDATE ALIAS_SUMMARY SET importance_score = 0.454545, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 9  AND key_type = 'token signature' AND key_value = 'Metro|PCS';
+-- alias 10 'Google'   : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 10 AND key_type = 'token signature' AND key_value = 'Google';
+-- alias 11 'Alphabet' : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 11 AND key_type = 'token signature' AND key_value = 'Alphabet';
+
+-- ── ALIAS_SUMMARY: normalized token signatures ───────────────────────────────
+-- alias 1  'att'       : n=1, s=1.0 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 1  AND key_type = 'normalized token signature' AND key_value = 'att';
+-- alias 1  't'         : no TOKENS_SUMMARY backing → 0
+UPDATE ALIAS_SUMMARY SET importance_score = 0,        updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 1  AND key_type = 'normalized token signature' AND key_value = 't';
+-- alias 2  'verizon'           : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'normalized token signature' AND key_value = 'verizon';
+-- alias 2  'verizon|wireless'  : verizon(p1)→1.0, wireless(p2,r=0.333333)→0.313183 ; n=2, s=1.313183 → 0.522449
+UPDATE ALIAS_SUMMARY SET importance_score = 0.522449, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'normalized token signature' AND key_value = 'verizon|wireless';
+-- alias 2  'verizon|wirless'   : same → 0.522449
+UPDATE ALIAS_SUMMARY SET importance_score = 0.522449, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 2  AND key_type = 'normalized token signature' AND key_value = 'verizon|wirless';
+-- alias 3  't|mobile'  : t(p1,r=1)→1.0, mobile(p2,r=0.710935)→0.667945 ; n=2, s=1.667945 → 0.581581
+UPDATE ALIAS_SUMMARY SET importance_score = 0.581581, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 3  AND key_type = 'normalized token signature' AND key_value = 't|mobile';
+-- alias 4  'sprint'    : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 4  AND key_type = 'normalized token signature' AND key_value = 'sprint';
+-- alias 5  'boost|mobile' : boost(p1,r=1)→1.0, mobile(p2,r=0.710935)→0.667945 ; n=2 → 0.581581
+UPDATE ALIAS_SUMMARY SET importance_score = 0.581581, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 5  AND key_type = 'normalized token signature' AND key_value = 'boost|mobile';
+-- alias 6  'cricket'   : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 6  AND key_type = 'normalized token signature' AND key_value = 'cricket';
+-- alias 8  'us|cellular' : us(p1,r=1)→1.0, cellular(p2,r=1.0)→0.939548 ; n=2, s=1.939548 → 0.617763
+UPDATE ALIAS_SUMMARY SET importance_score = 0.617763, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 8  AND key_type = 'normalized token signature' AND key_value = 'us|cellular';
+-- alias 9  'metropcs'  : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 9  AND key_type = 'normalized token signature' AND key_value = 'metropcs';
+-- alias 9  'metro|pcs' : no TOKENS_SUMMARY backing → 0
+UPDATE ALIAS_SUMMARY SET importance_score = 0,        updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 9  AND key_type = 'normalized token signature' AND key_value = 'metro|pcs';
+-- alias 10 'google'    : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 10 AND key_type = 'normalized token signature' AND key_value = 'google';
+-- alias 11 'alphabet'  : n=1 → 0.500000
+UPDATE ALIAS_SUMMARY SET importance_score = 0.500000, updated_at = CURRENT_TIMESTAMP
+WHERE alias_id = 11 AND key_type = 'normalized token signature' AND key_value = 'alphabet';
+
+-- ── TOKENS_SUMMARY: alias tokens — importance_score NULL, rarity 0 (defaults) ─
+
+-- ============================================================================
+-- END OF ONE-TIME IMPORTANCE SCORE SEEDS
+-- ============================================================================
 
 -- -- ============================================================================
 -- -- SAMPLE RUN DATA
