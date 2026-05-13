@@ -124,7 +124,7 @@ The UI interacts with these Snowflake objects:
 
 ### No data displayed
 - Ensure the run has been executed and has run_groups and run_items
-- Verify the run_groups have proper alias_name values set
+- Verify the run_groups have proper alias_name_literal_value values set
 - Check that run_items are properly linked to run_groups via group_id
 
 ## Development

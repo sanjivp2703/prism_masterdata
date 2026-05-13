@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { invalidateAliasCacheEntries } from '@/app/api/_lib/redis-cache';
 
 async function exec(
   connection: any,
@@ -31,8 +32,8 @@ export async function POST(
     }
 
     let moves: Array<{ run_item_id: number; group_id: number | null }> = [];
-    let aliasNameChanges: Array<{ group_id: number; alias_name: string }> = [];
-    let newGroups: Array<{ temp_group_id: number; alias_name: string }> = [];
+    let aliasNameChanges: Array<{ group_id: number; alias_name_literal_value: string }> = [];
+    let newGroups: Array<{ temp_group_id: number; alias_name_literal_value: string }> = [];
 
     try {
       const body = await request.json();
@@ -40,13 +41,13 @@ export async function POST(
         newGroups = body.new_groups
           .map((g: any) => ({
             temp_group_id: Number.parseInt(String(g?.temp_group_id), 10),
-            alias_name: String(g?.alias_name ?? '').trim() || 'Unnamed Group',
+            alias_name_literal_value: String(g?.alias_name_literal_value ?? '').trim() || 'Unnamed Group',
           }))
           .filter(
-            (g: { temp_group_id: number; alias_name: string }) =>
+            (g: { temp_group_id: number; alias_name_literal_value: string }) =>
               Number.isFinite(g.temp_group_id) &&
               g.temp_group_id < 0 &&
-              g.alias_name.length > 0
+              g.alias_name_literal_value.length > 0
           );
       }
       if (Array.isArray(body?.moves)) {
@@ -68,11 +69,11 @@ export async function POST(
         aliasNameChanges = body.alias_name_changes
           .map((c: any) => ({
             group_id: Number.parseInt(String(c?.group_id), 10),
-            alias_name: String(c?.alias_name ?? '').trim(),
+            alias_name_literal_value: String(c?.alias_name_literal_value ?? '').trim(),
           }))
           .filter(
-            (c: { group_id: number; alias_name: string }) =>
-              Number.isFinite(c.group_id) && c.alias_name.length > 0
+            (c: { group_id: number; alias_name_literal_value: string }) =>
+              Number.isFinite(c.group_id) && c.alias_name_literal_value.length > 0
           );
       }
     } catch {
@@ -104,14 +105,14 @@ export async function POST(
               INSERT INTO STAND_DB.STAND_INTERNAL.RUN_GROUPS (
                 run_id,
                 initial_alias_name,
-                alias_name,
+                alias_name_literal_value,
                 is_user_created,
                 created_at,
                 updated_at
               )
               VALUES (?, ?, ?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `,
-            [run_id, g.alias_name, g.alias_name]
+            [run_id, g.alias_name_literal_value, g.alias_name_literal_value]
           );
 
           const rows = await exec(
@@ -120,15 +121,15 @@ export async function POST(
               SELECT MAX(group_id) AS group_id
               FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS
               WHERE run_id = ?
-                AND alias_name = ?
+                AND alias_name_literal_value = ?
                 AND is_user_created = TRUE
             `,
-            [run_id, g.alias_name]
+            [run_id, g.alias_name_literal_value]
           );
           const groupId = Number(rows?.[0]?.GROUP_ID ?? rows?.[0]?.group_id);
           if (!Number.isFinite(groupId)) {
             throw new Error(
-              `Failed to resolve created group_id for alias_name=${g.alias_name}`
+              `Failed to resolve created group_id for alias_name_literal_value=${g.alias_name_literal_value}`
             );
           }
           tempToRealGroupId.set(g.temp_group_id, groupId);
@@ -151,7 +152,7 @@ export async function POST(
         const pairs = aliasNameChanges.map(() => '(?, ?)').join(', ');
         const binds: any[] = [];
         for (const c of aliasNameChanges) {
-          binds.push(c.group_id, c.alias_name);
+          binds.push(c.group_id, c.alias_name_literal_value);
         }
         binds.push(run_id);
 
@@ -159,9 +160,9 @@ export async function POST(
           connection,
           `
             UPDATE STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
-            SET alias_name = mv.alias_name
+            SET alias_name_literal_value = mv.alias_name_literal_value
             FROM (
-              SELECT column1::NUMBER AS group_id, column2::VARCHAR AS alias_name
+              SELECT column1::NUMBER AS group_id, column2::VARCHAR AS alias_name_literal_value
               FROM VALUES ${pairs}
             ) mv
             WHERE rg.run_id = ?
@@ -230,18 +231,18 @@ export async function POST(
       // - If a group has no final_alias_id, ensure an alias exists for (concept_id, desired_alias_name) and link the group.
       // - If a group has an existing final_alias_id, rename it to match the desired name (and touch updated_at).
       //
-      // "desired" name is the current user-edited alias_name, falling back to initial_alias_name.
+      // "desired" name is the current user-edited alias_name_literal_value, falling back to initial_alias_name.
 
       // Create missing aliases for this concept (for groups without final_alias_id).
       await exec(
         connection,
         `
           INSERT INTO STAND_DB.STAND_INTERNAL.ALIASES (
-            concept_id, alias_name, alias_subgroup_id, status, created_at, updated_at
+            concept_id, alias_name_literal_value, alias_subgroup_id, status, created_at, updated_at
           )
           SELECT DISTINCT
             r.concept_id,
-            COALESCE(rg.alias_name, rg.initial_alias_name) AS alias_name,
+            COALESCE(rg.alias_name_literal_value, rg.initial_alias_name) AS alias_name_literal_value,
             rg.group_id AS alias_subgroup_id,
             'active' AS status,
             CURRENT_TIMESTAMP,
@@ -252,19 +253,19 @@ export async function POST(
           WHERE r.run_id = ?
             AND rg.final_alias_id IS NULL
             AND rg.is_user_created = TRUE
-            AND COALESCE(rg.alias_name, rg.initial_alias_name) IS NOT NULL
+            AND COALESCE(rg.alias_name_literal_value, rg.initial_alias_name) IS NOT NULL
             AND NOT EXISTS (
               SELECT 1
               FROM STAND_DB.STAND_INTERNAL.ALIASES a
               WHERE a.concept_id = r.concept_id
-                AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+                AND a.alias_name_literal_value = COALESCE(rg.alias_name_literal_value, rg.initial_alias_name)
                 AND a.alias_subgroup_id = rg.group_id
             )
         `,
         [run_id]
       );
 
-      // Link any still-unlinked groups to the alias_id for their desired alias_name.
+      // Link any still-unlinked groups to the alias_id for their desired alias_name_literal_value.
       await exec(
         connection,
         `
@@ -278,14 +279,14 @@ export async function POST(
             AND r.run_id = ?
             AND rg.final_alias_id IS NULL
             AND rg.is_user_created = TRUE
-            AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+            AND a.alias_name_literal_value = COALESCE(rg.alias_name_literal_value, rg.initial_alias_name)
             AND a.alias_subgroup_id = rg.group_id
         `,
         [run_id]
       );
 
       // If a referenced alias is being renamed to a name that already exists for the same concept
-      // AND the same alias_subgroup_id, UNIQUE(concept_id, alias_name, alias_subgroup_id) would be
+      // AND the same alias_subgroup_id, UNIQUE(concept_id, alias_name_literal_value, alias_subgroup_id) would be
       // violated. In that case, merge the two aliases (within the same subgroup):
       // - Keep the existing alias row that already has the desired name
       // - Re-point all references from the "from" alias_id -> "to" alias_id
@@ -300,7 +301,7 @@ export async function POST(
           CREATE OR REPLACE TEMP TABLE TMP_ALIAS_DESIRED AS
           SELECT
             rg.final_alias_id AS alias_id,
-            MIN(COALESCE(rg.alias_name, rg.initial_alias_name)) AS desired_alias_name
+            MIN(COALESCE(rg.alias_name_literal_value, rg.initial_alias_name)) AS desired_alias_name
           FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
           WHERE rg.run_id = ?
             AND rg.final_alias_id IS NOT NULL
@@ -323,13 +324,13 @@ export async function POST(
             ON a_from.alias_id = d.alias_id
           JOIN STAND_DB.STAND_INTERNAL.ALIASES a_keep
             ON a_keep.concept_id = a_from.concept_id
-           AND a_keep.alias_name = d.desired_alias_name
+           AND a_keep.alias_name_literal_value = d.desired_alias_name
            AND a_keep.alias_subgroup_id = a_from.alias_subgroup_id
            AND a_keep.alias_id <> d.alias_id
           LEFT JOIN TMP_ALIAS_DESIRED d_keep
             ON d_keep.alias_id = a_keep.alias_id
           WHERE d_keep.alias_id IS NULL
-             OR d_keep.desired_alias_name = a_keep.alias_name
+             OR d_keep.desired_alias_name = a_keep.alias_name_literal_value
         `
       );
 
@@ -345,11 +346,11 @@ export async function POST(
         `
       );
 
-      // Re-point references: RAW_VALUES.alias_id
+      // Re-point references: ALIAS_ITEMS.alias_id
       await exec(
         connection,
         `
-          UPDATE STAND_DB.STAND_INTERNAL.RAW_VALUES rv
+          UPDATE STAND_DB.STAND_INTERNAL.ALIAS_ITEMS rv
           SET alias_id = m.to_alias_id,
               updated_at = CURRENT_TIMESTAMP
           FROM TMP_ALIAS_MERGES m
@@ -383,18 +384,18 @@ export async function POST(
         connection,
         `
           UPDATE STAND_DB.STAND_INTERNAL.ALIASES a
-          SET alias_name = '__tmp__' || a.alias_id || '__' || TO_VARCHAR(CURRENT_TIMESTAMP, 'YYYYMMDDHH24MISSFF3'),
+          SET alias_name_literal_value = '__tmp__' || a.alias_id || '__' || TO_VARCHAR(CURRENT_TIMESTAMP, 'YYYYMMDDHH24MISSFF3'),
               updated_at = updated_at
           FROM (
             SELECT DISTINCT
               rg.final_alias_id AS alias_id,
-              COALESCE(rg.alias_name, rg.initial_alias_name) AS desired_alias_name
+              COALESCE(rg.alias_name_literal_value, rg.initial_alias_name) AS desired_alias_name
             FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
             WHERE rg.run_id = ?
               AND rg.final_alias_id IS NOT NULL
           ) rg_desired
           WHERE a.alias_id = rg_desired.alias_id
-            AND a.alias_name <> rg_desired.desired_alias_name
+            AND a.alias_name_literal_value <> rg_desired.desired_alias_name
         `,
         [run_id]
       );
@@ -403,24 +404,24 @@ export async function POST(
         connection,
         `
           UPDATE STAND_DB.STAND_INTERNAL.ALIASES a
-          SET alias_name = rg_desired.desired_alias_name,
+          SET alias_name_literal_value = rg_desired.desired_alias_name,
               updated_at = CURRENT_TIMESTAMP
           FROM (
             SELECT DISTINCT
               rg.final_alias_id AS alias_id,
-              COALESCE(rg.alias_name, rg.initial_alias_name) AS desired_alias_name
+              COALESCE(rg.alias_name_literal_value, rg.initial_alias_name) AS desired_alias_name
             FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
             WHERE rg.run_id = ?
               AND rg.final_alias_id IS NOT NULL
           ) rg_desired
           WHERE a.alias_id = rg_desired.alias_id
-            AND a.alias_name <> rg_desired.desired_alias_name
+            AND a.alias_name_literal_value <> rg_desired.desired_alias_name
         `,
         [run_id]
       );
 
-      // 4) RAW_VALUES:
-      // For every run item, ensure raw_value exists for the (profile_id, raw_value) pair.
+      // 4) ALIAS_ITEMS:
+      // For every run item, ensure literal_value exists for the (profile_id, literal_value) pair.
       // If it exists, update alias_id if it changed, set confidence=99, approved=true, and touch updated_at.
       // If it doesn't exist, insert with confidence=99 + approved=true.
       //
@@ -430,10 +431,11 @@ export async function POST(
       await exec(
         connection,
         `
-          MERGE INTO STAND_DB.STAND_INTERNAL.RAW_VALUES tgt
+          MERGE INTO STAND_DB.STAND_INTERNAL.ALIAS_ITEMS tgt
           USING (
             SELECT
-              ri.raw_value,
+              ri.literal_value,
+              ri.cleaned_value,
               ri.profile_id,
               ri.normalization_value,
               ri.tokens,
@@ -445,14 +447,14 @@ export async function POST(
               IFF(
                 EXISTS (
                   SELECT 1
-                  FROM STAND_DB.STAND_INTERNAL.RAW_VALUES existing
+                  FROM STAND_DB.STAND_INTERNAL.ALIAS_ITEMS existing
                   JOIN STAND_DB.STAND_INTERNAL.ALIASES a
                     ON a.alias_id = existing.alias_id
                   WHERE existing.profile_id = ri.profile_id
-                    AND existing.raw_value = ri.raw_value
+                    AND existing.literal_value = ri.literal_value
                     AND existing.alias_id = rg.final_alias_id
                     AND a.concept_id = r.concept_id
-                    AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+                    AND a.alias_name_literal_value = COALESCE(rg.alias_name_literal_value, rg.initial_alias_name)
                 ),
                 100,
                 99
@@ -468,10 +470,11 @@ export async function POST(
               AND rg.final_alias_id IS NOT NULL
           ) src
           ON tgt.profile_id = src.profile_id
-         AND tgt.raw_value = src.raw_value
+         AND tgt.literal_value = src.literal_value
           WHEN MATCHED THEN
             UPDATE SET
               alias_id = src.alias_id,
+              cleaned_value = COALESCE(tgt.cleaned_value, src.cleaned_value),
               normalization_value = src.normalization_value,
               tokens = src.tokens,
               tokens_count = src.tokens_count,
@@ -485,7 +488,8 @@ export async function POST(
             INSERT (
               alias_id,
               profile_id,
-              raw_value,
+              literal_value,
+              cleaned_value,
               normalization_value,
               tokens,
               tokens_count,
@@ -500,7 +504,8 @@ export async function POST(
             VALUES (
               src.alias_id,
               src.profile_id,
-              src.raw_value,
+              src.literal_value,
+              src.cleaned_value,
               src.normalization_value,
               src.tokens,
               src.tokens_count,
@@ -542,23 +547,23 @@ export async function POST(
         [run_id]
       );
 
-      // Tokenize canonical alias names using the concept's classification ruleset (same as raw values).
+      // Tokenize canonical alias names using the concept's classification ruleset (same as alias items).
       await exec(
         connection,
         `
           UPDATE STAND_DB.STAND_INTERNAL.ALIASES a
           SET
-            tokens = sub.pipeline:tokens,
-            token_count = sub.pipeline:tokens_count::NUMBER,
+            alias_name_tokens = sub.pipeline:tokens,
+            alias_name_tokens_count = sub.pipeline:tokens_count::NUMBER,
             updated_at = CURRENT_TIMESTAMP()
           FROM (
             SELECT
               a2.alias_id,
-              STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(a2.alias_name, prof.ruleset) AS pipeline
+              STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(a2.alias_name_literal_value, ecr.enriched_ruleset) AS pipeline
             FROM STAND_DB.STAND_INTERNAL.ALIASES a2
             JOIN STAND_DB.STAND_INTERNAL.CONCEPTS c ON c.concept_id = a2.concept_id
-            JOIN STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES prof
-              ON prof.profile_id = c.profile_id
+            JOIN STAND_DB.STAND_INTERNAL.ENRICHED_CONCEPT_RULESETS ecr
+              ON ecr.concept_id = c.concept_id
             WHERE a2.alias_id IN (
               SELECT DISTINCT rg.final_alias_id
               FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
@@ -584,6 +589,12 @@ export async function POST(
           `CALL STAND_DB.STAND.REFRESH_TOKENS_SUMMARY(?)`,
           [aliasId]
         );
+
+        // Invalidate all cached LLM results for this alias. Both new alias_items
+        // (from the MERGE above) and alias renames change the feature payload that
+        // would be sent for future (run_item, alias) comparisons, making any
+        // cached results stale. from_cache: false is the safe default after this.
+        await invalidateAliasCacheEntries(conceptId, aliasId);
       }
 
       return Response.json(

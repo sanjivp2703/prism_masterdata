@@ -19,28 +19,47 @@ USE SCHEMA STAND_INTERNAL;
 -- - No casing / punctuation logic beyond the steps above
 -- ============================================================================
 
--- Apply a profile ruleset (ordered list) to compute normalization_value.
+-- Apply a profile ruleset (ordered list) to compute classification metadata.
 --
--- ruleset JSON shape (v1-ish):
+-- Returns: { normalization_value, cleaned_value, tokens, tokens_count,
+--            normalized_tokens, normalized_tokens_count }
+--
+-- Ruleset JSON shape (v2 — preferred):
 -- {
---   "normalization": { "rules": [ ... ] },
---   "tokenization": { "config": { ... }, "rules": [ ... ] },
---   "token_normalization": { "rules": [ ... ] },
---   "token_normalization": { "config": { "stopword_sets": { ... } }, "rules": [ ... ] }
+--   "cleaning": {
+--     "rules": [
+--       -- Text-hygiene rules applied before tokenization (unicode, punctuation, whitespace).
+--       -- Casing is preserved in stored metadata by default. Scoring comparisons should
+--       -- lower/case-fold at comparison time when case should be ignored.
+--     ]
+--   },
+--   "normalization": {
+--     "rules": [
+--       -- Deterministic rewrites and stopword-style rules applied after cleaning + tokenization.
+--       -- cleaned_value is set before this pass; normalization_value reflects its output.
+--     ]
+--   },
+--   "tokenization":      { "config": { ... }, "rules": [ ... ] },
+--   "token_normalization": { "config": { "stopword_sets": { ... }, ... }, "rules": [ ... ] }
 -- }
-CREATE OR REPLACE FUNCTION APPLY_CLASSIFICATION_PIPELINE(raw_value VARCHAR, ruleset VARIANT)
+--
+-- Back-compat (v1): if no "cleaning" section, reads normalization.rules using the
+-- pre_tokenization flag (true = pre-tokenize, false = post-tokenize). lowercase in
+-- normalization.rules with pre_tokenization:false is still applied to the string (not tokens).
+CREATE OR REPLACE FUNCTION APPLY_CLASSIFICATION_PIPELINE(literal_value VARCHAR, ruleset VARIANT)
 RETURNS VARIANT
 LANGUAGE JAVASCRIPT
 AS
 $$
 // Snowflake uppercases JavaScript UDF parameter names; alias to lowercase for readability.
-const raw_value = RAW_VALUE;
+const literal_value = LITERAL_VALUE;
 const ruleset   = RULESET;
 
 // Null-safe
-if (raw_value === null) {
+if (literal_value === null) {
   return {
     normalization_value: null,
+    cleaned_value: null,
     tokens: null,
     tokens_count: null,
     normalized_tokens: null,
@@ -48,11 +67,16 @@ if (raw_value === null) {
   };
 }
 
-let s = String(raw_value);
+let s = String(literal_value);
 let caseFoldAlreadyApplied = false;
 
 // Extract ruleset sections
 let normalizationRules = [];
+// cleaning.rules: all pre-tokenization text hygiene rules.
+// If a legacy profile lists 'lowercase' here, it is deferred to after tokenization so
+// tokenization rules (e.g. split_camel_pascal) can still see the original casing.
+let cleaningRules = [];
+let cleaningLowercaseEnabled = false;
 let tokenizationRules = [];
 let tokenNormalizationRules = [];
 let tokenizationConfig = null;
@@ -68,6 +92,16 @@ try {
     else if (Array.isArray(ruleset.rules)) normalizationRules = ruleset.rules;
     else if (ruleset.normalization && Array.isArray(ruleset.normalization.rules)) {
       normalizationRules = ruleset.normalization.rules;
+    }
+    // New: cleaning section (pre-tokenization hygiene rules + deferred lowercase).
+    if (ruleset.cleaning && Array.isArray(ruleset.cleaning.rules)) {
+      cleaningRules = ruleset.cleaning.rules;
+      for (const r of cleaningRules) {
+        const isObj = r && typeof r === 'object' && !Array.isArray(r);
+        const name = (typeof r === 'string') ? r : (isObj ? String(r.name || '') : '');
+        const enabled = isObj && Object.prototype.hasOwnProperty.call(r, 'enabled') ? Boolean(r.enabled) : true;
+        if (name === 'lowercase' && enabled) { cleaningLowercaseEnabled = true; break; }
+      }
     }
     if (ruleset.tokenization && Array.isArray(ruleset.tokenization.rules)) {
       tokenizationRules = ruleset.tokenization.rules;
@@ -119,6 +153,8 @@ try {
   }
 } catch (e) {
   normalizationRules = [];
+  cleaningRules = [];
+  cleaningLowercaseEnabled = false;
   tokenizationRules = [];
   tokenNormalizationRules = [];
   tokenizationConfig = null;
@@ -170,6 +206,60 @@ for (const rules of [tokenizationRules, tokenNormalizationRules]) {
 if (usesDigitGrouping) {
   extraProtected.push({ pattern: '\\\\b\\\\d{1,3}(?:,\\\\d{3})+\\\\b', flags: 'gu' });
 }
+
+// ── Shared number-to-words tables (used by both Stage 3 and Stage 4) ─────────
+const NUM_ONES = {
+  zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9
+};
+const NUM_TEENS = {
+  ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,
+  sixteen:16,seventeen:17,eighteen:18,nineteen:19
+};
+const NUM_TENS = {
+  twenty:20,thirty:30,forty:40,fifty:50,sixty:60,seventy:70,eighty:80,ninety:90
+};
+const NUM_DIGIT_TO_WORD = [
+  'zero','one','two','three','four','five','six','seven','eight','nine',
+  'ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'
+];
+const NUM_TENS_WORD = {
+  20:'twenty',30:'thirty',40:'forty',50:'fifty',60:'sixty',70:'seventy',80:'eighty',90:'ninety'
+};
+
+// Converts an integer 0–9999 to an array of word parts (e.g. 22 → ["twenty","two"]).
+// Returns null if out of supported range.
+const numberToWordParts = (n) => {
+  if (!Number.isFinite(n) || n < 0 || n > 9999 || Math.trunc(n) !== n) return null;
+  if (n < 20) return [NUM_DIGIT_TO_WORD[n]];
+  if (n < 100) {
+    const tens = Math.trunc(n / 10) * 10;
+    const ones = n % 10;
+    return ones === 0 ? [NUM_TENS_WORD[tens]] : [NUM_TENS_WORD[tens], NUM_DIGIT_TO_WORD[ones]];
+  }
+  if (n < 1000) {
+    const h = Math.trunc(n / 100);
+    const rem = n % 100;
+    const out = [NUM_DIGIT_TO_WORD[h], 'hundred'];
+    if (rem > 0) out.push(...numberToWordParts(rem));
+    return out;
+  }
+  const th = Math.trunc(n / 1000);
+  const rem = n % 1000;
+  const out = [NUM_DIGIT_TO_WORD[th], 'thousand'];
+  if (rem > 0) out.push(...numberToWordParts(rem));
+  return out;
+};
+
+// Converts a numeric string to a single joined word token (no spaces), first letter capitalised.
+// E.g. "22" → "Twentytwo",  "1" → "One",  "101" → "Onehundredone".
+// Returns null if not supported.
+const numericTokenToWord = (t) => {
+  if (!/^\d+$/.test(t)) return null;
+  const parts = numberToWordParts(Number(t));
+  if (!parts) return null;
+  const joined = parts.join('');
+  return joined.charAt(0).toUpperCase() + joined.slice(1);
+};
 
 // Applies a single normalization rule to `s`.
 // Captures `s` and `caseFoldAlreadyApplied` from the outer scope via closure.
@@ -285,6 +375,39 @@ function applyNormRule(name, params) {
           s = s.split(k).join(rep);
         }
       }
+      break;
+    }
+
+    case 'stopword_removal': {
+      // Remove stopwords from the space-separated token string.
+      // Intended for normalization.rules (runs on the lowercased cleaned string after
+      // tokenization), so comparisons are case-insensitive regardless of casing in params.
+      //
+      // Params mirror token_normalization.config.post.stopword_sets for consistency:
+      //   enabled: string[] — names of the sets to activate
+      //   sets:    Record<string, string[]> — named lists of stopwords
+      const swEnabled = Array.isArray(params && params.enabled) ? params.enabled : [];
+      const swSets = (params && typeof params.sets === 'object' && !Array.isArray(params.sets))
+        ? params.sets : null;
+      if (swEnabled.length === 0 || !swSets) break;
+
+      const stopSet = new Set();
+      for (const setName of swEnabled) {
+        const words = Array.isArray(swSets[setName]) ? swSets[setName] : [];
+        for (const w of words) {
+          const sw = String(w ?? '').trim().toLowerCase();
+          if (sw) stopSet.add(sw);
+        }
+      }
+      if (stopSet.size === 0) break;
+
+      // Split on single spaces (cleaning pass normalises whitespace),
+      // drop stopwords, then rejoin. Trim to handle leading/trailing spaces
+      // that could appear if a boundary token is removed.
+      const kept = s.split(' ').filter(function(t) {
+        return t.length > 0 && !stopSet.has(t.toLowerCase());
+      });
+      s = kept.join(' ');
       break;
     }
 
@@ -471,23 +594,61 @@ function applyNormRule(name, params) {
       break;
     }
 
+    case 'number_word_digit_rewrite': {
+      // String-level numeric→word rewrite for normalization.rules (Stage 3).
+      // Splits `s` on spaces, converts each purely-numeric token to its joined
+      // word form (e.g. "22" → "twentytwo", "101" → "onehundredone"), then
+      // rejoins. Multi-word numbers become a single contiguous token with no
+      // internal spaces so they are unambiguously one token in later stages.
+      // Only the numeric→words direction is supported here (words_to_numeric
+      // is deferred to Stage 4 where token parsing is available).
+      const parts = s.split(' ');
+      const converted = [];
+      for (const part of parts) {
+        if (part.length === 0) continue;
+        const word = numericTokenToWord(part);
+        converted.push(word !== null ? word : part);
+      }
+      s = converted.join(' ');
+      break;
+    }
+
     default:
       // Unknown rule: ignore (forward-compatible)
       break;
   }
 }
 
-// Pre-tokenization normalization pass: run rules with pre_tokenization: true (the default).
-for (const r of normalizationRules) {
-  const isObj = r && typeof r === 'object' && !Array.isArray(r);
-  const name = (typeof r === 'string') ? r : (isObj ? String(r.name || '') : '');
-  const enabled = isObj && Object.prototype.hasOwnProperty.call(r, 'enabled') ? Boolean(r.enabled) : true;
-  const params = isObj ? (r.params || {}) : {};
-  // pre_tokenization defaults to true; rules with pre_tokenization: false are deferred until after tokenization.
-  const preTokenization = isObj && Object.prototype.hasOwnProperty.call(r, 'pre_tokenization')
-    ? Boolean(r.pre_tokenization) : true;
-  if (!name || !enabled || !preTokenization) continue;
-  applyNormRule(name, params);
+// ── Cleaning pass (pre-tokenization) ────────────────────────────────────────
+// When a 'cleaning' section exists in the ruleset, all cleaning.rules are applied here
+// EXCEPT 'lowercase', which is supported for legacy profiles and deferred until after
+// tokenization so that tokenization rules (split_camel_pascal, split_alpha_numeric_boundary,
+// etc.) can still see the original casing. The standard seeded profile does not use it,
+// so cleaned_value and standard tokens preserve capitalization.
+//
+// Back-compat: if no cleaning section is present, falls back to normalization.rules
+// filtered to those with pre_tokenization:true (the legacy behaviour).
+if (cleaningRules.length > 0) {
+  for (const r of cleaningRules) {
+    const isObj = r && typeof r === 'object' && !Array.isArray(r);
+    const name = (typeof r === 'string') ? r : (isObj ? String(r.name || '') : '');
+    const enabled = isObj && Object.prototype.hasOwnProperty.call(r, 'enabled') ? Boolean(r.enabled) : true;
+    const params = isObj ? (r.params || {}) : {};
+    if (!name || !enabled || name === 'lowercase') continue; // lowercase deferred
+    applyNormRule(name, params);
+  }
+} else {
+  // Back-compat: run normalization rules flagged as pre-tokenization.
+  for (const r of normalizationRules) {
+    const isObj = r && typeof r === 'object' && !Array.isArray(r);
+    const name = (typeof r === 'string') ? r : (isObj ? String(r.name || '') : '');
+    const enabled = isObj && Object.prototype.hasOwnProperty.call(r, 'enabled') ? Boolean(r.enabled) : true;
+    const params = isObj ? (r.params || {}) : {};
+    const preTokenization = isObj && Object.prototype.hasOwnProperty.call(r, 'pre_tokenization')
+      ? Boolean(r.pre_tokenization) : true;
+    if (!name || !enabled || !preTokenization) continue;
+    applyNormRule(name, params);
+  }
 }
 
 // =========================
@@ -693,21 +854,50 @@ for (const r of tokenizationRules) {
   }
 }
 
-// Post-tokenization normalization pass: run rules with pre_tokenization: false on the normalized string.
-// These rules run after tokenization and their output becomes the final normalization_value saved to the DB.
+// ── Deferred lowercase (cleaning section) ────────────────────────────────────
+// When 'lowercase' is enabled in the cleaning section, apply it to each token now
+// (after tokenization so CamelCase / alpha-numeric splitting saw the original casing).
+// Rejoining the lowercased tokens updates s, which becomes cleaned_value.
+if (cleaningLowercaseEnabled && Array.isArray(tokenList)) {
+  tokenList = tokenList.map(function(t) { return String(t).toLowerCase(); });
+  s = tokenList.join(' ');
+}
+
+// cleaned_value: string after cleaning pass. Capitalization is preserved unless a legacy
+// lowercase rule is explicitly enabled.
+// Stored on RUN_ITEMS / ALIAS_ITEMS and used for 'clean value' alias summary lookups
+// and step-1 exact-match scoring.
+const cleanedValue = s;
+
+// ── Sync s to post-tokenization form ─────────────────────────────────────────
+// Tokenization rules (split_alpha_numeric_boundary, split_camel_pascal, etc.) only
+// update tokenList, not s. Rejoin now so the normalization pass and normalization_value
+// both operate on the fully-split token stream (e.g. "C1" → "C 1", "MetroPCS" → "Metro PCS").
+// cleanedValue is already captured above so this does not affect it.
+if (cleaningRules.length > 0 && Array.isArray(tokenList)) {
+  s = tokenList.join(' ');
+}
+
+// ── Normalization pass (post-tokenization) ────────────────────────────────────
+// When a 'cleaning' section is present: all normalization.rules are deterministic
+// rewrites / stopword-style rules that run here (after cleaning + tokenization).
+// Back-compat: if no cleaning section, only rules with pre_tokenization:false run here.
 for (const r of normalizationRules) {
   const isObj = r && typeof r === 'object' && !Array.isArray(r);
   const name = (typeof r === 'string') ? r : (isObj ? String(r.name || '') : '');
   const enabled = isObj && Object.prototype.hasOwnProperty.call(r, 'enabled') ? Boolean(r.enabled) : true;
   const params = isObj ? (r.params || {}) : {};
-  const preTokenization = isObj && Object.prototype.hasOwnProperty.call(r, 'pre_tokenization')
-    ? Boolean(r.pre_tokenization) : true;
-  if (!name || !enabled || preTokenization) continue; // skip pre-tokenization rules
+  if (!name || !enabled) continue;
+  // Back-compat: when no cleaning section exists, skip pre-tokenization rules here.
+  if (cleaningRules.length === 0) {
+    const preTokenization = isObj && Object.prototype.hasOwnProperty.call(r, 'pre_tokenization')
+      ? Boolean(r.pre_tokenization) : true;
+    if (preTokenization) continue;
+  }
   applyNormRule(name, params);
 }
 
-// Final normalization value persisted to metadata-bearing rows (RUN_ITEMS / RAW_VALUES).
-// Reflects all normalization rules (pre-tokenization pass + post-tokenization pass).
+// Final normalization value: string after cleaning + normalization passes.
 const normalizationValue = s;
 
 // =========================
@@ -719,10 +909,16 @@ tokenList = applyPostTokenConfig(tokenList, tokenizationConfig, null);
 // =========================
 // TOKEN NORMALIZATION (section)
 // Stored under ruleset.token_normalization.rules (or token_nomalization.rules).
-// Applied to tokens AFTER tokenization + tokenization.config.
+// Seeds from normalization_value (Stage 3 output) so that stopword removal and
+// deterministic rewrites are inherited from Stage 3 rather than repeated here.
+// Only purely token-level transforms (number rewrites, collapse, join, etc.) run here.
+// Post-config: token_deduplication and max_token_frequency only (no stopword_sets).
 // =========================
 try {
-  if (Array.isArray(tokenList)) normalizedTokenList = tokenList.slice();
+  // Re-tokenize the normalized string: split on whitespace, drop empty segments.
+  normalizedTokenList = normalizationValue.trim().length > 0
+    ? normalizationValue.trim().split(/\s+/)
+    : [];
 
   if (Array.isArray(normalizedTokenList) && normalizedTokenList.length > 0) {
     for (const r of tokenNormalizationRules) {
@@ -755,38 +951,22 @@ try {
 
         case 'number_word_digit_rewrite': {
           // Token-level bidirectional rewrite between spelled-out English numbers and digits.
+          // Uses shared numberToWordParts / numericTokenToWord helpers defined at UDF top level.
           //
           // Params:
           // - words_to_numeric (boolean):
-          //    - true  => rewrite number words -> numeric token (e.g., "one" -> "1", "twenty one" -> "21")
-          //    - false => rewrite numeric token -> number words (e.g., "1" -> "one", "21" -> "twenty one")
+          //    - true  => rewrite number-word tokens -> a single numeric token
+          //              ("one" -> "1"; consecutive words like "twenty","two" -> "22")
+          //    - false => rewrite numeric tokens -> a single joined word token with no spaces
+          //              ("1" -> "one", "22" -> "twentytwo", "101" -> "onehundredone")
           //
-          // Notes:
-          // - This is deterministic + idempotent for supported ranges.
-          // - Supported (numeric->words): integers 0..9999 (inclusive).
-          // - Supported (words->numeric): basic English number phrases using:
-          //   zero..nineteen, twenty..ninety, hundred, thousand, and (optional).
+          // Supported (numeric→words): integers 0..9999.
+          // Supported (words→numeric): English phrases using zero..nineteen, twenty..ninety,
+          //   hundred, thousand, and (optional).
           const wordsToNumeric =
             params && typeof params === 'object' && Object.prototype.hasOwnProperty.call(params, 'words_to_numeric')
               ? Boolean(params.words_to_numeric)
               : true;
-
-          const ONES = {
-            zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9
-          };
-          const TEENS = {
-            ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19
-          };
-          const TENS = {
-            twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90
-          };
-          const DIGIT_TO_WORD_0_19 = [
-            'zero','one','two','three','four','five','six','seven','eight','nine',
-            'ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'
-          ];
-          const TENS_WORD = {
-            20: 'twenty', 30: 'thirty', 40: 'forty', 50: 'fifty', 60: 'sixty', 70: 'seventy', 80: 'eighty', 90: 'ninety'
-          };
 
           const parseNumberWordsAt = (tokens, startIdx) => {
             let i = startIdx;
@@ -794,148 +974,60 @@ try {
             let current = 0;
             let consumed = 0;
             let sawAny = false;
-
             while (i < tokens.length) {
               const raw = String(tokens[i] ?? '');
               if (isDoNotTouchToken(raw)) break;
               const w = raw.toLowerCase();
-
-              if (w === 'and') {
-                // allow optional "and" inside number phrases ("one hundred and two")
-                if (!sawAny) break;
-                i++; consumed++;
-                continue;
-              }
-
-              if (Object.prototype.hasOwnProperty.call(ONES, w)) {
-                current += ONES[w];
-                sawAny = true;
-                i++; consumed++;
-                continue;
-              }
-              if (Object.prototype.hasOwnProperty.call(TEENS, w)) {
-                current += TEENS[w];
-                sawAny = true;
-                i++; consumed++;
-                continue;
-              }
-              if (Object.prototype.hasOwnProperty.call(TENS, w)) {
-                current += TENS[w];
-                sawAny = true;
-                i++; consumed++;
-                continue;
-              }
-
-              if (w === 'hundred') {
-                if (!sawAny) break;
-                current = current * 100;
-                i++; consumed++;
-                continue;
-              }
-              if (w === 'thousand') {
-                if (!sawAny) break;
-                total += current * 1000;
-                current = 0;
-                i++; consumed++;
-                continue;
-              }
-
+              if (w === 'and') { if (!sawAny) break; i++; consumed++; continue; }
+              if (Object.prototype.hasOwnProperty.call(NUM_ONES, w))  { current += NUM_ONES[w];  sawAny = true; i++; consumed++; continue; }
+              if (Object.prototype.hasOwnProperty.call(NUM_TEENS, w)) { current += NUM_TEENS[w]; sawAny = true; i++; consumed++; continue; }
+              if (Object.prototype.hasOwnProperty.call(NUM_TENS, w))  { current += NUM_TENS[w];  sawAny = true; i++; consumed++; continue; }
+              if (w === 'hundred')  { if (!sawAny) break; current = current * 100;          i++; consumed++; continue; }
+              if (w === 'thousand') { if (!sawAny) break; total += current * 1000; current = 0; i++; consumed++; continue; }
               break;
             }
-
             if (!sawAny) return null;
             return { value: total + current, consumed };
-          };
-
-          const numberToWordsTokens = (n) => {
-            if (!Number.isFinite(n) || n < 0 || n > 9999 || Math.trunc(n) !== n) return null;
-            if (n < 20) return [DIGIT_TO_WORD_0_19[n]];
-            if (n < 100) {
-              const tens = Math.trunc(n / 10) * 10;
-              const ones = n % 10;
-              if (ones === 0) return [TENS_WORD[tens]];
-              return [TENS_WORD[tens], DIGIT_TO_WORD_0_19[ones]];
-            }
-            if (n < 1000) {
-              const h = Math.trunc(n / 100);
-              const rem = n % 100;
-              const out = [DIGIT_TO_WORD_0_19[h], 'hundred'];
-              if (rem > 0) out.push(...numberToWordsTokens(rem));
-              return out;
-            }
-            // 1000..9999
-            const th = Math.trunc(n / 1000);
-            const rem = n % 1000;
-            const out = [DIGIT_TO_WORD_0_19[th], 'thousand'];
-            if (rem > 0) out.push(...numberToWordsTokens(rem));
-            return out;
           };
 
           if (wordsToNumeric) {
             const out = [];
             for (let i = 0; i < normalizedTokenList.length; ) {
-              if (isDoNotTouchToken(normalizedTokenList[i])) {
-                out.push(String(normalizedTokenList[i]));
-                i += 1;
-                continue;
-              }
+              if (isDoNotTouchToken(normalizedTokenList[i])) { out.push(String(normalizedTokenList[i])); i++; continue; }
               const parsed = parseNumberWordsAt(normalizedTokenList, i);
-              if (parsed && parsed.consumed > 0) {
-                out.push(String(parsed.value));
-                i += parsed.consumed;
-              } else {
-                out.push(String(normalizedTokenList[i]));
-                i += 1;
-              }
+              if (parsed && parsed.consumed > 0) { out.push(String(parsed.value)); i += parsed.consumed; }
+              else { out.push(String(normalizedTokenList[i])); i++; }
             }
             normalizedTokenList = out;
           } else {
+            // numeric→words: each numeric token becomes one joined word token (no spaces).
             const out = [];
             for (let i = 0; i < normalizedTokenList.length; ) {
               const t = String(normalizedTokenList[i]);
-              if (isDoNotTouchToken(t)) {
-                out.push(t);
-                i += 1;
-                continue;
-              }
+              if (isDoNotTouchToken(t)) { out.push(t); i++; continue; }
 
-              // Merge longest span of consecutive single-digit numeric tokens: ["1","0","1"] -> "101"
+              // Merge a run of consecutive single-digit tokens: ["1","0","1"] -> "onehundredone"
               if (/^\d$/.test(t)) {
                 let j = i;
                 let digits = '';
                 while (j < normalizedTokenList.length) {
                   const tj = String(normalizedTokenList[j]);
-                  if (isDoNotTouchToken(tj)) break;
-                  if (!/^\d$/.test(tj)) break;
-                  digits += tj;
-                  j++;
+                  if (isDoNotTouchToken(tj) || !/^\d$/.test(tj)) break;
+                  digits += tj; j++;
                 }
-
                 if (j > i + 1) {
-                  const n = Number(digits);
-                  const words = numberToWordsTokens(Number.isFinite(n) ? Math.trunc(n) : NaN);
-                  if (words) {
-                    // Emit as ONE token (contains spaces) per requirement.
-                    out.push(words.join(' '));
-                    i = j;
-                    continue;
-                  }
+                  const word = numericTokenToWord(digits);
+                  if (word) { out.push(word); i = j; continue; }
                 }
               }
 
-              // Single token numeric rewrite: "101" -> "one hundred one" (single token)
+              // Single multi-digit numeric token: "22" -> "twentytwo"
               if (/^\d+$/.test(t)) {
-                const n = Number(t);
-                const words = numberToWordsTokens(Number.isFinite(n) ? Math.trunc(n) : NaN);
-                if (words) {
-                  out.push(words.join(' '));
-                  i += 1;
-                  continue;
-                }
+                const word = numericTokenToWord(t);
+                if (word) { out.push(word); i++; continue; }
               }
 
-              out.push(t);
-              i += 1;
+              out.push(t); i++;
             }
             normalizedTokenList = out;
           }
@@ -1054,6 +1146,7 @@ normalizedTokenList = applyPostTokenConfig(normalizedTokenList, tokenNormalizati
 
 return {
   normalization_value: normalizationValue,
+  cleaned_value: cleanedValue,
   tokens: tokenList,
   tokens_count: Array.isArray(tokenList) ? tokenList.length : null,
   normalized_tokens: normalizedTokenList,
@@ -1062,22 +1155,101 @@ return {
 $$;
 
 -- Back-compat: return normalization_value only (string)
-CREATE OR REPLACE FUNCTION APPLY_CLASSIFICATION_RULESET(raw_value VARCHAR, ruleset VARIANT)
+CREATE OR REPLACE FUNCTION APPLY_CLASSIFICATION_RULESET(literal_value VARCHAR, ruleset VARIANT)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
 $$
-  SELECT STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(raw_value, ruleset):normalization_value::VARCHAR
+  SELECT STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(literal_value, ruleset):normalization_value::VARCHAR
 $$;
 
--- Back-compat convenience: standard profile normalization_value from raw_value
-CREATE OR REPLACE FUNCTION CLASSIFICATION_NORMALIZATION_VALUE(raw_value VARCHAR)
+-- Back-compat convenience: standard profile normalization_value from literal_value
+CREATE OR REPLACE FUNCTION CLASSIFICATION_NORMALIZATION_VALUE(literal_value VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
 $$
   SELECT STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(
-    raw_value,
+    literal_value,
     (SELECT ruleset FROM STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES WHERE profile_id = 1)
   ):normalization_value::VARCHAR
 $$;
+
+-- ============================================================================
+-- ENRICH_RULESET_STOPWORDS
+-- Merges table-driven stopword lists into a base profile ruleset before the
+-- pipeline runs, implementing two-tier stopword scoping:
+--
+--   generic_words  — apply to every run, regardless of concept
+--   concept_words  — apply only when the run belongs to a specific concept
+--
+-- The function locates (or creates) the `stopword_removal` rule inside
+-- ruleset.normalization.rules and:
+--   • writes generic_words  into params.sets.generic (when non-empty)
+--   • writes concept_words  into params.sets.concept_specific (when non-empty)
+--   • sets params.enabled   to every tier that still has words after merge
+--
+-- If LKP_STOPWORDS returns no rows, ARRAY_AGG yields NULL / empty arrays.
+-- In that case we keep the profile's inline lists (and legacy `carriers`
+-- becomes concept_specific when concept_specific would otherwise be empty)
+-- so CREATE_RUN still strips stopwords without requiring a seeded table.
+--
+-- Callers can use view STAND_INTERNAL.ENRICHED_CONCEPT_RULESETS (01_internal_tables.sql)
+-- so subqueries against LKP_STOPWORDS are not repeated at every call site.
+-- ============================================================================
+CREATE OR REPLACE FUNCTION ENRICH_RULESET_STOPWORDS(
+    base_ruleset    VARIANT,
+    generic_words   ARRAY,
+    concept_words   ARRAY
+)
+RETURNS VARIANT
+LANGUAGE JAVASCRIPT
+AS $$
+  const ruleset = JSON.parse(JSON.stringify(BASE_RULESET ?? {}));
+  const gWords = Array.isArray(GENERIC_WORDS)  ? GENERIC_WORDS.filter(w => w != null).map(String)  : [];
+  const cWords = Array.isArray(CONCEPT_WORDS) ? CONCEPT_WORDS.filter(w => w != null).map(String) : [];
+
+  // Locate the stopword_removal rule in normalization.rules; create it if absent.
+  if (!ruleset.normalization)                          ruleset.normalization = {};
+  if (!Array.isArray(ruleset.normalization.rules))     ruleset.normalization.rules = [];
+  let swRule = ruleset.normalization.rules.find(r => r && r.name === 'stopword_removal');
+  if (!swRule) {
+    swRule = { name: 'stopword_removal', enabled: true, params: { enabled: [], sets: {} } };
+    ruleset.normalization.rules.push(swRule);
+  }
+  if (!swRule.params)       swRule.params = {};
+  if (!swRule.params.sets)  swRule.params.sets = {};
+
+  const sets = swRule.params.sets;
+  const inlineGeneric = Array.isArray(sets.generic)
+    ? sets.generic.filter((w) => w != null).map(String)
+    : [];
+  const inlineCarriers = Array.isArray(sets.carriers)
+    ? sets.carriers.filter((w) => w != null).map(String)
+    : [];
+  const inlineConceptSpecific = Array.isArray(sets.concept_specific)
+    ? sets.concept_specific.filter((w) => w != null).map(String)
+    : [];
+
+  // Table-driven lists win when Snowflake passed a non-empty array; otherwise
+  // fall back to inline profile tiers (and carriers → concept_specific).
+  sets.generic =
+    gWords.length > 0 ? gWords : inlineGeneric;
+  sets.concept_specific =
+    cWords.length > 0
+      ? cWords
+      : inlineConceptSpecific.length > 0
+        ? inlineConceptSpecific
+        : inlineCarriers;
+
+  const active = [];
+  if ((sets.generic || []).length > 0) active.push('generic');
+  if ((sets.concept_specific || []).length > 0) active.push('concept_specific');
+  swRule.params.enabled = active;
+
+  return ruleset;
+$$;
+
+-- ENRICHED_CONCEPT_RULESETS view: defined in 01_internal_tables.sql (after
+-- LKP_STOPWORDS DDL + seed). Deploy 01a_classification_pipeline_functions.sql
+-- before 01_internal_tables.sql so ENRICH_RULESET_STOPWORDS exists.

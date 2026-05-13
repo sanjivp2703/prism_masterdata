@@ -1,26 +1,95 @@
 @import "tailwindcss";
 
+/* ─── Force light mode — this app has no dark theme ────────────────────── */
+html {
+  color-scheme: light;
+  background-color: #F4F6F8;
+}
+
+/* ─── Design tokens ─────────────────────────────────────────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Colors */
+  --page-bg:          #F4F6F8;
+  --surface:          #FFFFFF;
+  --surface-hover:    #F9FAFB;
+
+  --accent:           #378ADD;
+  --accent-strong:    #185FA5;
+  --accent-tint:      #EAF1FE;
+  --accent-border:    #C5D8FC;
+
+  --text-primary:     #1A1A2E;
+  --text-secondary:   #374151;
+  --text-muted:       #6B7280;
+  --text-hint:        #9CA3AF;
+
+  --border:           #E5E7EB;
+  --border-subtle:    #F3F4F6;
+
+  --confidence-high:  #0F6E56;
+  --confidence-med:   #BA7517;
+  --confidence-low:   #A32D2D;
+
+  /* Border radius */
+  --radius-card:          14px;
+  --radius-button:        8px;
+  --radius-toggle-option: 6px;
+  --radius-pill:          20px;
+  --radius-checkbox:      50%;
+  --radius-row:           10px;
+
+  /* Spacing */
+  --page-padding-x:   40px;
+  --page-padding-y:   32px;
+  --card-padding:     24px;
+  --row-padding-y:    13px;
+
+  /* Border widths */
+  --border-width:     0.5px;
+  --border-width-active: 2px;
 }
 
+/* ─── Tailwind v4 theme mapping ─────────────────────────────────────────── */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --color-page-bg:         var(--page-bg);
+  --color-surface:         var(--surface);
+  --color-surface-hover:   var(--surface-hover);
+
+  --color-accent:          var(--accent);
+  --color-accent-strong:   var(--accent-strong);
+  --color-accent-tint:     var(--accent-tint);
+  --color-accent-border:   var(--accent-border);
+
+  --color-text-primary:    var(--text-primary);
+  --color-text-secondary:  var(--text-secondary);
+  --color-text-muted:      var(--text-muted);
+  --color-text-hint:       var(--text-hint);
+
+  --color-border:          var(--border);
+  --color-border-subtle:   var(--border-subtle);
+
+  --color-confidence-high: var(--confidence-high);
+  --color-confidence-med:  var(--confidence-med);
+  --color-confidence-low:  var(--confidence-low);
+
+  --radius-card:           var(--radius-card);
+  --radius-button:         var(--radius-button);
+  --radius-toggle-option:  var(--radius-toggle-option);
+  --radius-pill:           var(--radius-pill);
+  --radius-checkbox:       var(--radius-checkbox);
+  --radius-row:            var(--radius-row);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/* ─── Base styles ───────────────────────────────────────────────────────── */
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: var(--page-bg);
+  color: var(--text-primary);
+  font-family: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }

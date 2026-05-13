@@ -1,168 +1,28 @@
 'use client';
 
-import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useEffect, useMemo, useState } from 'react';
 
-const TABLES = [
-  'CLASSIFICATION_METADATA_PROFILES',
-  'CONCEPTS',
-  'ALIASES',
-  'ALIAS_SUMMARY',
-  'TOKENS_SUMMARY',
-  'RAW_VALUES',
-  'USERS',
-  'RUNS',
-  'RUN_GROUPS',
-  'RUN_ITEMS',
-  'RUN_APPLIED_TARGETS',
-  'AUDIT_LOG',
+// ── Tables tab ────────────────────────────────────────────────────────────────
+
+const TABLES: { name: string; section?: string }[] = [
+  { name: 'CLASSIFICATION_METADATA_PROFILES' },
+  { name: 'CONCEPTS' },
+  { name: 'ALIASES' },
+  { name: 'ALIAS_SUMMARY' },
+  { name: 'TOKENS_SUMMARY' },
+  { name: 'ALIAS_ITEMS' },
+  { name: 'USERS' },
+  { name: 'RUNS' },
+  { name: 'RUN_GROUPS' },
+  { name: 'RUN_ITEMS' },
+  { name: 'RUN_APPLIED_TARGETS' },
+  { name: 'AUDIT_LOG' },
+  { name: 'ONE_PROMPT_RUN_STATE',             section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_LITERAL_ALIAS_MATCHES', section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_APPROVED_ALIAS_NAMES',  section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_VALIDATION_LOG',        section: 'One-Prompt' },
 ];
-
-export default function AdminPage() {
-  const [tab, setTab] = useState<'tables' | 'validation'>('tables');
-
-  return (
-    <div className="min-h-screen bg-gray-50 p-8">
-      <div className="max-w-7xl mx-auto">
-        <h1 className="text-4xl font-bold text-gray-900 mb-8">
-          Database Admin
-        </h1>
-
-        <div className="flex items-center gap-2 mb-8">
-          <button
-            type="button"
-            onClick={() => setTab('tables')}
-            className={[
-              'px-4 py-2 rounded-md text-sm font-semibold border',
-              tab === 'tables'
-                ? 'bg-gray-900 text-white border-gray-900'
-                : 'bg-white text-gray-900 border-gray-200 hover:bg-gray-50',
-            ].join(' ')}
-          >
-            Tables
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('validation')}
-            className={[
-              'px-4 py-2 rounded-md text-sm font-semibold border',
-              tab === 'validation'
-                ? 'bg-purple-700 text-white border-purple-700'
-                : 'bg-white text-gray-900 border-gray-200 hover:bg-gray-50',
-            ].join(' ')}
-          >
-            Run Validation
-          </button>
-        </div>
-
-        {tab === 'tables' ? (
-          <div className="space-y-8">
-            {TABLES.map((tableName) => (
-              <TableSection key={tableName} tableName={tableName} />
-            ))}
-          </div>
-        ) : (
-          <RunValidationTab />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function RunValidationTab() {
-  const [runs, setRuns] = useState<
-    Array<{
-      run_id: number;
-      source_relation: string;
-      source_column: string;
-      run_status: string;
-      updated_at: string;
-    }>
-  >([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'completed': return 'bg-green-100 text-green-800';
-      case 'validating': return 'bg-purple-100 text-purple-800';
-      case 'running': return 'bg-blue-100 text-blue-800';
-      case 'failed': return 'bg-red-100 text-red-800';
-      case 'created': return 'bg-gray-100 text-gray-800';
-      default: return 'bg-gray-100 text-gray-800';
-    }
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch('/api/admin/validating-runs', { cache: 'no-store' });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body?.error || 'Failed to load validating runs');
-        if (!cancelled) setRuns((body?.data || []) as any);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load validating runs');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return (
-    <div className="bg-white rounded-lg shadow-md p-6">
-      <h2 className="text-2xl font-semibold text-gray-800 mb-2">
-        Run Validation
-      </h2>
-      <p className="text-sm text-gray-600 mb-4">
-        Runs that were sent for approval (includes <span className="font-mono">completed</span>).
-      </p>
-
-      {loading ? (
-        <div className="text-gray-500 italic">Loading…</div>
-      ) : error ? (
-        <div className="text-red-600 bg-red-50 p-4 rounded">{error}</div>
-      ) : runs.length === 0 ? (
-        <div className="text-gray-500 italic">No validating runs</div>
-      ) : (
-        <div className="space-y-2">
-          {runs.map((r) => (
-            <div
-              key={r.run_id}
-              className="flex items-center justify-between gap-4 border border-gray-200 rounded-md px-4 py-3 hover:bg-gray-50"
-            >
-              <div className="min-w-0 flex items-center gap-3">
-                <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${getStatusColor(r.run_status)}`}>
-                  {r.run_status || 'unknown'}
-                </span>
-                <div className="min-w-0">
-                  <div className="font-semibold text-gray-900">
-                    Run <span className="font-mono">{r.run_id}</span>
-                  </div>
-                  <div className="text-sm text-gray-600 truncate">
-                    {r.source_relation} · {r.source_column}
-                  </div>
-                </div>
-              </div>
-              <Link
-                href={`/admin/validating/${r.run_id}`}
-                className="px-3 py-2 rounded-md bg-purple-700 text-white text-sm font-semibold hover:bg-purple-800"
-              >
-                {r.run_status === 'completed' ? 'View →' : 'Validate →'}
-              </Link>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
 function TableSection({ tableName }: { tableName: string }) {
   const [data, setData] = useState<any[]>([]);
@@ -172,19 +32,14 @@ function TableSection({ tableName }: { tableName: string }) {
   useEffect(() => {
     async function fetchData() {
       try {
-        const response = await fetch(`/api/admin/table/${tableName}`, {
-          cache: 'no-store',
-        });
-        
+        const response = await fetch(`/api/admin/table/${tableName}`, { cache: 'no-store' });
         if (response.ok) {
           const result = await response.json();
           setData(result.data || []);
           setError(null);
         } else {
           const body = await response.json().catch(() => ({} as any));
-          const msg =
-            (body && (body.error || body.message)) ||
-            `${response.status} ${response.statusText}`;
+          const msg = (body && (body.error || body.message)) || `${response.status} ${response.statusText}`;
           const details = body?.details ? ` (${String(body.details)})` : '';
           setError(`Failed to fetch: ${msg}${details}`);
         }
@@ -194,7 +49,6 @@ function TableSection({ tableName }: { tableName: string }) {
         setLoading(false);
       }
     }
-
     fetchData();
   }, [tableName]);
 
@@ -206,13 +60,10 @@ function TableSection({ tableName }: { tableName: string }) {
           ({loading ? '...' : `${data.length} rows`})
         </span>
       </h2>
-
       {loading ? (
         <div className="text-gray-500 italic">Loading...</div>
       ) : error ? (
-        <div className="text-red-600 bg-red-50 p-4 rounded">
-          {error}
-        </div>
+        <div className="text-red-600 bg-red-50 p-4 rounded">{error}</div>
       ) : data.length === 0 ? (
         <div className="text-gray-500 italic">No data</div>
       ) : (
@@ -234,13 +85,12 @@ function TableSection({ tableName }: { tableName: string }) {
               {data.map((row, idx) => (
                 <tr key={idx} className="hover:bg-gray-50">
                   {Object.values(row).map((value, colIdx) => (
-                    <td
-                      key={colIdx}
-                      className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap"
-                    >
-                      {value === null
-                        ? <span className="text-gray-400 italic">null</span>
-                        : String(value)}
+                    <td key={colIdx} className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap">
+                      {value === null ? (
+                        <span className="text-gray-400 italic">null</span>
+                      ) : (
+                        String(value)
+                      )}
                     </td>
                   ))}
                 </tr>
@@ -253,3 +103,263 @@ function TableSection({ tableName }: { tableName: string }) {
   );
 }
 
+// ── Concepts tab ──────────────────────────────────────────────────────────────
+
+type Concept = {
+  CONCEPT_ID?: number;
+  CONCEPT_KEY?: string;
+  DESCRIPTION?: string | null;
+  DATA_TYPE?: string;
+  IS_ACTIVE?: boolean;
+};
+
+function ConceptsTab() {
+  const [concepts, setConcepts] = useState<Concept[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newKey, setNewKey] = useState('');
+  const [newDesc, setNewDesc] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/concepts', { cache: 'no-store' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Failed to load concepts');
+      setConcepts((body?.data || []) as Concept[]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load concepts');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, []);
+
+  async function createConcept() {
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const concept_key = newKey.trim();
+      const description = newDesc.trim();
+      const res = await fetch('/api/concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ concept_key, description: description.length ? description : null }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Failed to create concept');
+
+      setCreateOpen(false);
+      setNewKey('');
+      setNewDesc('');
+      await load();
+
+      const id = Number(body?.data?.CONCEPT_ID ?? body?.data?.concept_id);
+      if (Number.isFinite(id)) window.location.href = `/concepts/${id}`;
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : 'Failed to create concept');
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return concepts;
+    return concepts.filter((c) => {
+      const key = String(c.CONCEPT_KEY ?? '').toLowerCase();
+      const desc = String(c.DESCRIPTION ?? '').toLowerCase();
+      return key.includes(q) || desc.includes(q);
+    });
+  }, [concepts, query]);
+
+  return (
+    <div>
+      <div className="mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-semibold text-gray-800">Concepts</h2>
+          <p className="mt-1 text-sm text-gray-600">
+            Browse and manage semantic concepts.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => { setCreateOpen((v) => !v); setCreateError(null); }}
+          className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
+        >
+          Create concept
+        </button>
+      </div>
+
+      {createOpen && (
+        <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 px-4 py-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="sm:col-span-1">
+              <div className="text-xs font-bold tracking-wider text-blue-800 uppercase mb-1">
+                Name (concept_key)
+              </div>
+              <input
+                value={newKey}
+                onChange={(e) => setNewKey(e.target.value)}
+                placeholder="e.g. mobile_carrier"
+                className="w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+              <div className="mt-1 text-xs text-blue-900/70">
+                Use lowercase letters, numbers, underscores.
+              </div>
+            </div>
+            <div className="sm:col-span-2">
+              <div className="text-xs font-bold tracking-wider text-blue-800 uppercase mb-1">
+                Short description (optional)
+              </div>
+              <input
+                value={newDesc}
+                onChange={(e) => setNewDesc(e.target.value)}
+                placeholder="Optional short description…"
+                className="w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+            </div>
+          </div>
+          {createError && (
+            <div className="mt-3 bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded">
+              {createError}
+            </div>
+          )}
+          <div className="mt-3 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setCreateOpen(false)}
+              disabled={creating}
+              className="px-3 py-2 rounded-md border border-blue-200 bg-white text-blue-900 text-sm font-semibold hover:bg-blue-100"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void createConcept()}
+              disabled={creating || !newKey.trim()}
+              className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {creating ? 'Creating…' : 'Create'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="mb-4">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search concepts…"
+          className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+        />
+      </div>
+
+      {loading ? (
+        <div className="text-gray-500 italic">Loading…</div>
+      ) : error ? (
+        <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded">{error}</div>
+      ) : (
+        <div className="rounded-lg border border-gray-200 bg-white">
+          {filtered.length === 0 ? (
+            <div className="px-4 py-6 text-sm text-gray-700">No concepts found.</div>
+          ) : (
+            <ul className="divide-y divide-gray-200">
+              {filtered.map((c) => {
+                const id = Number(c.CONCEPT_ID);
+                const key = String(c.CONCEPT_KEY ?? '');
+                const desc = c.DESCRIPTION ? String(c.DESCRIPTION) : '';
+                const href = Number.isFinite(id) ? `/concepts/${id}` : '#';
+                return (
+                  <li key={`${id}-${key}`} className="px-4 py-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-gray-900">
+                          {key || 'Unnamed concept'}
+                        </div>
+                        {desc && <div className="mt-1 text-sm text-gray-600">{desc}</div>}
+                      </div>
+                      {Number.isFinite(id) ? (
+                        <Link
+                          href={href}
+                          className="shrink-0 px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
+                        >
+                          Open
+                        </Link>
+                      ) : (
+                        <span className="shrink-0 px-3 py-2 rounded-md bg-gray-100 text-gray-500 text-sm font-semibold">
+                          N/A
+                        </span>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+type Tab = 'tables' | 'concepts';
+
+export default function AdminPage() {
+  const [activeTab, setActiveTab] = useState<Tab>('concepts');
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-8">
+      <div className="max-w-7xl mx-auto">
+        <h1 className="text-4xl font-bold text-gray-900 mb-6">Admin</h1>
+
+        {/* Tab bar */}
+        <div className="flex items-center gap-1 border-b border-gray-200 mb-8">
+          {([['concepts', 'Concepts'], ['tables', 'Database tables']] as [Tab, string][]).map(
+            ([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                className={[
+                  'px-4 py-2.5 text-sm font-medium rounded-t-md border-b-2 -mb-px transition-colors',
+                  activeTab === id
+                    ? 'border-blue-600 text-blue-700 bg-white'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
+                ].join(' ')}
+              >
+                {label}
+              </button>
+            )
+          )}
+        </div>
+
+        {activeTab === 'concepts' && <ConceptsTab />}
+
+        {activeTab === 'tables' && (
+          <div className="space-y-8">
+            {TABLES.map((entry, i) => (
+              <div key={entry.name}>
+                {entry.section && (i === 0 || TABLES[i - 1].section !== entry.section) && (
+                  <h2 className="text-xs font-bold tracking-widest text-gray-400 uppercase mb-4 mt-2">
+                    {entry.section}
+                  </h2>
+                )}
+                <TableSection tableName={entry.name} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

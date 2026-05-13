@@ -13,7 +13,7 @@ type Groupings = Record<
   string,
   {
     alias_id: number;
-    items: Array<{ raw_value: string; confidence: number | null }>;
+    items: Array<{ literal_value: string; confidence: number | null }>;
   }
 >;
 
@@ -73,7 +73,7 @@ export default function ConceptGroupingsClient({
     if (!q) return entries;
     return entries.filter(([aliasName, g]) => {
       if (aliasName.toLowerCase().includes(q)) return true;
-      return (g.items || []).some((it) => String(it.raw_value).toLowerCase().includes(q));
+      return (g.items || []).some((it) => String(it.literal_value).toLowerCase().includes(q));
     });
   }, [entries, query]);
 
@@ -93,7 +93,7 @@ export default function ConceptGroupingsClient({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search aliases / raw values…"
+            placeholder="Search aliases / literal values…"
             className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
           />
         </div>
@@ -114,7 +114,7 @@ export default function ConceptGroupingsClient({
                   Alias Name
                 </th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Raw Values
+                  Literal Values
                 </th>
               </tr>
             </thead>
@@ -129,7 +129,7 @@ export default function ConceptGroupingsClient({
                 filtered.map(([aliasName, group]) => {
                   const seen = new Set<string>();
                   const items = (group.items || []).filter((it) => {
-                    const key = String(it.raw_value);
+                    const key = String(it.literal_value);
                     if (seen.has(key)) return false;
                     seen.add(key);
                     return true;
@@ -145,10 +145,10 @@ export default function ConceptGroupingsClient({
                           <div className="flex flex-wrap gap-2">
                             {items.map((it) => (
                               <span
-                                key={`${aliasName}:${it.raw_value}`}
+                                key={`${aliasName}:${it.literal_value}`}
                                 className="inline-flex items-center rounded-md bg-gray-100 px-2 py-1 text-xs font-medium text-gray-900"
                               >
-                                {String(it.raw_value)}
+                                {String(it.literal_value)}
                                 {typeof it.confidence === 'number' &&
                                   Number.isFinite(it.confidence) && (
                                     <span className="ml-1 text-[10px] font-semibold text-gray-500">

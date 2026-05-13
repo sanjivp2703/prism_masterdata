@@ -1,4 +1,45 @@
+import Link from 'next/link';
 import RunReviewClient from './RunReviewClient';
+
+function PrismMark({ size = 32 }: { size?: number }) {
+  const h = size;
+  const w = Math.round(size * 1.28);
+  const cx = w / 2;
+  const cy = h / 2;
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} fill="none" aria-hidden="true">
+      <polygon points={`0,0 0,${h} ${cx},${cy}`} fill="#1A1A2E" />
+      <polygon points={`${w},0 ${w},${h} ${cx},${cy}`} fill="#378ADD" />
+      <circle cx={cx} cy={cy} r={size * 0.065} fill="white" />
+    </svg>
+  );
+}
+
+function humanizeDate(val: string | undefined | null): string {
+  if (!val) return '—';
+  try {
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return String(val);
+    return (
+      d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) +
+      ' · ' +
+      d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
+    );
+  } catch {
+    return String(val);
+  }
+}
+
+function MetaItem({ label, value }: { label: string; value: string | undefined | null }) {
+  return (
+    <div className="flex items-baseline gap-1.5">
+      <span className="text-xs" style={{ color: 'var(--text-hint)' }}>{label}</span>
+      <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+        {value || '—'}
+      </span>
+    </div>
+  );
+}
 
 export default async function RunPage({
   params,
@@ -7,93 +48,59 @@ export default async function RunPage({
 }) {
   const { run_id } = await params;
 
-  let runData = null;
-  let error = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let runData: any = null;
 
   try {
-    const response = await fetch(
-      `http://localhost:8000/api/run/${run_id}`,
-      { cache: 'no-store' }
-    );
-    
+    const response = await fetch(`http://localhost:8000/api/run/${run_id}`, { cache: 'no-store' });
     if (response.ok) {
       const result = await response.json();
       runData = result.data;
-    } else {
-      error = 'Run not found';
     }
-  } catch (e) {
-    error = 'Failed to load run data';
+  } catch {
+    // Run data is optional — the client component handles the alias mapping independently.
   }
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'completed': return 'bg-green-100 text-green-800';
-      case 'running': return 'bg-blue-100 text-blue-800';
-      case 'failed': return 'bg-red-100 text-red-800';
-      case 'created': return 'bg-gray-100 text-gray-800';
-      default: return 'bg-gray-100 text-gray-800';
-    }
-  };
-
   return (
-    <div className="min-h-screen p-8 bg-gray-50">
+    <div
+      className="min-h-screen"
+      style={{ backgroundColor: 'var(--page-bg)', padding: 'var(--page-padding-y) var(--page-padding-x)' }}
+    >
       <div className="max-w-6xl mx-auto">
+        {/* ── Page header ─────────────────────────────────────────────────── */}
         <div className="mb-8">
-          <div className="flex items-center justify-between mb-4">
-            <h1 className="text-4xl font-bold text-gray-900">
-              Run #{run_id}
-            </h1>
-            {runData && (
-              <span className={`px-4 py-2 rounded-full text-sm font-semibold uppercase ${getStatusColor(runData.RUN_STATUS)}`}>
-                {runData.RUN_STATUS}
-              </span>
-            )}
-          </div>
-
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded mb-4">
-              {error}
-            </div>
-          )}
+          {/* Logo — links back home */}
+          <Link href="/home" className="inline-flex items-center gap-2.5 group mb-6">
+            <PrismMark size={32} />
+            <span
+              className="text-lg font-semibold tracking-tight transition-colors"
+              style={{ color: 'var(--text-primary)' }}
+            >
+              Prism
+            </span>
+          </Link>
 
           {runData && (
-            <div className="grid grid-cols-2 gap-4 text-sm">
-              <div>
-                <span className="text-gray-600">Concept:</span>{' '}
-                <span className="font-medium text-gray-900">{runData.CONCEPT_KEY}</span>
+            <>
+              {/* Row 1: Concept · Source · Column · Created by */}
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 mt-1">
+                <MetaItem label="Concept" value={runData.CONCEPT_KEY} />
+                <MetaItem label="Source" value={runData.SOURCE_RELATION} />
+                <MetaItem label="Column" value={runData.SOURCE_COLUMN} />
+                <MetaItem label="Created by" value={runData.CREATED_BY_NAME} />
               </div>
-              <div>
-                <span className="text-gray-600">Mode:</span>{' '}
-                <span className="font-medium text-gray-900">{runData.MODE}</span>
+              {/* Row 2: Mode · Date */}
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 mt-1.5">
+                <MetaItem label="Mode" value={runData.MODE} />
+                <MetaItem label="Date" value={humanizeDate(runData.CREATED_AT)} />
               </div>
-              <div>
-                <span className="text-gray-600">Source:</span>{' '}
-                <span className="font-medium text-gray-900">{runData.SOURCE_RELATION}</span>
-              </div>
-              <div>
-                <span className="text-gray-600">Column:</span>{' '}
-                <span className="font-medium text-gray-900">{runData.SOURCE_COLUMN}</span>
-              </div>
-              <div>
-                <span className="text-gray-600">Created By:</span>{' '}
-                <span className="font-medium text-gray-900">{runData.CREATED_BY_NAME}</span>
-              </div>
-              <div>
-                <span className="text-gray-600">Created:</span>{' '}
-                <span className="font-medium text-gray-900">
-                  {new Date(runData.CREATED_AT).toLocaleString()}
-                </span>
-              </div>
-            </div>
+            </>
           )}
         </div>
 
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <RunReviewClient runId={run_id} />
-        </div>
+        {/* ── Run review card ─────────────────────────────────────────────── */}
+        <RunReviewClient runId={run_id} initialRunStatus={runData?.RUN_STATUS} />
       </div>
     </div>
   );
 }
-

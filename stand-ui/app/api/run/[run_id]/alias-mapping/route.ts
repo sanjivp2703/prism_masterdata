@@ -2,8 +2,6 @@ import { NextRequest } from 'next/server';
 import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
 
 function quoteIdent(ident: string) {
-  // Quote as a Snowflake identifier (handles reserved words / mixed case).
-  // Escapes quotes defensively.
   return `"${String(ident).replace(/"/g, '""')}"`;
 }
 
@@ -18,8 +16,6 @@ function parseFqn(fqn: string) {
 }
 
 function isSimpleIdent(s: string) {
-  // Conservative identifier check to prevent SQL injection in dynamic SQL.
-  // Accepts common unquoted Snowflake identifier chars.
   return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(s);
 }
 
@@ -27,9 +23,13 @@ type AliasMap = Record<
   string,
   {
     group_id: number | null;
+    // Human-readable display name. For alias-backed groups this equals the key.
+    // For cluster groups (final_alias_id IS NULL) the key is `g_${group_id}` so
+    // display_name carries the sequential label ("Group 1", etc.).
+    display_name: string;
     items: Array<{
       run_item_id: number;
-      raw_value: string;
+      literal_value: string;
       confidence_score: number | null;
     }>;
   }
@@ -45,8 +45,7 @@ export async function GET(
 
   try {
     return await withSnowflake(async (connection) => {
-      // Optional: keep validation/approval runs up to date if the source table gains new distinct values.
-      // Those values should start as ungrouped (group_id NULL) so reviewers can decide.
+      // Load run metadata to determine if we need to sync new source values.
       const runMetaRows = await new Promise<
         Array<{
           SOURCE_RELATION: string;
@@ -83,9 +82,9 @@ export async function GET(
       const runMeta = runMetaRows[0];
       const runStatus = String((runMeta as any).RUN_STATUS ?? '');
       const requiresValidation = Boolean((runMeta as any).REQUIRES_VALIDATION);
-      const conceptId = Number((runMeta as any).CONCEPT_ID);
 
       // Sync only for the validation flow (either actively validating, or flagged for admin validation).
+      // New source values are inserted as ungrouped so reviewers can decide.
       const shouldSync = runStatus === 'validating' || requiresValidation === true;
       if (shouldSync) {
         const sourceRelation = String((runMeta as any).SOURCE_RELATION ?? '');
@@ -99,35 +98,34 @@ export async function GET(
             isSimpleIdent(table) &&
             isSimpleIdent(sourceColumn)
           ) {
-            const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(
-              table
-            )}`;
+            const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
             const colRef = quoteIdent(sourceColumn);
 
             await new Promise<void>((resolve, reject) => {
               connection.execute({
                 sqlText: `
                   INSERT INTO STAND_DB.STAND_INTERNAL.RUN_ITEMS (
-                    run_id, group_id, raw_value, profile_id,
+                    run_id, group_id, literal_value, cleaned_value, profile_id,
                     normalization_value, tokens, tokens_count, normalized_tokens, normalized_tokens_count,
                     confidence_score, decision_status, created_at, updated_at
                   )
                   SELECT
                     ?,
                     NULL,
-                    sv.raw_value,
+                    sv.literal_value,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):cleaned_value::VARCHAR,
                     c.profile_id,
-                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.raw_value, p.ruleset):normalization_value::VARCHAR,
-                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.raw_value, p.ruleset):tokens,
-                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.raw_value, p.ruleset):tokens_count::NUMBER,
-                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.raw_value, p.ruleset):normalized_tokens,
-                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.raw_value, p.ruleset):normalized_tokens_count::NUMBER,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):normalization_value::VARCHAR,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):tokens,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):tokens_count::NUMBER,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):normalized_tokens,
+                    STAND_DB.STAND_INTERNAL.APPLY_CLASSIFICATION_PIPELINE(sv.literal_value, ecr.enriched_ruleset):normalized_tokens_count::NUMBER,
                     0,
                     'pending',
                     CURRENT_TIMESTAMP(),
                     CURRENT_TIMESTAMP()
                   FROM (
-                    SELECT DISTINCT TO_VARCHAR(${colRef}) AS raw_value
+                    SELECT DISTINCT TO_VARCHAR(${colRef}) AS literal_value
                     FROM ${tableRef}
                     WHERE ${colRef} IS NOT NULL
                   ) sv
@@ -135,13 +133,13 @@ export async function GET(
                     ON r.run_id = ?
                   JOIN STAND_DB.STAND_INTERNAL.CONCEPTS c
                     ON c.concept_id = r.concept_id
-                  JOIN STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES p
-                    ON p.profile_id = c.profile_id
+                  JOIN STAND_DB.STAND_INTERNAL.ENRICHED_CONCEPT_RULESETS ecr
+                    ON ecr.concept_id = c.concept_id
                   WHERE NOT EXISTS (
                     SELECT 1
                     FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS ri
                     WHERE ri.run_id = ?
-                      AND ri.raw_value = sv.raw_value
+                      AND ri.literal_value = sv.literal_value
                   )
                 `,
                 binds: [run_id, run_id, run_id],
@@ -158,18 +156,23 @@ export async function GET(
             );
           }
         } catch (e) {
-          // Don't break the UI load if sync fails; just fall back to existing run snapshot.
           console.warn('RUN_ITEMS sync failed; continuing without sync', e);
         }
       }
 
-      const groups = await new Promise<Array<{ GROUP_ID: number; ALIAS_NAME: string }>>(
+      // ── Load persisted groups from DB ────────────────────────────────────────
+      const groups = await new Promise<Array<{
+        GROUP_ID: number;
+        ALIAS_NAME_LITERAL_VALUE: string;
+        FINAL_ALIAS_ID: number | null;
+      }>>(
         (resolve, reject) => {
           connection.execute({
             sqlText: `
               SELECT
                 group_id,
-                COALESCE(alias_name, initial_alias_name) AS alias_name
+                COALESCE(alias_name_literal_value, initial_alias_name) AS alias_name_literal_value,
+                final_alias_id
               FROM STAND_DB.STAND_INTERNAL.RUN_GROUPS
               WHERE run_id = ?
               ORDER BY group_id
@@ -183,11 +186,12 @@ export async function GET(
         }
       );
 
+      // ── Load persisted items from DB ─────────────────────────────────────────
       const items = await new Promise<
         Array<{
           RUN_ITEM_ID: number;
           GROUP_ID: number | null;
-          RAW_VALUE: string;
+          LITERAL_VALUE: string;
           CONFIDENCE_SCORE: number | null;
         }>
       >(
@@ -195,13 +199,11 @@ export async function GET(
           connection.execute({
             sqlText: shouldSync
               ? `
-                -- Validation/approval flow:
-                -- Hide items that have already been validated before, i.e. the exact mapping
-                -- (raw_value, alias_id, alias_name) already exists in RAW_VALUES.
+                -- Validation flow: hide items already validated with the exact mapping.
                 SELECT
                   ri.run_item_id,
                   ri.group_id,
-                  ri.raw_value,
+                  ri.literal_value,
                   ri.confidence_score
                 FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS ri
                 WHERE ri.run_id = ?
@@ -211,28 +213,28 @@ export async function GET(
                     JOIN STAND_DB.STAND_INTERNAL.RUN_GROUPS rg
                       ON rg.run_id = r.run_id
                      AND rg.group_id = ri.group_id
-                    JOIN STAND_DB.STAND_INTERNAL.RAW_VALUES rv
-                      ON rv.raw_value = ri.raw_value
+                    JOIN STAND_DB.STAND_INTERNAL.ALIAS_ITEMS rv
+                      ON rv.literal_value = ri.literal_value
                      AND rv.alias_id = rg.final_alias_id
                     JOIN STAND_DB.STAND_INTERNAL.ALIASES a
                       ON a.alias_id = rv.alias_id
                     WHERE r.run_id = ri.run_id
                       AND rg.final_alias_id IS NOT NULL
                       AND a.concept_id = r.concept_id
-                      AND a.alias_name = COALESCE(rg.alias_name, rg.initial_alias_name)
+                      AND a.alias_name_literal_value = COALESCE(rg.alias_name_literal_value, rg.initial_alias_name)
                   )
                 ORDER BY ri.group_id, ri.run_item_id
               `
               : `
-                -- Review flow: show everything in the run snapshot.
+                -- Review flow: show the full run snapshot.
                 SELECT
-                  run_item_id,
-                  group_id,
-                  raw_value,
-                  confidence_score
-                FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS
-                WHERE run_id = ?
-                ORDER BY group_id, run_item_id
+                  ri.run_item_id,
+                  ri.group_id,
+                  ri.literal_value,
+                  ri.confidence_score
+                FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS ri
+                WHERE ri.run_id = ?
+                ORDER BY ri.group_id, ri.run_item_id
               `,
             binds: [run_id],
             complete: (err, stmt, rows) => {
@@ -243,1235 +245,48 @@ export async function GET(
         }
       );
 
-      const confidenceRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            WITH run_items AS (
-              SELECT
-                run_item_id,
-                run_id,
-                raw_value,
-                normalization_value,
-                tokens,
-                normalized_tokens,
-                group_id
-              FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS
-              WHERE run_id = ?
-            ),
-            /* Direct match: run_item raw string appears in ALIAS_SUMMARY as key_type='raw value' for this concept */
-            direct_matches AS (
-              SELECT
-                ri.run_item_id,
-                ri.raw_value,
-                s_raw.alias_id,
-                s_name.key_value AS alias_name
-              FROM run_items ri
-              INNER JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_raw
-                ON s_raw.concept_id = ?
-               AND s_raw.key_type = 'raw value'
-               AND s_raw.key_value = ri.raw_value
-              INNER JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_name
-                ON s_name.concept_id = s_raw.concept_id
-               AND s_name.alias_id = s_raw.alias_id
-               AND s_name.key_type = 'alias name'
-               AND s_name.key_value IS NOT NULL
-              QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY ri.run_item_id
-                ORDER BY s_raw.alias_id ASC, s_raw.alias_summary_id ASC
-              ) = 1
-            ),
-            run_items_to_score AS (
-              SELECT ri.*
-              FROM run_items ri
-              WHERE NOT EXISTS (
-                SELECT 1
-                FROM direct_matches d
-                WHERE d.run_item_id = ri.run_item_id
-              )
-            ),
-            flat_tokens AS (
-              SELECT
-                ri.run_item_id,
-                t.value::VARCHAR AS token_val
-              FROM run_items_to_score ri,
-              LATERAL FLATTEN(input => ri.tokens) t
-              WHERE ri.tokens IS NOT NULL
-                AND IS_ARRAY(ri.tokens)
-                AND t.value IS NOT NULL
-            ),
-            flat_norm_tokens AS (
-              SELECT
-                ri.run_item_id,
-                nt.value::VARCHAR AS token_val
-              FROM run_items_to_score ri,
-              LATERAL FLATTEN(input => ri.normalized_tokens) nt
-              WHERE ri.normalized_tokens IS NOT NULL
-                AND IS_ARRAY(ri.normalized_tokens)
-                AND nt.value IS NOT NULL
-            ),
-            alias_candidates AS (
-              SELECT
-                s.alias_id,
-                s.concept_id,
-                s.key_value AS alias_name
-              FROM STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s
-              WHERE s.concept_id = ?
-                AND s.key_type = 'alias name'
-                AND s.key_value IS NOT NULL
-              QUALIFY ROW_NUMBER() OVER (PARTITION BY s.alias_id ORDER BY s.alias_summary_id ASC) = 1
-            ),
-            scored AS (
-              SELECT
-                ri.run_item_id,
-                ri.raw_value,
-                ri.normalization_value,
-                ri.tokens,
-                ri.normalized_tokens,
-                ri.group_id,
-                ac.alias_id,
-                ac.alias_name,
-                (s1.alias_summary_id IS NOT NULL) AS step_1_raw_value_match,
-                (s2.alias_summary_id IS NOT NULL) AS step_2_normalization_value_match,
-                (s3.pipe_sig IS NOT NULL) AS step_3_token_signature_match,
-                (s4.hit IS NOT NULL) AS step_4_any_token_match,
-                (s5.pipe_sig IS NOT NULL) AS step_5_normalized_token_signature_match,
-                (s6.hit IS NOT NULL) AS step_6_any_normalized_token_match,
-                (
-                  ac.alias_name = ri.raw_value
-                  OR ac.alias_name = ri.normalization_value
-                  OR ft7.run_item_id IS NOT NULL
-                  OR fn7.run_item_id IS NOT NULL
-                ) AS step_7_matches_alias_name
-              FROM run_items_to_score ri
-              CROSS JOIN alias_candidates ac
-              LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s1
-                ON s1.concept_id = ac.concept_id
-               AND s1.alias_id = ac.alias_id
-               AND s1.key_type = 'raw value'
-               AND s1.key_value = ri.raw_value
-              LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s2
-                ON s2.concept_id = ac.concept_id
-               AND s2.alias_id = ac.alias_id
-               AND s2.key_type = 'normalized value'
-               AND s2.key_value = ri.normalization_value
-              LEFT JOIN (
-                SELECT
-                  ts.alias_id,
-                  LISTAGG(ts.token, '|') WITHIN GROUP (ORDER BY ts.position_in_signature) AS pipe_sig
-                FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-                WHERE ts.token_type = 'alias'
-                  AND ts.alias_id IS NOT NULL
-                GROUP BY ts.alias_id
-              ) s3
-                ON s3.alias_id = ac.alias_id
-               AND s3.pipe_sig = IFF(
-                    ri.tokens IS NOT NULL AND IS_ARRAY(ri.tokens) AND ARRAY_SIZE(ri.tokens::ARRAY) > 0,
-                    ARRAY_TO_STRING(ri.tokens::ARRAY, '|'),
-                    NULL
-                  )
-              LEFT JOIN (
-                SELECT DISTINCT
-                  ft.run_item_id,
-                  ts.alias_id,
-                  1 AS hit
-                FROM flat_tokens ft
-                INNER JOIN STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-                  ON ts.token = ft.token_val
-                 AND ts.token_type = 'alias'
-                 AND ts.alias_id IS NOT NULL
-              ) s4
-                ON s4.run_item_id = ri.run_item_id
-               AND s4.alias_id = ac.alias_id
-              LEFT JOIN (
-                SELECT
-                  ts.alias_id,
-                  LISTAGG(ts.token, '|') WITHIN GROUP (ORDER BY ts.position_in_signature) AS pipe_sig
-                FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-                WHERE ts.token_type = 'alias'
-                  AND ts.alias_id IS NOT NULL
-                GROUP BY ts.alias_id
-              ) s5
-                ON s5.alias_id = ac.alias_id
-               AND s5.pipe_sig = IFF(
-                    ri.normalized_tokens IS NOT NULL
-                    AND IS_ARRAY(ri.normalized_tokens)
-                    AND ARRAY_SIZE(ri.normalized_tokens::ARRAY) > 0,
-                    ARRAY_TO_STRING(ri.normalized_tokens::ARRAY, '|'),
-                    NULL
-                  )
-              LEFT JOIN (
-                SELECT DISTINCT
-                  ft.run_item_id,
-                  ts.alias_id,
-                  1 AS hit
-                FROM flat_norm_tokens ft
-                INNER JOIN STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-                  ON ts.token = ft.token_val
-                 AND ts.token_type = 'alias'
-                 AND ts.alias_id IS NOT NULL
-              ) s6
-                ON s6.run_item_id = ri.run_item_id
-               AND s6.alias_id = ac.alias_id
-              LEFT JOIN (
-                SELECT DISTINCT run_item_id, token_val
-                FROM flat_tokens
-              ) ft7
-                ON ft7.run_item_id = ri.run_item_id
-               AND ft7.token_val = ac.alias_name
-              LEFT JOIN (
-                SELECT DISTINCT run_item_id, token_val
-                FROM flat_norm_tokens
-              ) fn7
-                ON fn7.run_item_id = ri.run_item_id
-               AND fn7.token_val = ac.alias_name
-            ),
-            direct_rows AS (
-              SELECT
-                d.run_item_id,
-                d.raw_value,
-                d.alias_id,
-                d.alias_name,
-                100 AS confidence_score,
-                NULL::BOOLEAN AS step_1_raw_value_match,
-                NULL::BOOLEAN AS step_2_normalization_value_match,
-                NULL::BOOLEAN AS step_3_token_signature_match,
-                NULL::BOOLEAN AS step_4_any_token_match,
-                NULL::BOOLEAN AS step_5_normalized_token_signature_match,
-                NULL::BOOLEAN AS step_6_any_normalized_token_match,
-                NULL::BOOLEAN AS step_7_matches_alias_name,
-                TRUE AS chosen_alias,
-                'stored_raw_value' AS match_source
-              FROM direct_matches d
-            ),
-            scored_rows AS (
-              SELECT
-                s.run_item_id,
-                s.raw_value,
-                s.alias_id,
-                s.alias_name,
-                (
-                  IFF(s.step_1_raw_value_match, 1, 0)
-                  + IFF(s.step_2_normalization_value_match, 1, 0)
-                  + IFF(s.step_3_token_signature_match, 1, 0)
-                  + IFF(s.step_4_any_token_match, 1, 0)
-                  + IFF(s.step_5_normalized_token_signature_match, 1, 0)
-                  + IFF(s.step_6_any_normalized_token_match, 1, 0)
-                  + IFF(s.step_7_matches_alias_name, 1, 0)
-                ) AS confidence_score,
-                s.step_1_raw_value_match,
-                s.step_2_normalization_value_match,
-                s.step_3_token_signature_match,
-                s.step_4_any_token_match,
-                s.step_5_normalized_token_signature_match,
-                s.step_6_any_normalized_token_match,
-                s.step_7_matches_alias_name,
-                IFF(
-                  ROW_NUMBER() OVER (
-                    PARTITION BY s.run_item_id
-                    ORDER BY
-                      (
-                        IFF(s.step_1_raw_value_match, 1, 0)
-                        + IFF(s.step_2_normalization_value_match, 1, 0)
-                        + IFF(s.step_3_token_signature_match, 1, 0)
-                        + IFF(s.step_4_any_token_match, 1, 0)
-                        + IFF(s.step_5_normalized_token_signature_match, 1, 0)
-                        + IFF(s.step_6_any_normalized_token_match, 1, 0)
-                        + IFF(s.step_7_matches_alias_name, 1, 0)
-                      ) DESC,
-                      s.alias_id ASC
-                  ) = 1,
-                  TRUE,
-                  FALSE
-                ) AS chosen_alias,
-                'alias_summary_scoring' AS match_source
-              FROM scored s
-            )
-            SELECT
-              q.run_item_id,
-              q.raw_value,
-              q.alias_id,
-              q.alias_name,
-              q.confidence_score,
-              q.step_1_raw_value_match,
-              q.step_2_normalization_value_match,
-              q.step_3_token_signature_match,
-              q.step_4_any_token_match,
-              q.step_5_normalized_token_signature_match,
-              q.step_6_any_normalized_token_match,
-              q.step_7_matches_alias_name,
-              q.chosen_alias,
-              q.match_source
-            FROM (
-              SELECT * FROM direct_rows
-              UNION ALL
-              SELECT * FROM scored_rows
-            ) q
-            ORDER BY q.run_item_id ASC, q.confidence_score DESC NULLS LAST, q.alias_id ASC
-          `,
-          binds: [run_id, conceptId, conceptId],
-          complete: (err, stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      const runItemTokenRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              run_item_id,
-              normalization_value,
-              tokens,
-              normalized_tokens,
-              IFF(
-                tokens IS NOT NULL AND IS_ARRAY(tokens) AND ARRAY_SIZE(tokens::ARRAY) > 0,
-                ARRAY_TO_STRING(tokens::ARRAY, '|'),
-                NULL
-              ) AS new_token_signature,
-              IFF(
-                normalized_tokens IS NOT NULL AND IS_ARRAY(normalized_tokens) AND ARRAY_SIZE(normalized_tokens::ARRAY) > 0,
-                ARRAY_TO_STRING(normalized_tokens::ARRAY, '|'),
-                NULL
-              ) AS new_normalized_token_signature
-            FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS
-            WHERE run_id = ?
-          `,
-          binds: [run_id],
-          complete: (err, stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      const aliasNormalizationRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              rv.alias_id,
-              rv.raw_value_id,
-              rv.normalization_value
-            FROM STAND_DB.STAND_INTERNAL.RAW_VALUES rv
-            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
-              ON a.alias_id = rv.alias_id
-            WHERE a.concept_id = ?
-              AND rv.normalization_value IS NOT NULL
-          `,
-          binds: [conceptId],
-          complete: (err, _stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      const aliasTokenRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              ts.alias_id,
-              an.key_value AS alias_name,
-              LISTAGG(ts.token, '|') WITHIN GROUP (ORDER BY ts.position_in_signature) AS token_signature_pipe,
-              COUNT(*)::NUMBER AS token_count
-            FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-            INNER JOIN (
-              SELECT alias_id, key_value
-              FROM STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY
-              WHERE concept_id = ?
-                AND key_type = 'alias name'
-                AND key_value IS NOT NULL
-              QUALIFY ROW_NUMBER() OVER (PARTITION BY alias_id ORDER BY alias_summary_id ASC) = 1
-            ) an
-              ON an.alias_id = ts.alias_id
-            WHERE ts.token_type = 'alias'
-              AND ts.alias_id IS NOT NULL
-            GROUP BY ts.alias_id, an.key_value
-          `,
-          binds: [conceptId],
-          complete: (err, stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      // Per-alias raw-value token signatures (standard + normalized) for this concept
-      const rawValueSigRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              rv.alias_id,
-              ts.raw_value_id,
-              ts.token_type,
-              LISTAGG(ts.token, '|') WITHIN GROUP (ORDER BY ts.position_in_signature) AS token_signature_pipe
-            FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-            INNER JOIN STAND_DB.STAND_INTERNAL.RAW_VALUES rv
-              ON rv.raw_value_id = ts.raw_value_id
-            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
-              ON a.alias_id = rv.alias_id
-            WHERE a.concept_id = ?
-              AND ts.token_type IN ('standard', 'normalized')
-              AND ts.raw_value_id IS NOT NULL
-            GROUP BY rv.alias_id, ts.raw_value_id, ts.token_type
-          `,
-          binds: [conceptId],
-          complete: (err, _stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      // Per-token importance scores for all raw-value tokens in this concept
-      const tokenImportanceRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              ts.raw_value_id,
-              ts.token_type,
-              ts.token,
-              ts.position_in_signature,
-              ts.importance_score
-            FROM STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY ts
-            INNER JOIN STAND_DB.STAND_INTERNAL.RAW_VALUES rv
-              ON rv.raw_value_id = ts.raw_value_id
-            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
-              ON a.alias_id = rv.alias_id
-            WHERE a.concept_id = ?
-              AND ts.token_type IN ('standard', 'normalized')
-              AND ts.raw_value_id IS NOT NULL
-            ORDER BY ts.raw_value_id, ts.token_type, ts.position_in_signature
-          `,
-          binds: [conceptId],
-          complete: (err, _stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      // Per-raw-value signature importance scores from ALIAS_SUMMARY
-      const rawValueSigScoreRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `
-            SELECT
-              rv.raw_value_id,
-              COALESCE(s_std.importance_score,  0) AS standard_sig_score,
-              COALESCE(s_norm.importance_score, 0) AS normalized_sig_score
-            FROM STAND_DB.STAND_INTERNAL.RAW_VALUES rv
-            INNER JOIN STAND_DB.STAND_INTERNAL.ALIASES a
-              ON a.alias_id = rv.alias_id
-            LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_std
-              ON s_std.alias_id  = rv.alias_id
-             AND s_std.key_type  = 'token signature'
-             AND rv.tokens IS NOT NULL
-             AND s_std.key_value = ARRAY_TO_STRING(rv.tokens::ARRAY, '|')
-            LEFT JOIN STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY s_norm
-              ON s_norm.alias_id  = rv.alias_id
-             AND s_norm.key_type  = 'normalized token signature'
-             AND rv.normalized_tokens IS NOT NULL
-             AND s_norm.key_value = ARRAY_TO_STRING(rv.normalized_tokens::ARRAY, '|')
-            WHERE a.concept_id = ?
-          `,
-          binds: [conceptId],
-          complete: (err, _stmt, rows) => {
-            if (err) reject(err);
-            else resolve(rows || []);
-          },
-        });
-      });
-
-      const tokensFromVariant = (v: unknown): string[] => {
-        if (v == null) return [];
-        if (Array.isArray(v)) {
-          return v.map((x) => String(x).trim()).filter((t) => t.length > 0);
-        }
-        if (typeof v === 'string') {
-          try {
-            const p = JSON.parse(v);
-            if (Array.isArray(p)) {
-              return p.map((x) => String(x).trim()).filter((t) => t.length > 0);
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-        return [];
-      };
-
-      const runItemTokensById = new Map<
-        number,
-        {
-          std: string[];
-          norm: string[];
-          normalization_value: string | null;
-          new_token_signature: string | null;
-          new_normalized_token_signature: string | null;
-        }
-      >();
-      for (const row of runItemTokenRows) {
-        const id = Number((row as any).RUN_ITEM_ID);
-        const std = tokensFromVariant((row as any).TOKENS);
-        const norm = tokensFromVariant((row as any).NORMALIZED_TOKENS);
-        runItemTokensById.set(id, {
-          std,
-          norm,
-          normalization_value:
-            (row as any).NORMALIZATION_VALUE === null ||
-            (row as any).NORMALIZATION_VALUE === undefined
-              ? null
-              : String((row as any).NORMALIZATION_VALUE),
-          new_token_signature:
-            (row as any).NEW_TOKEN_SIGNATURE === null || (row as any).NEW_TOKEN_SIGNATURE === undefined
-              ? null
-              : String((row as any).NEW_TOKEN_SIGNATURE),
-          new_normalized_token_signature:
-            (row as any).NEW_NORMALIZED_TOKEN_SIGNATURE === null ||
-            (row as any).NEW_NORMALIZED_TOKEN_SIGNATURE === undefined
-              ? null
-              : String((row as any).NEW_NORMALIZED_TOKEN_SIGNATURE),
-        });
-      }
-
-      const parsePipeTokens = (pipe: string | null | undefined): string[] =>
-        String(pipe ?? '')
-          .split('|')
-          .map((t) => t.trim())
-          .filter((t) => t.length > 0);
-
-      const aliasTokensById = new Map<number, string[]>();
-      const aliasNameById = new Map<number, string>();
-      for (const row of aliasTokenRows) {
-        const aliasId = Number((row as any).ALIAS_ID);
-        aliasTokensById.set(aliasId, parsePipeTokens((row as any).TOKEN_SIGNATURE_PIPE as string));
-        const aliasName = String((row as any).ALIAS_NAME ?? '').trim();
-        if (aliasName) aliasNameById.set(aliasId, aliasName);
-      }
-
-      type RawSigEntry = { raw_value_id: number; tokens: string[] };
-      const rawValueSigsById = new Map<
-        number,
-        { standard: RawSigEntry[]; normalized: RawSigEntry[] }
-      >();
-      for (const row of rawValueSigRows) {
-        const aliasId = Number((row as any).ALIAS_ID);
-        const rawValueId = Number((row as any).RAW_VALUE_ID);
-        const tokenType = String((row as any).TOKEN_TYPE ?? '').toLowerCase();
-        const tokens = parsePipeTokens((row as any).TOKEN_SIGNATURE_PIPE as string);
-        if (!rawValueSigsById.has(aliasId)) {
-          rawValueSigsById.set(aliasId, { standard: [], normalized: [] });
-        }
-        const entry = rawValueSigsById.get(aliasId)!;
-        if (tokenType === 'standard') {
-          entry.standard.push({ raw_value_id: rawValueId, tokens });
-        } else if (tokenType === 'normalized') {
-          entry.normalized.push({ raw_value_id: rawValueId, tokens });
-        }
-      }
-
-      // Per-token importance scores keyed by raw_value_id
-      type TokenImportanceEntry = { token: string; score: number };
-      const tokenImportanceByRawValueId = new Map<
-        number,
-        { standard: TokenImportanceEntry[]; normalized: TokenImportanceEntry[] }
-      >();
-      for (const row of tokenImportanceRows) {
-        const rawValueId = Number((row as any).RAW_VALUE_ID);
-        const tokenType = String((row as any).TOKEN_TYPE ?? '').toLowerCase();
-        const token = String((row as any).TOKEN ?? '');
-        const score = Number((row as any).IMPORTANCE_SCORE ?? 0);
-        if (!tokenImportanceByRawValueId.has(rawValueId)) {
-          tokenImportanceByRawValueId.set(rawValueId, { standard: [], normalized: [] });
-        }
-        const imp = tokenImportanceByRawValueId.get(rawValueId)!;
-        if (tokenType === 'standard') {
-          imp.standard.push({ token, score });
-        } else if (tokenType === 'normalized') {
-          imp.normalized.push({ token, score });
-        }
-      }
-
-      // Per-raw-value signature importance scores
-      const rawValueSigScoreById = new Map<
-        number,
-        { standard_sig_score: number; normalized_sig_score: number }
-      >();
-      for (const row of rawValueSigScoreRows) {
-        const rawValueId = Number((row as any).RAW_VALUE_ID);
-        rawValueSigScoreById.set(rawValueId, {
-          standard_sig_score: Number((row as any).STANDARD_SIG_SCORE ?? 0),
-          normalized_sig_score: Number((row as any).NORMALIZED_SIG_SCORE ?? 0),
-        });
-      }
-
-      type AliasSigComparison = {
-        comparison_kind: string;
-        existing_signature: string;
-        signature_length: number;
-        overlap_score_signature: number;
-        overlap_score_calculation: string;
-        is_subset_new_to_old: boolean;
-        is_subset_old_to_new: boolean;
-        longest_matching_subsequence_length: number;
-      };
-      type NormalizedAliasSigComparison = AliasSigComparison & {
-        acronym: boolean;
-        run_normalized_token_signature_sorted: string;
-        existing_normalized_token_signature_sorted: string;
-        levenshtein_score: number;
-      };
-      type StandardAliasSigComparison = AliasSigComparison & {
-        acronym: boolean;
-      };
-      type NormalizedToAliasSigComparison = AliasSigComparison & {
-        run_normalized_token_signature_sorted: string;
-        alias_normalized_token_signature_sorted: string;
-        levenshtein_score: number;
-      };
-      type TokenSimilarityResult = {
-        overlap_score_alias: number;
-        levenshtein_score_total: number;
-        acronym_total: number;
-        num_subsets: number;
-        sum_subsequence_length: number;
-        new_token_signature: string | null;
-        new_normalized_token_signature: string | null;
-        token_signature_comparisons: Array<
-          StandardAliasSigComparison & { existing_raw_value_id: number }
-        >;
-        normalized_token_signature_comparisons: Array<
-          NormalizedAliasSigComparison & { existing_raw_value_id: number }
-        >;
-        alias_token_signature_comparison: {
-          alias_id: number;
-          alias_token_signature: string;
-          standard_to_alias: AliasSigComparison;
-          normalized_to_alias: NormalizedToAliasSigComparison;
-        };
-      };
-      const tokenSimilarityByKey = new Map<string, TokenSimilarityResult>();
-      type AliasNormalizationEntry = { raw_value_id: number; normalization_value: string };
-      type StringSimilarityComparison = {
-        comparison_kind: string;
-        existing_raw_value_id: number;
-        run_item_normalization_value: string;
-        existing_normalization_value: string;
-        jaro_winkler_score: number;
-      };
-      type NormalizationValueToAliasNameComparison = {
-        comparison_kind: string;
-        run_item_normalization_value: string;
-        alias_name: string;
-        jaro_winkler_score: number;
-      };
-      type StringSimilarityResult = {
-        run_item_normalization_value: string | null;
-        normalization_value_comparisons: StringSimilarityComparison[];
-        normalization_value_to_alias_name_comparison: NormalizationValueToAliasNameComparison | null;
-        jaro_winkler_score_total: number;
-      };
-      const stringSimilarityByKey = new Map<string, StringSimilarityResult>();
-
-      const isSubset = (subsetTokens: string[], supersetTokens: string[]): boolean => {
-        if (subsetTokens.length === 0) return false;
-        const superset = new Set(supersetTokens);
-        for (const token of subsetTokens) {
-          if (!superset.has(token)) return false;
-        }
-        return true;
-      };
-
-      const longestCommonSubsequenceLength = (a: string[], b: string[]): number => {
-        const m = a.length;
-        const n = b.length;
-        if (m === 0 || n === 0) return 0;
-        const dp: number[][] = Array.from({ length: m + 1 }, () =>
-          new Array<number>(n + 1).fill(0)
-        );
-        for (let i = 1; i <= m; i++) {
-          for (let j = 1; j <= n; j++) {
-            if (a[i - 1] === b[j - 1]) {
-              dp[i][j] = dp[i - 1][j - 1] + 1;
-            } else {
-              dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-            }
-          }
-        }
-        return dp[m][n];
-      };
-
-      const jaroWinklerScore = (leftInput: string, rightInput: string): number => {
-        const left = String(leftInput ?? '');
-        const right = String(rightInput ?? '');
-        if (left === right) return 1;
-        if (left.length === 0 || right.length === 0) return 0;
-
-        const matchDistance = Math.max(Math.floor(Math.max(left.length, right.length) / 2) - 1, 0);
-        const leftMatches = new Array<boolean>(left.length).fill(false);
-        const rightMatches = new Array<boolean>(right.length).fill(false);
-
-        let matches = 0;
-        for (let i = 0; i < left.length; i++) {
-          const start = Math.max(0, i - matchDistance);
-          const end = Math.min(i + matchDistance + 1, right.length);
-          for (let j = start; j < end; j++) {
-            if (rightMatches[j]) continue;
-            if (left[i] !== right[j]) continue;
-            leftMatches[i] = true;
-            rightMatches[j] = true;
-            matches++;
-            break;
-          }
-        }
-        if (matches === 0) return 0;
-
-        let transpositions = 0;
-        let rightIdx = 0;
-        for (let i = 0; i < left.length; i++) {
-          if (!leftMatches[i]) continue;
-          while (!rightMatches[rightIdx]) rightIdx++;
-          if (left[i] !== right[rightIdx]) transpositions++;
-          rightIdx++;
-        }
-        transpositions /= 2;
-
-        const jaro =
-          (matches / left.length + matches / right.length + (matches - transpositions) / matches) / 3;
-
-        let prefixLength = 0;
-        const maxPrefix = Math.min(4, left.length, right.length);
-        while (prefixLength < maxPrefix && left[prefixLength] === right[prefixLength]) {
-          prefixLength++;
-        }
-
-        const scalingFactor = 0.1;
-        const winkler = jaro + prefixLength * scalingFactor * (1 - jaro);
-        return Number(winkler.toFixed(6));
-      };
-
-      const sortedTokenSignature = (tokens: string[]): string =>
-        [...tokens].sort((a, b) => a.localeCompare(b)).join('|');
-
-      const levenshteinDistance = (leftInput: string, rightInput: string): number => {
-        const left = String(leftInput ?? '');
-        const right = String(rightInput ?? '');
-        const m = left.length;
-        const n = right.length;
-        if (m === 0) return n;
-        if (n === 0) return m;
-
-        const dp: number[][] = Array.from({ length: m + 1 }, () =>
-          new Array<number>(n + 1).fill(0)
-        );
-        for (let i = 0; i <= m; i++) dp[i][0] = i;
-        for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-        for (let i = 1; i <= m; i++) {
-          for (let j = 1; j <= n; j++) {
-            const cost = left[i - 1] === right[j - 1] ? 0 : 1;
-            dp[i][j] = Math.min(
-              dp[i - 1][j] + 1,
-              dp[i][j - 1] + 1,
-              dp[i - 1][j - 1] + cost
-            );
-          }
-        }
-        return dp[m][n];
-      };
-
-      const normalizeComparableValue = (value: string | null | undefined): string =>
-        String(value ?? '')
-          .trim()
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, '');
-
-      const acronymFromTokens = (tokens: string[]): string =>
-        tokens
-          .map((token) => String(token ?? '').trim())
-          .filter((token) => token.length > 0)
-          .map((token) => token[0].toLowerCase())
-          .join('');
-
-      const isAcronymMatch = (
-        runTokens: string[],
-        existingTokens: string[],
-        runNormalizationValue: string,
-        existingNormalizationValue: string
-      ): boolean => {
-        if (runTokens.length === 0 || existingTokens.length === 0) return false;
-        if (runTokens.length === existingTokens.length) return false;
-
-        const runIsLonger = runTokens.length > existingTokens.length;
-        const longerTokens = runIsLonger ? runTokens : existingTokens;
-        const otherNormalizationValue = runIsLonger ? existingNormalizationValue : runNormalizationValue;
-
-        const acronym = acronymFromTokens(longerTokens);
-        const normalizedOther = normalizeComparableValue(otherNormalizationValue);
-        return acronym.length > 0 && normalizedOther.length > 0 && acronym === normalizedOther;
-      };
-
-      /** Overlap score: positions defined by the existing signature's token order; checks if run tokens contain each. */
-      const overlapAgainstSignature = (
-        existingTokensOrdered: string[],
-        runSideTokens: string[]
-      ): { overlap_score_signature: number; overlap_score_calculation: string; signature_length: number; existing_signature: string } => {
-        const runSet = new Set(runSideTokens);
-        let sum = 0;
-        const parts: string[] = [];
-        for (let i = 0; i < existingTokensOrdered.length; i++) {
-          const position = i + 1;
-          const tok = existingTokensOrdered[i];
-          const tokenMatch = runSet.has(tok) ? 1 : 0;
-          sum += tokenMatch * position;
-          parts.push(`${tok}:${tokenMatch}*${position}=${tokenMatch * position}`);
-        }
-        return {
-          overlap_score_signature: sum,
-          overlap_score_calculation: parts.join(', '),
-          signature_length: existingTokensOrdered.length,
-          existing_signature: existingTokensOrdered.join('|'),
-        };
-      };
-
-      const aliasNormalizationById = new Map<number, AliasNormalizationEntry[]>();
-      const aliasNormalizationByRawValueId = new Map<number, string>();
-      for (const row of aliasNormalizationRows) {
-        const aliasId = Number((row as any).ALIAS_ID);
-        const rawValueId = Number((row as any).RAW_VALUE_ID);
-        const normalizationValue = String((row as any).NORMALIZATION_VALUE ?? '').trim();
-        if (!normalizationValue) continue;
-        if (!aliasNormalizationById.has(aliasId)) {
-          aliasNormalizationById.set(aliasId, []);
-        }
-        aliasNormalizationById.get(aliasId)!.push({
-          raw_value_id: rawValueId,
-          normalization_value: normalizationValue,
-        });
-        aliasNormalizationByRawValueId.set(rawValueId, normalizationValue);
-      }
-
-      const buildTokenSimilarity = (runItemId: number, aliasId: number): TokenSimilarityResult => {
-        const ri = runItemTokensById.get(runItemId);
-        const aliasToks = aliasTokensById.get(aliasId) ?? [];
-        const std = ri?.std ?? [];
-        const norm = ri?.norm ?? [];
-        const runNormalizationValue = String(ri?.normalization_value ?? '');
-        const runNormSortedSignature = sortedTokenSignature(norm);
-        const rawSigs = rawValueSigsById.get(aliasId) ?? { standard: [], normalized: [] };
-
-        // --- Per-raw-value standard signature comparisons (run std tokens vs each existing std sig) ---
-        const token_signature_comparisons = rawSigs.standard.map((entry) => {
-          const overlap = overlapAgainstSignature(entry.tokens, std);
-          const lcs = longestCommonSubsequenceLength(std, entry.tokens);
-          const existingNormalizationValue =
-            aliasNormalizationByRawValueId.get(entry.raw_value_id) ?? '';
-          const imp = tokenImportanceByRawValueId.get(entry.raw_value_id) ?? { standard: [], normalized: [] };
-          const sigScores = rawValueSigScoreById.get(entry.raw_value_id) ?? { standard_sig_score: 0, normalized_sig_score: 0 };
-          return {
-            comparison_kind: 'run_standard_tokens_to_raw_value_standard_tokens',
-            existing_raw_value_id: entry.raw_value_id,
-            ...overlap,
-            is_subset_new_to_old: isSubset(std, entry.tokens),
-            is_subset_old_to_new: isSubset(entry.tokens, std),
-            longest_matching_subsequence_length: lcs,
-            acronym: isAcronymMatch(
-              std,
-              entry.tokens,
-              runNormalizationValue,
-              existingNormalizationValue
-            ),
-            standard_tokens: imp.standard,
-            token_signature_score: sigScores.standard_sig_score,
-            normalized_tokens: imp.normalized,
-            normalized_token_signature_score: sigScores.normalized_sig_score,
-          };
-        });
-
-        // --- Per-raw-value normalized signature comparisons (run norm tokens vs each existing norm sig) ---
-        const normalized_token_signature_comparisons = rawSigs.normalized.map((entry) => {
-          const overlap = overlapAgainstSignature(entry.tokens, norm);
-          const lcs = longestCommonSubsequenceLength(norm, entry.tokens);
-          const existingNormSortedSignature = sortedTokenSignature(entry.tokens);
-          const levenshteinScore = levenshteinDistance(
-            runNormSortedSignature,
-            existingNormSortedSignature
-          );
-          const existingNormalizationValue =
-            aliasNormalizationByRawValueId.get(entry.raw_value_id) ?? '';
-          const imp = tokenImportanceByRawValueId.get(entry.raw_value_id) ?? { standard: [], normalized: [] };
-          const sigScores = rawValueSigScoreById.get(entry.raw_value_id) ?? { standard_sig_score: 0, normalized_sig_score: 0 };
-          return {
-            comparison_kind: 'run_normalized_tokens_to_raw_value_normalized_tokens',
-            existing_raw_value_id: entry.raw_value_id,
-            ...overlap,
-            is_subset_new_to_old: isSubset(norm, entry.tokens),
-            is_subset_old_to_new: isSubset(entry.tokens, norm),
-            longest_matching_subsequence_length: lcs,
-            acronym: isAcronymMatch(
-              norm,
-              entry.tokens,
-              runNormalizationValue,
-              existingNormalizationValue
-            ),
-            run_normalized_token_signature_sorted: runNormSortedSignature,
-            existing_normalized_token_signature_sorted: existingNormSortedSignature,
-            levenshtein_score: levenshteinScore,
-            standard_tokens: imp.standard,
-            token_signature_score: sigScores.standard_sig_score,
-            normalized_tokens: imp.normalized,
-            normalized_token_signature_score: sigScores.normalized_sig_score,
-          };
-        });
-
-        // --- Alias token signature comparison (run std + run norm vs the single alias token signature) ---
-        const stdAliasOverlap = overlapAgainstSignature(aliasToks, std);
-        const normAliasOverlap = overlapAgainstSignature(aliasToks, norm);
-        const stdAliasLcs = longestCommonSubsequenceLength(std, aliasToks);
-        const normAliasLcs = longestCommonSubsequenceLength(norm, aliasToks);
-
-        const aliasSortedNormSig = sortedTokenSignature(aliasToks);
-        const normToAliasLevenshteinScore = levenshteinDistance(runNormSortedSignature, aliasSortedNormSig);
-
-        const alias_token_signature_comparison = {
-          alias_id: aliasId,
-          alias_token_signature: aliasToks.join('|'),
-          standard_to_alias: {
-            comparison_kind: 'run_standard_tokens_to_alias_tokens',
-            ...stdAliasOverlap,
-            is_subset_new_to_old: isSubset(std, aliasToks),
-            is_subset_old_to_new: isSubset(aliasToks, std),
-            longest_matching_subsequence_length: stdAliasLcs,
-          },
-          normalized_to_alias: {
-            comparison_kind: 'run_normalized_tokens_to_alias_tokens',
-            ...normAliasOverlap,
-            is_subset_new_to_old: isSubset(norm, aliasToks),
-            is_subset_old_to_new: isSubset(aliasToks, norm),
-            longest_matching_subsequence_length: normAliasLcs,
-            run_normalized_token_signature_sorted: runNormSortedSignature,
-            alias_normalized_token_signature_sorted: aliasSortedNormSig,
-            levenshtein_score: normToAliasLevenshteinScore,
-          },
-        };
-
-        // --- Aggregate scores across all three comparison sections ---
-        const overlapScoreAlias =
-          token_signature_comparisons.reduce((s, c) => s + c.overlap_score_signature, 0) +
-          normalized_token_signature_comparisons.reduce((s, c) => s + c.overlap_score_signature, 0) +
-          stdAliasOverlap.overlap_score_signature +
-          normAliasOverlap.overlap_score_signature;
-        const levenshteinScoreTotal =
-          normalized_token_signature_comparisons.reduce((s, c) => s + c.levenshtein_score, 0) +
-          normToAliasLevenshteinScore;
-        const acronymTotal =
-          token_signature_comparisons.reduce((s, c) => s + (c.acronym ? 1 : 0), 0) +
-          normalized_token_signature_comparisons.reduce((s, c) => s + (c.acronym ? 1 : 0), 0);
-
-        const numSubsets =
-          token_signature_comparisons.reduce(
-            (s, c) => s + (c.is_subset_new_to_old ? 1 : 0) + (c.is_subset_old_to_new ? 1 : 0),
-            0
-          ) +
-          normalized_token_signature_comparisons.reduce(
-            (s, c) => s + (c.is_subset_new_to_old ? 1 : 0) + (c.is_subset_old_to_new ? 1 : 0),
-            0
-          ) +
-          (alias_token_signature_comparison.standard_to_alias.is_subset_new_to_old ? 1 : 0) +
-          (alias_token_signature_comparison.standard_to_alias.is_subset_old_to_new ? 1 : 0) +
-          (alias_token_signature_comparison.normalized_to_alias.is_subset_new_to_old ? 1 : 0) +
-          (alias_token_signature_comparison.normalized_to_alias.is_subset_old_to_new ? 1 : 0);
-
-        const sumSubsequenceLength =
-          token_signature_comparisons.reduce((s, c) => s + c.longest_matching_subsequence_length, 0) +
-          normalized_token_signature_comparisons.reduce(
-            (s, c) => s + c.longest_matching_subsequence_length,
-            0
-          ) +
-          stdAliasLcs +
-          normAliasLcs;
-
-        return {
-          overlap_score_alias: overlapScoreAlias,
-          levenshtein_score_total: levenshteinScoreTotal,
-          acronym_total: acronymTotal,
-          num_subsets: numSubsets,
-          sum_subsequence_length: sumSubsequenceLength,
-          new_token_signature: ri?.new_token_signature ?? null,
-          new_normalized_token_signature: ri?.new_normalized_token_signature ?? null,
-          token_signature_comparisons,
-          normalized_token_signature_comparisons,
-          alias_token_signature_comparison,
-        };
-      };
-
-      const buildStringSimilarity = (runItemId: number, aliasId: number): StringSimilarityResult => {
-        const ri = runItemTokensById.get(runItemId);
-        const runNorm = String(ri?.normalization_value ?? '').trim();
-        const aliasNormEntries = aliasNormalizationById.get(aliasId) ?? [];
-        const aliasName = aliasNameById.get(aliasId) ?? null;
-
-        if (!runNorm || aliasNormEntries.length === 0) {
-          return {
-            run_item_normalization_value: runNorm || null,
-            normalization_value_comparisons: [],
-            normalization_value_to_alias_name_comparison: null,
-            jaro_winkler_score_total: 0,
-          };
-        }
-
-        const normalizationValueComparisons: StringSimilarityComparison[] = aliasNormEntries.map((entry) => {
-          const score = jaroWinklerScore(runNorm, entry.normalization_value);
-          return {
-            comparison_kind: 'run_item_normalization_value_to_alias_normalization_value',
-            existing_raw_value_id: entry.raw_value_id,
-            run_item_normalization_value: runNorm,
-            existing_normalization_value: entry.normalization_value,
-            jaro_winkler_score: score,
-          };
-        });
-
-        // normalization_value to alias name comparison
-        const normalizationValueToAliasNameComparison: NormalizationValueToAliasNameComparison | null =
-          runNorm && aliasName
-            ? {
-                comparison_kind: 'run_item_normalization_value_to_alias_name',
-                run_item_normalization_value: runNorm,
-                alias_name: aliasName,
-                jaro_winkler_score: jaroWinklerScore(runNorm, aliasName),
-              }
-            : null;
-
-        const jaroWinklerScoreTotal = Number(
-          (
-            normalizationValueComparisons.reduce((sum, comparison) => sum + comparison.jaro_winkler_score, 0) +
-            (normalizationValueToAliasNameComparison?.jaro_winkler_score ?? 0)
-          ).toFixed(6)
-        );
-
-        return {
-          run_item_normalization_value: runNorm,
-          normalization_value_comparisons: normalizationValueComparisons,
-          normalization_value_to_alias_name_comparison: normalizationValueToAliasNameComparison,
-          jaro_winkler_score_total: jaroWinklerScoreTotal,
-        };
-      };
-
-      const similarityKeySet = new Set<string>();
-      for (const r of confidenceRows) {
-        const ms = String((r as any).MATCH_SOURCE ?? 'alias_summary_scoring');
-        if (ms === 'stored_raw_value') continue;
-        const runItemId = Number((r as any).RUN_ITEM_ID);
-        const aliasId = Number((r as any).ALIAS_ID);
-        similarityKeySet.add(`${runItemId}::${aliasId}`);
-      }
-      for (const key of similarityKeySet) {
-        const [runItemIdStr, aliasIdStr] = key.split('::');
-        const runItemId = Number(runItemIdStr);
-        const aliasId = Number(aliasIdStr);
-        tokenSimilarityByKey.set(
-          key,
-          buildTokenSimilarity(runItemId, aliasId)
-        );
-        stringSimilarityByKey.set(key, buildStringSimilarity(runItemId, aliasId));
-      }
-
-      const computedConfidenceRows = confidenceRows.map((r: any) => {
-        const matchSource = String(r.MATCH_SOURCE ?? 'alias_summary_scoring');
-        const runItemId = Number(r.RUN_ITEM_ID);
-        const aliasId = Number(r.ALIAS_ID);
-        const baseConfidence =
-          r.CONFIDENCE_SCORE === null || r.CONFIDENCE_SCORE === undefined
-            ? 0
-            : Number(r.CONFIDENCE_SCORE);
-        const similarity = tokenSimilarityByKey.get(`${runItemId}::${aliasId}`);
-        const stringSimilarity = stringSimilarityByKey.get(`${runItemId}::${aliasId}`);
-        const overlapScoreAlias = similarity?.overlap_score_alias ?? 0;
-        const levenshteinScoreTotal = similarity?.levenshtein_score_total ?? 0;
-        const numSubsets = similarity?.num_subsets ?? 0;
-        const sumSubsequenceLength = similarity?.sum_subsequence_length ?? 0;
-        const jaroWinklerScoreTotal = stringSimilarity?.jaro_winkler_score_total ?? 0;
-        const finalConfidence =
-          matchSource === 'stored_raw_value'
-            ? 100
-            : baseConfidence +
-              overlapScoreAlias +
-              levenshteinScoreTotal +
-              numSubsets +
-              sumSubsequenceLength +
-              jaroWinklerScoreTotal;
-
-        return {
-          ...r,
-          _matchSource: matchSource,
-          _runItemId: runItemId,
-          _aliasId: aliasId,
-          _baseConfidence: baseConfidence,
-          _overlapScoreAlias: overlapScoreAlias,
-          _levenshteinScoreTotal: levenshteinScoreTotal,
-          _numSubsets: numSubsets,
-          _sumSubsequenceLength: sumSubsequenceLength,
-          _jaroWinklerScoreTotal: jaroWinklerScoreTotal,
-          _finalConfidence: finalConfidence,
-          _tokenSimilarity: similarity ?? null,
-          _stringSimilarity: stringSimilarity ?? null,
-        };
-      });
-
-      // Recompute chosen alias using final confidence:
-      // base + overlap_score_alias + levenshtein_score_total + num_subsets + sum_subsequence_length + jaro_winkler_score_total.
-      const topByRunItem = new Map<number, { aliasId: number; score: number }>();
-      for (const r of computedConfidenceRows) {
-        const runItemId = (r as any)._runItemId as number;
-        const aliasId = (r as any)._aliasId as number;
-        const score = (r as any)._finalConfidence as number;
-        const existing = topByRunItem.get(runItemId);
-        if (!existing || score > existing.score || (score === existing.score && aliasId < existing.aliasId)) {
-          topByRunItem.set(runItemId, { aliasId, score });
-        }
-      }
-
-      const confidenceDetails = computedConfidenceRows.map((r: any) => {
-        const matchSource = r._matchSource as 'stored_raw_value' | 'alias_summary_scoring';
-        const runItemId = r._runItemId as number;
-        const aliasId = r._aliasId as number;
-        const similarity = r._tokenSimilarity as TokenSimilarityResult | null;
-        const stringSimilarity = r._stringSimilarity as StringSimilarityResult | null;
-        const top = topByRunItem.get(runItemId);
-        const isChosen = Boolean(top && top.aliasId === aliasId);
-
-        const base = {
-          run_item_id: runItemId,
-          raw_value: String(r.RAW_VALUE ?? ''),
-          alias_id: aliasId,
-          alias_name: String(r.ALIAS_NAME ?? ''),
-          confidence_score: Number(r._finalConfidence ?? 0),
-          chosen_alias: isChosen,
-          match_source: matchSource,
-          token_similarity: {
-            overlap_score_alias: similarity?.overlap_score_alias ?? 0,
-            levenshtein_score_total: similarity?.levenshtein_score_total ?? 0,
-            acronym_total: similarity?.acronym_total ?? 0,
-            num_subsets: similarity?.num_subsets ?? 0,
-            sum_subsequence_length: similarity?.sum_subsequence_length ?? 0,
-            new_token_signature: similarity?.new_token_signature ?? null,
-            new_normalized_token_signature: similarity?.new_normalized_token_signature ?? null,
-            token_signature_comparisons: similarity?.token_signature_comparisons ?? [],
-            normalized_token_signature_comparisons:
-              similarity?.normalized_token_signature_comparisons ?? [],
-            alias_token_signature_comparison:
-              similarity?.alias_token_signature_comparison ?? null,
-          },
-          string_similarity: {
-            run_item_normalization_value: stringSimilarity?.run_item_normalization_value ?? null,
-            normalization_value_comparisons:
-              stringSimilarity?.normalization_value_comparisons ?? [],
-            normalization_value_to_alias_name_comparison:
-              stringSimilarity?.normalization_value_to_alias_name_comparison ?? null,
-            jaro_winkler_score_total: stringSimilarity?.jaro_winkler_score_total ?? 0,
-          },
-        };
-
-        if (matchSource === 'stored_raw_value') {
-          return {
-            ...base,
-            exact_match: null,
-            token_similarity: null,
-            string_similarity: null,
-            note: 'Matched from ALIAS_SUMMARY (key_type=raw value) for this concept; full step scoring skipped.',
-          };
-        }
-
-        return {
-          ...base,
-          exact_match: {
-            step_1_raw_value_match: Boolean(r.STEP_1_RAW_VALUE_MATCH),
-            step_2_normalization_value_match: Boolean(r.STEP_2_NORMALIZATION_VALUE_MATCH),
-            step_3_token_signature_match: Boolean(r.STEP_3_TOKEN_SIGNATURE_MATCH),
-            step_4_any_token_match: Boolean(r.STEP_4_ANY_TOKEN_MATCH),
-            step_5_normalized_token_signature_match: Boolean(
-              r.STEP_5_NORMALIZED_TOKEN_SIGNATURE_MATCH
-            ),
-            step_6_any_normalized_token_match: Boolean(r.STEP_6_ANY_NORMALIZED_TOKEN_MATCH),
-            step_7_matches_alias_name: Boolean(r.STEP_7_MATCHES_ALIAS_NAME),
-          },
-        };
-      });
-
-      /** Best chosen confidence per run_item (100 = ALIAS_SUMMARY direct match; else base + overlap + levenshtein + subsets + sum_subsequence_length + jaro_winkler_score_total) */
-      const chosenConfidenceByRunItemId = new Map<number, number>();
-      for (const detail of confidenceDetails) {
-        if (detail.chosen_alias) {
-          chosenConfidenceByRunItemId.set(detail.run_item_id, Number(detail.confidence_score ?? 0));
-        }
-      }
-
+      // ── Build aliasMap purely from DB state ──────────────────────────────────
+      // No confidence scoring — only persisted RUN_GROUPS rows become buckets.
+      // Items are placed by their DB group_id; ungrouped items go to __UNGROUPED__.
       const groupKeyById = new Map<number, string>();
       const aliasMap: AliasMap = {};
 
       for (const g of groups) {
-        const key = g.ALIAS_NAME ?? `group_${g.GROUP_ID}`;
+        const humanName = String(g.ALIAS_NAME_LITERAL_VALUE ?? `group_${g.GROUP_ID}`);
+        const isCluster = g.FINAL_ALIAS_ID == null;
+        // Cluster groups keyed by unique DB id to prevent collisions.
+        // Alias-backed groups keyed by alias name (unique by DB constraint).
+        const key = isCluster ? `g_${g.GROUP_ID}` : humanName;
         groupKeyById.set(g.GROUP_ID, key);
-        aliasMap[key] = { group_id: g.GROUP_ID, items: [] };
+        aliasMap[key] = { group_id: g.GROUP_ID, display_name: humanName, items: [] };
       }
 
-      const itemPayload = (it: (typeof items)[0], chosenScore?: number) => {
-        const resolvedConfidence =
-          typeof chosenScore === 'number' && Number.isFinite(chosenScore)
-            ? chosenScore
-            : (it as any).CONFIDENCE_SCORE === null || (it as any).CONFIDENCE_SCORE === undefined
-              ? null
-              : Number((it as any).CONFIDENCE_SCORE);
-
-        return {
-          run_item_id: it.RUN_ITEM_ID,
-          raw_value: it.RAW_VALUE,
-          confidence_score: resolvedConfidence,
-        };
-      };
-
       for (const it of items) {
-        const runItemId = Number((it as any).RUN_ITEM_ID);
-        const chosenScore = chosenConfidenceByRunItemId.get(runItemId);
-        const forceUngrouped = chosenScore === 0;
+        const dbGroupId = (it as any).GROUP_ID != null ? Number((it as any).GROUP_ID) : null;
+        const key = dbGroupId != null ? groupKeyById.get(dbGroupId) : undefined;
+        const payload = {
+          run_item_id: Number(it.RUN_ITEM_ID),
+          literal_value: String(it.LITERAL_VALUE),
+          confidence_score: it.CONFIDENCE_SCORE != null ? Number(it.CONFIDENCE_SCORE) : null,
+        };
 
-        if (forceUngrouped) {
+        if (key != null) {
+          aliasMap[key].items.push(payload);
+        } else {
           if (!aliasMap[UNGROUPED_KEY]) {
-            aliasMap[UNGROUPED_KEY] = { group_id: null, items: [] };
+            aliasMap[UNGROUPED_KEY] = { group_id: null, display_name: '', items: [] };
           }
-          aliasMap[UNGROUPED_KEY].items.push(itemPayload(it, chosenScore));
-          continue;
+          aliasMap[UNGROUPED_KEY].items.push(payload);
         }
-
-        const rawGroupId = (it as any).GROUP_ID;
-        const groupIdNum =
-          rawGroupId === null || rawGroupId === undefined
-            ? null
-            : Number(rawGroupId);
-
-        if (typeof groupIdNum === 'number' && Number.isFinite(groupIdNum)) {
-          const key = groupKeyById.get(groupIdNum) ?? `group_${groupIdNum}`;
-          if (!aliasMap[key]) {
-            aliasMap[key] = { group_id: groupIdNum, items: [] };
-          }
-          aliasMap[key].items.push(itemPayload(it, chosenScore));
-          continue;
-        }
-
-        // Ungrouped (group_id NULL)
-        if (!aliasMap[UNGROUPED_KEY]) {
-          aliasMap[UNGROUPED_KEY] = { group_id: null, items: [] };
-        }
-        aliasMap[UNGROUPED_KEY].items.push(itemPayload(it, chosenScore));
       }
 
       // Always include the ungrouped bucket so the UI has a stable drop target.
       if (!aliasMap[UNGROUPED_KEY]) {
-        aliasMap[UNGROUPED_KEY] = { group_id: null, items: [] };
+        aliasMap[UNGROUPED_KEY] = { group_id: null, display_name: '', items: [] };
       }
 
       return Response.json(
-        { data: aliasMap, confidence_details: confidenceDetails },
+        { data: aliasMap },
         {
           headers: {
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
@@ -1486,5 +301,3 @@ export async function GET(
     return snowflakeErrorResponse(error, 'Failed to fetch alias mapping');
   }
 }
-
-
