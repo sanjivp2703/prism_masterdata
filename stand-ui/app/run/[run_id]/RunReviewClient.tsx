@@ -144,17 +144,13 @@ export default function RunReviewClient({
   const [copiedSql, setCopiedSql] = useState(false);
 
   const [grouping, setGrouping] = useState(false);
-  const [groupingMode, setGroupingMode] = useState<'basic' | 'advanced' | 'one_prompt'>('basic');
   const [groupingError, setGroupingError] = useState<string | null>(null);
   const [groupingResult, setGroupingResult] = useState<{
     groups_created: number;
     items_committed: number;
     elapsed_secs: number;
     llm_elapsed_secs: number | null;
-    deterministic_elapsed_secs: number | null;
     estimated_cost_usd: number;
-    llm_pairs_scored: number;
-    mode: 'basic' | 'advanced' | 'one_prompt';
     chunk_count: number | null;
   } | null>(null);
   const [groupingProgress, setGroupingProgress] = useState<{
@@ -172,43 +168,6 @@ export default function RunReviewClient({
   const [groupingStartedAt, setGroupingStartedAt] = useState<number | null>(null);
   const [groupingElapsed, setGroupingElapsed] = useState(0);
 
-  const [applyingAssignments, setApplyingAssignments] = useState(false);
-  const [assignmentsApplied, setAssignmentsApplied] = useState<{
-    assigned: number;
-    groups_created: number;
-    elapsed_secs: number;
-    llm_elapsed_secs: number | null;
-    deterministic_elapsed_secs: number | null;
-    estimated_cost_usd: number | null;
-    total_tokens: number | null;
-  } | null>(null);
-  const [scoringProgress, setScoringProgress] = useState<{
-    phase: 'scoring' | 'saving' | 'done';
-    items_scored: number;
-    items_total: number;
-    pairs_scored: number;
-    pairs_total: number;
-    estimated_cost_usd?: number;
-    llm_elapsed_ms?: number;
-    deterministic_elapsed_ms?: number;
-    token_usage?: {
-      input_tokens: number;
-      output_tokens: number;
-      cache_read_input_tokens: number;
-      cache_creation_input_tokens: number;
-    };
-  } | null>(null);
-  const [scoringStartedAt, setScoringStartedAt] = useState<number | null>(null);
-  const [elapsedSecs, setElapsedSecs] = useState(0);
-  const latestProgressRef = useRef<{
-    phase: 'scoring' | 'saving' | 'done';
-    items_scored: number; items_total: number;
-    pairs_scored: number; pairs_total: number;
-    estimated_cost_usd?: number;
-    llm_elapsed_ms?: number;
-    deterministic_elapsed_ms?: number;
-    token_usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
-  } | null>(null);
 
   const [sfExportModalOpen, setSfExportModalOpen] = useState(false);
   const [includeOriginalCol, setIncludeOriginalCol] = useState(true);
@@ -232,6 +191,11 @@ export default function RunReviewClient({
   const [downloadTitle,        setDownloadTitle]        = useState<string | null>(null);
   const [downloadSourceColumn, setDownloadSourceColumn] = useState<string>('');
   const [downloadError,        setDownloadError]        = useState<string | null>(null);
+
+  // ── Google Sheets export ──────────────────────────────────────────────
+  const [googleSheetsLoading, setGoogleSheetsLoading] = useState(false);
+  const [googleSheetsError,   setGoogleSheetsError]   = useState<string | null>(null);
+  const [googleSheetsUrl,     setGoogleSheetsUrl]     = useState<string | null>(null);
 
   // ── Effects ──────────────────────────────────────────────────────────────
 
@@ -275,13 +239,6 @@ export default function RunReviewClient({
     return () => { cancelled = true; };
   }, [runId]);
 
-  useEffect(() => {
-    if (!applyingAssignments || scoringStartedAt === null) return;
-    const id = setInterval(() => {
-      setElapsedSecs(Math.floor((Date.now() - scoringStartedAt) / 1000));
-    }, 1000);
-    return () => clearInterval(id);
-  }, [applyingAssignments, scoringStartedAt]);
 
   useEffect(() => {
     if (!grouping || groupingStartedAt === null) return;
@@ -363,86 +320,6 @@ export default function RunReviewClient({
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
-  async function applyConfidentAssignments() {
-    const startedAt = Date.now();
-    setApplyingAssignments(true);
-    setAssignmentsApplied(null);
-    setScoringProgress(null);
-    latestProgressRef.current = null;
-    setScoringStartedAt(startedAt);
-    setElapsedSecs(0);
-
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    function startPolling() {
-      pollTimer = setInterval(async () => {
-        try {
-          const r = await fetch(`/api/run/${runId}/apply-confident-assignments`, { cache: 'no-store' });
-          const body = await r.json().catch(() => ({}));
-          if (body?.progress) {
-            latestProgressRef.current = body.progress;
-            setScoringProgress(body.progress);
-          }
-        } catch { /* polling failures are silent */ }
-      }, 800);
-    }
-    function stopPolling() {
-      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-    }
-
-    try {
-      startPolling();
-      const res = await fetch(`/api/run/${runId}/apply-confident-assignments`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      stopPolling();
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) return;
-
-      const assigned = Number(body?.assigned ?? 0);
-      const groupsCreated = Number(body?.groups_created ?? 0);
-      const finalElapsed = Math.floor((Date.now() - startedAt) / 1000);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const lastProg = latestProgressRef.current as any;
-      const finalCost: number | null = lastProg?.estimated_cost_usd ?? null;
-      const finalTokens: number | null = lastProg?.token_usage
-        ? (lastProg.token_usage.input_tokens as number) +
-          (lastProg.token_usage.output_tokens as number) +
-          (lastProg.token_usage.cache_read_input_tokens as number) +
-          (lastProg.token_usage.cache_creation_input_tokens as number)
-        : null;
-      const finalLLMElapsedSecs: number | null =
-        typeof lastProg?.llm_elapsed_ms === 'number'
-          ? Math.floor(lastProg.llm_elapsed_ms / 1000)
-          : null;
-      const finalDetElapsedSecs: number | null =
-        typeof lastProg?.deterministic_elapsed_ms === 'number'
-          ? Math.floor(lastProg.deterministic_elapsed_ms / 1000)
-          : null;
-      setAssignmentsApplied({ assigned, groups_created: groupsCreated, elapsed_secs: finalElapsed, llm_elapsed_secs: finalLLMElapsedSecs, deterministic_elapsed_secs: finalDetElapsedSecs, estimated_cost_usd: finalCost, total_tokens: finalTokens });
-
-      const refreshed = await fetch(`/api/run/${runId}/alias-mapping`, { cache: 'no-store' });
-      const refreshedBody = await refreshed.json().catch(() => ({}));
-      if (refreshed.ok) {
-        const data = (refreshedBody?.data || {}) as AliasMap;
-        setAliasMap(data);
-        setUiAliasMap(structuredClone(data));
-        setPendingMoves({});
-        setPendingAliasNames({});
-        setCheckedAliases(new Set());
-        setUndoStack([]);
-        setRedoStack([]);
-      }
-    } catch {
-      console.warn('apply-confident-assignments failed silently');
-    } finally {
-      stopPolling();
-      setApplyingAssignments(false);
-      setScoringProgress(null);
-      setScoringStartedAt(null);
-    }
-  }
 
   // ── Computed ──────────────────────────────────────────────────────────────
 
@@ -737,52 +614,42 @@ export default function RunReviewClient({
     setGroupingElapsed(0);
 
     const ungroupedIds = (ungrouped?.items || []).map((it) => it.run_item_id);
-    const apiMode = groupingMode;
-
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    function startPolling() {
-      pollTimer = setInterval(async () => {
-        try {
-          const r = await fetch(`/api/run/${runId}/unassigned-grouping/commit`, { cache: 'no-store' });
-          const body = await r.json().catch(() => ({}));
-          if (body?.progress) setGroupingProgress(body.progress);
-        } catch { /* silent */ }
-      }, 800);
-    }
-    function stopPolling() {
-      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-    }
 
     try {
-      startPolling();
-      const res = await fetch(`/api/run/${runId}/unassigned-grouping/commit`, {
+      setGroupingProgress({
+        phase: 'llm_scoring',
+        sub_phase: `1-Prompt LLM grouping (${ungroupedIds.length} items)…`,
+        items_total: ungroupedIds.length,
+        groups_found: 0,
+        progress_pct: 10,
+        llm_calls_made: 0,
+        llm_calls_total: 1,
+        estimated_cost_usd: 0,
+        llm_elapsed_ms: 0,
+        deterministic_elapsed_ms: 0,
+      });
+
+      const res = await fetch(`/api/one-prompt/runs/${runId}/auto-group`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ run_item_ids: ungroupedIds, mode: apiMode }),
+        body: JSON.stringify({ run_item_ids: ungroupedIds }),
       });
-      stopPolling();
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const detail = typeof body?.details === 'string' && body.details.trim()
-          ? body.details.trim()
-          : '';
         const msg = body?.error || 'Grouping failed';
+        const detail = typeof body?.details === 'string' && body.details.trim() ? body.details.trim() : '';
         throw new Error(detail ? `${msg}: ${detail}` : msg);
       }
 
       const finalElapsed = Math.floor((Date.now() - startedAt) / 1000);
       setGroupingResult({
-        groups_created:              body?.data?.groups_created    ?? 0,
-        items_committed:             body?.data?.items_committed   ?? 0,
-        elapsed_secs:                finalElapsed,
-        llm_elapsed_secs:            typeof body?.data?.llm_elapsed_ms === 'number'
+        groups_created:     body?.data?.groups_created    ?? 0,
+        items_committed:    body?.data?.items_committed   ?? 0,
+        elapsed_secs:       finalElapsed,
+        llm_elapsed_secs:   typeof body?.data?.llm_elapsed_ms === 'number'
           ? Math.floor(body.data.llm_elapsed_ms / 1000) : null,
-        deterministic_elapsed_secs:  typeof body?.data?.deterministic_elapsed_ms === 'number'
-          ? Math.floor(body.data.deterministic_elapsed_ms / 1000) : null,
-        estimated_cost_usd:          body?.data?.estimated_cost_usd ?? 0,
-        llm_pairs_scored:            body?.data?.llm_pairs_scored  ?? 0,
-        mode:                        body?.data?.mode              ?? apiMode,
-        chunk_count:                 typeof body?.data?.chunk_count === 'number' ? body.data.chunk_count : null,
+        estimated_cost_usd: body?.data?.estimated_cost_usd ?? 0,
+        chunk_count:        typeof body?.data?.chunk_count === 'number' ? body.data.chunk_count : null,
       });
 
       const refreshed = await fetch(`/api/run/${runId}/alias-mapping`, { cache: 'no-store' });
@@ -800,7 +667,6 @@ export default function RunReviewClient({
     } catch (e) {
       setGroupingError(e instanceof Error ? e.message : 'Grouping failed');
     } finally {
-      stopPolling();
       setGrouping(false);
       setGroupingProgress(null);
       setGroupingStartedAt(null);
@@ -900,6 +766,9 @@ export default function RunReviewClient({
     setDownloadSourceColumn('');
     setDownloadLoading(true);
     setDownloadError(null);
+    setGoogleSheetsLoading(false);
+    setGoogleSheetsError(null);
+    setGoogleSheetsUrl(null);
     try {
       const res  = await fetch(`/api/run/${runId}/export-mapping`);
       const body = await res.json().catch(() => ({}));
@@ -914,6 +783,76 @@ export default function RunReviewClient({
       setDownloadLoading(false);
     }
   }
+
+  // ── Google Sheets export ─────────────────────────────────────────────────
+
+  async function doGoogleSheetsExportWithConfig(inc: boolean) {
+    triggerOpExport();
+    setGoogleSheetsLoading(true);
+    setGoogleSheetsError(null);
+    setGoogleSheetsUrl(null);
+    try {
+      const res = await fetch(`/api/run/${runId}/export-to-google-sheets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeOriginalCol: inc }),
+      });
+
+      if (res.status === 401) {
+        // Need Google auth — redirect preserving the desired export config
+        const base = window.location.href.split('?')[0];
+        const returnTo = `${base}?gsExport=1&includeOriginalCol=${inc}`;
+        window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}`;
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Failed to create Google Sheet');
+
+      setGoogleSheetsUrl(data.url);
+      window.open(data.url, '_blank', 'noopener,noreferrer');
+    } catch (err) {
+      setGoogleSheetsError(err instanceof Error ? err.message : 'Failed to export to Google Sheets');
+    } finally {
+      setGoogleSheetsLoading(false);
+    }
+  }
+
+  async function doGoogleSheetsExport() {
+    await doGoogleSheetsExportWithConfig(includeOriginalCol);
+  }
+
+  // After returning from Google OAuth, auto-trigger the export.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('gsExport') !== '1') return;
+
+    const inc = params.get('includeOriginalCol') !== 'false';
+
+    // Clean up URL params
+    const cleanUrl = new URL(window.location.href);
+    cleanUrl.searchParams.delete('gsExport');
+    cleanUrl.searchParams.delete('includeOriginalCol');
+    cleanUrl.searchParams.delete('gauth');
+    window.history.replaceState({}, '', cleanUrl.toString());
+
+    setIncludeOriginalCol(inc);
+    setDownloadModalOpen(true);
+    setGoogleSheetsLoading(true);
+    void doGoogleSheetsExportWithConfig(inc);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── One-prompt backend write trigger ────────────────────────────────────
+  // Fires on the first download/export action to signal the user is done
+  // making corrections. The backend is idempotent — repeated calls are no-ops.
+  // Never blocks the download; errors are silently swallowed.
+
+  function triggerOpExport(): void {
+    fetch(`/api/one-prompt/runs/${runId}/export`, { method: 'POST' }).catch(() => {});
+  }
+
+  // ── CSV / Excel helpers ───────────────────────────────────────────────────
 
   function escapeCsv(val: string): string {
     if (/[,"\n\r]/.test(val)) return `"${val.replace(/"/g, '""')}"`;
@@ -953,6 +892,7 @@ export default function RunReviewClient({
 
   async function doCsvDownload() {
     if (!downloadRows) return;
+    triggerOpExport();
     const { headers: hdrs, rows } = buildExportData();
     const lines = [
       hdrs.map(h => escapeCsv(h)).join(','),
@@ -969,6 +909,7 @@ export default function RunReviewClient({
 
   async function doExcelDownload() {
     if (!downloadRows) return;
+    triggerOpExport();
     const XLSX = await import('xlsx');
     const { headers: hdrs, rows } = buildExportData();
     const aoaData = [hdrs, ...rows.map(r => hdrs.map(h => r[h] ?? ''))];
@@ -1036,22 +977,6 @@ export default function RunReviewClient({
 
             <button
               type="button"
-              onClick={() => void applyConfidentAssignments()}
-              disabled={loadingAliasMap || applyingAssignments || !!aliasMapError}
-              className="px-3 py-1.5 rounded-button border-[0.5px] text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{
-                borderColor: 'var(--border)',
-                backgroundColor: 'var(--surface)',
-                color: 'var(--text-secondary)',
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
-            >
-              {applyingAssignments ? 'Applying…' : 'Apply confident assignments'}
-            </button>
-
-            <button
-              type="button"
               onClick={() => void openDownloadModal()}
               disabled={loadingAliasMap || !!aliasMapError}
               className="px-3 py-1.5 rounded-button text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1080,87 +1005,6 @@ export default function RunReviewClient({
           </div>
         </div>
 
-        {/* Apply assignments progress */}
-        {applyingAssignments && (
-          <div
-            className="rounded-button border-[0.5px] px-4 py-3 mb-5 space-y-2"
-            style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)' }}
-          >
-            <div className="flex items-center justify-between text-sm font-medium" style={{ color: 'var(--accent-strong)' }}>
-              <span>
-                {!scoringProgress
-                  ? 'Starting confidence scoring…'
-                  : scoringProgress.phase === 'saving'
-                  ? 'Saving assignments…'
-                  : `Scoring — ${scoringProgress.items_scored} / ${scoringProgress.items_total} items`}
-              </span>
-              <span className="flex items-center gap-3 tabular-nums text-xs" style={{ color: 'var(--accent)' }}>
-                <span>{formatElapsed(elapsedSecs)}</span>
-                {scoringProgress?.llm_elapsed_ms != null && scoringProgress.llm_elapsed_ms > 0 && (
-                  <span style={{ color: 'var(--text-muted)' }}>LLM {formatElapsed(Math.floor(scoringProgress.llm_elapsed_ms / 1000))}</span>
-                )}
-                <span className="font-semibold text-sm">
-                  {!scoringProgress ? '…'
-                    : scoringProgress.phase === 'saving' ? '100%'
-                    : `${Math.round((scoringProgress.items_scored / Math.max(scoringProgress.items_total, 1)) * 100)}%`}
-                </span>
-              </span>
-            </div>
-            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--accent-border)' }}>
-              <div
-                className="h-full rounded-full transition-all duration-500 ease-out"
-                style={{
-                  backgroundColor: 'var(--accent)',
-                  width: !scoringProgress ? '0%'
-                    : scoringProgress.phase === 'saving' ? '100%'
-                    : `${Math.round((scoringProgress.items_scored / Math.max(scoringProgress.items_total, 1)) * 100)}%`,
-                }}
-              />
-            </div>
-            {scoringProgress && (
-              <div className="flex items-center justify-between text-xs tabular-nums" style={{ color: 'var(--accent)' }}>
-                <span>
-                  {scoringProgress.pairs_scored.toLocaleString()} / {scoringProgress.pairs_total.toLocaleString()} comparisons
-                </span>
-                {scoringProgress.estimated_cost_usd !== undefined && scoringProgress.estimated_cost_usd > 0 && (
-                  <span>
-                    ~${scoringProgress.estimated_cost_usd < 0.01
-                      ? scoringProgress.estimated_cost_usd.toFixed(4)
-                      : scoringProgress.estimated_cost_usd.toFixed(3)} USD
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Apply assignments result */}
-        {assignmentsApplied && !applyingAssignments && (
-          <div
-            className="rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
-            style={{ backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' }}
-          >
-            <p className="font-medium" style={{ color: 'var(--confidence-high)' }}>
-              {assignmentsApplied.assigned > 0
-                ? <>Assigned {assignmentsApplied.assigned} item{assignmentsApplied.assigned !== 1 ? 's' : ''} to existing aliases{assignmentsApplied.groups_created > 0 ? ` (created ${assignmentsApplied.groups_created} new group${assignmentsApplied.groups_created !== 1 ? 's' : ''})` : ''}.</>
-                : 'No items passed the confidence gate.'}
-            </p>
-            <div className="flex items-center gap-4 mt-1 text-xs tabular-nums" style={{ color: 'var(--confidence-high)' }}>
-              <span>⏱ total {formatElapsed(assignmentsApplied.elapsed_secs)}</span>
-              {assignmentsApplied.llm_elapsed_secs !== null && assignmentsApplied.llm_elapsed_secs > 0 && (
-                <span>LLM {formatElapsed(assignmentsApplied.llm_elapsed_secs)}</span>
-              )}
-              {assignmentsApplied.deterministic_elapsed_secs !== null && assignmentsApplied.deterministic_elapsed_secs > 0 && (
-                <span>det. {formatElapsed(assignmentsApplied.deterministic_elapsed_secs)}</span>
-              )}
-              {assignmentsApplied.estimated_cost_usd !== null && assignmentsApplied.estimated_cost_usd > 0 && (
-                <span>~${assignmentsApplied.estimated_cost_usd < 0.01
-                  ? assignmentsApplied.estimated_cost_usd.toFixed(4)
-                  : assignmentsApplied.estimated_cost_usd.toFixed(3)} USD</span>
-              )}
-            </div>
-          </div>
-        )}
 
         {/* Export error */}
         {exportError && (
@@ -1527,32 +1371,6 @@ export default function RunReviewClient({
                 </div>
 
                 <div className="flex items-center gap-3">
-                  {/* Mode toggle */}
-                  <div
-                    className="flex items-center gap-0.5 rounded-button p-0.5"
-                    style={{ backgroundColor: 'var(--accent-tint)' }}
-                  >
-                    {(['basic', 'advanced', 'one_prompt'] as const).map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        onClick={() => setGroupingMode(mode)}
-                        disabled={grouping}
-                        className="px-3 py-1.5 rounded-toggle-option text-xs font-medium transition-all disabled:cursor-not-allowed"
-                        style={groupingMode === mode
-                          ? {
-                              backgroundColor: 'var(--surface)',
-                              color: 'var(--accent)',
-                              boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
-                            }
-                          : { color: 'var(--text-muted)' }
-                        }
-                      >
-                        {mode === 'basic' ? 'Basic' : mode === 'advanced' ? 'Advanced' : '1 Prompt'}
-                      </button>
-                    ))}
-                  </div>
-
                   {/* Auto-group button */}
                   <button
                     type="button"
@@ -1650,14 +1468,8 @@ export default function RunReviewClient({
                     {groupingResult.llm_elapsed_secs !== null && groupingResult.llm_elapsed_secs > 0 && (
                       <span>LLM {formatElapsed(groupingResult.llm_elapsed_secs)}</span>
                     )}
-                    {groupingResult.deterministic_elapsed_secs !== null && groupingResult.deterministic_elapsed_secs > 0 && (
-                      <span>det. {formatElapsed(groupingResult.deterministic_elapsed_secs)}</span>
-                    )}
                     {groupingResult.chunk_count !== null && groupingResult.chunk_count > 1 && (
                       <span>{groupingResult.chunk_count} parallel chunks</span>
-                    )}
-                    {groupingResult.llm_pairs_scored > 0 && (
-                      <span>{groupingResult.llm_pairs_scored.toLocaleString()} pairs LLM-scored</span>
                     )}
                     {groupingResult.estimated_cost_usd > 0 && (
                       <span>~${groupingResult.estimated_cost_usd < 0.01
@@ -1888,6 +1700,65 @@ export default function RunReviewClient({
                     <p className="text-xs mt-0.5" style={{ color: 'var(--text-hint)' }}>.csv file</p>
                   </div>
                 </button>
+
+                {/* Divider */}
+                <div className="my-1" style={{ height: '0.5px', backgroundColor: 'var(--border-subtle)' }} />
+
+                {/* Google Sheets */}
+                <button
+                  type="button"
+                  onClick={() => void doGoogleSheetsExport()}
+                  disabled={googleSheetsLoading}
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-button text-left transition-colors w-full disabled:opacity-60 disabled:cursor-not-allowed"
+                  onMouseEnter={(e) => { if (!googleSheetsLoading) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
+                >
+                  <div className="w-8 h-8 rounded-button flex items-center justify-center flex-shrink-0 flex-shrink-0" style={{ backgroundColor: '#E8F5E9' }}>
+                    {googleSheetsLoading ? (
+                      <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="#1E8E3E" strokeWidth="3" />
+                        <path className="opacity-75" fill="#1E8E3E" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                      </svg>
+                    ) : (
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <rect x="2.5" y="1" width="9" height="11.5" rx="1" fill="#1E8E3E" />
+                        <path d="M8.5 1v3.5H12L8.5 1z" fill="#0D652D" />
+                        <rect x="2.5" y="6" width="9" height="6.5" rx="0" fill="#34A853" />
+                        <path d="M4.5 8h5M4.5 9.5h5M4.5 11h3" stroke="white" strokeWidth="0.8" strokeLinecap="round" />
+                        <rect x="2.5" y="1" width="9" height="11.5" rx="1" stroke="#1E8E3E" strokeWidth="0.5" fill="none" />
+                      </svg>
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                      {googleSheetsLoading ? 'Exporting to Google Sheets…' : 'Export to Google Sheets'}
+                    </p>
+                    <p className="text-xs mt-0.5" style={{ color: 'var(--text-hint)' }}>
+                      {googleSheetsUrl ? 'Opened in new tab ↗' : 'Creates a new spreadsheet'}
+                    </p>
+                  </div>
+                </button>
+
+                {/* Google Sheets result / error */}
+                {googleSheetsUrl && !googleSheetsLoading && (
+                  <a
+                    href={googleSheetsUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 mx-1 mt-0.5 px-3 py-2 rounded-button text-xs font-medium transition-colors"
+                    style={{ backgroundColor: '#E8F5E9', color: '#1E8E3E', border: '0.5px solid #A8D5B5' }}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                      <path d="M2 10l8-8M10 2H4M10 2v6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    Open Google Sheet
+                  </a>
+                )}
+                {googleSheetsError && !googleSheetsLoading && (
+                  <p className="mx-1 mt-0.5 px-3 py-2 rounded-button text-xs" style={{ backgroundColor: '#FEF2F2', color: 'var(--confidence-low)', border: '0.5px solid #FECACA' }}>
+                    {googleSheetsError}
+                  </p>
+                )}
 
               </div>
             )}

@@ -29,8 +29,9 @@ const MERGE_MAX_TOKENS   = 4_096;
 // ---------------------------------------------------------------------------
 
 export interface OpStateItem {
+  run_item_id?:         number;   // stable 1-based index assigned at run creation; absent for legacy blobs
   literal_value:        string;
-  source_frequency?:    number;  // absent when initialised from RUN_ITEMS
+  source_frequency?:    number;
   matched_from_lookup:  boolean;
   alias_name?:          string;
 }
@@ -404,12 +405,13 @@ async function fetchUsageCounts(
 export async function loadOpRunState(connection: any, runId: number): Promise<OpRunState | null> {
   const rows = await exec(
     connection,
-    `SELECT state FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUN_STATE WHERE run_id = ?`,
+    `SELECT state FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS WHERE run_id = ?`,
     [runId],
   );
   if (!rows.length) return null;
 
   const raw = (rows[0] as any).STATE ?? (rows[0] as any).state;
+  if (raw == null) return null;
   return (typeof raw === 'string' ? JSON.parse(raw) : raw) as OpRunState;
 }
 
@@ -419,27 +421,23 @@ export async function saveOpRunState(
   state:      OpRunState,
 ): Promise<void> {
   const json = JSON.stringify(state);
-  // MERGE so this is safe on both first write and subsequent updates.
   await exec(
     connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUN_STATE AS tgt
-     USING (SELECT ? AS run_id, PARSE_JSON(?) AS state) AS src
-       ON tgt.run_id = src.run_id
-     WHEN MATCHED THEN UPDATE SET
-       tgt.state      = src.state,
-       tgt.updated_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (run_id, state, updated_at)
-       VALUES (src.run_id, src.state, CURRENT_TIMESTAMP())`,
-    [runId, json],
+    `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+     SET state      = PARSE_JSON(?),
+         updated_at = CURRENT_TIMESTAMP()
+     WHERE run_id = ?`,
+    [json, runId],
   );
 }
 
 // ---------------------------------------------------------------------------
-// State initialisation from RUN_ITEMS (when no state blob exists yet)
+// State initialisation fallback (when ONE_PROMPT_RUNS.state is NULL for a run
+// created before this migration). In practice never called for new runs.
 // ---------------------------------------------------------------------------
 
 async function initOpRunState(connection: any, runId: number): Promise<OpRunState> {
-  // Read literal values from the standard RUN_ITEMS table.
+  // Try to read literal values from the legacy RUN_ITEMS table as a last resort.
   const itemRows = await exec(
     connection,
     `SELECT literal_value
@@ -449,7 +447,8 @@ async function initOpRunState(connection: any, runId: number): Promise<OpRunStat
     [runId],
   );
 
-  const items: OpStateItem[] = itemRows.map((row) => ({
+  const items: OpStateItem[] = itemRows.map((row, idx) => ({
+    run_item_id:         idx + 1,
     literal_value:       String((row as any).LITERAL_VALUE ?? (row as any).literal_value ?? ''),
     matched_from_lookup: false,
   }));

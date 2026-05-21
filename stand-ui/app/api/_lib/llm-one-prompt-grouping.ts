@@ -642,6 +642,8 @@ export interface OnePromptBreakdown {
     total_output_tokens:         number;
     total_cache_read_tokens:     number;
     total_cache_creation_tokens: number;
+    /** Items resolved from ONE_PROMPT_LITERAL_ALIAS_MATCHES (skipped LLM). */
+    lookup_matched: number;
   };
   system_prompt: string;
   chunks:        OnePromptChunkBreakdown[];
@@ -748,6 +750,7 @@ export async function runOnePromptGrouping(
         estimated_cost_usd: 0, llm_elapsed_ms: 0,
         total_input_tokens: 0, total_output_tokens: 0,
         total_cache_read_tokens: 0, total_cache_creation_tokens: 0,
+        lookup_matched: 0,
       },
       system_prompt: '',
       chunks:        [],
@@ -965,6 +968,7 @@ export async function runOnePromptGrouping(
       total_output_tokens:         llm_usage.output_tokens,
       total_cache_read_tokens:     llm_usage.cache_read_input_tokens,
       total_cache_creation_tokens: llm_usage.cache_creation_input_tokens,
+      lookup_matched:              0, // filled in by caller if a lookup pass was run
     },
     system_prompt: systemText,
     chunks:        chunkBreakdowns,

@@ -38,7 +38,7 @@ export async function POST(
       // Verify the run exists in the standard RUNS table.
       const runRows = await exec(
         connection,
-        `SELECT run_status FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
+        `SELECT run_status FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS WHERE run_id = ?`,
         [runId],
       );
 
@@ -50,16 +50,9 @@ export async function POST(
         (runRows[0] as any).RUN_STATUS ?? (runRows[0] as any).run_status ?? '',
       ).toLowerCase();
 
-      if (runStatus === 'completed') {
-        return Response.json(
-          { error: 'This run has already been exported.' },
-          { status: 409 },
-        );
-      }
-
-      // Steps 1–2: write alias matches, approved names, mark complete.
-      // Steps 3–5: fire-and-forget validation pass (does not block this response).
-      const result = await runOpExport(connection, runId, apiKey);
+      // Always export the run's groupings regardless of status.
+      // Backend table writes are only initiated on the first export (handled inside runOpExport).
+      const result = await runOpExport(connection, runId, apiKey, runStatus);
 
       return Response.json({ data: result }, { status: 200 });
     });

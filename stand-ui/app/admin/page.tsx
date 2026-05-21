@@ -1,11 +1,107 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+
+// ── JSON modal viewer ─────────────────────────────────────────────────────────
+
+function JsonModal({ title, value, onClose }: { title: string; value: unknown; onClose: () => void }) {
+  const pretty = useMemo(() => {
+    try {
+      const obj = typeof value === 'string' ? JSON.parse(value) : value;
+      return JSON.stringify(obj, null, 2);
+    } catch {
+      return String(value);
+    }
+  }, [value]);
+
+  // Close on Escape key
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') onClose(); }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="relative flex flex-col bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200 shrink-0">
+          <span className="text-sm font-semibold text-gray-700 font-mono">{title}</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-700 text-xl leading-none px-1"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+        {/* Scrollable JSON body */}
+        <div className="overflow-auto flex-1 p-4 bg-gray-950 rounded-b-xl">
+          <pre className="text-xs text-green-300 font-mono whitespace-pre leading-relaxed">
+            {pretty}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Detect whether a value is a JSON object/array (or a JSON string encoding one).
+function isJsonValue(v: unknown): boolean {
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'object') return true;
+  if (typeof v === 'string') {
+    const t = v.trimStart();
+    if (t.startsWith('{') || t.startsWith('[')) {
+      try { JSON.parse(v); return true; } catch { /* not JSON */ }
+    }
+  }
+  return false;
+}
+
+function JsonCell({ colKey, value }: { colKey: string; value: unknown }) {
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+
+  if (!isJsonValue(value)) {
+    // Regular cell — truncate long strings
+    const str = value === null ? '' : String(value);
+    return (
+      <span className={str.length > 80 ? 'cursor-default' : ''} title={str.length > 80 ? str : undefined}>
+        {str.length > 80 ? `${str.slice(0, 80)}…` : str || (
+          <span className="text-gray-400 italic">null</span>
+        )}
+      </span>
+    );
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 transition-colors"
+      >
+        <span>{'{ }'}</span>
+        <span>View JSON</span>
+      </button>
+      {open && <JsonModal title={colKey} value={value} onClose={close} />}
+    </>
+  );
+}
 
 // ── Tables tab ────────────────────────────────────────────────────────────────
 
 const TABLES: { name: string; section?: string }[] = [
+  { name: 'ONE_PROMPT_RUNS',                  section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_LITERAL_ALIAS_MATCHES', section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_APPROVED_ALIAS_NAMES',  section: 'One-Prompt' },
+  { name: 'ONE_PROMPT_VALIDATION_LOG',        section: 'One-Prompt' },
   { name: 'CLASSIFICATION_METADATA_PROFILES' },
   { name: 'CONCEPTS' },
   { name: 'ALIASES' },
@@ -13,15 +109,6 @@ const TABLES: { name: string; section?: string }[] = [
   { name: 'TOKENS_SUMMARY' },
   { name: 'ALIAS_ITEMS' },
   { name: 'USERS' },
-  { name: 'RUNS' },
-  { name: 'RUN_GROUPS' },
-  { name: 'RUN_ITEMS' },
-  { name: 'RUN_APPLIED_TARGETS' },
-  { name: 'AUDIT_LOG' },
-  { name: 'ONE_PROMPT_RUN_STATE',             section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_LITERAL_ALIAS_MATCHES', section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_APPROVED_ALIAS_NAMES',  section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_VALIDATION_LOG',        section: 'One-Prompt' },
 ];
 
 function TableSection({ tableName }: { tableName: string }) {
@@ -84,12 +171,12 @@ function TableSection({ tableName }: { tableName: string }) {
             <tbody className="bg-white divide-y divide-gray-200">
               {data.map((row, idx) => (
                 <tr key={idx} className="hover:bg-gray-50">
-                  {Object.values(row).map((value, colIdx) => (
-                    <td key={colIdx} className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap">
+                  {Object.entries(row).map(([colKey, value]) => (
+                    <td key={colKey} className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap max-w-xs">
                       {value === null ? (
                         <span className="text-gray-400 italic">null</span>
                       ) : (
-                        String(value)
+                        <JsonCell colKey={colKey} value={value} />
                       )}
                     </td>
                   ))}

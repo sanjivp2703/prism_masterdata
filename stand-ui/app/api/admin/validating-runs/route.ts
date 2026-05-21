@@ -8,9 +8,9 @@ export async function GET(request: NextRequest) {
         connection.execute({
           sqlText: `
             SELECT run_id, source_relation, source_column, run_status, updated_at
-            FROM STAND_DB.STAND_INTERNAL.RUNS
-            WHERE requires_validation = TRUE
-            ORDER BY IFF(run_status = 'validating', 1, 0) DESC, updated_at DESC
+            FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+            WHERE run_status IN ('validating', 'created', 'running')
+            ORDER BY updated_at DESC
             LIMIT 1000
           `,
           complete: (err, stmt, rows) => {
@@ -21,11 +21,11 @@ export async function GET(request: NextRequest) {
       });
 
       const data = rows.map((r: any) => ({
-        run_id: Number(r?.RUN_ID ?? r?.run_id),
+        run_id:          Number(r?.RUN_ID         ?? r?.run_id),
         source_relation: String(r?.SOURCE_RELATION ?? r?.source_relation ?? ''),
-        source_column: String(r?.SOURCE_COLUMN ?? r?.source_column ?? ''),
-        run_status: String(r?.RUN_STATUS ?? r?.run_status ?? ''),
-        updated_at: String(r?.UPDATED_AT ?? r?.updated_at ?? ''),
+        source_column:   String(r?.SOURCE_COLUMN   ?? r?.source_column   ?? ''),
+        run_status:      String(r?.RUN_STATUS      ?? r?.run_status      ?? ''),
+        updated_at:      String(r?.UPDATED_AT      ?? r?.updated_at      ?? ''),
       }));
 
       return Response.json(
@@ -33,8 +33,8 @@ export async function GET(request: NextRequest) {
         {
           headers: {
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-            Pragma: 'no-cache',
-            Expires: '0',
+            Pragma:          'no-cache',
+            Expires:         '0',
           },
         }
       );
@@ -44,5 +44,3 @@ export async function GET(request: NextRequest) {
     return snowflakeErrorResponse(error, 'Failed to fetch validating runs');
   }
 }
-
-

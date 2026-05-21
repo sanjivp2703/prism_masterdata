@@ -12,24 +12,19 @@ export async function GET(
       const rows = await new Promise<any[]>((resolve, reject) => {
         connection.execute({
           sqlText: `
-            SELECT 
+            SELECT
               r.run_id,
               r.run_status,
               r.mode,
-              r.created_at,
-              r.started_at,
-              r.completed_at,
               r.source_relation,
               r.source_column,
-              r.error_message,
-              sc.concept_key,
-              sc.description AS concept_description,
-              u.display_name AS created_by_name
-            FROM STAND_DB.STAND_INTERNAL.RUNS r
-            LEFT JOIN STAND_DB.STAND_INTERNAL.CONCEPTS sc 
-              ON r.concept_id = sc.concept_id
-            LEFT JOIN STAND_DB.STAND_INTERNAL.USERS u 
-              ON r.created_by = u.user_id
+              r.created_at,
+              r.updated_at,
+              c.concept_key,
+              c.description AS concept_description
+            FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS r
+            LEFT JOIN STAND_DB.STAND_INTERNAL.CONCEPTS c
+              ON c.concept_id = r.concept_id
             WHERE r.run_id = ?
           `,
           binds: [run_id],
@@ -51,4 +46,3 @@ export async function GET(
     return snowflakeErrorResponse(error, 'Failed to fetch run data');
   }
 }
-

@@ -9,13 +9,8 @@ const ALLOWED_TABLES = [
   'TOKENS_SUMMARY',
   'ALIAS_ITEMS',
   'USERS',
-  'RUNS',
-  'RUN_GROUPS',
-  'RUN_ITEMS',
-  'RUN_APPLIED_TARGETS',
-  'AUDIT_LOG',
-  // One-prompt tables
-  'ONE_PROMPT_RUN_STATE',
+  // One-prompt tables (primary run table + supporting lookup tables)
+  'ONE_PROMPT_RUNS',
   'ONE_PROMPT_LITERAL_ALIAS_MATCHES',
   'ONE_PROMPT_APPROVED_ALIAS_NAMES',
   'ONE_PROMPT_VALIDATION_LOG',

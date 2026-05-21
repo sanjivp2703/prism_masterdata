@@ -1,22 +1,25 @@
 /**
- * One-Prompt Export Pipeline (Steps 1–5).
+ * One-Prompt Export Pipeline (Steps 1–4).
  *
  * Called after the user confirms and exports a one-prompt run.
  *
- *   Step 1 — Read state blob          (sole source of truth)
- *   Step 2 — Write alias matches       (upsert literal→alias, upsert approved names,
- *                                        mark run 'complete')
- *   Step 3 — Detect validation cases   (Case A: item moved; Case B: group renamed)
- *   Step 4 — LLM validation pass       (async, does not block the export response)
- *   Step 5 — Apply validation decisions (revert/persist, log every decision)
+ *   Step 1 — Read state blob            (sole source of truth)
+ *   Step 2 — Detect validation cases    (Case A: item moved; Case B: group renamed)
+ *   Step 3 — LLM validation pass        (async background; decides Case A/B outcomes)
+ *   Step 4 — Write everything at once   (Case A/B per LLM decision; all other items
+ *                                         written as-is; log decisions; mark run done)
  *
- * Steps 3–5 run in the background after the HTTP response is already sent.
- * They open their own Snowflake connection via withSnowflake.
+ * Steps 3–4 run in the background after the HTTP response is sent.
+ * The run is immediately marked 'validating' to prevent double-export.
+ * On LLM parse failure the run is marked 'failed' so it can be retried.
  *
  * Zero writes to RUN_ITEMS, RUN_GROUPS, RAW_VALUES, ALIAS_SUMMARY, TOKENS_SUMMARY.
  */
 
 import 'server-only';
+
+import fs   from 'node:fs';
+import path from 'node:path';
 
 import { withSnowflake } from './snowflake';
 import { loadOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
@@ -113,7 +116,7 @@ function tryParseJson<T>(text: string): T | null {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 helpers — upsert alias matches + approved names
+// DB write helpers
 // ---------------------------------------------------------------------------
 
 async function upsertLiteralMatch(
@@ -153,40 +156,7 @@ async function upsertApprovedAlias(connection: any, aliasName: string): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 — write export data to DB
-// ---------------------------------------------------------------------------
-
-async function writeExportData(
-  connection: any,
-  runId:      number,
-  state:      OpRunState,
-): Promise<ExportResult> {
-  let items_written   = 0;
-  const aliasesToUpsert = new Set<string>();
-
-  for (const group of state.groups) {
-    for (const item of group.items) {
-      await upsertLiteralMatch(connection, item.literal_value, group.alias_name, runId);
-      items_written++;
-    }
-    aliasesToUpsert.add(group.alias_name);
-  }
-
-  for (const aliasName of aliasesToUpsert) {
-    await upsertApprovedAlias(connection, aliasName);
-  }
-
-  await exec(
-    connection,
-    `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-    [runId],
-  );
-
-  return { items_written, aliases_updated: aliasesToUpsert.size };
-}
-
-// ---------------------------------------------------------------------------
-// Step 3 — detect Case A and Case B
+// Step 2 — detect Case A and Case B from state (no DB)
 // ---------------------------------------------------------------------------
 
 interface DetectResult {
@@ -195,14 +165,12 @@ interface DetectResult {
 }
 
 function detectCases(state: OpRunState): DetectResult {
-  // Build a fast lookup: literal_value → OpStateItem (from top-level items array).
   const itemByLiteral = new Map<string, OpStateItem>(
     state.items.map((it) => [it.literal_value, it]),
   );
 
-  // Build a map: literal_value → current group (scanning state.groups).
-  const groupByLiteral = new Map<number, OpGroup>();   // group_id → group
-  const groupIdByLiteral = new Map<string, number>();  // literal_value → group_id
+  const groupByLiteral = new Map<number, OpGroup>();
+  const groupIdByLiteral = new Map<string, number>();
   for (const group of state.groups) {
     groupByLiteral.set(group.group_id, group);
     for (const item of group.items) {
@@ -211,21 +179,14 @@ function detectCases(state: OpRunState): DetectResult {
   }
 
   // ── Detect Case B first ──────────────────────────────────────────────────
-  // Case B: group was originally lookup-validated but user renamed it.
-  //   from_lookup_chunk = true  AND  alias_name_source = 'user_override'
-  // Original alias: the alias_name recorded in state.items for any
-  //   matched_from_lookup item in this group.
-
   type RawCaseB = Omit<CaseBGroup, 'alias_exact_literal' | 'prior_lookup_literal' | 'current_new_literal' | 'prior_other_literal' | 'total_known_literals'>;
 
   const caseBGroups: RawCaseB[] = [];
-  // Track (group_id, original_alias) for Case A exclusion below.
   const caseBOriginalByGroupId = new Map<number, string>();
 
   for (const group of state.groups) {
     if (!group.from_lookup_chunk || group.alias_name_source !== 'user_override') continue;
 
-    // Find original alias from the first lookup-matched item in this group.
     let originalAlias: string | null = null;
     for (const gi of group.items) {
       const si = itemByLiteral.get(gi.literal_value);
@@ -234,8 +195,8 @@ function detectCases(state: OpRunState): DetectResult {
         break;
       }
     }
-    if (!originalAlias) continue;  // no matched items — can't determine original
-    if (originalAlias === group.alias_name) continue;  // name unchanged
+    if (!originalAlias) continue;
+    if (originalAlias === group.alias_name) continue;
 
     caseBGroups.push({
       group_id:            group.group_id,
@@ -247,27 +208,21 @@ function detectCases(state: OpRunState): DetectResult {
   }
 
   // ── Detect Case A ────────────────────────────────────────────────────────
-  // Case A: item has a preexisting lookup match (matched_from_lookup = true,
-  //   alias_name set) but is now in a group with a DIFFERENT alias_name.
-  //   Exclude items whose discrepancy is fully explained by a Case B rename
-  //   of the group they currently belong to.
-
   const caseAItems: CaseAItem[] = [];
 
   for (const si of state.items) {
     if (!si.matched_from_lookup || !si.alias_name) continue;
 
     const currentGroupId = groupIdByLiteral.get(si.literal_value);
-    if (currentGroupId === undefined) continue;  // item is in ungrouped — skip
+    if (currentGroupId === undefined) continue;
 
     const currentGroup = groupByLiteral.get(currentGroupId);
     if (!currentGroup) continue;
 
-    if (currentGroup.alias_name === si.alias_name) continue;  // name matches, no change
+    if (currentGroup.alias_name === si.alias_name) continue;
 
-    // Check if this discrepancy is a Case B rename (group was renamed from si.alias_name).
     const caseBOriginal = caseBOriginalByGroupId.get(currentGroupId);
-    if (caseBOriginal === si.alias_name) continue;  // explained by Case B rename — skip
+    if (caseBOriginal === si.alias_name) continue;
 
     caseAItems.push({
       literal_value:       si.literal_value,
@@ -280,7 +235,7 @@ function detectCases(state: OpRunState): DetectResult {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 — fetch representative context for Case B groups
+// Step 3a — fetch representative context for Case B groups (DB read)
 // ---------------------------------------------------------------------------
 
 async function fetchCaseBContext(
@@ -296,7 +251,6 @@ async function fetchCaseBContext(
   for (const raw of rawCaseBGroups) {
     const groupItemLiterals = new Set(raw.group_items.map((gi) => gi.literal_value));
 
-    // 1. Literal value in one_prompt_literal_alias_matches where literal_value = original_alias_name.
     const exactRows = await exec(
       connection,
       `SELECT literal_value FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
@@ -308,22 +262,18 @@ async function fetchCaseBContext(
         ? String((exactRows[0] as any).LITERAL_VALUE ?? (exactRows[0] as any).literal_value ?? '')
         : null;
 
-    // 2. One literal from this run that WAS a preexisting lookup match for this group.
     const prior_lookup_literal =
       raw.group_items.find((gi) => {
         const si = itemByLiteral.get(gi.literal_value);
         return si?.matched_from_lookup === true;
       })?.literal_value ?? null;
 
-    // 3. One literal from this run that was NOT a preexisting lookup match.
     const current_new_literal =
       raw.group_items.find((gi) => {
         const si = itemByLiteral.get(gi.literal_value);
         return si?.matched_from_lookup === false;
       })?.literal_value ?? null;
 
-    // 4. One literal from one_prompt_literal_alias_matches for this alias that is
-    //    NOT in the current run at all.
     const allKnownRows = await exec(
       connection,
       `SELECT literal_value, COUNT(*) AS total
@@ -357,7 +307,7 @@ async function fetchCaseBContext(
 }
 
 // ---------------------------------------------------------------------------
-// Step 4 — build validation prompt and call LLM
+// Step 3b — build validation prompt and call LLM
 // ---------------------------------------------------------------------------
 
 const VALIDATION_SYSTEM_PROMPT = `\
@@ -452,125 +402,132 @@ async function callValidationLLM(apiKey: string, userTurn: string): Promise<stri
 }
 
 // ---------------------------------------------------------------------------
-// Step 5 — apply validation decisions
+// Step 4 — write all decisions at once
+//
+// Combines what was formerly Step 2 (bulk write) and Step 5 (corrections).
+// Every literal gets exactly one write here, using its LLM-adjudicated alias.
+// Non-case items are written as-is from the user's current grouping.
 // ---------------------------------------------------------------------------
 
-async function applyValidationDecisions(
+async function writeAllDecisions(
   connection:  any,
   runId:       number,
+  state:       OpRunState,
   caseAItems:  CaseAItem[],
   caseBGroups: CaseBGroup[],
-  decisions:   ValidationResponse,
-): Promise<void> {
-  // ── Case A decisions ──────────────────────────────────────────────────────
-  for (const decision of decisions.case_a ?? []) {
-    const item = caseAItems.find((a) => a.literal_value === decision.lv);
-    if (!item) continue;
-
-    if (decision.k === 'o') {
-      // Revert: put the literal back to its original alias.
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-         SET alias_name = ?, confirmed_at = CURRENT_TIMESTAMP()
-         WHERE literal_value = ?`,
-        [item.original_alias_name, item.literal_value],
-      );
-      // Decrement the group alias that was incorrectly used.
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-         SET usage_count = GREATEST(0, usage_count - 1), last_used_at = CURRENT_TIMESTAMP()
-         WHERE alias_name = ?`,
-        [item.user_moved_to],
-      );
-      // Increment the original alias.
-      await upsertApprovedAlias(connection, item.original_alias_name);
+  decisions:   ValidationResponse | null,
+): Promise<{ items_written: number; aliases_updated: number }> {
+  // Build a map: literal_value → final alias, starting from user's current grouping.
+  const finalAlias = new Map<string, string>();
+  for (const group of state.groups) {
+    for (const gi of group.items) {
+      finalAlias.set(gi.literal_value, group.alias_name);
     }
-    // k = 'u': record from Step 2 is already correct — no action needed.
+  }
 
-    // Log the decision.
+  // Override Case A items per LLM decision.
+  const caseADecisions = new Map<string, 'u' | 'o'>();
+  for (const d of decisions?.case_a ?? []) {
+    caseADecisions.set(d.lv, d.k);
+  }
+  for (const item of caseAItems) {
+    const k = caseADecisions.get(item.literal_value) ?? 'u';
+    finalAlias.set(item.literal_value, k === 'o' ? item.original_alias_name : item.user_moved_to);
+  }
+
+  // Override Case B groups per LLM decision; collect global renames.
+  const caseBDecisions = new Map<string, ValidationDecisionB>();
+  for (const d of decisions?.case_b ?? []) {
+    caseBDecisions.set(`${d.original_alias}|${d.new_alias}`, d);
+  }
+
+  const globalRenames: Array<{ from: string; to: string }> = [];
+
+  for (const group of caseBGroups) {
+    const d = caseBDecisions.get(`${group.original_alias_name}|${group.user_changed_to}`);
+    const k = d?.k ?? 'u';
+
+    if (k === 'o') {
+      for (const gi of group.group_items) {
+        finalAlias.set(gi.literal_value, group.original_alias_name);
+      }
+    } else if (d?.apply_to_all) {
+      globalRenames.push({ from: group.original_alias_name, to: group.user_changed_to });
+    }
+    // k='u', apply_to_all=false: finalAlias already has user's new name.
+  }
+
+  // ── Write all literal→alias matches for this run ──────────────────────────
+  let items_written = 0;
+  for (const [literalValue, aliasName] of finalAlias) {
+    await upsertLiteralMatch(connection, literalValue, aliasName, runId);
+    items_written++;
+  }
+
+  // ── Apply global Case B renames (touches historical rows outside this run) ─
+  for (const rename of globalRenames) {
+    const origRows = await exec(
+      connection,
+      `SELECT usage_count FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
+       WHERE alias_name = ?`,
+      [rename.from],
+    );
+    const origCount = Number((origRows[0] as any)?.USAGE_COUNT ?? (origRows[0] as any)?.usage_count ?? 0);
+
+    await exec(
+      connection,
+      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
+       SET alias_name = ?, confirmed_at = CURRENT_TIMESTAMP()
+       WHERE alias_name = ?`,
+      [rename.to, rename.from],
+    );
+
+    await exec(
+      connection,
+      `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES AS t
+       USING (SELECT ? AS alias_name, ? AS extra_count) AS s
+         ON t.alias_name = s.alias_name
+       WHEN MATCHED THEN UPDATE SET
+         t.usage_count  = t.usage_count + s.extra_count,
+         t.last_used_at = CURRENT_TIMESTAMP()
+       WHEN NOT MATCHED THEN INSERT (alias_name, usage_count, last_used_at)
+         VALUES (s.alias_name, s.extra_count, CURRENT_TIMESTAMP())`,
+      [rename.to, origCount],
+    );
+
+    await exec(
+      connection,
+      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
+       SET usage_count = 0
+       WHERE alias_name = ?`,
+      [rename.from],
+    );
+  }
+
+  // ── Upsert approved alias names for every final alias used in this run ────
+  const finalAliasNames = new Set(finalAlias.values());
+  for (const aliasName of finalAliasNames) {
+    await upsertApprovedAlias(connection, aliasName);
+  }
+
+  // ── Log Case A/B decisions ────────────────────────────────────────────────
+  for (const d of decisions?.case_a ?? []) {
+    const item = caseAItems.find((a) => a.literal_value === d.lv);
+    if (!item) continue;
     await exec(
       connection,
       `INSERT INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_VALIDATION_LOG
          (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
       [item.literal_value, runId, item.original_alias_name, item.user_moved_to,
-       decision.k === 'u' ? 'user' : 'original'],
+       d.k === 'u' ? 'user' : 'original'],
     );
   }
-
-  // ── Case B decisions ──────────────────────────────────────────────────────
-  for (const decision of decisions.case_b ?? []) {
+  for (const d of decisions?.case_b ?? []) {
     const group = caseBGroups.find(
-      (b) => b.original_alias_name === decision.original_alias && b.user_changed_to === decision.new_alias,
+      (b) => b.original_alias_name === d.original_alias && b.user_changed_to === d.new_alias,
     );
     if (!group) continue;
-
-    if (decision.k === 'o') {
-      // Revert: put all run items back to original alias.
-      for (const gi of group.group_items) {
-        await exec(
-          connection,
-          `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-           SET alias_name = ?, confirmed_at = CURRENT_TIMESTAMP()
-           WHERE literal_value = ?`,
-          [group.original_alias_name, gi.literal_value],
-        );
-      }
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-         SET usage_count = GREATEST(0, usage_count - 1), last_used_at = CURRENT_TIMESTAMP()
-         WHERE alias_name = ?`,
-        [group.user_changed_to],
-      );
-      await upsertApprovedAlias(connection, group.original_alias_name);
-
-    } else if (decision.k === 'u' && decision.apply_to_all) {
-      // Apply globally: rename ALL literals mapped to original_alias to new_alias.
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-         SET alias_name = ?, confirmed_at = CURRENT_TIMESTAMP()
-         WHERE alias_name = ?`,
-        [group.user_changed_to, group.original_alias_name],
-      );
-      // Carry forward the original's usage_count into the new alias.
-      const origRows = await exec(
-        connection,
-        `SELECT usage_count FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-         WHERE alias_name = ?`,
-        [group.original_alias_name],
-      );
-      const origCount = Number((origRows[0] as any)?.USAGE_COUNT ?? (origRows[0] as any)?.usage_count ?? 0);
-
-      await exec(
-        connection,
-        `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES AS t
-         USING (SELECT ? AS alias_name, ? AS extra_count) AS s
-           ON t.alias_name = s.alias_name
-         WHEN MATCHED THEN UPDATE SET
-           t.usage_count  = t.usage_count + s.extra_count,
-           t.last_used_at = CURRENT_TIMESTAMP()
-         WHEN NOT MATCHED THEN INSERT (alias_name, usage_count, last_used_at)
-           VALUES (s.alias_name, s.extra_count, CURRENT_TIMESTAMP())`,
-        [group.user_changed_to, origCount],
-      );
-      // Zero out (not delete) the original alias.
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-         SET usage_count = 0
-         WHERE alias_name = ?`,
-        [group.original_alias_name],
-      );
-
-    }
-    // k = 'u' AND apply_to_all = false: run items already correct from Step 2.
-    // Both alias names remain in approved names. No further action.
-
-    // Log one entry per affected literal value.
     for (const gi of group.group_items) {
       await exec(
         connection,
@@ -578,45 +535,183 @@ async function applyValidationDecisions(
            (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
         [gi.literal_value, runId, group.original_alias_name, group.user_changed_to,
-         decision.k === 'u' ? 'user' : 'original'],
+         d.k === 'u' ? 'user' : 'original'],
       );
     }
+  }
+
+  // ── Mark run complete ─────────────────────────────────────────────────────
+  await exec(
+    connection,
+    `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+    [runId],
+  );
+
+  return { items_written, aliases_updated: finalAliasNames.size };
+}
+
+// ---------------------------------------------------------------------------
+// Validation audit JSON writer
+// ---------------------------------------------------------------------------
+
+function writeValidationAudit(
+  runId:      number,
+  caseAItems: CaseAItem[],
+  caseBGroups: CaseBGroup[],
+  systemPrompt: string,
+  userTurn:   string,
+  rawResponse: string,
+  decisions:  ValidationResponse | null,
+  appliedDecisions: Array<{
+    type:              'case_a' | 'case_b';
+    literal_value?:    string;
+    original_alias:    string;
+    user_changed_to:   string;
+    llm_decision:      'user' | 'original';
+    apply_to_all?:     boolean;
+  }>,
+  error: string | null,
+): void {
+  try {
+    const audit = {
+      meta: {
+        run_id:        runId,
+        generated_at:  new Date().toISOString(),
+        case_a_count:  caseAItems.length,
+        case_b_count:  caseBGroups.length,
+        parse_success: decisions !== null,
+        error,
+      },
+
+      detected_cases: {
+        case_a: caseAItems.map((item) => ({
+          literal_value:       item.literal_value,
+          original_alias_name: item.original_alias_name,
+          user_moved_to:       item.user_moved_to,
+        })),
+        case_b: caseBGroups.map((g) => ({
+          group_id:            g.group_id,
+          original_alias_name: g.original_alias_name,
+          user_changed_to:     g.user_changed_to,
+          group_items:         g.group_items.map((gi) => gi.literal_value),
+          context: {
+            alias_exact_literal:  g.alias_exact_literal,
+            prior_lookup_literal: g.prior_lookup_literal,
+            current_new_literal:  g.current_new_literal,
+            prior_other_literal:  g.prior_other_literal,
+            total_known_literals: g.total_known_literals,
+          },
+        })),
+      },
+
+      llm: {
+        system_prompt: systemPrompt,
+        user_turn:     userTurn,
+        raw_response:  rawResponse,
+        parsed:        decisions,
+      },
+
+      applied_decisions: appliedDecisions,
+    };
+
+    const projectRoot = path.resolve(process.cwd(), '..');
+    const outPath = path.join(projectRoot, `validation_audit_run_${runId}.json`);
+    fs.writeFileSync(outPath, JSON.stringify(audit, null, 2), 'utf8');
+    console.log(`[op-export] Validation audit written → ${outPath}`);
+  } catch (writeErr) {
+    console.warn('[op-export] Could not write validation audit JSON:', writeErr);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Background validation pass (Steps 3–5)  — creates its own DB connection
+// Background write+validate pass (Steps 3–4) — creates its own DB connection
 // ---------------------------------------------------------------------------
 
-async function runValidationPass(
-  runId:  number,
-  state:  OpRunState,
-  apiKey: string,
+async function runWriteAndValidatePass(
+  runId:          number,
+  state:          OpRunState,
+  caseAItems:     CaseAItem[],
+  rawCaseBGroups: Omit<CaseBGroup, 'alias_exact_literal' | 'prior_lookup_literal' | 'current_new_literal' | 'prior_other_literal' | 'total_known_literals'>[],
+  apiKey:         string,
 ): Promise<void> {
-  const { caseAItems, caseBGroups: rawCaseBGroups } = detectCases(state);
-
-  if (caseAItems.length === 0 && rawCaseBGroups.length === 0) {
-    console.log(`[op-export] Run ${runId}: no validation cases detected.`);
-    return;
-  }
-
   await withSnowflake(async (connection) => {
-    const caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups);
+    try {
+      let decisions:  ValidationResponse | null = null;
+      let rawText   = '';
+      let userTurn  = '';
+      let caseBGroups: CaseBGroup[] = [];
 
-    const userTurn = buildValidationUserTurn(caseAItems, caseBGroups);
-    const rawText  = await callValidationLLM(apiKey, userTurn);
-    const decisions = tryParseJson<ValidationResponse>(rawText);
+      if (caseAItems.length > 0 || rawCaseBGroups.length > 0) {
+        caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups);
+        userTurn    = buildValidationUserTurn(caseAItems, caseBGroups);
+        rawText     = await callValidationLLM(apiKey, userTurn);
+        decisions   = tryParseJson<ValidationResponse>(rawText);
 
-    if (!decisions) {
-      console.error(`[op-export] Run ${runId}: failed to parse validation LLM response.\nRaw: ${rawText.slice(0, 800)}`);
-      return;
+        if (!decisions) {
+          console.error(`[op-export] Run ${runId}: failed to parse validation LLM response.\nRaw: ${rawText.slice(0, 800)}`);
+          writeValidationAudit(
+            runId, caseAItems, caseBGroups,
+            VALIDATION_SYSTEM_PROMPT, userTurn, rawText,
+            null, [],
+            'Failed to parse LLM response as JSON',
+          );
+          await exec(
+            connection,
+            `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+            [runId],
+          );
+          return;
+        }
+      }
+
+      // Step 4: write everything (normal items + Case A/B decisions) in one pass.
+      await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions);
+
+      // Build flat appliedDecisions list for audit.
+      const appliedDecisions: Parameters<typeof writeValidationAudit>[7] = [];
+      for (const d of decisions?.case_a ?? []) {
+        const item = caseAItems.find((a) => a.literal_value === d.lv);
+        if (!item) continue;
+        appliedDecisions.push({
+          type:            'case_a',
+          literal_value:   item.literal_value,
+          original_alias:  item.original_alias_name,
+          user_changed_to: item.user_moved_to,
+          llm_decision:    d.k === 'u' ? 'user' : 'original',
+        });
+      }
+      for (const d of decisions?.case_b ?? []) {
+        const group = caseBGroups.find(
+          (b) => b.original_alias_name === d.original_alias && b.user_changed_to === d.new_alias,
+        );
+        if (!group) continue;
+        appliedDecisions.push({
+          type:            'case_b',
+          original_alias:  group.original_alias_name,
+          user_changed_to: group.user_changed_to,
+          llm_decision:    d.k === 'u' ? 'user' : 'original',
+          apply_to_all:    d.apply_to_all,
+        });
+      }
+
+      writeValidationAudit(
+        runId, caseAItems, caseBGroups,
+        VALIDATION_SYSTEM_PROMPT, userTurn, rawText,
+        decisions, appliedDecisions,
+        null,
+      );
+
+      const aCount = appliedDecisions.filter((d) => d.type === 'case_a').length;
+      const bCount = appliedDecisions.filter((d) => d.type === 'case_b').length;
+      console.log(`[op-export] Run ${runId}: write+validate complete — ${aCount} Case A, ${bCount} Case B decisions applied.`);
+    } catch (err) {
+      await exec(
+        connection,
+        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+        [runId],
+      ).catch(() => {});
+      throw err;
     }
-
-    await applyValidationDecisions(connection, runId, caseAItems, caseBGroups, decisions);
-
-    const aCount = (decisions.case_a ?? []).length;
-    const bCount = (decisions.case_b ?? []).length;
-    console.log(`[op-export] Run ${runId}: validation complete — ${aCount} Case A, ${bCount} Case B decisions applied.`);
   });
 }
 
@@ -624,23 +719,51 @@ async function runValidationPass(
 // Main export entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * Handles a one-prompt run export request.
+ *
+ * The caller passes `currentStatus` (already queried) so we avoid a redundant
+ * round-trip.  Export always succeeds and returns the run's grouping counts.
+ *
+ * Backend table writes (ONE_PROMPT_LITERAL_ALIAS_MATCHES, ONE_PROMPT_APPROVED_ALIAS_NAMES,
+ * ONE_PROMPT_VALIDATION_LOG) are triggered only on the FIRST export — i.e. when
+ * currentStatus is not already 'validating', 'completed', or 'failed'.
+ * Subsequent exports return the same counts without re-triggering the write pass.
+ */
 export async function runOpExport(
-  connection: any,
-  runId:      number,
-  apiKey:     string,
+  connection:    any,
+  runId:         number,
+  apiKey:        string,
+  currentStatus: string,
 ): Promise<ExportResult> {
   // Step 1 — read state blob.
   const state = await loadOpRunState(connection, runId);
   if (!state) throw new Error(`[op-export] No state found for run_id=${runId}`);
 
-  // Step 2 — write all alias matches + approved names + mark run complete.
-  const result = await writeExportData(connection, runId, state);
+  // Compute return counts from state (always returned regardless of status).
+  const items_written   = state.groups.reduce((n, g) => n + g.items.length, 0);
+  const aliases_updated = new Set(state.groups.map((g) => g.alias_name)).size;
 
-  // Steps 3–5 — fire and forget.  The connection used here is already closing
-  // after this function returns; the validation pass opens its own connection.
-  runValidationPass(runId, state, apiKey).catch((err) => {
-    console.error(`[op-export] Background validation failed for run ${runId}:`, err);
-  });
+  const isFirstExport = currentStatus !== 'validating'
+                     && currentStatus !== 'completed'
+                     && currentStatus !== 'failed';
 
-  return result;
+  if (isFirstExport) {
+    // Step 2 — detect Case A/B from state (no DB writes).
+    const { caseAItems, caseBGroups: rawCaseBGroups } = detectCases(state);
+
+    // Mark run as 'validating' so concurrent first-export calls are recognised.
+    await exec(
+      connection,
+      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+      [runId],
+    );
+
+    // Steps 3–4 — fire and forget. Opens its own Snowflake connection.
+    runWriteAndValidatePass(runId, state, caseAItems, rawCaseBGroups, apiKey).catch((err) => {
+      console.error(`[op-export] Background write+validate failed for run ${runId}:`, err);
+    });
+  }
+
+  return { items_written, aliases_updated };
 }

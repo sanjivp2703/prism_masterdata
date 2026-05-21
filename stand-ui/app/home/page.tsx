@@ -1,51 +1,26 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useState, useMemo } from 'react';
+import Link from 'next/link';
+import { useState, useRef, useCallback } from 'react';
 
 // ── Prism mark (inline SVG — matches brand reference) ─────────────────────
 function PrismMark({ size = 40 }: { size?: number }) {
   const h = size;
-  const w = Math.round(size * 1.28); // ~aspect ratio of the mark
+  const w = Math.round(size * 1.28);
   const cx = w / 2;
   const cy = h / 2;
   return (
     <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} fill="none" aria-hidden="true">
-      {/* Left — dark navy */}
       <polygon points={`0,0 0,${h} ${cx},${cy}`} fill="#1A1A2E" />
-      {/* Right — brand blue */}
       <polygon points={`${w},0 ${w},${h} ${cx},${cy}`} fill="#378ADD" />
-      {/* Centre dot */}
       <circle cx={cx} cy={cy} r={size * 0.065} fill="white" />
     </svg>
   );
 }
 
 // ── Step icons ─────────────────────────────────────────────────────────────
-function IconTable() {
-  return (
-    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
-      <rect x="2" y="2" width="18" height="18" rx="2.5" stroke="currentColor" strokeWidth="1.5" />
-      <line x1="2" y1="8" x2="20" y2="8" stroke="currentColor" strokeWidth="1.5" />
-      <line x1="10" y1="8" x2="10" y2="20" stroke="currentColor" strokeWidth="1.5" />
-    </svg>
-  );
-}
-
-function IconGroup() {
-  return (
-    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
-      {/* Three dots merging into one */}
-      <circle cx="5"  cy="11" r="2" stroke="currentColor" strokeWidth="1.5" />
-      <circle cx="5"  cy="6"  r="2" stroke="currentColor" strokeWidth="1.5" />
-      <circle cx="5"  cy="16" r="2" stroke="currentColor" strokeWidth="1.5" />
-      <path d="M7 6.5 Q13 6.5 13 11 Q13 15.5 7 15.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" fill="none" />
-      <circle cx="15" cy="11" r="2" stroke="currentColor" strokeWidth="1.5" />
-    </svg>
-  );
-}
-
-function IconExport() {
+function IconUpload() {
   return (
     <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
       <path d="M11 3v10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -55,25 +30,160 @@ function IconExport() {
   );
 }
 
-// ── Paste parsing ───────────────────────────────────────────────────────────
+function IconGroup() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+      <circle cx="5" cy="11" r="2" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="5" cy="6"  r="2" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="5" cy="16" r="2" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M7 6.5 Q13 6.5 13 11 Q13 15.5 7 15.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" fill="none" />
+      <circle cx="15" cy="11" r="2" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function IconExport() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+      <rect x="2" y="2" width="18" height="18" rx="2.5" stroke="currentColor" strokeWidth="1.5" />
+      <line x1="2" y1="8" x2="20" y2="8" stroke="currentColor" strokeWidth="1.5" />
+      <line x1="10" y1="8" x2="10" y2="20" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+// ── Spinner ────────────────────────────────────────────────────────────────
+function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+    </svg>
+  );
+}
+
+// ── Back button ─────────────────────────────────────────────────────────────
+function BackBtn({ onClick, disabled }: { onClick: () => void; disabled?: boolean }) {
+  return (
+    <div className="flex justify-center mt-3">
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        className="flex items-center gap-1 text-xs transition-colors disabled:opacity-40"
+        style={{ color: 'var(--text-muted)' }}
+        onMouseEnter={e => { if (!disabled) (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}
+        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+          <path d="M7.5 2L3.5 6l4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        Back
+      </button>
+    </div>
+  );
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────
 type ParsedTable = { title: string; headers: string[]; rows: string[][] };
+type UploadStep = 'idle' | 'parsing' | 'error' | 'select-sheet' | 'select-column' | 'preview' | 'submitting';
 
-function parsePastedTable(text: string): ParsedTable | null {
-  // Strip \r, drop trailing blank lines
-  const lines = text.split('\n').map(l => l.replace(/\r$/, ''));
-  const nonEmpty = lines.filter(l => l.trim() !== '');
-  if (nonEmpty.length < 3) return null; // need title + headers + ≥1 data row
+const ACCEPTED_EXTENSIONS = ['.xlsx', '.xls', '.csv'];
 
-  const title   = (nonEmpty[0].split('\t')[0] ?? '').trim();
-  const headers = nonEmpty[1].split('\t').map(h => h.trim());
-  if (headers.length === 0 || headers.every(h => h === '')) return null;
+function isAcceptedFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return ACCEPTED_EXTENSIONS.some(ext => name.endsWith(ext));
+}
 
-  const rows = nonEmpty.slice(2).map(l => {
-    const cells = l.split('\t');
-    return headers.map((_, i) => (cells[i] ?? '').trim());
-  });
+function isTitleRow(cells: string[]): boolean {
+  // A title row has exactly one populated cell (and it's not a number)
+  const filled = cells.filter(c => c !== '');
+  return filled.length === 1 && isNaN(Number(filled[0]));
+}
 
-  return { title, headers, rows };
+function looksLikeHeaders(cells: string[]): boolean {
+  const filled = cells.filter(c => c !== '');
+  if (filled.length === 0) return false;
+  // All non-empty cells must be non-numeric
+  return filled.every(c => isNaN(Number(c)));
+}
+
+async function parseUploadedFile(file: File, sheetName?: string): Promise<ParsedTable> {
+  const XLSX = await import('xlsx');
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+
+  const targetSheet = sheetName ?? workbook.SheetNames[0];
+  if (!targetSheet) throw new Error('The file appears to be empty.');
+  if (!workbook.Sheets[targetSheet]) throw new Error(`Sheet "${targetSheet}" was not found in the file.`);
+
+  const sheet = workbook.Sheets[targetSheet];
+  const rawRows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: false,
+  }) as (string | number | boolean | null)[][];
+
+  const allRows: string[][] = rawRows.map(row =>
+    row.map(cell => (cell == null ? '' : String(cell).trim()))
+  );
+
+  // Skip leading blank rows
+  const firstNonBlankIdx = allRows.findIndex(row => row.some(c => c !== ''));
+  if (firstNonBlankIdx === -1) {
+    throw new Error('The file appears to be empty — no data was found.');
+  }
+
+  let title = '';
+  let headerRowIdx = firstNonBlankIdx;
+
+  // Detect title row: single cell with a value, rest empty
+  if (isTitleRow(allRows[firstNonBlankIdx])) {
+    title = allRows[firstNonBlankIdx].find(c => c !== '') ?? '';
+    headerRowIdx = firstNonBlankIdx + 1;
+    // Skip any further blank rows
+    while (headerRowIdx < allRows.length && !allRows[headerRowIdx].some(c => c !== '')) {
+      headerRowIdx++;
+    }
+  }
+
+  if (headerRowIdx >= allRows.length) {
+    throw new Error(
+      'Could not find column headers. Make sure your file has a header row with column names followed by data rows. ' +
+      'If there is a title above your headers, that is fine — but the file must have at least one header row and one data row.'
+    );
+  }
+
+  const headerCells = allRows[headerRowIdx];
+
+  if (!looksLikeHeaders(headerCells)) {
+    throw new Error(
+      'The first row contains numbers instead of column names. ' +
+      'Please make sure your column headers are text, in the first row, with no title rows above them. ' +
+      'Your data rows should start in the row immediately below the headers.'
+    );
+  }
+
+  const nonEmptyHeaders = headerCells.filter(c => c !== '');
+  if (nonEmptyHeaders.length === 0) {
+    throw new Error(
+      'No column headers were found. Make sure the first row contains column names.'
+    );
+  }
+
+  const dataRows = allRows
+    .slice(headerRowIdx + 1)
+    .filter(row => row.some(c => c !== ''))
+    .map(row => {
+      const padded = [...row];
+      while (padded.length < headerCells.length) padded.push('');
+      return padded.slice(0, headerCells.length);
+    });
+
+  if (dataRows.length === 0) {
+    throw new Error('No data rows were found below the header row.');
+  }
+
+  return { title, headers: headerCells, rows: dataRows };
 }
 
 // ── Page ───────────────────────────────────────────────────────────────────
@@ -81,26 +191,208 @@ export default function HomePage() {
   const router = useRouter();
 
   // ── Tab state ──────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab] = useState<'snowflake' | 'paste'>('snowflake');
+  const [activeTab, setActiveTab] = useState<'upload' | 'snowflake'>('upload');
 
   // ── Snowflake tab state ────────────────────────────────────────────────
-  const [tableFqn,    setTableFqn]    = useState('TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS');
-  const [columnName,  setColumnName]  = useState('RAW_CARRIER_VALUE');
-  const [loading,     setLoading]     = useState(false);
-  const [error,       setError]       = useState<string | null>(null);
+  const [tableFqn,   setTableFqn]   = useState('TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS');
+  const [columnName, setColumnName] = useState('RAW_CARRIER_VALUE');
+  const [loading,    setLoading]    = useState(false);
+  const [sfError,    setSfError]    = useState<string | null>(null);
 
-  // ── Paste tab state ────────────────────────────────────────────────────
-  const [pasteText,         setPasteText]         = useState('');
-  const [pasteSourceColumn, setPasteSourceColumn] = useState('');
-  const [pasteLoading,      setPasteLoading]      = useState(false);
-  const [pasteError,        setPasteError]        = useState<string | null>(null);
+  // ── Upload tab state ───────────────────────────────────────────────────
+  const [uploadStep,     setUploadStep]     = useState<UploadStep>('idle');
+  const [uploadError,    setUploadError]    = useState<string | null>(null);
+  const [parsedTable,    setParsedTable]    = useState<ParsedTable | null>(null);
+  const [selectedColumn, setSelectedColumn] = useState('');
+  const [previewValues,  setPreviewValues]  = useState<string[]>([]);
+  const [totalRowCount,  setTotalRowCount]  = useState(0);
+  const [distinctCount,  setDistinctCount]  = useState(0);
+  const [isDragging,     setIsDragging]     = useState(false);
+  // Sheet selection state
+  const [currentFile,    setCurrentFile]    = useState<File | null>(null);
+  const [sheetNames,     setSheetNames]     = useState<string[]>([]);
+  const [selectedSheet,  setSelectedSheet]  = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const parsedTable = useMemo(() => parsePastedTable(pasteText), [pasteText]);
+  // Non-empty headers for selection dropdown
+  const availableHeaders = parsedTable
+    ? parsedTable.headers.filter(h => h !== '')
+    : [];
 
-  // index of the typed source column in the detected headers (-1 = not found / not yet typed)
-  const pasteColIdx = parsedTable && pasteSourceColumn.trim()
-    ? parsedTable.headers.findIndex(h => h.toLowerCase() === pasteSourceColumn.trim().toLowerCase())
-    : -1;
+  function computePreview(table: ParsedTable, column: string) {
+    const colIdx = table.headers.findIndex(
+      h => h.toLowerCase() === column.toLowerCase()
+    );
+    if (colIdx === -1) return;
+
+    const allVals = table.rows
+      .map(r => (r[colIdx] ?? '').trim())
+      .filter(v => v !== '');
+
+    const distinct = [...new Set(allVals)];
+    setTotalRowCount(allVals.length);
+    setDistinctCount(distinct.length);
+    setPreviewValues(distinct.slice(0, 15));
+  }
+
+  // Shared: parse a specific sheet and advance to the next step.
+  // Must be defined before processFile / handleSheetConfirm since both call it.
+  const parseAndAdvance = useCallback(async (file: File, sheet: string) => {
+    setUploadStep('parsing');
+    setUploadError(null);
+    setParsedTable(null);
+    setSelectedColumn('');
+    try {
+      const table = await parseUploadedFile(file, sheet);
+      setParsedTable(table);
+      const nonEmpty = table.headers.filter(h => h !== '');
+      if (nonEmpty.length === 1) {
+        const col = nonEmpty[0];
+        setSelectedColumn(col);
+        computePreview(table, col);
+        setUploadStep('preview');
+      } else {
+        setUploadStep('select-column');
+      }
+    } catch (err) {
+      setUploadError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to read the file. Please check the format and try again.'
+      );
+      setUploadStep('error');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const processFile = useCallback(async (file: File) => {
+    if (!isAcceptedFile(file)) {
+      const ext = file.name.includes('.')
+        ? file.name.split('.').pop()?.toUpperCase()
+        : 'unknown';
+      setUploadError(
+        `.${ext} files are not supported. Please upload a .xlsx, .xls, or .csv file.`
+      );
+      setUploadStep('error');
+      return;
+    }
+
+    setUploadStep('parsing');
+    setCurrentFile(file);
+    setUploadError(null);
+
+    try {
+      // Quick read: just get sheet names (bookSheets skips full cell parsing)
+      const XLSX = await import('xlsx');
+      const buffer = await file.arrayBuffer();
+      const wb = XLSX.read(new Uint8Array(buffer), { type: 'array', bookSheets: true });
+      const names: string[] = wb.SheetNames;
+
+      if (names.length > 1) {
+        setSheetNames(names);
+        setSelectedSheet(names[0]);
+        setUploadStep('select-sheet');
+        return;
+      }
+
+      // Single sheet — skip selection, go straight to parsing
+      await parseAndAdvance(file, names[0] ?? '');
+    } catch (err) {
+      setUploadError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to read the file. Please check the format and try again.'
+      );
+      setUploadStep('error');
+    }
+  }, [parseAndAdvance]);
+
+  function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) processFile(file);
+    e.target.value = '';
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) processFile(file);
+  }
+
+  // Single back handler — goes to the natural previous step.
+  function handleBack() {
+    switch (uploadStep) {
+      case 'error':
+      case 'select-sheet':
+        resetUpload();
+        break;
+      case 'select-column':
+        if (sheetNames.length > 1) setUploadStep('select-sheet');
+        else resetUpload();
+        break;
+      case 'preview':
+        if (availableHeaders.length > 1) setUploadStep('select-column');
+        else if (sheetNames.length > 1) setUploadStep('select-sheet');
+        else resetUpload();
+        break;
+    }
+  }
+
+  async function handleSheetConfirm() {
+    if (!currentFile || !selectedSheet) return;
+    await parseAndAdvance(currentFile, selectedSheet);
+  }
+
+  function handleColumnConfirm() {
+    if (!parsedTable || !selectedColumn) return;
+    computePreview(parsedTable, selectedColumn);
+    setUploadStep('preview');
+  }
+
+  function resetUpload() {
+    setUploadStep('idle');
+    setUploadError(null);
+    setParsedTable(null);
+    setSelectedColumn('');
+    setPreviewValues([]);
+    setTotalRowCount(0);
+    setDistinctCount(0);
+    setCurrentFile(null);
+    setSheetNames([]);
+    setSelectedSheet('');
+  }
+
+  async function handleUploadSubmit() {
+    if (!parsedTable || !selectedColumn) return;
+    setUploadStep('submitting');
+
+    try {
+      const exactColName =
+        parsedTable.headers.find(
+          h => h.toLowerCase() === selectedColumn.toLowerCase()
+        ) ?? selectedColumn;
+
+      const res = await fetch('/api/run/create-from-paste', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_column: exactColName,
+          table_json:    JSON.stringify(parsedTable),
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Failed to create run');
+      const run_id = body?.data?.run_id;
+      if (!run_id) throw new Error('Run was created but no ID was returned.');
+      router.push(`/run/${run_id}`);
+    } catch (err) {
+      setUploadError(
+        err instanceof Error ? err.message : 'Something went wrong. Please try again.'
+      );
+      setUploadStep('error');
+    }
+  }
 
   // ── Snowflake submit ───────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
@@ -110,7 +402,7 @@ export default function HomePage() {
     if (!table || !column || loading) return;
 
     setLoading(true);
-    setError(null);
+    setSfError(null);
 
     try {
       const res = await fetch('/api/runs', {
@@ -129,50 +421,18 @@ export default function HomePage() {
       if (!run_id) throw new Error('Run was created but no ID was returned.');
       router.push(`/run/${run_id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
+      setSfError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
       setLoading(false);
     }
   }
 
-  // ── Paste submit ───────────────────────────────────────────────────────
-  async function handlePasteSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!parsedTable || pasteColIdx === -1 || pasteLoading) return;
-
-    setPasteLoading(true);
-    setPasteError(null);
-
-    try {
-      // Use exact casing from detected headers
-      const exactColName = parsedTable.headers[pasteColIdx];
-
-      const res = await fetch('/api/run/create-from-paste', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source_column: exactColName,
-          table_json:    JSON.stringify(parsedTable),
-        }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error || 'Failed to create run');
-      const run_id = body?.data?.run_id;
-      if (!run_id) throw new Error('Run was created but no ID was returned.');
-      router.push(`/run/${run_id}`);
-    } catch (err) {
-      setPasteError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
-      setPasteLoading(false);
-    }
-  }
-
-  const canSubmit      = tableFqn.trim().length > 0 && columnName.trim().length > 0 && !loading;
-  const pasteCanSubmit = parsedTable !== null && pasteColIdx !== -1 && !pasteLoading;
+  const canSubmit = tableFqn.trim().length > 0 && columnName.trim().length > 0 && !loading;
 
   const steps = [
     {
-      icon:  <IconTable />,
-      label: 'Enter table & column',
-      sub:   'Point Prism at the source data you want to clean up',
+      icon:  <IconUpload />,
+      label: 'Upload or connect your data',
+      sub:   'Point Prism at the source values you want to standardize',
     },
     {
       icon:  <IconGroup />,
@@ -181,7 +441,7 @@ export default function HomePage() {
     },
     {
       icon:  <IconExport />,
-      label: 'Export to Snowflake',
+      label: 'Export clean mappings',
       sub:   "Write canonical mappings back when you're happy with the result",
     },
   ];
@@ -196,12 +456,11 @@ export default function HomePage() {
     >
       <div className="w-full max-w-5xl mx-auto">
 
-        {/* ── Two-column layout ───────────────────────────────────────── */}
+        {/* ── Two-column layout ──────────────────────────────────────────── */}
         <div className="grid grid-cols-[1fr_1fr] gap-16 items-center">
 
-          {/* ── Left: logo, tagline, steps ───────────────────────────── */}
+          {/* ── Left: logo, tagline, steps ───────────────────────────────── */}
           <div>
-            {/* Lockup */}
             <div className="flex items-center gap-3 mb-5">
               <PrismMark size={42} />
               <span
@@ -212,7 +471,6 @@ export default function HomePage() {
               </span>
             </div>
 
-            {/* Tagline */}
             <p
               className="text-[15px] leading-relaxed mb-12"
               style={{ color: 'var(--text-secondary)', maxWidth: 360 }}
@@ -222,7 +480,6 @@ export default function HomePage() {
               canonical data.
             </p>
 
-            {/* Steps */}
             <div className="flex flex-col gap-6">
               {steps.map(({ icon, label, sub }, i) => (
                 <div key={i} className="flex items-start gap-4">
@@ -243,9 +500,46 @@ export default function HomePage() {
                 </div>
               ))}
             </div>
+
+            {/* ── Global Standardizations link ─────────────────────────── */}
+            <div className="mt-10 pt-6" style={{ borderTop: '0.5px solid var(--border)' }}>
+              <Link
+                href="/global-standardizations"
+                className="group inline-flex items-center gap-3 w-full rounded-card border-[0.5px] px-4 py-3.5 transition-colors"
+                style={{ borderColor: '#C7D2FE', backgroundColor: '#EEF2FF' }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLAnchorElement).style.backgroundColor = '#E0E7FF';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLAnchorElement).style.backgroundColor = '#EEF2FF';
+                }}
+              >
+                <div
+                  className="w-8 h-8 rounded-[8px] flex items-center justify-center flex-shrink-0"
+                  style={{ backgroundColor: '#6366F1', color: 'white' }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <rect x="1" y="3" width="14" height="2" rx="1" fill="currentColor" />
+                    <rect x="1" y="7" width="10" height="2" rx="1" fill="currentColor" />
+                    <rect x="1" y="11" width="12" height="2" rx="1" fill="currentColor" />
+                  </svg>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold" style={{ color: '#3730A3' }}>
+                    Global Standardizations
+                  </p>
+                  <p className="text-xs mt-0.5" style={{ color: '#6366F1' }}>
+                    View &amp; edit the canonical library across all runs
+                  </p>
+                </div>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" style={{ color: '#6366F1' }}>
+                  <path d="M6 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </Link>
+            </div>
           </div>
 
-          {/* ── Right: tabs + form ───────────────────────────────────── */}
+          {/* ── Right: tabs + form ───────────────────────────────────────── */}
           <div>
 
             {/* Tab navigation */}
@@ -254,8 +548,8 @@ export default function HomePage() {
               style={{ borderBottom: '0.5px solid var(--border)' }}
             >
               {([
+                { id: 'upload',    label: 'Upload File' },
                 { id: 'snowflake', label: 'Snowflake Table' },
-                { id: 'paste',     label: 'Excel / Google Sheets' },
               ] as const).map(({ id, label }) => (
                 <button
                   key={id}
@@ -279,14 +573,301 @@ export default function HomePage() {
                 backgroundColor: 'var(--surface)',
                 borderColor:     'var(--border)',
                 padding:         'var(--card-padding)',
-                borderTopLeftRadius: activeTab === 'snowflake' ? 0 : undefined,
+                borderTopLeftRadius: activeTab === 'upload' ? 0 : undefined,
               }}
             >
 
-              {/* ── Snowflake tab ─────────────────────────────────────── */}
+              {/* ── Upload tab ────────────────────────────────────────────── */}
+              {activeTab === 'upload' && (
+                <div>
+
+                  {/* Hidden file input */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={handleFileInputChange}
+                  />
+
+                  {/* ── Step: idle (drop zone) ─────────────────────────── */}
+                  {uploadStep === 'idle' && (
+                    <div>
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => fileInputRef.current?.click()}
+                        onKeyDown={e => e.key === 'Enter' && fileInputRef.current?.click()}
+                        onDrop={handleDrop}
+                        onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+                        onDragEnter={e => { e.preventDefault(); setIsDragging(true); }}
+                        onDragLeave={() => setIsDragging(false)}
+                        className="w-full flex flex-col items-center justify-center gap-3 rounded-[10px] border-[1.5px] border-dashed cursor-pointer transition-colors py-10"
+                        style={{
+                          borderColor:     isDragging ? 'var(--accent)' : 'var(--border)',
+                          backgroundColor: isDragging ? 'var(--accent-tint)' : 'transparent',
+                        }}
+                      >
+                        <div
+                          className="w-11 h-11 rounded-[10px] flex items-center justify-center"
+                          style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)' }}
+                        >
+                          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+                            <path d="M11 13V3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                            <path d="M7.5 6L11 2.5L14.5 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M4 13.5V17A1.5 1.5 0 005.5 18.5h11A1.5 1.5 0 0018 17v-3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                          </svg>
+                        </div>
+                        <div className="text-center">
+                          <p className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                            {isDragging ? 'Drop file here' : 'Drop your file here'}
+                          </p>
+                          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                            or{' '}
+                            <span style={{ color: 'var(--accent)' }}>browse to upload</span>
+                          </p>
+                        </div>
+                        <p className="text-xs" style={{ color: 'var(--text-hint)' }}>
+                          Accepts .xlsx, .xls, .csv
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Step: parsing ─────────────────────────────────── */}
+                  {uploadStep === 'parsing' && (
+                    <div className="flex flex-col items-center justify-center gap-3 py-12">
+                      <Spinner className="w-6 h-6" />
+                      <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                        Reading file…
+                      </p>
+                    </div>
+                  )}
+
+                  {/* ── Step: error ───────────────────────────────────── */}
+                  {uploadStep === 'error' && (
+                    <div>
+                      <div
+                        className="rounded-[10px] border-[0.5px] px-4 py-4 mb-5 text-sm leading-relaxed"
+                        style={{
+                          backgroundColor: '#FEF2F2',
+                          borderColor:     '#FECACA',
+                          color:           'var(--confidence-low)',
+                        }}
+                      >
+                        {uploadError}
+                      </div>
+                      <BackBtn onClick={handleBack} />
+                    </div>
+                  )}
+
+                  {/* ── Step: select-sheet ────────────────────────────── */}
+                  {uploadStep === 'select-sheet' && (
+                    <div>
+                      <p className="text-sm font-medium mb-1" style={{ color: 'var(--text-primary)' }}>
+                        This file has multiple sheets. Which one should we use?
+                      </p>
+                      <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>
+                        {sheetNames.length} sheets found
+                      </p>
+
+                      <div className="mb-6">
+                        {sheetNames.map(name => (
+                          <button
+                            key={name}
+                            onClick={() => setSelectedSheet(name)}
+                            className="w-full text-left px-3.5 py-2.5 rounded-[8px] text-sm mb-1.5 border-[0.5px] transition-colors"
+                            style={{
+                              borderColor:     selectedSheet === name ? 'var(--accent)' : 'var(--border)',
+                              backgroundColor: selectedSheet === name ? 'var(--accent-tint)' : 'var(--surface)',
+                              color:           selectedSheet === name ? 'var(--accent)' : 'var(--text-primary)',
+                              fontWeight:      selectedSheet === name ? 500 : 400,
+                            }}
+                          >
+                            {name}
+                          </button>
+                        ))}
+                      </div>
+
+                      <button
+                        onClick={handleSheetConfirm}
+                        disabled={!selectedSheet}
+                        className="w-full py-3 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ backgroundColor: 'var(--accent)' }}
+                        onMouseEnter={e => {
+                          if (selectedSheet) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)';
+                        }}
+                      >
+                        Use &ldquo;{selectedSheet}&rdquo;
+                      </button>
+
+                      <BackBtn onClick={handleBack} />
+                    </div>
+                  )}
+
+                  {/* ── Step: select-column ───────────────────────────── */}
+                  {uploadStep === 'select-column' && parsedTable && (
+                    <div>
+                      <p className="text-sm font-medium mb-1" style={{ color: 'var(--text-primary)' }}>
+                        Which column contains the values to standardize?
+                      </p>
+                      <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>
+                        {availableHeaders.length} column{availableHeaders.length !== 1 ? 's' : ''} detected
+                        {parsedTable.title && (
+                          <> · <span style={{ color: 'var(--text-secondary)' }}>{parsedTable.title}</span></>
+                        )}
+                      </p>
+
+                      <div className="mb-6">
+                        <select
+                          value={selectedColumn}
+                          onChange={e => setSelectedColumn(e.target.value)}
+                          className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors"
+                          style={{
+                            borderColor:     selectedColumn ? 'var(--accent)' : 'var(--border)',
+                            backgroundColor: 'var(--surface)',
+                            color:           selectedColumn ? 'var(--text-primary)' : 'var(--text-muted)',
+                          }}
+                        >
+                          <option value="" disabled>Select a column…</option>
+                          {availableHeaders.map(h => (
+                            <option key={h} value={h}>{h}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <button
+                        onClick={handleColumnConfirm}
+                        disabled={!selectedColumn}
+                        className="w-full py-3 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ backgroundColor: 'var(--accent)' }}
+                        onMouseEnter={e => {
+                          if (selectedColumn) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)';
+                        }}
+                      >
+                        Continue
+                      </button>
+
+                      <BackBtn onClick={handleBack} />
+                    </div>
+                  )}
+
+                  {/* ── Step: preview / submitting ────────────────────── */}
+                  {(uploadStep === 'preview' || uploadStep === 'submitting') && parsedTable && (
+                    <div>
+                      {/* Stats row */}
+                      <div
+                        className="flex items-center gap-4 rounded-[8px] px-4 py-3 mb-5"
+                        style={{ backgroundColor: 'var(--accent-tint)' }}
+                      >
+                        <div className="text-center">
+                          <p className="text-lg font-semibold leading-none" style={{ color: 'var(--accent)' }}>
+                            {totalRowCount.toLocaleString()}
+                          </p>
+                          <p className="text-[11px] mt-1" style={{ color: 'var(--text-muted)' }}>total rows</p>
+                        </div>
+                        <div
+                          className="w-px h-8 flex-shrink-0"
+                          style={{ backgroundColor: 'var(--border)' }}
+                        />
+                        <div className="text-center">
+                          <p className="text-lg font-semibold leading-none" style={{ color: 'var(--accent)' }}>
+                            {distinctCount.toLocaleString()}
+                          </p>
+                          <p className="text-[11px] mt-1" style={{ color: 'var(--text-muted)' }}>distinct values</p>
+                        </div>
+                        <div className="ml-auto text-right">
+                          <p className="text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+                            {selectedColumn}
+                          </p>
+                          {parsedTable.title && (
+                            <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                              {parsedTable.title}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Preview list */}
+                      <div className="mb-1">
+                        <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>
+                          Preview{previewValues.length < distinctCount ? ` (first ${previewValues.length} of ${distinctCount.toLocaleString()})` : ''}
+                        </p>
+                        <div
+                          className="rounded-[8px] border-[0.5px] overflow-hidden"
+                          style={{ borderColor: 'var(--border)' }}
+                        >
+                          {previewValues.map((val, i) => (
+                            <div
+                              key={i}
+                              className="px-3.5 py-2 text-sm"
+                              style={{
+                                color:           'var(--text-primary)',
+                                borderTop:       i > 0 ? '0.5px solid var(--border)' : undefined,
+                                backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent',
+                              }}
+                            >
+                              {val}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] mb-5 mt-2" style={{ color: 'var(--text-muted)' }}>
+                        Duplicate rows were removed silently. The run will use {distinctCount.toLocaleString()} distinct value{distinctCount !== 1 ? 's' : ''}.
+                      </p>
+
+                      {uploadError && (
+                        <div
+                          className="rounded-button border-[0.5px] px-4 py-3 mb-4 text-sm"
+                          style={{
+                            backgroundColor: '#FEF2F2',
+                            borderColor:     '#FECACA',
+                            color:           'var(--confidence-low)',
+                          }}
+                        >
+                          {uploadError}
+                        </div>
+                      )}
+
+                      <button
+                        onClick={handleUploadSubmit}
+                        disabled={uploadStep === 'submitting'}
+                        className="w-full py-3 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                        style={{ backgroundColor: 'var(--accent)' }}
+                        onMouseEnter={e => {
+                          if (uploadStep !== 'submitting') (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)';
+                        }}
+                      >
+                        {uploadStep === 'submitting' ? (
+                          <span className="inline-flex items-center justify-center gap-2">
+                            <Spinner />
+                            Creating run…
+                          </span>
+                        ) : (
+                          'Looks right — start standardization'
+                        )}
+                      </button>
+
+                      <BackBtn onClick={handleBack} disabled={uploadStep === 'submitting'} />
+                    </div>
+                  )}
+
+                </div>
+              )}
+
+              {/* ── Snowflake tab ──────────────────────────────────────────── */}
               {activeTab === 'snowflake' && (
                 <form onSubmit={handleSubmit}>
-                  {/* Source table */}
                   <div className="mb-5">
                     <label
                       htmlFor="table-fqn"
@@ -299,7 +880,7 @@ export default function HomePage() {
                       id="table-fqn"
                       type="text"
                       value={tableFqn}
-                      onChange={(e) => setTableFqn(e.target.value)}
+                      onChange={e => setTableFqn(e.target.value)}
                       placeholder="DATABASE.SCHEMA.TABLE_NAME"
                       autoCapitalize="off"
                       autoCorrect="off"
@@ -312,15 +893,14 @@ export default function HomePage() {
                         backgroundColor: 'var(--surface)',
                         color:           'var(--text-primary)',
                       }}
-                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                      onBlur={(e)  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+                      onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+                      onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
                     />
                     <p className="mt-1.5 text-xs" style={{ color: 'var(--text-hint)' }}>
                       Fully qualified — database, schema, and table name separated by dots
                     </p>
                   </div>
 
-                  {/* Column */}
                   <div className="mb-7">
                     <label
                       htmlFor="column-name"
@@ -333,7 +913,7 @@ export default function HomePage() {
                       id="column-name"
                       type="text"
                       value={columnName}
-                      onChange={(e) => setColumnName(e.target.value)}
+                      onChange={e => setColumnName(e.target.value)}
                       placeholder="COLUMN_NAME"
                       autoCapitalize="off"
                       autoCorrect="off"
@@ -346,15 +926,15 @@ export default function HomePage() {
                         backgroundColor: 'var(--surface)',
                         color:           'var(--text-primary)',
                       }}
-                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                      onBlur={(e)  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+                      onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+                      onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
                     />
                     <p className="mt-1.5 text-xs" style={{ color: 'var(--text-hint)' }}>
                       The column containing the raw values to standardize
                     </p>
                   </div>
 
-                  {error && (
+                  {sfError && (
                     <div
                       className="rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
                       style={{
@@ -363,7 +943,7 @@ export default function HomePage() {
                         color:           'var(--confidence-low)',
                       }}
                     >
-                      {error}
+                      {sfError}
                     </div>
                   )}
 
@@ -372,19 +952,16 @@ export default function HomePage() {
                     disabled={!canSubmit}
                     className="w-full py-3 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ backgroundColor: 'var(--accent)' }}
-                    onMouseEnter={(e) => {
+                    onMouseEnter={e => {
                       if (canSubmit) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)';
                     }}
-                    onMouseLeave={(e) => {
+                    onMouseLeave={e => {
                       (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)';
                     }}
                   >
                     {loading ? (
                       <span className="inline-flex items-center justify-center gap-2">
-                        <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-                        </svg>
+                        <Spinner />
                         Creating run…
                       </span>
                     ) : (
@@ -394,151 +971,6 @@ export default function HomePage() {
 
                   <p className="mt-4 text-xs text-center" style={{ color: 'var(--text-hint)' }}>
                     Nothing is written back until you export after reviewing.
-                  </p>
-                </form>
-              )}
-
-              {/* ── Paste tab ─────────────────────────────────────────── */}
-              {activeTab === 'paste' && (
-                <form onSubmit={handlePasteSubmit}>
-                  <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>
-                    Copy your spreadsheet from Excel or Google Sheets and paste it below.
-                    The <strong>first row</strong> is the title,
-                    the <strong>second row</strong> is column headers,
-                    and the remaining rows are data.
-                  </p>
-
-                  {/* Table textarea */}
-                  <div className="mb-5">
-                    <label
-                      htmlFor="paste-table"
-                      className="block text-sm font-medium mb-1.5"
-                      style={{ color: 'var(--text-primary)' }}
-                    >
-                      Paste table
-                    </label>
-                    <textarea
-                      id="paste-table"
-                      value={pasteText}
-                      onChange={(e) => setPasteText(e.target.value)}
-                      placeholder="Paste here…"
-                      rows={8}
-                      disabled={pasteLoading}
-                      className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50 resize-y font-mono"
-                      style={{
-                        borderColor:     'var(--border)',
-                        backgroundColor: 'var(--surface)',
-                        color:           'var(--text-primary)',
-                      }}
-                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                      onBlur={(e)  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
-                    />
-                    {parsedTable && (
-                      <p className="mt-1.5 text-xs" style={{ color: 'var(--text-hint)' }}>
-                        {parsedTable.title && (
-                          <><strong style={{ color: 'var(--text-secondary)' }}>{parsedTable.title}</strong>{' · '}</>
-                        )}
-                        {parsedTable.headers.length} column{parsedTable.headers.length !== 1 ? 's' : ''}
-                        {' · '}
-                        {parsedTable.rows.length} row{parsedTable.rows.length !== 1 ? 's' : ''}
-                      </p>
-                    )}
-                  </div>
-
-                  {/* Source column textbox */}
-                  <div className="mb-7">
-                    <label
-                      htmlFor="paste-source-col"
-                      className="block text-sm font-medium mb-1.5"
-                      style={{ color: 'var(--text-primary)' }}
-                    >
-                      Source column
-                    </label>
-                    <input
-                      id="paste-source-col"
-                      type="text"
-                      list="paste-col-hints"
-                      value={pasteSourceColumn}
-                      onChange={(e) => setPasteSourceColumn(e.target.value)}
-                      placeholder="Column name to standardize"
-                      autoCapitalize="off"
-                      autoCorrect="off"
-                      autoComplete="off"
-                      spellCheck={false}
-                      disabled={pasteLoading}
-                      className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"
-                      style={{
-                        borderColor:     pasteSourceColumn.trim() && parsedTable && pasteColIdx === -1
-                          ? '#FECACA' : 'var(--border)',
-                        backgroundColor: 'var(--surface)',
-                        color:           'var(--text-primary)',
-                      }}
-                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                      onBlur={(e)  => {
-                        e.currentTarget.style.borderColor =
-                          pasteSourceColumn.trim() && parsedTable && pasteColIdx === -1
-                            ? '#FECACA' : 'var(--border)';
-                      }}
-                    />
-                    {parsedTable && (
-                      <datalist id="paste-col-hints">
-                        {parsedTable.headers.map(h => <option key={h} value={h} />)}
-                      </datalist>
-                    )}
-                    <p className="mt-1.5 text-xs" style={{ color: 'var(--text-hint)' }}>
-                      {pasteSourceColumn.trim() && parsedTable && pasteColIdx === -1
-                        ? <span style={{ color: 'var(--confidence-low)' }}>
-                            Column not found. Available: {parsedTable.headers.join(', ')}
-                          </span>
-                        : pasteColIdx !== -1
-                        ? <span style={{ color: 'var(--confidence-high)' }}>
-                            ✓ Found — {[...new Set(parsedTable!.rows.map(r => r[pasteColIdx]).filter(Boolean))].length} distinct values
-                          </span>
-                        : 'The column containing the raw values to standardize'
-                      }
-                    </p>
-                  </div>
-
-                  {pasteError && (
-                    <div
-                      className="rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
-                      style={{
-                        backgroundColor: '#FEF2F2',
-                        borderColor:     '#FECACA',
-                        color:           'var(--confidence-low)',
-                      }}
-                    >
-                      {pasteError}
-                    </div>
-                  )}
-
-                  <button
-                    type="submit"
-                    disabled={!pasteCanSubmit}
-                    className="w-full py-3 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    style={{ backgroundColor: 'var(--accent)' }}
-                    onMouseEnter={(e) => {
-                      if (pasteCanSubmit) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)';
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)';
-                    }}
-                  >
-                    {pasteLoading ? (
-                      <span className="inline-flex items-center justify-center gap-2">
-                        <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-                        </svg>
-                        Creating run…
-                      </span>
-                    ) : (
-                      'Run Standardization →'
-                    )}
-                  </button>
-
-                  <p className="mt-4 text-xs text-center" style={{ color: 'var(--text-hint)' }}>
-                    Your full table will be exported with the standardized column added.
                   </p>
                 </form>
               )}

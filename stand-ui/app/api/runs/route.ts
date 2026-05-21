@@ -1,4 +1,21 @@
 import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { saveOpRunState, type OpRunState } from '@/app/api/_lib/op-auto-group';
+
+function quoteIdent(ident: string) {
+  return `"${String(ident).replace(/"/g, '""')}"`;
+}
+
+function parseFqn(fqn: string) {
+  const parts = String(fqn).split('.').map((p) => p.trim());
+  if (parts.length !== 3) {
+    throw new Error(`Expected DB.SCHEMA.TABLE, got: ${fqn}`);
+  }
+  return { db: parts[0], schema: parts[1], table: parts[2] };
+}
+
+function isSimpleIdent(s: string) {
+  return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(s);
+}
 
 async function exec(connection: any, sqlText: string, binds?: any[]) {
   return await new Promise<any[]>((resolve, reject) => {
@@ -26,66 +43,110 @@ export async function POST(request: Request) {
   const column_name = String(body?.column_name  ?? '').trim();
   const mode        = String(body?.mode         ?? 'review').trim();
 
-  if (!table_fqn) {
-    return Response.json({ error: 'table_fqn is required' }, { status: 400 });
+  if (!table_fqn)   return Response.json({ error: 'table_fqn is required' },   { status: 400 });
+  if (!column_name) return Response.json({ error: 'column_name is required' }, { status: 400 });
+
+  // Validate FQN format
+  let db: string, schema: string, table: string;
+  try {
+    const fqn = parseFqn(table_fqn);
+    db = fqn.db; schema = fqn.schema; table = fqn.table;
+  } catch {
+    return Response.json(
+      { error: `Invalid table_fqn format. Expected DB.SCHEMA.TABLE, got: ${table_fqn}` },
+      { status: 400 }
+    );
   }
-  if (!column_name) {
-    return Response.json({ error: 'column_name is required' }, { status: 400 });
+
+  if (!isSimpleIdent(db) || !isSimpleIdent(schema) || !isSimpleIdent(table) || !isSimpleIdent(column_name)) {
+    return Response.json({ error: 'Table or column name contains unsupported characters.' }, { status: 400 });
   }
 
   try {
     return await withSnowflake(async (connection) => {
-      const rows = await exec(
+      // Look up concept_id.
+      const conceptRows = await exec(
         connection,
-        `CALL STAND_DB.STAND.CREATE_RUN(?, ?, ?, ?)`,
-        [concept_key, table_fqn, column_name, mode]
+        `SELECT concept_id FROM STAND_DB.STAND_INTERNAL.CONCEPTS WHERE concept_key = ? LIMIT 1`,
+        [concept_key]
       );
+      if (!conceptRows.length) {
+        return Response.json({ error: `Concept "${concept_key}" not found.` }, { status: 400 });
+      }
+      const conceptId = Number(conceptRows[0].CONCEPT_ID ?? conceptRows[0].concept_id);
 
-      // The procedure returns a VARCHAR; the Snowflake driver surfaces it
-      // under the procedure name as the column key (uppercase).
-      const resultMsg = String(
-        rows?.[0]?.CREATE_RUN ?? rows?.[0]?.create_run ?? ''
-      );
-
-      if (resultMsg.startsWith('ERROR:')) {
-        let detail = resultMsg.replace(/^ERROR:\s*/i, '');
-
-        // Parse the structured STEP=... SQLCODE=... SQLERRM=... format
-        // from the stored procedure's catch-all exception handler and convert
-        // known patterns into human-readable messages.
-        const stepMatch = detail.match(/^STEP=(\S+)\s+SQLCODE=(\d+)\s+SQLERRM=(.*)/s);
-        if (stepMatch) {
-          const step     = stepMatch[1];
-          const sqlcode  = stepMatch[2];
-          const sqlerrm  = stepMatch[3].trim();
-
-          if ((step === 'tmp_source_values_fill' || step === 'probe_column_access') && sqlcode === '904') {
-            // Invalid identifier — the column name doesn't exist in the source table.
-            const colMatch = sqlerrm.match(/invalid identifier '([^']+)'/i);
-            const colName  = colMatch ? colMatch[1] : column_name;
-            detail = `Column "${colName}" was not found in table ${table_fqn}. Please check the column name and try again.`;
-          } else if (step === 'probe_table_access' || (sqlcode === '2003' || sqlcode === '90083')) {
-            detail = `Table "${table_fqn}" does not exist or you do not have access.`;
-          } else {
-            // Generic structured error — still cleaner than raw STEP=... output.
-            detail = `${sqlerrm} (step: ${step})`;
-          }
+      // Probe the source table and fetch distinct values with frequencies.
+      const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+      const colRef   = quoteIdent(column_name);
+      let valueRows: any[];
+      try {
+        valueRows = await exec(
+          connection,
+          `SELECT DISTINCT TO_VARCHAR(${colRef}) AS literal_value,
+                  COUNT(*) AS source_frequency
+           FROM ${tableRef}
+           WHERE ${colRef} IS NOT NULL
+           GROUP BY TO_VARCHAR(${colRef})
+           ORDER BY source_frequency DESC`
+        );
+      } catch (e: any) {
+        const msg = String(e?.message ?? e ?? '');
+        if (/invalid identifier/i.test(msg)) {
+          return Response.json(
+            { error: `Column "${column_name}" was not found in table ${table_fqn}.` },
+            { status: 400 }
+          );
         }
-
-        return Response.json({ error: detail }, { status: 400 });
+        if (/does not exist|not found|unauthorized|object.*not.*found/i.test(msg)) {
+          return Response.json(
+            { error: `Table "${table_fqn}" does not exist or you do not have access.` },
+            { status: 400 }
+          );
+        }
+        throw e;
       }
 
-      // Result message contains "Run ID: <n>" somewhere in its body.
-      const match = resultMsg.match(/Run ID:\s*(\d+)/i);
-      if (!match) {
-        console.error('CREATE_RUN unexpected response:', resultMsg);
+      // Create the run row. Use a nonce so we can retrieve the auto-assigned run_id.
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      await exec(
+        connection,
+        `INSERT INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+           (concept_id, source_relation, source_column, mode, run_status, creation_nonce, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'created', ?, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`,
+        [conceptId, table_fqn, column_name, mode, nonce]
+      );
+
+      const runIdRows = await exec(
+        connection,
+        `SELECT run_id FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+         WHERE creation_nonce = ? LIMIT 1`,
+        [nonce]
+      );
+      if (!runIdRows.length) {
         return Response.json(
-          { error: 'Run was created but the run ID could not be parsed from the response.' },
+          { error: 'Run was created but the run ID could not be retrieved.' },
           { status: 500 }
         );
       }
+      const run_id = Number(runIdRows[0].RUN_ID ?? runIdRows[0].run_id);
 
-      const run_id = Number(match[1]);
+      // Build and persist the initial state blob.
+      const initialState: OpRunState = {
+        status:    'created',
+        items:     valueRows.map((row, idx) => ({
+          run_item_id:         idx + 1,
+          literal_value:       String(row.LITERAL_VALUE ?? row.literal_value ?? ''),
+          source_frequency:    Number(row.SOURCE_FREQUENCY ?? row.source_frequency ?? 1),
+          matched_from_lookup: false,
+        })),
+        groups:    [],
+        ungrouped: valueRows.map((row) => ({
+          literal_value:       String(row.LITERAL_VALUE ?? row.literal_value ?? ''),
+          matched_from_lookup: false,
+        })),
+      };
+      await saveOpRunState(connection, run_id, initialState);
+
       return Response.json({ data: { run_id } }, { status: 201 });
     });
   } catch (error) {
