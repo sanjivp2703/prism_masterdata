@@ -42,6 +42,7 @@ export async function POST(request: Request) {
   const table_fqn   = String(body?.table_fqn   ?? '').trim();
   const column_name = String(body?.column_name  ?? '').trim();
   const mode        = String(body?.mode         ?? 'review').trim();
+  const domain_id   = body?.domain_id != null ? Number(body.domain_id) : null;
 
   if (!table_fqn)   return Response.json({ error: 'table_fqn is required' },   { status: 400 });
   if (!column_name) return Response.json({ error: 'column_name is required' }, { status: 400 });
@@ -64,17 +65,6 @@ export async function POST(request: Request) {
 
   try {
     return await withSnowflake(async (connection) => {
-      // Look up concept_id.
-      const conceptRows = await exec(
-        connection,
-        `SELECT concept_id FROM STAND_DB.STAND_INTERNAL.CONCEPTS WHERE concept_key = ? LIMIT 1`,
-        [concept_key]
-      );
-      if (!conceptRows.length) {
-        return Response.json({ error: `Concept "${concept_key}" not found.` }, { status: 400 });
-      }
-      const conceptId = Number(conceptRows[0].CONCEPT_ID ?? conceptRows[0].concept_id);
-
       // Probe the source table and fetch distinct values with frequencies.
       const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
       const colRef   = quoteIdent(column_name);
@@ -110,15 +100,28 @@ export async function POST(request: Request) {
       const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
       await exec(
         connection,
-        `INSERT INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
-           (concept_id, source_relation, source_column, mode, run_status, creation_nonce, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'created', ?, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`,
-        [conceptId, table_fqn, column_name, mode, nonce]
+        `INSERT INTO STAND_DB.STAND_INTERNAL.RUNS
+           (concept_key, source_relation, source_column, mode, domain_id, run_status, creation_nonce, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ${domain_id != null ? String(Number(domain_id)) : 'NULL'}, 'created', ?, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`,
+        [concept_key, table_fqn, column_name, mode, nonce]
       );
+
+      // Bump the domain's usage_count + last_used_at if a domain was provided
+      if (domain_id != null && Number.isFinite(domain_id)) {
+        await exec(
+          connection,
+          `UPDATE STAND_DB.STAND_INTERNAL.DOMAINS
+           SET usage_count  = usage_count + 1,
+               last_used_at = CURRENT_TIMESTAMP(),
+               updated_at   = CURRENT_TIMESTAMP()
+           WHERE domain_id = ?`,
+          [domain_id],
+        );
+      }
 
       const runIdRows = await exec(
         connection,
-        `SELECT run_id FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+        `SELECT run_id FROM STAND_DB.STAND_INTERNAL.RUNS
          WHERE creation_nonce = ? LIMIT 1`,
         [nonce]
       );

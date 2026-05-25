@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 
 const UNGROUPED_KEY = '__UNGROUPED__';
 
@@ -125,6 +126,9 @@ export default function RunReviewClient({
   runId: string;
   initialRunStatus?: string;
 }) {
+  const router = useRouter();
+  const isAutoExport = process.env.NEXT_PUBLIC_APP_MODE === 'premium';
+
   const [aliasMap, setAliasMap] = useState<AliasMap | null>(null);
   const [uiAliasMap, setUiAliasMap] = useState<AliasMap | null>(null);
   const [aliasMapError, setAliasMapError] = useState<string | null>(null);
@@ -629,7 +633,7 @@ export default function RunReviewClient({
         deterministic_elapsed_ms: 0,
       });
 
-      const res = await fetch(`/api/one-prompt/runs/${runId}/auto-group`, {
+      const res = await fetch(`/api/run/${runId}/auto-group`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ run_item_ids: ungroupedIds }),
@@ -680,7 +684,7 @@ export default function RunReviewClient({
     setCopiedSql(false);
 
     try {
-      const res = await fetch(`/api/run/${runId}/export-to-snowflake`, {
+      const res = await fetch(`/api/run/${runId}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -694,7 +698,6 @@ export default function RunReviewClient({
           alias_name_changes: Object.entries(pendingAliasNames).map(([group_id, alias_name_literal_value]) => ({
             group_id: Number(group_id), alias_name_literal_value,
           })),
-          include_original_col: includeOriginalCol,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -716,6 +719,41 @@ export default function RunReviewClient({
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed');
     } finally {
+      setExporting(false);
+    }
+  }
+
+  async function doAcceptStandardizations() {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const res = await fetch(`/api/run/${runId}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          new_groups: Object.entries(uiAliasMap || {})
+            .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
+            .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
+            .map(([alias_name_literal_value, g]) => ({ temp_group_id: g.group_id, alias_name_literal_value })),
+          moves: Object.entries(pendingMoves).map(([run_item_id, group_id]) => ({
+            run_item_id: Number(run_item_id), group_id,
+          })),
+          alias_name_changes: Object.entries(pendingAliasNames).map(([group_id, alias_name_literal_value]) => ({
+            group_id: Number(group_id), alias_name_literal_value,
+          })),
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Failed to accept standardizations');
+
+      // If a pipeline_id came back, stash it so the home page shows the activation card
+      if (body?.pipeline_id) {
+        localStorage.setItem('prism_ae_pending_pipeline_id', String(body.pipeline_id));
+      }
+
+      router.push('/home');
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : 'Failed to accept standardizations');
       setExporting(false);
     }
   }
@@ -849,7 +887,7 @@ export default function RunReviewClient({
   // Never blocks the download; errors are silently swallowed.
 
   function triggerOpExport(): void {
-    fetch(`/api/one-prompt/runs/${runId}/export`, { method: 'POST' }).catch(() => {});
+    fetch(`/api/run/${runId}/export`, { method: 'POST' }).catch(() => {});
   }
 
   // ── CSV / Excel helpers ───────────────────────────────────────────────────
@@ -975,33 +1013,49 @@ export default function RunReviewClient({
               {totalGroups}
             </span>
 
-            <button
-              type="button"
-              onClick={() => void openDownloadModal()}
-              disabled={loadingAliasMap || !!aliasMapError}
-              className="px-3 py-1.5 rounded-button text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ backgroundColor: '#4BAE4F', color: '#FFFFFF' }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#439A47';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#4BAE4F';
-              }}
-            >
-              Export to Spreadsheet
-            </button>
+            {isAutoExport ? (
+              <button
+                type="button"
+                onClick={() => void doAcceptStandardizations()}
+                disabled={exporting || loadingAliasMap || !!aliasMapError}
+                className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ backgroundColor: 'var(--accent)' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
+              >
+                {exporting ? 'Saving…' : 'Accept Standardizations'}
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void openDownloadModal()}
+                  disabled={loadingAliasMap || !!aliasMapError}
+                  className="px-3 py-1.5 rounded-button text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{ backgroundColor: '#4BAE4F', color: '#FFFFFF' }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#439A47';
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#4BAE4F';
+                  }}
+                >
+                  Export to Spreadsheet
+                </button>
 
-            <button
-              type="button"
-              onClick={onExportClick}
-              disabled={exporting || loadingAliasMap || !!aliasMapError}
-              className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ backgroundColor: 'var(--accent)' }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
-            >
-              {exporting ? 'Exporting…' : 'Export to Snowflake'}
-            </button>
+                <button
+                  type="button"
+                  onClick={onExportClick}
+                  disabled={exporting || loadingAliasMap || !!aliasMapError}
+                  className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{ backgroundColor: 'var(--accent)' }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
+                >
+                  {exporting ? 'Exporting…' : 'Export to Snowflake'}
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -1016,8 +1070,8 @@ export default function RunReviewClient({
           </div>
         )}
 
-        {/* Export success */}
-        {exportResult?.view_fqn && (
+        {/* Export success — not shown in auto_export mode (we redirect instead) */}
+        {!isAutoExport && exportResult?.view_fqn && (
           <div
             className="rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
             style={{ backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' }}

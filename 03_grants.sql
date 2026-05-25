@@ -1,119 +1,98 @@
-USE DATABASE STAND_DB;
-
 -- ============================================================================
--- ROLE DEFINITIONS
--- Three-tier role structure for data standardization system
--- ============================================================================
-
--- STAND_ADMIN: Full administrative access to internal tables and system management
-CREATE ROLE IF NOT EXISTS STAND_ADMIN;
-
--- STAND_USER: Standard users who can execute standardization procedures
-CREATE ROLE IF NOT EXISTS STAND_USER;
-
--- STAND_VIEWER: Read-only access to public views (future)
-CREATE ROLE IF NOT EXISTS STAND_VIEWER;
-
--- ============================================================================
--- DATABASE AND SCHEMA GRANTS
+-- 03_grants.sql
+--
+-- All Snowflake role and privilege grants for Prism.
+-- Run as ACCOUNTADMIN after 00_bootstrap.sql and 01_internal_tables.sql.
 -- ============================================================================
 
--- All roles get USAGE on the database
+USE ROLE ACCOUNTADMIN;
+
+-- ============================================================================
+-- SECTION 1 — Roles
+-- ============================================================================
+
+CREATE ROLE IF NOT EXISTS STAND_ADMIN;   -- full access; used by the Prism app service user
+CREATE ROLE IF NOT EXISTS STAND_USER;    -- reserved for future human users
+CREATE ROLE IF NOT EXISTS STAND_VIEWER;  -- reserved for read-only access
+
+-- Hierarchy: STAND_ADMIN inherits STAND_USER which inherits STAND_VIEWER
+GRANT ROLE STAND_USER   TO ROLE STAND_ADMIN;
+GRANT ROLE STAND_VIEWER TO ROLE STAND_USER;
+
+-- ============================================================================
+-- SECTION 2 — Prism internal database / schema access
+-- ============================================================================
+
 GRANT USAGE ON DATABASE STAND_DB TO ROLE STAND_ADMIN;
 GRANT USAGE ON DATABASE STAND_DB TO ROLE STAND_USER;
 GRANT USAGE ON DATABASE STAND_DB TO ROLE STAND_VIEWER;
 
--- All roles get USAGE on the public API schema
-GRANT USAGE ON SCHEMA STAND_DB.STAND TO ROLE STAND_ADMIN;
-GRANT USAGE ON SCHEMA STAND_DB.STAND TO ROLE STAND_USER;
-GRANT USAGE ON SCHEMA STAND_DB.STAND TO ROLE STAND_VIEWER;
-
--- Only STAND_ADMIN gets access to internal schema
-GRANT USAGE ON SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
+-- STAND_INTERNAL is private — only STAND_ADMIN
+GRANT USAGE         ON SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
 GRANT ALL PRIVILEGES ON SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
 
--- ============================================================================
--- PROCEDURE GRANTS (Public API in STAND schema)
--- ============================================================================
+-- Current live tables (01_internal_tables.sql)
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.DOMAINS               TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.PIPELINES              TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE         TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.RUNS                   TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.ACCOUNTS               TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.INVITATIONS            TO ROLE STAND_ADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE STAND_DB.STAND_INTERNAL.VALIDATION_LOG         TO ROLE STAND_ADMIN;
 
--- STAND_USER and STAND_ADMIN can execute procedures
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.CREATE_RUN(VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE STAND_USER;
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.CREATE_RUN(VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE STAND_ADMIN;
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.REFRESH_ALIAS_SUMMARY(INTEGER) TO ROLE STAND_USER;
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.REFRESH_ALIAS_SUMMARY(INTEGER) TO ROLE STAND_ADMIN;
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.REFRESH_TOKENS_SUMMARY(INTEGER) TO ROLE STAND_USER;
-GRANT USAGE ON PROCEDURE STAND_DB.STAND.REFRESH_TOKENS_SUMMARY(INTEGER) TO ROLE STAND_ADMIN;
-
--- Grant on future procedures in STAND schema
-GRANT USAGE ON ALL PROCEDURES IN SCHEMA STAND_DB.STAND TO ROLE STAND_USER;
-GRANT USAGE ON ALL PROCEDURES IN SCHEMA STAND_DB.STAND TO ROLE STAND_ADMIN;
-GRANT USAGE ON FUTURE PROCEDURES IN SCHEMA STAND_DB.STAND TO ROLE STAND_USER;
-GRANT USAGE ON FUTURE PROCEDURES IN SCHEMA STAND_DB.STAND TO ROLE STAND_ADMIN;
-
--- ============================================================================
--- INTERNAL TABLE GRANTS (STAND_INTERNAL schema)
--- Only STAND_ADMIN has access - these are not part of the customer contract
--- ============================================================================
-
--- Admin gets full access to all internal tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
+-- Future tables created in STAND_INTERNAL automatically get full access
 GRANT SELECT, INSERT, UPDATE, DELETE ON FUTURE TABLES IN SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
 
--- Specific table grants for STAND_ADMIN
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_DATA_TYPE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_ALIAS_STATUS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_ALIAS_VALUE_SOURCE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_ALIAS_SUMMARY_KEY_TYPE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.USER_TYPE_OPTIONS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_RUN_MODE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_RUN_STATUS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_DECISION_STATUS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_APPLY_MODE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_APPLY_STATUS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.LKP_ENTITY_TYPE TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.CONCEPTS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.ALIASES TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.ALIAS_SUMMARY TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.TOKENS_SUMMARY TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.ALIAS_ITEMS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.USERS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.RUNS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.RUN_ITEMS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.RUN_APPLIED_TARGETS TO ROLE STAND_ADMIN;
-GRANT ALL PRIVILEGES ON TABLE STAND_DB.STAND_INTERNAL.AUDIT_LOG TO ROLE STAND_ADMIN;
-
 -- ============================================================================
--- PUBLIC VIEWS (STAND schema)
--- When public views are created, STAND_VIEWER will get SELECT access
+-- SECTION 3 — UDF privilege (needed for any custom functions in STAND_INTERNAL)
 -- ============================================================================
 
--- Future: Grant SELECT on public views to STAND_VIEWER
--- Example (uncomment when views are created):
--- GRANT SELECT ON ALL VIEWS IN SCHEMA STAND_DB.STAND TO ROLE STAND_VIEWER;
--- GRANT SELECT ON FUTURE VIEWS IN SCHEMA STAND_DB.STAND TO ROLE STAND_VIEWER;
+GRANT CREATE FUNCTION ON SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
+GRANT ALL PRIVILEGES  ON FUTURE FUNCTIONS IN SCHEMA STAND_DB.STAND_INTERNAL TO ROLE STAND_ADMIN;
 
 -- ============================================================================
--- ROLE HIERARCHY (Optional)
--- Allows STAND_ADMIN to inherit permissions from lower roles
+-- SECTION 4 — Source database / schema access
+--
+-- STAND_ADMIN needs USAGE on any database/schema that contains a source table
+-- connected to a pipeline (for INFORMATION_SCHEMA column discovery and SELECT
+-- when building the export table).
+--
+-- It also needs CREATE TABLE on any schema where an export table will live.
+--
+-- Add one block for every source/export database+schema you onboard.
 -- ============================================================================
 
-GRANT ROLE STAND_USER TO ROLE STAND_ADMIN;
-GRANT ROLE STAND_VIEWER TO ROLE STAND_USER;
+-- GRANT USAGE        ON DATABASE <source_db>              TO ROLE STAND_ADMIN;
+-- GRANT USAGE        ON SCHEMA   <source_db>.<schema>     TO ROLE STAND_ADMIN;
+-- GRANT SELECT       ON ALL TABLES IN SCHEMA <source_db>.<schema> TO ROLE STAND_ADMIN;
+-- GRANT CREATE TABLE ON SCHEMA   <export_db>.<schema>     TO ROLE STAND_ADMIN;
+
+-- Development / test
+GRANT USAGE        ON DATABASE TEST_DB        TO ROLE STAND_ADMIN;
+GRANT USAGE        ON SCHEMA   TEST_DB.PUBLIC TO ROLE STAND_ADMIN;
+GRANT SELECT       ON ALL TABLES IN SCHEMA TEST_DB.PUBLIC TO ROLE STAND_ADMIN;
+GRANT CREATE TABLE ON SCHEMA   TEST_DB.PUBLIC TO ROLE STAND_ADMIN;
 
 -- ============================================================================
--- USAGE NOTES
+-- SECTION 5 — Assign the service user to STAND_ADMIN
+--
+-- The Snowflake user the Prism backend connects as (SNOWFLAKE_USER in
+-- .env.local) must hold STAND_ADMIN for all privileges above to take effect.
 -- ============================================================================
 
--- To assign roles to users:
---   GRANT ROLE STAND_USER TO USER <username>;
---   GRANT ROLE STAND_ADMIN TO USER <username>;
---   GRANT ROLE STAND_VIEWER TO USER <username>;
+-- GRANT ROLE STAND_ADMIN TO USER <your_service_user>;
 
--- To use a role:
---   USE ROLE STAND_USER;
+-- Development
+GRANT ROLE STAND_ADMIN TO USER SANJIVP2703;
 
--- To set a default role for a user:
---   ALTER USER <username> SET DEFAULT_ROLE = STAND_USER;
+-- ============================================================================
+-- SECTION 6 — Verification queries (run after setup to confirm)
+-- ============================================================================
 
+-- All grants held by STAND_ADMIN:
+-- SHOW GRANTS TO ROLE STAND_ADMIN;
 
+-- Confirm the export table was created after a standardization pass:
+-- SHOW TABLES IN SCHEMA TEST_DB.PUBLIC;

@@ -1,0 +1,40 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+
+// Run in Node.js so SESSION_SECRET and full crypto are always available.
+export const runtime = 'nodejs';
+
+// Paths that are always accessible without a session
+function isPublicPath(pathname: string): boolean {
+  if (pathname === '/login')          return true;
+  if (pathname === '/accept-invite')  return true;
+  if (pathname.startsWith('/api/auth/login'))  return true;
+  if (pathname.startsWith('/api/auth/google')) return true;
+  return false;
+}
+
+export async function proxy(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  if (isPublicPath(pathname)) return NextResponse.next();
+
+  const sessionValue = request.cookies.get(SESSION_COOKIE_NAME)?.value;
+  const session = sessionValue ? await decodeSession(sessionValue) : null;
+
+  if (session) return NextResponse.next();
+
+  // API routes: return 401 JSON rather than an HTML redirect
+  if (pathname.startsWith('/api/')) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  // Pages: redirect to /login, preserving the intended destination
+  const loginUrl = new URL('/login', request.url);
+  const returnTo = pathname + request.nextUrl.search;
+  if (returnTo !== '/') loginUrl.searchParams.set('returnTo', returnTo);
+  return NextResponse.redirect(loginUrl);
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+};

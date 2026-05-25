@@ -29,7 +29,7 @@ const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE
 
 // ── POST /api/global-standardizations/export ──────────────────────────────────
 // Body: { format: 'sheets' | 'snowflake', snowflakeTableFqn?: string }
-// Reads the current state of ONE_PROMPT_LITERAL_ALIAS_MATCHES and exports.
+// Reads the current state of LITERAL_ALIAS_MATCHES and exports.
 // Changes should be saved via POST /api/global-standardizations first.
 
 export async function POST(request: NextRequest) {
@@ -50,9 +50,11 @@ export async function POST(request: NextRequest) {
     const result = await withSnowflake(async (connection) => {
       const sfRows = await exec(
         connection,
-        `SELECT alias_name AS canonical_name, literal_value AS raw_value
-         FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-         ORDER BY alias_name, literal_value`,
+        `SELECT aan.alias_name AS canonical_name, lam.literal_value AS raw_value
+         FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
+         JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+           ON lam.alias_id = aan.alias_id
+         ORDER BY aan.alias_name, lam.literal_value`,
       );
       return sfRows.map((r) => ({
         canonical_name: String(r.CANONICAL_NAME ?? r.canonical_name ?? ''),
@@ -175,10 +177,12 @@ export async function POST(request: NextRequest) {
           connection,
           `CREATE OR REPLACE TABLE ${targetFqn} AS
            SELECT
-             alias_name     AS canonical_name,
-             literal_value  AS raw_value,
-             confirmed_at
-           FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
+             aan.alias_name    AS canonical_name,
+             lam.literal_value AS raw_value,
+             lam.confirmed_at
+           FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
+           JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+             ON lam.alias_id = aan.alias_id
            ORDER BY canonical_name, raw_value`,
         );
       });

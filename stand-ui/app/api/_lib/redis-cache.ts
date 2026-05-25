@@ -10,64 +10,8 @@
  * No TTL — entries are invalidated explicitly when alias data changes.
  */
 
-import Redis from 'ioredis';
 import type { LLMConfidenceResponse } from './llm-confidence';
-
-// ---------------------------------------------------------------------------
-// Redis client singleton with graceful disable
-// ---------------------------------------------------------------------------
-
-let _redis: Redis | null = null;
-// Set to true after the first unrecoverable connection failure. All cache
-// operations become silent no-ops for the rest of the process lifetime.
-// A single warning is logged; no per-request error spam.
-let _cacheDisabled = false;
-
-/**
- * Returns the Redis client, or null if:
- *   - REDIS_URL is not set, OR
- *   - A previous connection attempt permanently failed.
- *
- * Callers must treat a null return as "cache unavailable — proceed without it."
- */
-function getRedis(): Redis | null {
-  if (_cacheDisabled) return null;
-  if (_redis) return _redis;
-
-  const url = process.env.REDIS_URL;
-  if (!url) {
-    _cacheDisabled = true;
-    console.warn('[redis-cache] REDIS_URL is not set — LLM result caching is disabled.');
-    return null;
-  }
-
-  const client = new Redis(url, {
-    // Commands fail immediately when not connected rather than queuing.
-    maxRetriesPerRequest: 0,
-    // Try to reconnect up to 3 times, then give up.
-    retryStrategy: (times) => (times > 3 ? null : Math.min(times * 500, 2000)),
-    lazyConnect: true,
-  });
-
-  client.on('error', () => {
-    // Suppress all per-error log lines. The 'close' handler below fires once
-    // when the client gives up and logs a single actionable message.
-  });
-
-  client.on('close', () => {
-    if (_redis === client) {
-      _redis = null;
-      _cacheDisabled = true;
-      console.warn(
-        '[redis-cache] Could not connect to Redis — LLM result caching is disabled for this session. ' +
-        'Start Redis and restart the dev server to enable caching.',
-      );
-    }
-  });
-
-  _redis = client;
-  return _redis;
-}
+import { getRedisClient } from './redis';
 
 // ---------------------------------------------------------------------------
 // Cache key
@@ -94,7 +38,7 @@ export async function getCachedResult(
   conceptId: number,
   aliasId: number,
 ): Promise<LLMConfidenceResponse | null> {
-  const redis = getRedis();
+  const redis = getRedisClient();
   if (!redis) return null;
   try {
     const key = buildCacheKey(literalValue, conceptId, aliasId);
@@ -117,7 +61,7 @@ export async function setCachedResult(
   aliasId: number,
   result: LLMConfidenceResponse,
 ): Promise<void> {
-  const redis = getRedis();
+  const redis = getRedisClient();
   if (!redis) return;
   try {
     const key = buildCacheKey(literalValue, conceptId, aliasId);
@@ -148,7 +92,7 @@ export async function invalidateAliasCacheEntries(
   conceptId: number,
   aliasId: number,
 ): Promise<void> {
-  const redis = getRedis();
+  const redis = getRedisClient();
   if (!redis) return;
   try {
     const pattern = `llm_cache:${conceptId}:${aliasId}:*`;

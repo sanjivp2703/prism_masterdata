@@ -35,7 +35,7 @@ type Snapshot = {
 
 function buildFilename(ext: string) {
   const ts = new Date().toISOString().slice(0, 10);
-  return `global-standardizations-${ts}.${ext}`;
+  return `domain-standardizations-${ts}.${ext}`;
 }
 
 function computeDelta(
@@ -104,7 +104,7 @@ function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function GlobalStandardizationsClient() {
+export default function GlobalStandardizationsClient({ domainId }: { domainId?: number | null }) {
   const [aliasMap,    setAliasMap]    = useState<GlobalAliasMap | null>(null);
   const [uiAliasMap,  setUiAliasMap]  = useState<GlobalAliasMap | null>(null);
   const [loadError,   setLoadError]   = useState<string | null>(null);
@@ -152,7 +152,10 @@ export default function GlobalStandardizationsClient() {
       setLoading(true);
       setLoadError(null);
       try {
-        const res  = await fetch('/api/global-standardizations', { cache: 'no-store' });
+        const url = domainId != null
+          ? `/api/global-standardizations?domain_id=${domainId}`
+          : '/api/global-standardizations';
+        const res  = await fetch(url, { cache: 'no-store' });
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body?.error || 'Failed to load global standardizations');
         if (!cancelled) {
@@ -478,7 +481,7 @@ export default function GlobalStandardizationsClient() {
     }
     const ws  = XLSX.utils.aoa_to_sheet(data);
     const wb  = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Global Standardizations');
+    XLSX.utils.book_append_sheet(wb, ws, 'Domain Standardizations');
     const buf  = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
     const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const url  = URL.createObjectURL(blob);
@@ -573,7 +576,7 @@ export default function GlobalStandardizationsClient() {
               style={{ backgroundColor: INDIGO.tint, color: INDIGO.badgeText }}
             >
               <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: INDIGO.accent }} />
-              Global Library
+              Domain Library
             </span>
           </div>
 
@@ -629,7 +632,7 @@ export default function GlobalStandardizationsClient() {
         {/* ── Loading / error / content ──────────────────────────────────── */}
         {loading ? (
           <p className="text-sm italic py-4" style={{ color: 'var(--text-muted)' }}>
-            Loading global standardizations…
+            Loading domain standardizations…
           </p>
         ) : loadError ? (
           <div
@@ -660,7 +663,7 @@ export default function GlobalStandardizationsClient() {
             <div>
               {groupEntries.length === 0 && (
                 <p className="text-sm italic py-4 text-center" style={{ color: 'var(--text-muted)' }}>
-                  No global standardizations yet. Export a run to populate them.
+                  No domain standardizations yet. Accept a run to populate them.
                 </p>
               )}
 
@@ -876,7 +879,7 @@ export default function GlobalStandardizationsClient() {
             {/* ── Ungrouped / removal zone ─────────────────────────────────── */}
             <div className="mt-5">
               <p className="text-[10px] font-medium uppercase tracking-wider mb-2" style={{ color: 'var(--text-hint)' }}>
-                Remove from global library
+                Remove from domain library
               </p>
               <div
                 className="rounded-row border-[0.5px] border-dashed px-4 py-4 min-h-[60px]"
@@ -914,7 +917,7 @@ export default function GlobalStandardizationsClient() {
                   </div>
                 ) : (
                   <p className="text-sm text-center" style={{ color: 'var(--text-muted)' }}>
-                    Drag values here to remove them from the global library on export
+                    Drag values here to remove them from the domain library on export
                   </p>
                 )}
               </div>
@@ -943,7 +946,7 @@ export default function GlobalStandardizationsClient() {
             <div className="flex items-center justify-between mb-5">
               <div>
                 <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-                  Export Global Standardizations
+                  Export Domain Standardizations
                 </h3>
                 <p className="text-xs mt-0.5" style={{ color: 'var(--text-hint)' }}>
                   Changes are saved to the database before export.
@@ -979,7 +982,7 @@ export default function GlobalStandardizationsClient() {
                 className="rounded-button border-[0.5px] px-3 py-2.5 mb-4 text-sm"
                 style={{ backgroundColor: '#FFF7ED', borderColor: '#FED7AA', color: '#92400E' }}
               >
-                {ungroupedCount} value{ungroupedCount !== 1 ? 's' : ''} will be removed from the global library on export.
+                {ungroupedCount} value{ungroupedCount !== 1 ? 's' : ''} will be removed from the domain library on export.
               </div>
             )}
 

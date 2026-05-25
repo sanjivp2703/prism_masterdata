@@ -2,7 +2,9 @@
 
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { getAppMode } from '@/app/api/_lib/feature-flags';
+import AutoExportHome from './AutoExportHome';
 
 // ── Prism mark (inline SVG — matches brand reference) ─────────────────────
 function PrismMark({ size = 40 }: { size?: number }) {
@@ -188,7 +190,19 @@ async function parseUploadedFile(file: File, sheetName?: string): Promise<Parsed
 
 // ── Page ───────────────────────────────────────────────────────────────────
 export default function HomePage() {
+  // ── Mode gate ──────────────────────────────────────────────────────────
+  if (getAppMode() === 'premium') return <AutoExportHome />;
+
   const router = useRouter();
+
+  // ── Role: null = loading, true = admin, false = user ──────────────────
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+  useEffect(() => {
+    fetch('/api/auth/session')
+      .then(r => r.json())
+      .then(d => setIsAdmin(d.role === 'admin'))
+      .catch(() => setIsAdmin(false));
+  }, []);
 
   // ── Tab state ──────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState<'upload' | 'snowflake'>('upload');
@@ -452,9 +466,35 @@ export default function HomePage() {
       style={{
         backgroundColor: 'var(--page-bg)',
         padding: 'var(--page-padding-y) var(--page-padding-x)',
+        paddingTop: 'calc(var(--page-padding-y) + 44px)',
       }}
     >
       <div className="w-full max-w-5xl mx-auto">
+
+        {/* ── Top bar ────────────────────────────────────────────────────── */}
+        <div className="flex justify-end mb-6" style={{ paddingRight: 52 }}>
+          {/* null = still loading (keep space but hide); false = user (render nothing) */}
+          {isAdmin !== false && (
+          <Link
+            href="/invite"
+            style={{ visibility: isAdmin === true ? 'visible' : 'hidden' }}
+            className="inline-flex items-center gap-2 text-sm font-medium rounded-[8px] px-3.5 py-2 border-[0.5px] transition-colors"
+            style={{
+              borderColor: 'var(--accent-border)',
+              backgroundColor: 'var(--accent-tint)',
+              color: 'var(--accent)',
+              textDecoration: 'none',
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <circle cx="5.5" cy="4" r="2.5" stroke="currentColor" strokeWidth="1.3" />
+              <path d="M1 12c0-2.5 2-4 4.5-4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+              <path d="M10.5 8v4M8.5 10h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+            </svg>
+            Invite teammate
+          </Link>
+          )}
+        </div>
 
         {/* ── Two-column layout ──────────────────────────────────────────── */}
         <div className="grid grid-cols-[1fr_1fr] gap-16 items-center">

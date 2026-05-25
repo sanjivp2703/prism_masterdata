@@ -1,7 +1,8 @@
 'use client';
 
-import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { AppMode } from '@/app/api/_lib/feature-flags';
+import { APP_MODE_CONFIG } from '@/app/api/_lib/feature-flags';
 
 // ── JSON modal viewer ─────────────────────────────────────────────────────────
 
@@ -95,20 +96,158 @@ function JsonCell({ colKey, value }: { colKey: string; value: unknown }) {
   );
 }
 
+// ── Configuration section ─────────────────────────────────────────────────────
+
+const MODES: AppMode[] = ['basic', 'premium'];
+
+function ConfigSection() {
+  const [currentMode, setCurrentMode]     = useState<AppMode | null>(null);
+  const [saving,      setSaving]          = useState(false);
+  const [restartBanner, setRestartBanner] = useState(false);
+  const [error,       setError]           = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/admin/config')
+      .then(r => r.json())
+      .then(d => { if (d.mode) setCurrentMode(d.mode as AppMode); })
+      .catch(() => setError('Could not load configuration.'));
+  }, []);
+
+  async function handleModeChange(mode: AppMode) {
+    if (mode === currentMode || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const res  = await fetch('/api/admin/config', {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ mode }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      setCurrentMode(mode);
+      setRestartBanner(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save configuration.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="bg-white rounded-lg shadow-md p-6">
+      {/* Section header */}
+      <div className="flex items-center gap-2 mb-6">
+        <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-gray-100">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.5" stroke="#374151" strokeWidth="1.4" />
+            <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.42 1.42M11.54 11.54l1.41 1.41M3.05 12.95l1.42-1.42M11.54 4.46l1.41-1.41" stroke="#374151" strokeWidth="1.4" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-semibold text-gray-800">Configuration</h2>
+      </div>
+
+      {/* Restart required banner */}
+      {restartBanner && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 mb-6">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="mt-0.5 flex-shrink-0" aria-hidden="true">
+            <path d="M8 2L14.5 13H1.5L8 2Z" stroke="#92400E" strokeWidth="1.4" strokeLinejoin="round" />
+            <path d="M8 6v3" stroke="#92400E" strokeWidth="1.4" strokeLinecap="round" />
+            <circle cx="8" cy="11" r="0.75" fill="#92400E" />
+          </svg>
+          <div className="flex-1">
+            <p className="text-sm font-medium text-amber-800">Restart required</p>
+            <p className="text-xs text-amber-700 mt-0.5">
+              Mode saved to <code className="font-mono bg-amber-100 px-1 rounded">.env.local</code>.
+              Restart the dev server for the change to take effect.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRestartBanner(false)}
+            className="text-amber-500 hover:text-amber-700 text-lg leading-none"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 mb-6 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      {/* Mode picker row */}
+      <div className="flex items-start gap-6">
+        <div className="w-36 pt-0.5 flex-shrink-0">
+          <p className="text-sm font-medium text-gray-700">Product Mode</p>
+          <p className="text-xs text-gray-400 mt-0.5 leading-relaxed">
+            Controls which features are active
+          </p>
+        </div>
+
+        {/* Mode cards */}
+        <div className="flex gap-3 flex-1">
+          {MODES.map(mode => {
+            const cfg      = APP_MODE_CONFIG[mode];
+            const selected = currentMode === mode;
+            const loading  = currentMode === null;
+            return (
+              <button
+                key={mode}
+                type="button"
+                disabled={saving || loading}
+                onClick={() => handleModeChange(mode)}
+                className="flex-1 text-left rounded-xl border-2 px-5 py-4 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{
+                  borderColor:     selected ? cfg.color : '#E5E7EB',
+                  backgroundColor: selected ? cfg.bg    : '#FAFAFA',
+                  boxShadow:       selected ? `0 0 0 1px ${cfg.border}` : 'none',
+                  cursor:          saving || loading ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {/* Top row: label + active pill */}
+                <div className="flex items-center justify-between mb-2">
+                  <span
+                    className="text-sm font-semibold"
+                    style={{ color: selected ? cfg.color : '#374151' }}
+                  >
+                    {cfg.label}
+                  </span>
+                  {selected && !loading && (
+                    <span
+                      className="text-[10px] font-bold px-2 py-0.5 rounded-full"
+                      style={{ color: cfg.color, backgroundColor: cfg.border }}
+                    >
+                      ACTIVE
+                    </span>
+                  )}
+                  {loading && (
+                    <span className="w-3 h-3 rounded-full bg-gray-200 animate-pulse" />
+                  )}
+                </div>
+                <p className="text-xs leading-relaxed text-gray-500">
+                  {cfg.description}
+                </p>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Tables tab ────────────────────────────────────────────────────────────────
 
 const TABLES: { name: string; section?: string }[] = [
-  { name: 'ONE_PROMPT_RUNS',                  section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_LITERAL_ALIAS_MATCHES', section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_APPROVED_ALIAS_NAMES',  section: 'One-Prompt' },
-  { name: 'ONE_PROMPT_VALIDATION_LOG',        section: 'One-Prompt' },
-  { name: 'CLASSIFICATION_METADATA_PROFILES' },
-  { name: 'CONCEPTS' },
-  { name: 'ALIASES' },
-  { name: 'ALIAS_SUMMARY' },
-  { name: 'TOKENS_SUMMARY' },
-  { name: 'ALIAS_ITEMS' },
-  { name: 'USERS' },
+  { name: 'RUNS',                  section: 'One-Prompt' },
+  { name: 'LITERAL_ALIAS_MATCHES', section: 'One-Prompt' },
+  { name: 'APPROVED_ALIAS_NAMES',  section: 'One-Prompt' },
+  { name: 'VALIDATION_LOG',        section: 'One-Prompt' },
 ];
 
 function TableSection({ tableName }: { tableName: string }) {
@@ -190,262 +329,36 @@ function TableSection({ tableName }: { tableName: string }) {
   );
 }
 
-// ── Concepts tab ──────────────────────────────────────────────────────────────
-
-type Concept = {
-  CONCEPT_ID?: number;
-  CONCEPT_KEY?: string;
-  DESCRIPTION?: string | null;
-  DATA_TYPE?: string;
-  IS_ACTIVE?: boolean;
-};
-
-function ConceptsTab() {
-  const [concepts, setConcepts] = useState<Concept[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
-
-  const [createOpen, setCreateOpen] = useState(false);
-  const [newKey, setNewKey] = useState('');
-  const [newDesc, setNewDesc] = useState('');
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/concepts', { cache: 'no-store' });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error || 'Failed to load concepts');
-      setConcepts((body?.data || []) as Concept[]);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load concepts');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => { void load(); }, []);
-
-  async function createConcept() {
-    setCreating(true);
-    setCreateError(null);
-    try {
-      const concept_key = newKey.trim();
-      const description = newDesc.trim();
-      const res = await fetch('/api/concepts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ concept_key, description: description.length ? description : null }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error || 'Failed to create concept');
-
-      setCreateOpen(false);
-      setNewKey('');
-      setNewDesc('');
-      await load();
-
-      const id = Number(body?.data?.CONCEPT_ID ?? body?.data?.concept_id);
-      if (Number.isFinite(id)) window.location.href = `/concepts/${id}`;
-    } catch (e) {
-      setCreateError(e instanceof Error ? e.message : 'Failed to create concept');
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return concepts;
-    return concepts.filter((c) => {
-      const key = String(c.CONCEPT_KEY ?? '').toLowerCase();
-      const desc = String(c.DESCRIPTION ?? '').toLowerCase();
-      return key.includes(q) || desc.includes(q);
-    });
-  }, [concepts, query]);
-
-  return (
-    <div>
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-semibold text-gray-800">Concepts</h2>
-          <p className="mt-1 text-sm text-gray-600">
-            Browse and manage semantic concepts.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => { setCreateOpen((v) => !v); setCreateError(null); }}
-          className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
-        >
-          Create concept
-        </button>
-      </div>
-
-      {createOpen && (
-        <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 px-4 py-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <div className="sm:col-span-1">
-              <div className="text-xs font-bold tracking-wider text-blue-800 uppercase mb-1">
-                Name (concept_key)
-              </div>
-              <input
-                value={newKey}
-                onChange={(e) => setNewKey(e.target.value)}
-                placeholder="e.g. mobile_carrier"
-                className="w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-              />
-              <div className="mt-1 text-xs text-blue-900/70">
-                Use lowercase letters, numbers, underscores.
-              </div>
-            </div>
-            <div className="sm:col-span-2">
-              <div className="text-xs font-bold tracking-wider text-blue-800 uppercase mb-1">
-                Short description (optional)
-              </div>
-              <input
-                value={newDesc}
-                onChange={(e) => setNewDesc(e.target.value)}
-                placeholder="Optional short description…"
-                className="w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-              />
-            </div>
-          </div>
-          {createError && (
-            <div className="mt-3 bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded">
-              {createError}
-            </div>
-          )}
-          <div className="mt-3 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setCreateOpen(false)}
-              disabled={creating}
-              className="px-3 py-2 rounded-md border border-blue-200 bg-white text-blue-900 text-sm font-semibold hover:bg-blue-100"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => void createConcept()}
-              disabled={creating || !newKey.trim()}
-              className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {creating ? 'Creating…' : 'Create'}
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="mb-4">
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search concepts…"
-          className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-        />
-      </div>
-
-      {loading ? (
-        <div className="text-gray-500 italic">Loading…</div>
-      ) : error ? (
-        <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded">{error}</div>
-      ) : (
-        <div className="rounded-lg border border-gray-200 bg-white">
-          {filtered.length === 0 ? (
-            <div className="px-4 py-6 text-sm text-gray-700">No concepts found.</div>
-          ) : (
-            <ul className="divide-y divide-gray-200">
-              {filtered.map((c) => {
-                const id = Number(c.CONCEPT_ID);
-                const key = String(c.CONCEPT_KEY ?? '');
-                const desc = c.DESCRIPTION ? String(c.DESCRIPTION) : '';
-                const href = Number.isFinite(id) ? `/concepts/${id}` : '#';
-                return (
-                  <li key={`${id}-${key}`} className="px-4 py-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <div className="text-sm font-semibold text-gray-900">
-                          {key || 'Unnamed concept'}
-                        </div>
-                        {desc && <div className="mt-1 text-sm text-gray-600">{desc}</div>}
-                      </div>
-                      {Number.isFinite(id) ? (
-                        <Link
-                          href={href}
-                          className="shrink-0 px-3 py-2 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
-                        >
-                          Open
-                        </Link>
-                      ) : (
-                        <span className="shrink-0 px-3 py-2 rounded-md bg-gray-100 text-gray-500 text-sm font-semibold">
-                          N/A
-                        </span>
-                      )}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Page ──────────────────────────────────────────────────────────────────────
 
-type Tab = 'tables' | 'concepts';
-
 export default function AdminPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('concepts');
-
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
+    <div className="min-h-screen bg-gray-50 p-8" style={{ paddingTop: 76 }}>
       <div className="max-w-7xl mx-auto">
         <h1 className="text-4xl font-bold text-gray-900 mb-6">Admin</h1>
+        <div className="space-y-8">
 
-        {/* Tab bar */}
-        <div className="flex items-center gap-1 border-b border-gray-200 mb-8">
-          {([['concepts', 'Concepts'], ['tables', 'Database tables']] as [Tab, string][]).map(
-            ([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setActiveTab(id)}
-                className={[
-                  'px-4 py-2.5 text-sm font-medium rounded-t-md border-b-2 -mb-px transition-colors',
-                  activeTab === id
-                    ? 'border-blue-600 text-blue-700 bg-white'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
-                ].join(' ')}
-              >
-                {label}
-              </button>
-            )
-          )}
-        </div>
-
-        {activeTab === 'concepts' && <ConceptsTab />}
-
-        {activeTab === 'tables' && (
-          <div className="space-y-8">
-            {TABLES.map((entry, i) => (
-              <div key={entry.name}>
-                {entry.section && (i === 0 || TABLES[i - 1].section !== entry.section) && (
-                  <h2 className="text-xs font-bold tracking-widest text-gray-400 uppercase mb-4 mt-2">
-                    {entry.section}
-                  </h2>
-                )}
-                <TableSection tableName={entry.name} />
-              </div>
-            ))}
+          {/* ── Configuration ──────────────────────────────────────────────── */}
+          <div>
+            <h2 className="text-xs font-bold tracking-widest text-gray-400 uppercase mb-4 mt-2">
+              Configuration
+            </h2>
+            <ConfigSection />
           </div>
-        )}
+
+          {/* ── Data tables ────────────────────────────────────────────────── */}
+          {TABLES.map((entry, i) => (
+            <div key={entry.name}>
+              {entry.section && (i === 0 || TABLES[i - 1].section !== entry.section) && (
+                <h2 className="text-xs font-bold tracking-widest text-gray-400 uppercase mb-4 mt-2">
+                  {entry.section}
+                </h2>
+              )}
+              <TableSection tableName={entry.name} />
+            </div>
+          ))}
+
+        </div>
       </div>
     </div>
   );

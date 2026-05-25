@@ -165,23 +165,25 @@ async function callLLM(
 // Step 5 — Chunk grouping prompts
 // ---------------------------------------------------------------------------
 
-const CHUNK_SYSTEM_PROMPT = `\
-You are a grouping assistant for an entity-resolution system.
+function buildChunkSystemPrompt(domainName: string | null): string {
+  const domainLine = domainName
+    ? `\nDomain: "${domainName}" — apply domain-specific world knowledge when identifying canonical entity names.`
+    : '';
 
-You receive raw string values from a source data column. Each item has a
-literal_value and a source_frequency (how many times it appears in the data).
-
-Cluster items into groups where every item refers to the same real-world entity.
-Use your world knowledge freely — "VZW" abbreviates "Verizon Wireless",
-"T-Mo" means T-Mobile, etc.
-
-Only compare items within this batch. Bias toward NOT grouping when uncertain.
-Under-clustering is safe — a human can drag items together later.
-
-Items with no peer in the batch should be singleton groups.
-Items that are genuinely ambiguous go in "u" (not singletons).
-
-Respond only with valid JSON. No text outside the JSON.`;
+  return (
+    `You are a grouping assistant for an entity-resolution system.${domainLine}\n\n` +
+    `You receive raw string values from a source data column. Each item has a\n` +
+    `literal_value and a source_frequency (how many times it appears in the data).\n\n` +
+    `Cluster items into groups where every item refers to the same real-world entity.\n` +
+    `Use your world knowledge freely — "VZW" abbreviates "Verizon Wireless",\n` +
+    `"T-Mo" means T-Mobile, etc.\n\n` +
+    `Only compare items within this batch. Bias toward NOT grouping when uncertain.\n` +
+    `Under-clustering is safe — a human can drag items together later.\n\n` +
+    `Items with no peer in the batch should be singleton groups.\n` +
+    `Items that are genuinely ambiguous go in "u" (not singletons).\n\n` +
+    `Respond only with valid JSON. No text outside the JSON.`
+  );
+}
 
 function buildChunkUserTurn(items: OpStateItem[]): string {
   const N      = items.length;
@@ -214,7 +216,11 @@ function buildChunkUserTurn(items: OpStateItem[]): string {
 // Step 6 — Merge pass prompt
 // ---------------------------------------------------------------------------
 
-function buildMergeSystemPrompt(validatedAliasNames: string[]): string {
+function buildMergeSystemPrompt(validatedAliasNames: string[], domainName: string | null): string {
+  const domainLine = domainName
+    ? `Domain: "${domainName}" — use this context when choosing canonical names.\n\n`
+    : '';
+
   const validatedSection =
     validatedAliasNames.length > 0
       ? `\nVALIDATED ALIAS NAMES (preserve these when merging):\n${validatedAliasNames.join('\n')}\n`
@@ -222,6 +228,7 @@ function buildMergeSystemPrompt(validatedAliasNames: string[]): string {
 
   return (
     `You are reviewing proposed groups from a multi-chunk entity-resolution run.\n` +
+    domainLine +
     `Groups were clustered independently per chunk. Merge any groups that refer to\n` +
     `the same real-world entity.\n\n` +
     `Only merge when confident. When uncertain, leave groups separate.\n` +
@@ -347,21 +354,31 @@ async function exec(connection: any, sqlText: string, binds?: any[]): Promise<an
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 helpers — literal lookup + usage-count fetch
+// Step 3 helpers — literal lookup + usage-count fetch (domain-aware)
 // ---------------------------------------------------------------------------
 
 async function fetchLookupMatches(
   connection: any,
   literals:   string[],
+  domainId:   number | null,
 ): Promise<Map<string, string>> {
   if (literals.length === 0) return new Map();
 
   const placeholders = literals.map(() => '?').join(', ');
+  // domain_id is denormalized onto LITERAL_ALIAS_MATCHES for fast filtering;
+  // alias_name is retrieved via JOIN since it lives only on APPROVED_ALIAS_NAMES.
+  const domainFilter = domainId != null
+    ? `AND lam.domain_id = ${Number(domainId)}`
+    : `AND lam.domain_id IS NULL`;
+
   const rows = await exec(
     connection,
-    `SELECT literal_value, alias_name
-     FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-     WHERE literal_value IN (${placeholders})`,
+    `SELECT lam.literal_value, aan.alias_name
+     FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
+     JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan
+       ON lam.alias_id = aan.alias_id
+     WHERE lam.literal_value IN (${placeholders})
+     ${domainFilter}`,
     literals,
   );
 
@@ -377,15 +394,21 @@ async function fetchLookupMatches(
 async function fetchUsageCounts(
   connection:  any,
   aliasNames:  string[],
+  domainId:    number | null,
 ): Promise<Map<string, number>> {
   if (aliasNames.length === 0) return new Map();
 
   const placeholders = aliasNames.map(() => '?').join(', ');
+  const domainFilter = domainId != null
+    ? `AND domain_id = ${Number(domainId)}`
+    : `AND domain_id IS NULL`;
+
   const rows = await exec(
     connection,
     `SELECT alias_name, usage_count
-     FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-     WHERE alias_name IN (${placeholders})`,
+     FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+     WHERE alias_name IN (${placeholders})
+     ${domainFilter}`,
     aliasNames,
   );
 
@@ -405,7 +428,7 @@ async function fetchUsageCounts(
 export async function loadOpRunState(connection: any, runId: number): Promise<OpRunState | null> {
   const rows = await exec(
     connection,
-    `SELECT state FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS WHERE run_id = ?`,
+    `SELECT state FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
     [runId],
   );
   if (!rows.length) return null;
@@ -423,45 +446,12 @@ export async function saveOpRunState(
   const json = JSON.stringify(state);
   await exec(
     connection,
-    `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+    `UPDATE STAND_DB.STAND_INTERNAL.RUNS
      SET state      = PARSE_JSON(?),
          updated_at = CURRENT_TIMESTAMP()
      WHERE run_id = ?`,
     [json, runId],
   );
-}
-
-// ---------------------------------------------------------------------------
-// State initialisation fallback (when ONE_PROMPT_RUNS.state is NULL for a run
-// created before this migration). In practice never called for new runs.
-// ---------------------------------------------------------------------------
-
-async function initOpRunState(connection: any, runId: number): Promise<OpRunState> {
-  // Try to read literal values from the legacy RUN_ITEMS table as a last resort.
-  const itemRows = await exec(
-    connection,
-    `SELECT literal_value
-     FROM STAND_DB.STAND_INTERNAL.RUN_ITEMS
-     WHERE run_id = ?
-     ORDER BY literal_value`,
-    [runId],
-  );
-
-  const items: OpStateItem[] = itemRows.map((row, idx) => ({
-    run_item_id:         idx + 1,
-    literal_value:       String((row as any).LITERAL_VALUE ?? (row as any).literal_value ?? ''),
-    matched_from_lookup: false,
-  }));
-
-  const initialState: OpRunState = {
-    status:    'created',
-    items,
-    groups:    [],
-    ungrouped: [],
-  };
-
-  await saveOpRunState(connection, runId, initialState);
-  return initialState;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,15 +464,39 @@ export async function runOpAutoGroup(
   apiKey:     string,
 ): Promise<OpRunState> {
 
-  // Load the state blob, or initialise it from RUN_ITEMS if this is the first
-  // time auto-group is triggered for this run.
-  const state = (await loadOpRunState(connection, runId)) ?? (await initOpRunState(connection, runId));
+  const state = await loadOpRunState(connection, runId);
+  if (!state) {
+    throw new Error(`Run state not found for run_id=${runId}. Re-create the run to initialize state.`);
+  }
+
+  // ── Fetch domain info for this run ─────────────────────────────────────────
+  const runRows = await exec(
+    connection,
+    `SELECT domain_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
+    [runId],
+  );
+  const domainId: number | null =
+    runRows.length > 0
+      ? (Number((runRows[0] as any).DOMAIN_ID ?? (runRows[0] as any).domain_id) || null)
+      : null;
+
+  let domainName: string | null = null;
+  if (domainId != null) {
+    const domainRows = await exec(
+      connection,
+      `SELECT name FROM STAND_DB.STAND_INTERNAL.DOMAINS WHERE domain_id = ?`,
+      [domainId],
+    );
+    domainName = domainRows.length > 0
+      ? String((domainRows[0] as any).NAME ?? (domainRows[0] as any).name ?? '')
+      : null;
+  }
 
   const items: OpStateItem[] = state.items ?? [];
 
-  // ── Step 3: Literal lookup ─────────────────────────────────────────────────
+  // ── Step 3: Literal lookup (domain-scoped) ─────────────────────────────────
   const literals   = items.map((it) => it.literal_value);
-  const lookupMap  = await fetchLookupMatches(connection, literals);
+  const lookupMap  = await fetchLookupMatches(connection, literals, domainId);
 
   const matchedItems:   OpStateItem[] = [];
   const unmatchedItems: OpStateItem[] = [];
@@ -505,7 +519,7 @@ export async function runOpAutoGroup(
   }
 
   const lookupAliasNames = [...lookupGroupMap.keys()];
-  const usageCountMap    = await fetchUsageCounts(connection, lookupAliasNames);
+  const usageCountMap    = await fetchUsageCounts(connection, lookupAliasNames, domainId);
 
   // Each distinct alias_name → one PipelineGroup (from_lookup_chunk = true).
   // Lookup groups are never chunked — all items for a given alias land in one
@@ -532,10 +546,11 @@ export async function runOpAutoGroup(
       chunks.push(unmatchedItems.slice(i, i + MAX_CHUNK_SIZE));
     }
 
+    const chunkSystemPrompt = buildChunkSystemPrompt(domainName);
     const chunkResults = await Promise.all(
       chunks.map(async (chunk) => {
         const userTurn = buildChunkUserTurn(chunk);
-        const rawText  = await callLLM(apiKey, CHUNK_SYSTEM_PROMPT, userTurn, CHUNK_MAX_TOKENS);
+        const rawText  = await callLLM(apiKey, chunkSystemPrompt, userTurn, CHUNK_MAX_TOKENS);
         return { chunk, parsed: tryParseJson<LLMChunkResponse>(rawText) };
       }),
     );
@@ -583,7 +598,7 @@ export async function runOpAutoGroup(
     const validatedNames    = [...new Set(
       allGroups.filter((g) => g.from_lookup_chunk && g.alias_name).map((g) => g.alias_name!),
     )];
-    const mergeSystem       = buildMergeSystemPrompt(validatedNames);
+    const mergeSystem       = buildMergeSystemPrompt(validatedNames, domainName);
     const mergeUser         = buildMergeUserTurn(allGroups);
     const mergeRaw          = await callLLM(apiKey, mergeSystem, mergeUser, MERGE_MAX_TOKENS);
     const mergeParsed       = tryParseJson<LLMMergeResponse>(mergeRaw);

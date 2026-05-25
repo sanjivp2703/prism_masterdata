@@ -1,7 +1,7 @@
 /**
  * One-Prompt Export Pipeline (Steps 1–4).
  *
- * Called after the user confirms and exports a one-prompt run.
+ * Called after the user confirms and exports a run.
  *
  *   Step 1 — Read state blob            (sole source of truth)
  *   Step 2 — Detect validation cases    (Case A: item moved; Case B: group renamed)
@@ -23,6 +23,8 @@ import path from 'node:path';
 
 import { withSnowflake } from './snowflake';
 import { loadOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
+import { initBaseline, hasBaseline } from './auto-export-seen';
+import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -119,39 +121,129 @@ function tryParseJson<T>(text: string): T | null {
 // DB write helpers
 // ---------------------------------------------------------------------------
 
-async function upsertLiteralMatch(
+/**
+ * Upsert an alias name and return its alias_id.
+ * MERGE matches on (alias_name, domain_id) — the unique key — so the same name
+ * in two different domains produces two separate rows with separate alias_ids.
+ */
+async function upsertApprovedAlias(
   connection: any,
-  literalValue: string,
-  aliasName:    string,
-  runId:        number,
-): Promise<void> {
-  await exec(
-    connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES AS t
-     USING (SELECT ? AS literal_value, ? AS alias_name, ? AS run_id) AS s
-       ON t.literal_value = s.literal_value
-     WHEN MATCHED THEN UPDATE SET
-       t.alias_name    = s.alias_name,
-       t.run_id        = s.run_id,
-       t.confirmed_at  = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (literal_value, alias_name, run_id, confirmed_at)
-       VALUES (s.literal_value, s.alias_name, s.run_id, CURRENT_TIMESTAMP())`,
-    [literalValue, aliasName, runId],
-  );
-}
+  aliasName:  string,
+  domainId:   number | null,
+): Promise<number> {
+  // domainFilter for MERGE uses alias 't'; selectFilter for plain SELECT uses no alias
+  const domainFilter  = domainId != null
+    ? `AND t.domain_id = ${Number(domainId)}`
+    : `AND t.domain_id IS NULL`;
+  const selectFilter  = domainId != null
+    ? `AND domain_id = ${Number(domainId)}`
+    : `AND domain_id IS NULL`;
+  const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
 
-async function upsertApprovedAlias(connection: any, aliasName: string): Promise<void> {
   await exec(
     connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES AS t
-     USING (SELECT ? AS alias_name) AS s
-       ON t.alias_name = s.alias_name
+    `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES AS t
+     USING (SELECT ? AS alias_name, ${domainLiteral} AS domain_id) AS s
+       ON t.alias_name = s.alias_name ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
        t.usage_count  = t.usage_count + 1,
        t.last_used_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (alias_name, usage_count, last_used_at)
-       VALUES (s.alias_name, 1, CURRENT_TIMESTAMP())`,
+     WHEN NOT MATCHED THEN INSERT (alias_name, domain_id, usage_count, last_used_at)
+       VALUES (s.alias_name, s.domain_id, 1, CURRENT_TIMESTAMP())`,
     [aliasName],
+  );
+
+  // Retrieve the alias_id via the unique key (alias_name, domain_id).
+  const rows = await exec(
+    connection,
+    `SELECT alias_id
+     FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+     WHERE alias_name = ? ${selectFilter}`,
+    [aliasName],
+  );
+  const aliasId = Number((rows[0] as any)?.ALIAS_ID ?? (rows[0] as any)?.alias_id ?? 0);
+  if (!aliasId) throw new Error(`[op-export] Could not retrieve alias_id for "${aliasName}"`);
+  return aliasId;
+}
+
+/**
+ * Upsert a literal → alias mapping using the integer alias_id FK.
+ * Renames to the parent alias never require touching this table.
+ */
+async function upsertLiteralMatch(
+  connection:   any,
+  literalValue: string,
+  aliasId:      number,
+  domainId:     number | null,
+  runId:        number,
+): Promise<void> {
+  const domainFilter  = domainId != null
+    ? `AND t.domain_id = ${Number(domainId)}`
+    : `AND t.domain_id IS NULL`;
+  const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
+
+  await exec(
+    connection,
+    `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES AS t
+     USING (SELECT ? AS literal_value, ${Number(aliasId)} AS alias_id,
+                   ${domainLiteral} AS domain_id, ? AS run_id) AS s
+       ON t.literal_value = s.literal_value ${domainFilter}
+     WHEN MATCHED THEN UPDATE SET
+       t.alias_id     = s.alias_id,
+       t.run_id       = s.run_id,
+       t.confirmed_at = CURRENT_TIMESTAMP()
+     WHEN NOT MATCHED THEN INSERT (literal_value, alias_id, domain_id, run_id, confirmed_at)
+       VALUES (s.literal_value, s.alias_id, s.domain_id, s.run_id, CURRENT_TIMESTAMP())`,
+    [literalValue, runId],
+  );
+}
+
+/**
+ * Bulk-upsert all literal → alias mappings for a run in a single MERGE statement.
+ *
+ * A single Snowflake MERGE is inherently atomic (no transaction needed) and
+ * eliminates per-row network round-trips.  All entries share the same domain_id
+ * and run_id, so the ON condition is uniform across the batch.
+ *
+ * Snowflake's VALUES subquery exposes implicit column names column1, column2, …
+ * and supports up to ~65 k bind variables — well above the 5 000-literal cap
+ * used when fetching source values, so no chunking is needed.
+ */
+async function bulkUpsertLiteralMatches(
+  connection: any,
+  entries:    Array<{ literalValue: string; aliasId: number }>,
+  domainId:   number | null,
+  runId:      number,
+): Promise<void> {
+  if (entries.length === 0) return;
+
+  const domainFilter  = domainId != null
+    ? `AND t.domain_id = ${Number(domainId)}`
+    : `AND t.domain_id IS NULL`;
+  const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
+
+  // Build (?, ?, ?) placeholders and a flat binds array.
+  // column1 = literal_value, column2 = alias_id, column3 = run_id
+  const placeholders = entries.map(() => '(?, ?, ?)').join(', ');
+  const binds: any[] = entries.flatMap(e => [e.literalValue, e.aliasId, runId]);
+
+  await exec(
+    connection,
+    `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES AS t
+     USING (
+       SELECT column1 AS literal_value,
+              column2 AS alias_id,
+              column3 AS run_id
+       FROM VALUES ${placeholders}
+     ) AS s
+       ON t.literal_value = s.literal_value ${domainFilter}
+     WHEN MATCHED THEN UPDATE SET
+       t.alias_id     = s.alias_id,
+       t.run_id       = s.run_id,
+       t.confirmed_at = CURRENT_TIMESTAMP()
+     WHEN NOT MATCHED THEN INSERT (literal_value, alias_id, domain_id, run_id, confirmed_at)
+       VALUES (s.literal_value, s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
+    binds,
   );
 }
 
@@ -243,18 +335,25 @@ async function fetchCaseBContext(
   runId:      number,
   state:      OpRunState,
   rawCaseBGroups: Omit<CaseBGroup, 'alias_exact_literal' | 'prior_lookup_literal' | 'current_new_literal' | 'prior_other_literal' | 'total_known_literals'>[],
+  domainId:   number | null,
 ): Promise<CaseBGroup[]> {
   const result: CaseBGroup[] = [];
   const currentRunLiterals = new Set(state.items.map((it) => it.literal_value));
   const itemByLiteral = new Map<string, OpStateItem>(state.items.map((it) => [it.literal_value, it]));
+
+  const domainFilter = domainId != null
+    ? `AND lam.domain_id = ${Number(domainId)}`
+    : `AND lam.domain_id IS NULL`;
 
   for (const raw of rawCaseBGroups) {
     const groupItemLiterals = new Set(raw.group_items.map((gi) => gi.literal_value));
 
     const exactRows = await exec(
       connection,
-      `SELECT literal_value FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-       WHERE alias_name = ? AND literal_value = ? LIMIT 1`,
+      `SELECT lam.literal_value
+       FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
+       JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       WHERE aan.alias_name = ? AND lam.literal_value = ? ${domainFilter} LIMIT 1`,
       [raw.original_alias_name, raw.original_alias_name],
     );
     const alias_exact_literal =
@@ -276,10 +375,11 @@ async function fetchCaseBContext(
 
     const allKnownRows = await exec(
       connection,
-      `SELECT literal_value, COUNT(*) AS total
-       FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-       WHERE alias_name = ?
-       GROUP BY literal_value`,
+      `SELECT lam.literal_value, COUNT(*) AS total
+       FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
+       JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       WHERE aan.alias_name = ? ${domainFilter}
+       GROUP BY lam.literal_value`,
       [raw.original_alias_name],
     );
 
@@ -416,6 +516,7 @@ async function writeAllDecisions(
   caseAItems:  CaseAItem[],
   caseBGroups: CaseBGroup[],
   decisions:   ValidationResponse | null,
+  domainId:    number | null = null,
 ): Promise<{ items_written: number; aliases_updated: number }> {
   // Build a map: literal_value → final alias, starting from user's current grouping.
   const finalAlias = new Map<string, string>();
@@ -457,57 +558,84 @@ async function writeAllDecisions(
     // k='u', apply_to_all=false: finalAlias already has user's new name.
   }
 
-  // ── Write all literal→alias matches for this run ──────────────────────────
-  let items_written = 0;
-  for (const [literalValue, aliasName] of finalAlias) {
-    await upsertLiteralMatch(connection, literalValue, aliasName, runId);
-    items_written++;
+  // ── Upsert approved alias names first, collecting alias_ids ───────────────
+  const finalAliasNames = new Set(finalAlias.values());
+  const aliasIdMap = new Map<string, number>(); // aliasName → alias_id
+  for (const aliasName of finalAliasNames) {
+    const aliasId = await upsertApprovedAlias(connection, aliasName, domainId);
+    aliasIdMap.set(aliasName, aliasId);
   }
+
+  // ── Write all literal→alias matches in one bulk MERGE ────────────────────
+  // A single MERGE statement is atomic in Snowflake (no transaction needed)
+  // and eliminates N round-trips, so total_mapped jumps from 0 to final
+  // atomically on the next poll rather than incrementing one-by-one.
+  const matchEntries: Array<{ literalValue: string; aliasId: number }> = [];
+  for (const [literalValue, aliasName] of finalAlias) {
+    const aliasId = aliasIdMap.get(aliasName);
+    if (aliasId == null) continue; // should not happen
+    matchEntries.push({ literalValue, aliasId });
+  }
+  await bulkUpsertLiteralMatches(connection, matchEntries, domainId, runId);
+  const items_written = matchEntries.length;
 
   // ── Apply global Case B renames (touches historical rows outside this run) ─
+  const domainFilter  = domainId != null ? `AND domain_id = ${Number(domainId)}` : `AND domain_id IS NULL`;
   for (const rename of globalRenames) {
-    const origRows = await exec(
+    const fromRows = await exec(
       connection,
-      `SELECT usage_count FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-       WHERE alias_name = ?`,
+      `SELECT alias_id, usage_count
+       FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+       WHERE alias_name = ? ${domainFilter}`,
       [rename.from],
     );
-    const origCount = Number((origRows[0] as any)?.USAGE_COUNT ?? (origRows[0] as any)?.usage_count ?? 0);
+    if (!fromRows.length) continue;
+    const fromId    = Number((fromRows[0] as any).ALIAS_ID   ?? (fromRows[0] as any).alias_id);
+    const fromCount = Number((fromRows[0] as any).USAGE_COUNT ?? (fromRows[0] as any).usage_count ?? 0);
 
-    await exec(
+    // Check whether the target alias already exists under this domain.
+    const toRows = await exec(
       connection,
-      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-       SET alias_name = ?, confirmed_at = CURRENT_TIMESTAMP()
-       WHERE alias_name = ?`,
-      [rename.to, rename.from],
+      `SELECT alias_id
+       FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+       WHERE alias_name = ? ${domainFilter}`,
+      [rename.to],
     );
 
-    await exec(
-      connection,
-      `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES AS t
-       USING (SELECT ? AS alias_name, ? AS extra_count) AS s
-         ON t.alias_name = s.alias_name
-       WHEN MATCHED THEN UPDATE SET
-         t.usage_count  = t.usage_count + s.extra_count,
-         t.last_used_at = CURRENT_TIMESTAMP()
-       WHEN NOT MATCHED THEN INSERT (alias_name, usage_count, last_used_at)
-         VALUES (s.alias_name, s.extra_count, CURRENT_TIMESTAMP())`,
-      [rename.to, origCount],
-    );
-
-    await exec(
-      connection,
-      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES
-       SET usage_count = 0
-       WHERE alias_name = ?`,
-      [rename.from],
-    );
-  }
-
-  // ── Upsert approved alias names for every final alias used in this run ────
-  const finalAliasNames = new Set(finalAlias.values());
-  for (const aliasName of finalAliasNames) {
-    await upsertApprovedAlias(connection, aliasName);
+    if (toRows.length > 0) {
+      // Target exists → merge: repoint LITERAL_ALIAS_MATCHES to the target alias_id,
+      // then remove the source alias row. No alias_name scan needed.
+      const toId = Number((toRows[0] as any).ALIAS_ID ?? (toRows[0] as any).alias_id);
+      await exec(
+        connection,
+        `UPDATE STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
+         SET alias_id = ?, confirmed_at = CURRENT_TIMESTAMP()
+         WHERE alias_id = ?`,
+        [toId, fromId],
+      );
+      await exec(
+        connection,
+        `UPDATE STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+         SET usage_count = usage_count + ?, last_used_at = CURRENT_TIMESTAMP()
+         WHERE alias_id = ?`,
+        [fromCount, toId],
+      );
+      await exec(
+        connection,
+        `DELETE FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`,
+        [fromId],
+      );
+    } else {
+      // Pure rename → just update the name in place. LITERAL_ALIAS_MATCHES
+      // references alias_id, so this single UPDATE is the entire migration.
+      await exec(
+        connection,
+        `UPDATE STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+         SET alias_name = ?, last_used_at = CURRENT_TIMESTAMP()
+         WHERE alias_id = ?`,
+        [rename.to, fromId],
+      );
+    }
   }
 
   // ── Log Case A/B decisions ────────────────────────────────────────────────
@@ -516,7 +644,7 @@ async function writeAllDecisions(
     if (!item) continue;
     await exec(
       connection,
-      `INSERT INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_VALIDATION_LOG
+      `INSERT INTO STAND_DB.STAND_INTERNAL.VALIDATION_LOG
          (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
       [item.literal_value, runId, item.original_alias_name, item.user_moved_to,
@@ -531,7 +659,7 @@ async function writeAllDecisions(
     for (const gi of group.group_items) {
       await exec(
         connection,
-        `INSERT INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_VALIDATION_LOG
+        `INSERT INTO STAND_DB.STAND_INTERNAL.VALIDATION_LOG
            (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
         [gi.literal_value, runId, group.original_alias_name, group.user_changed_to,
@@ -543,7 +671,7 @@ async function writeAllDecisions(
   // ── Mark run complete ─────────────────────────────────────────────────────
   await exec(
     connection,
-    `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+    `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
     [runId],
   );
 
@@ -636,13 +764,24 @@ async function runWriteAndValidatePass(
 ): Promise<void> {
   await withSnowflake(async (connection) => {
     try {
+      // Fetch domain_id first — needed for both the Case B context lookup and writeAllDecisions.
+      const domainRows = await exec(
+        connection,
+        `SELECT domain_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
+        [runId],
+      );
+      const exportDomainId: number | null =
+        domainRows.length > 0
+          ? (Number((domainRows[0] as any).DOMAIN_ID ?? (domainRows[0] as any).domain_id) || null)
+          : null;
+
       let decisions:  ValidationResponse | null = null;
       let rawText   = '';
       let userTurn  = '';
       let caseBGroups: CaseBGroup[] = [];
 
       if (caseAItems.length > 0 || rawCaseBGroups.length > 0) {
-        caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups);
+        caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups, exportDomainId);
         userTurn    = buildValidationUserTurn(caseAItems, caseBGroups);
         rawText     = await callValidationLLM(apiKey, userTurn);
         decisions   = tryParseJson<ValidationResponse>(rawText);
@@ -657,7 +796,7 @@ async function runWriteAndValidatePass(
           );
           await exec(
             connection,
-            `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+            `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
             [runId],
           );
           return;
@@ -665,7 +804,71 @@ async function runWriteAndValidatePass(
       }
 
       // Step 4: write everything (normal items + Case A/B decisions) in one pass.
-      await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions);
+      await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions, exportDomainId);
+
+      // ── Premium mode: seed baseline + rebuild export table ───────────────
+      // Runs AFTER writeAllDecisions has committed so that:
+      //   • The Redis baseline reflects only the values written in this run.
+      //   • refreshExportTable reads the fully-committed LITERAL_ALIAS_MATCHES
+      //     rows — not an in-progress write — so the export table is complete.
+      if (process.env.NEXT_PUBLIC_APP_MODE === 'premium') {
+        try {
+          // Single query: run metadata + matching pipeline export config.
+          const runMetaRows = await exec(
+            connection,
+            `SELECT r.source_relation,
+                    r.source_column,
+                    p.pipeline_id,
+                    p.export_table_fqn
+             FROM STAND_DB.STAND_INTERNAL.RUNS r
+             LEFT JOIN STAND_DB.STAND_INTERNAL.PIPELINES p
+               ON  p.table_fqn   = r.source_relation
+               AND p.column_name = r.source_column
+               AND (
+                 (p.domain_id IS NULL AND r.domain_id IS NULL) OR
+                 p.domain_id = r.domain_id
+               )
+             WHERE r.run_id = ?
+             LIMIT 1`,
+            [runId],
+          );
+          if (runMetaRows.length > 0) {
+            const row            = runMetaRows[0] as any;
+            const tableFqn       = String(row.SOURCE_RELATION    ?? row.source_relation    ?? '');
+            const columnName     = String(row.SOURCE_COLUMN      ?? row.source_column      ?? '');
+            const exportTableFqn = (row.EXPORT_TABLE_FQN ?? row.export_table_fqn) as string | null;
+            const pipelineId     = (row.PIPELINE_ID     ?? row.pipeline_id) != null
+              ? Number(row.PIPELINE_ID ?? row.pipeline_id) : null;
+
+            // Seed Redis baseline if this is the first export for this source.
+            if (tableFqn && columnName) {
+              const alreadySet = await hasBaseline(tableFqn, columnName);
+              if (!alreadySet) {
+                const literals = state.items.map((it) => it.literal_value);
+                await initBaseline(tableFqn, columnName, literals);
+                console.log(
+                  `[op-export] Auto-export baseline seeded — ${literals.length} value(s) for ${tableFqn}.${columnName}`,
+                );
+              }
+            }
+
+            // Rebuild export table / update total_mapped now that all matches are committed.
+            if (exportTableFqn && pipelineId != null) {
+              refreshExportTable(tableFqn, columnName, exportTableFqn, exportDomainId, pipelineId).catch(err => {
+                console.error(`[op-export] Export table refresh failed for run ${runId}:`, err);
+              });
+            } else if (pipelineId != null && tableFqn && columnName) {
+              // No export table — still update total_mapped with the source row count.
+              updatePipelineMappedCount(tableFqn, columnName, exportDomainId, pipelineId).catch(err => {
+                console.warn(`[op-export] Could not update total_mapped for pipeline ${pipelineId}:`, err);
+              });
+            }
+          }
+        } catch (premiumErr) {
+          // Non-fatal — baseline / export table can be rebuilt on next cycle.
+          console.warn('[op-export] Failed in premium post-write steps:', premiumErr);
+        }
+      }
 
       // Build flat appliedDecisions list for audit.
       const appliedDecisions: Parameters<typeof writeValidationAudit>[7] = [];
@@ -707,7 +910,7 @@ async function runWriteAndValidatePass(
     } catch (err) {
       await exec(
         connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+        `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
         [runId],
       ).catch(() => {});
       throw err;
@@ -720,13 +923,13 @@ async function runWriteAndValidatePass(
 // ---------------------------------------------------------------------------
 
 /**
- * Handles a one-prompt run export request.
+ * Handles a run export request.
  *
  * The caller passes `currentStatus` (already queried) so we avoid a redundant
  * round-trip.  Export always succeeds and returns the run's grouping counts.
  *
- * Backend table writes (ONE_PROMPT_LITERAL_ALIAS_MATCHES, ONE_PROMPT_APPROVED_ALIAS_NAMES,
- * ONE_PROMPT_VALIDATION_LOG) are triggered only on the FIRST export — i.e. when
+ * Backend table writes (LITERAL_ALIAS_MATCHES, APPROVED_ALIAS_NAMES,
+ * VALIDATION_LOG) are triggered only on the FIRST export — i.e. when
  * currentStatus is not already 'validating', 'completed', or 'failed'.
  * Subsequent exports return the same counts without re-triggering the write pass.
  */
@@ -755,7 +958,7 @@ export async function runOpExport(
     // Mark run as 'validating' so concurrent first-export calls are recognised.
     await exec(
       connection,
-      `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+      `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
       [runId],
     );
 
@@ -766,4 +969,76 @@ export async function runOpExport(
   }
 
   return { items_written, aliases_updated };
+}
+
+/**
+ * Writes grouped items directly to the domain lookup tables without the
+ * validation LLM pass (no Case A / Case B deviation checks).
+ *
+ * Used for automated pipeline queue processing where there is no user review.
+ */
+export async function runOpExportDirect(
+  runId: number,
+): Promise<ExportResult> {
+  return await withSnowflake(async (connection) => {
+    const state = await loadOpRunState(connection, runId);
+    if (!state) throw new Error(`[op-export] No state found for run_id=${runId}`);
+
+    // Fetch run metadata + matching pipeline in one query so we can rebuild
+    // the export table / update total_mapped after writes commit.
+    const runMetaRows = await exec(
+      connection,
+      `SELECT r.domain_id,
+              p.pipeline_id,
+              p.table_fqn    AS pipeline_table_fqn,
+              p.column_name  AS pipeline_column_name,
+              p.export_table_fqn
+       FROM STAND_DB.STAND_INTERNAL.RUNS r
+       LEFT JOIN STAND_DB.STAND_INTERNAL.PIPELINES p
+         ON  p.table_fqn   = r.source_relation
+         AND p.column_name = r.source_column
+         AND (
+           (p.domain_id IS NULL AND r.domain_id IS NULL) OR
+           p.domain_id = r.domain_id
+         )
+       WHERE r.run_id = ?
+       LIMIT 1`,
+      [runId],
+    );
+
+    const metaRow  = runMetaRows.length > 0 ? (runMetaRows[0] as any) : null;
+    const domainId: number | null = metaRow
+      ? (Number(metaRow.DOMAIN_ID ?? metaRow.domain_id) || null)
+      : null;
+
+    await exec(
+      connection,
+      `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+      [runId],
+    );
+
+    const result = await writeAllDecisions(connection, runId, state, [], [], null, domainId);
+
+    // ── Rebuild export table / update total_mapped once writes have committed ──
+    // Runs only in premium mode (pipelines only exist there).
+    if (process.env.NEXT_PUBLIC_APP_MODE === 'premium' && metaRow) {
+      const exportTableFqn = (metaRow.EXPORT_TABLE_FQN ?? metaRow.export_table_fqn) as string | null;
+      const tableFqn       = String(metaRow.PIPELINE_TABLE_FQN   ?? metaRow.pipeline_table_fqn   ?? '');
+      const colName        = String(metaRow.PIPELINE_COLUMN_NAME  ?? metaRow.pipeline_column_name  ?? '');
+      const pipelineId     = (metaRow.PIPELINE_ID ?? metaRow.pipeline_id) != null
+        ? Number(metaRow.PIPELINE_ID ?? metaRow.pipeline_id) : null;
+
+      if (exportTableFqn && pipelineId != null) {
+        refreshExportTable(tableFqn, colName, exportTableFqn, domainId, pipelineId).catch(err => {
+          console.error(`[op-export] Export table refresh failed for run ${runId}:`, err);
+        });
+      } else if (pipelineId != null && tableFqn && colName) {
+        updatePipelineMappedCount(tableFqn, colName, domainId, pipelineId).catch(err => {
+          console.warn(`[op-export] Could not update total_mapped for pipeline ${pipelineId}:`, err);
+        });
+      }
+    }
+
+    return result;
+  });
 }

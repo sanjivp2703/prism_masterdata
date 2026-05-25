@@ -87,7 +87,7 @@ export async function POST(
       const runRows = await exec(
         connection,
         `SELECT source_relation, source_column, stats_snapshot
-         FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+         FROM STAND_DB.STAND_INTERNAL.RUNS
          WHERE run_id = ?`,
         [runIdNum],
       );
@@ -103,10 +103,12 @@ export async function POST(
 
       const mappingRows = await exec(
         connection,
-        `SELECT literal_value AS original_value, alias_name AS standardized_value
-         FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-         WHERE run_id = ?
-         ORDER BY standardized_value, original_value`,
+        `SELECT lam.literal_value AS original_value, aan.alias_name AS standardized_value
+         FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
+         JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+           ON lam.alias_id = aan.alias_id
+         WHERE lam.run_id = ?
+         ORDER BY aan.alias_name, lam.literal_value`,
         [runIdNum],
       );
 

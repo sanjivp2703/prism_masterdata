@@ -28,7 +28,7 @@ export async function GET(
       // Verify run exists.
       const runRows = await new Promise<any[]>((resolve, reject) => {
         connection.execute({
-          sqlText: `SELECT run_id FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS WHERE run_id = ? LIMIT 1`,
+          sqlText: `SELECT run_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ? LIMIT 1`,
           binds:   [run_id],
           complete: (err, _stmt, rows) => {
             if (err) reject(err);
@@ -42,7 +42,7 @@ export async function GET(
       }
 
       // Load the state blob that is written at run-creation time and updated by
-      // every auto-group call.  ONE_PROMPT_RUN_STATE is the single source of
+      // every auto-group call.  RUNS.state is the single source of
       // truth for items and groupings.
       const state = await loadOpRunState(connection, Number(run_id));
 

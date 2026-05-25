@@ -8,7 +8,7 @@ export async function GET(request: NextRequest) {
         connection.execute({
           sqlText: `
             SELECT run_id, source_relation, source_column, run_status, updated_at
-            FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS
+            FROM STAND_DB.STAND_INTERNAL.RUNS
             WHERE run_status IN ('validating', 'created', 'running')
             ORDER BY updated_at DESC
             LIMIT 1000

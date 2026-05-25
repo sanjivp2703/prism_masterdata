@@ -20,11 +20,8 @@ export async function GET(
               r.source_column,
               r.created_at,
               r.updated_at,
-              c.concept_key,
-              c.description AS concept_description
-            FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_RUNS r
-            LEFT JOIN STAND_DB.STAND_INTERNAL.CONCEPTS c
-              ON c.concept_id = r.concept_id
+              r.concept_key
+            FROM STAND_DB.STAND_INTERNAL.RUNS r
             WHERE r.run_id = ?
           `,
           binds: [run_id],

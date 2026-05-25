@@ -14,16 +14,31 @@ async function exec(connection: any, sqlText: string, binds?: any[]) {
 }
 
 // ── GET /api/global-standardizations ──────────────────────────────────────────
-// Returns all ONE_PROMPT_LITERAL_ALIAS_MATCHES grouped by alias_name.
+// Returns all LITERAL_ALIAS_MATCHES grouped by alias_name.
+// Optionally filters by domain_id query param.
 
-export async function GET() {
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const domainIdParam = searchParams.get('domain_id');
+  const domainId = domainIdParam != null && domainIdParam !== '' ? Number(domainIdParam) : null;
+
   try {
     return await withSnowflake(async (connection) => {
       const rows = await exec(
         connection,
-        `SELECT alias_name, literal_value, run_id, confirmed_at
-         FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-         ORDER BY alias_name, literal_value`,
+        domainId != null
+          ? `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
+             FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
+             JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+               ON lam.alias_id = aan.alias_id
+             WHERE lam.domain_id = ?
+             ORDER BY aan.alias_name, lam.literal_value`
+          : `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
+             FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
+             JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+               ON lam.alias_id = aan.alias_id
+             ORDER BY aan.alias_name, lam.literal_value`,
+        domainId != null ? [domainId] : undefined,
       );
 
       const grouped: Record<
@@ -67,26 +82,34 @@ export async function POST(request: Request) {
     };
 
     return await withSnowflake(async (connection) => {
-      // Apply item moves: UPDATE alias_name for specific literal values
+      // Apply item moves: upsert the target alias, get its alias_id, then repoint literal.
       for (const [litVal, newAlias] of Object.entries(item_moves)) {
         await exec(
           connection,
-          `UPDATE STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
-           SET alias_name = ?
-           WHERE literal_value = ?`,
-          [newAlias, litVal],
-        );
-        // Upsert new alias name into the approved-names catalog
-        await exec(
-          connection,
-          `MERGE INTO STAND_DB.STAND_INTERNAL.ONE_PROMPT_APPROVED_ALIAS_NAMES t
-           USING (SELECT ? AS alias_name) s ON t.alias_name = s.alias_name
+          `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES t
+           USING (SELECT ? AS alias_name) s
+             ON t.alias_name = s.alias_name AND t.domain_id IS NULL
            WHEN MATCHED THEN UPDATE SET
              usage_count  = t.usage_count + 1,
              last_used_at = CURRENT_TIMESTAMP()
-           WHEN NOT MATCHED THEN INSERT (alias_name, usage_count, last_used_at)
-             VALUES (s.alias_name, 1, CURRENT_TIMESTAMP())`,
+           WHEN NOT MATCHED THEN INSERT (alias_name, domain_id, usage_count, last_used_at)
+             VALUES (s.alias_name, NULL, 1, CURRENT_TIMESTAMP())`,
           [newAlias],
+        );
+        const aliasRows = await exec(
+          connection,
+          `SELECT alias_id FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+           WHERE alias_name = ? AND domain_id IS NULL`,
+          [newAlias],
+        );
+        if (!aliasRows.length) continue;
+        const aliasId = Number((aliasRows[0] as any).ALIAS_ID ?? (aliasRows[0] as any).alias_id);
+        await exec(
+          connection,
+          `UPDATE STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
+           SET alias_id = ?
+           WHERE literal_value = ?`,
+          [aliasId, litVal],
         );
       }
 
@@ -94,7 +117,7 @@ export async function POST(request: Request) {
       for (const litVal of deleted_literals) {
         await exec(
           connection,
-          `DELETE FROM STAND_DB.STAND_INTERNAL.ONE_PROMPT_LITERAL_ALIAS_MATCHES
+          `DELETE FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
            WHERE literal_value = ?`,
           [litVal],
         );

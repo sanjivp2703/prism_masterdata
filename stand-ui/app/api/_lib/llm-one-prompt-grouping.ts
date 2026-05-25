@@ -38,7 +38,7 @@ import type { FinalGroup } from './clique-detection';
 // Constants
 // ---------------------------------------------------------------------------
 
-export const ONE_PROMPT_MODEL_ID = 'claude-sonnet-4-6' as const;
+export const GROUPING_MODEL_ID = 'claude-sonnet-4-6' as const;
 
 /**
  * Max items per LLM call.  Derived from token-budget analysis in the file
@@ -126,7 +126,19 @@ function extractTopLevelJsonObject(s: string): string | null {
  *  1. Strip fences, parse directly.
  *  2. Brace-walk the fence-stripped text.
  *  3. Brace-walk the original text (catches preamble + raw JSON).
+ *
+ * Also normalises Unicode curly-quotes → ASCII and strips C0/C1 control chars
+ * that some models occasionally emit and that break JSON.parse.
  */
+function normaliseJsonText(s: string): string {
+  return s
+    // Unicode curly/typographic quotes → ASCII straight quotes
+    .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")
+    // Strip C0 control chars (except tab/newline/CR) and C1 range
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '');
+}
+
 function tryParseGroupingJson(text: string): LLMResponse | null {
   const stripped = stripMarkdownFences(text);
   const candidates = [
@@ -136,10 +148,13 @@ function tryParseGroupingJson(text: string): LLMResponse | null {
   ].filter((c): c is string => c != null && c.length > 0);
 
   const seen = new Set<string>();
-  for (const c of candidates) {
-    if (seen.has(c)) continue;
-    seen.add(c);
-    try { return JSON.parse(c) as LLMResponse; } catch { /* next */ }
+  for (const raw of candidates) {
+    // Try the candidate as-is, then with normalisation applied.
+    for (const c of [raw, normaliseJsonText(raw)]) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      try { return JSON.parse(c) as LLMResponse; } catch { /* next */ }
+    }
   }
   return null;
 }
@@ -270,7 +285,7 @@ async function callChunkLLM(
       'anthropic-beta':     'prompt-caching-2024-07-31',
     },
     body: JSON.stringify({
-      model:       ONE_PROMPT_MODEL_ID,
+      model:       GROUPING_MODEL_ID,
       max_tokens:  MAX_OUTPUT_TOKENS,
       temperature: 0,
       system:      [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }],
@@ -447,7 +462,7 @@ async function callMergeLLM(
       'anthropic-beta':    'prompt-caching-2024-07-31',
     },
     body: JSON.stringify({
-      model:       ONE_PROMPT_MODEL_ID,
+      model:       GROUPING_MODEL_ID,
       max_tokens:  2048,
       temperature: 0,
       system:      [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }],
@@ -642,7 +657,7 @@ export interface OnePromptBreakdown {
     total_output_tokens:         number;
     total_cache_read_tokens:     number;
     total_cache_creation_tokens: number;
-    /** Items resolved from ONE_PROMPT_LITERAL_ALIAS_MATCHES (skipped LLM). */
+    /** Items resolved from LITERAL_ALIAS_MATCHES (skipped LLM). */
     lookup_matched: number;
   };
   system_prompt: string;
@@ -742,7 +757,7 @@ export async function runOnePromptGrouping(
     chunk_count:        0,
     breakdown: {
       meta: {
-        run_id: 0, generated_at: new Date().toISOString(), model: ONE_PROMPT_MODEL_ID,
+        run_id: 0, generated_at: new Date().toISOString(), model: GROUPING_MODEL_ID,
         concept_name: conceptName, concept_definition: conceptDefinition,
         total_items: 0, chunk_count: 0, max_items_per_chunk: MAX_ITEMS_PER_CHUNK,
         total_groups_before_merge: 0, total_groups_after_merge: 0,
@@ -773,7 +788,26 @@ export async function runOnePromptGrouping(
     chunks.map((chunk, chunkIdx) => {
       const userText   = buildUserTurn(chunk, conceptName);
       const chunkLabel = `chunk ${chunkIdx + 1}/${chunks.length}, ${chunk.length} items`;
-      return callChunkLLM(apiKey, systemText, userText, chunkLabel);
+      return callChunkLLM(apiKey, systemText, userText, chunkLabel).catch((err: unknown) => {
+        // Parse/API failure for one chunk: degrade to all-singletons rather than
+        // aborting the whole run.  Items will appear ungrouped and can be merged
+        // manually by the user.
+        console.warn(
+          `[one-prompt-grouping] ${chunkLabel} failed — falling back to singletons. Error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        const syntheticParsed: LLMResponse = {
+          g: chunk.map((_, i) => [[i + 1], null, 'l'] as LLMResponseGroup),
+          u: [],
+        };
+        return {
+          parsed:        syntheticParsed,
+          raw_text:      '',
+          user_turn:     userText,
+          stop_reason:   'parse_error',
+          llm_elapsed_ms: 0,
+          llm_usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        } satisfies ChunkCallResult;
+      });
     })
   );
 
@@ -951,7 +985,7 @@ export async function runOnePromptGrouping(
     meta: {
       run_id:                      0, // caller fills in the real run_id via writeOnePromptBreakdown
       generated_at:                new Date().toISOString(),
-      model:                       ONE_PROMPT_MODEL_ID,
+      model:                       GROUPING_MODEL_ID,
       concept_name:                conceptName,
       concept_definition:          conceptDefinition,
       total_items:                 items.length,

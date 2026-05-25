@@ -15,7 +15,7 @@
  *   1. When a run does its initial grouping to pre-existing aliases
  *      (apply-confident-assignments route).
  *   2. When data is exported back to the backend
- *      (export-to-snowflake route).
+ *      (one-prompt export route).
  *   3. When an alias is created from unassigned item classification
  *      (unassigned-grouping/commit route).
  */

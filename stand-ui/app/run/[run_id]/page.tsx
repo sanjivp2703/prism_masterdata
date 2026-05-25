@@ -1,19 +1,4 @@
-import Link from 'next/link';
 import RunReviewClient from './RunReviewClient';
-
-function PrismMark({ size = 32 }: { size?: number }) {
-  const h = size;
-  const w = Math.round(size * 1.28);
-  const cx = w / 2;
-  const cy = h / 2;
-  return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} fill="none" aria-hidden="true">
-      <polygon points={`0,0 0,${h} ${cx},${cy}`} fill="#1A1A2E" />
-      <polygon points={`${w},0 ${w},${h} ${cx},${cy}`} fill="#378ADD" />
-      <circle cx={cx} cy={cy} r={size * 0.065} fill="white" />
-    </svg>
-  );
-}
 
 function humanizeDate(val: string | undefined | null): string {
   if (!val) return '—';
@@ -64,22 +49,15 @@ export default async function RunPage({
   return (
     <div
       className="min-h-screen"
-      style={{ backgroundColor: 'var(--page-bg)', padding: 'var(--page-padding-y) var(--page-padding-x)' }}
+      style={{
+        backgroundColor: 'var(--page-bg)',
+        padding: 'var(--page-padding-y) var(--page-padding-x)',
+        paddingTop: 'calc(var(--page-padding-y) + 44px)',
+      }}
     >
       <div className="max-w-6xl mx-auto">
         {/* ── Page header ─────────────────────────────────────────────────── */}
         <div className="mb-8">
-          {/* Logo — links back home */}
-          <Link href="/home" className="inline-flex items-center gap-2.5 group mb-6">
-            <PrismMark size={32} />
-            <span
-              className="text-lg font-semibold tracking-tight transition-colors"
-              style={{ color: 'var(--text-primary)' }}
-            >
-              Prism
-            </span>
-          </Link>
-
           {runData && (
             <>
               {/* Row 1: Concept · Source · Column · Created by */}
