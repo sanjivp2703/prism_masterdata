@@ -1,0 +1,22 @@
+# Logs
+*.log
+
+# Dependencies / build artifacts
+node_modules/
+stand-ui/.next/
+stand-ui/tsconfig.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.local
+.env*.local
+*.pem
+
+# Debug artifacts (LLM run breakdowns / validation audits)
+validation_audit_run_*.json
+one_prompt_breakdown_run_*.json
+*_breakdown_run_*.json
+boost_confidence_breakdown.json
+
+# OS
+.DS_Store
