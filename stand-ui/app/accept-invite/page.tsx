@@ -47,12 +47,13 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
     return <ErrorState message={ERROR_MESSAGES[urlError] ?? 'Something went wrong. Please contact the person who invited you.'} />;
   }
 
-  // Validate the token
-  let inviteStatus: InviteStatus = 'db_error';
+  // Validate the token. Return the status from the callback (rather than mutating
+  // an outer variable) so TypeScript's control-flow analysis can see the result
+  // type — assignments inside the callback are otherwise invisible to it.
   let invitedEmail = '';
-
+  let inviteStatus: InviteStatus;
   try {
-    await withSnowflake(async (conn) => {
+    inviteStatus = await withSnowflake(async (conn): Promise<InviteStatus> => {
       const rows = await exec(
         conn,
         `SELECT invited_email, status, expires_at
@@ -61,25 +62,16 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
         [token],
       );
 
-      if (!rows.length) {
-        inviteStatus = 'invalid';
-        return;
-      }
+      if (!rows.length) return 'invalid';
 
       const status    = String(row(rows[0], 'status'));
       const expiresAt = new Date(row(rows[0], 'expires_at'));
 
-      if (status === 'accepted') {
-        inviteStatus = 'already_accepted';
-        return;
-      }
-      if (status !== 'pending' || expiresAt < new Date()) {
-        inviteStatus = 'expired';
-        return;
-      }
+      if (status === 'accepted') return 'already_accepted';
+      if (status !== 'pending' || expiresAt < new Date()) return 'expired';
 
       invitedEmail = String(row(rows[0], 'invited_email'));
-      inviteStatus = 'valid';
+      return 'valid';
     });
   } catch {
     inviteStatus = 'db_error';

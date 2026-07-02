@@ -34,27 +34,36 @@ const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE
 
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
-  const { format, snowflakeTableFqn } = body as {
+  const { format, snowflakeTableFqn, domain_id: rawDomainId, domain_name: rawDomainName } = body as {
     format?: string;
     snowflakeTableFqn?: string;
+    domain_id?: number | null;
+    domain_name?: string | null;
   };
 
   if (!format || !['sheets', 'snowflake'].includes(format)) {
     return Response.json({ error: 'Invalid format. Use "sheets" or "snowflake".' }, { status: 400 });
   }
 
+  const domainId   = rawDomainId != null ? Number(rawDomainId) : null;
+  const domainName = rawDomainName ? String(rawDomainName) : null;
+
   // ── Load current mappings from Snowflake ────────────────────────────────────
   let rows: Array<{ canonical_name: string; raw_value: string }>;
 
   try {
     const result = await withSnowflake(async (connection) => {
+      const domainFilter = domainId != null ? 'WHERE lam.domain_id = ?' : '';
+      const binds        = domainId != null ? [domainId] : [];
       const sfRows = await exec(
         connection,
         `SELECT aan.alias_name AS canonical_name, lam.literal_value AS raw_value
          FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
          JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
            ON lam.alias_id = aan.alias_id
+         ${domainFilter}
          ORDER BY aan.alias_name, lam.literal_value`,
+        binds,
       );
       return sfRows.map((r) => ({
         canonical_name: String(r.CANONICAL_NAME ?? r.canonical_name ?? ''),
@@ -68,7 +77,7 @@ export async function POST(request: NextRequest) {
 
   const headers     = ['canonical_name', 'raw_value'];
   const sheetData   = [headers, ...rows.map((r) => [r.canonical_name, r.raw_value])];
-  const sheetTitle  = 'Global Standardizations';
+  const sheetTitle  = domainName ? `${domainName} — Lookup Table` : 'Global Standardizations';
 
   // ── Google Sheets ────────────────────────────────────────────────────────────
   if (format === 'sheets') {
@@ -169,7 +178,10 @@ export async function POST(request: NextRequest) {
 
   // ── Snowflake table ──────────────────────────────────────────────────────────
   if (format === 'snowflake') {
-    const targetFqn = snowflakeTableFqn?.trim() || 'STAND_DB.STAND_INTERNAL.GLOBAL_CANONICAL_MAPPINGS';
+    const defaultFqn = domainName
+      ? `STAND_DB.PUBLIC.${domainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+      : 'STAND_DB.STAND_INTERNAL.GLOBAL_CANONICAL_MAPPINGS';
+    const targetFqn = snowflakeTableFqn?.trim() || defaultFqn;
 
     try {
       await withSnowflake(async (connection) => {

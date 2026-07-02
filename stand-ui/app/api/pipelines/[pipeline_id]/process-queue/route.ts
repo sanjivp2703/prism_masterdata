@@ -20,12 +20,14 @@ import { cookies } from 'next/headers';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { premiumModeGuard } from '@/app/api/_lib/feature-flags';
+import { broadcastPipelineEvent } from '@/app/api/_lib/pipeline-broadcaster';
 import {
   fetchPipelineById,
   fetchQueueLiterals,
   bulkProcessPipelineQueue,
   type PipelineForProcessing,
 } from '@/app/api/_lib/pipeline-hourly-processor';
+import { readFileDistinctValues, syncSheetsColumn } from '@/app/api/_lib/op-file-pipeline';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -50,10 +52,12 @@ async function fetchSourceLiterals(
   const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
   const colRef   = quoteIdent(pipeline.column_name);
 
+  // Dedup by the normalized form; ANY_VALUE keeps a representative original.
   const rows = await exec(conn, `
-    SELECT DISTINCT ${colRef} AS val
+    SELECT ANY_VALUE(${colRef}) AS val
     FROM ${tableRef}
     WHERE ${colRef} IS NOT NULL
+    GROUP BY PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
   return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter(Boolean);
@@ -63,9 +67,14 @@ export async function POST(
   _request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
-  const cookieStore = await cookies();
-  const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
+  const cookieStore  = await cookies();
+  const session      = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
   if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  // Google OAuth tokens — same cookies set at sign-in (login already requests Sheets scope).
+  const gAccessToken  = cookieStore.get('google_access_token')?.value;
+  const gRefreshToken = cookieStore.get('google_refresh_token')?.value;
+  const gTokenExpiry  = cookieStore.get('google_token_expiry')?.value;
 
   const modeBlocked = premiumModeGuard();
   if (modeBlocked) return modeBlocked;
@@ -88,11 +97,92 @@ export async function POST(
       return Response.json({ error: `Pipeline ${pid} not found` }, { status: 404 });
     }
 
-    const isInitial = pipeline.status === 'pending_baseline';
+    const isInitial      = pipeline.status === 'pending_baseline';
+    const isFilePipeline = pipeline.source_type && pipeline.source_type !== 'snowflake';
 
-    // ── Collect literals to process ──────────────────────────────────────────
-    const literals = await withSnowflake(async (conn) => {
+    // ── Sheets: multi-column path ─────────────────────────────────────────────
+    // Handles all columns in file_source_meta.columns with ONE call, then syncs
+    // the output spreadsheet once. Returns early so the Snowflake-queue path below
+    // is not entered for Sheets pipelines.
+    if (pipeline.source_type === 'sheets') {
+      let fsm: Record<string, any> = {};
+      try {
+        const raw = pipeline.file_source_meta;
+        fsm = typeof raw === 'object' && raw !== null ? raw : JSON.parse(String(raw ?? '{}'));
+      } catch { /* ignore */ }
+
+      const colConfigs: Array<{ column_name: string; domain_id: number | null }> =
+        Array.isArray(fsm?.columns) && fsm.columns.length > 0
+          ? fsm.columns.map((c: any) => ({
+              column_name: String(c.column_name ?? ''),
+              domain_id:   c.domain_id != null ? Number(c.domain_id) : null,
+            }))
+          : [{ column_name: pipeline.column_name, domain_id: pipeline.domain_id }];
+
+      let totalItemsWritten      = 0;
+      let totalLiteralsProcessed = 0;
+      let anyLiterals            = false;
+
+      for (const colConfig of colConfigs) {
+        if (!colConfig.column_name) continue;
+        const colPipeline = { ...pipeline, column_name: colConfig.column_name, domain_id: colConfig.domain_id };
+        const colLiterals = await withSnowflake(async (conn) =>
+          readFileDistinctValues(conn, pid, colConfig.column_name));
+        if (colLiterals.length === 0) continue;
+        anyLiterals = true;
+        broadcastPipelineEvent({ type: 'standardizing_started', pipeline_id: pid });
+        const result = await bulkProcessPipelineQueue(colPipeline, colLiterals, apiKey);
+        broadcastPipelineEvent({ type: 'standardizing_finished', pipeline_id: pid });
+        totalItemsWritten      += result.items_written;
+        totalLiteralsProcessed += result.literals_processed;
+      }
+
       if (isInitial) {
+        await withSnowflake(async (conn) => {
+          await exec(conn, `
+            UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
+            SET status              = 'paused',
+                last_queue_empty_at = CURRENT_TIMESTAMP(),
+                updated_at          = CURRENT_TIMESTAMP()
+            WHERE pipeline_id = ? AND status = 'pending_baseline'
+          `, [pid]);
+        });
+      }
+
+      const sheetsSync = await syncSheetsColumn(pipeline, gAccessToken, gRefreshToken, gTokenExpiry);
+
+      return Response.json({
+        ok:                 true,
+        items_written:      totalItemsWritten,
+        literals_processed: totalLiteralsProcessed,
+        pipeline_advanced:  isInitial,
+        sheets_sync:        sheetsSync,
+        message: anyLiterals ? undefined : (isInitial ? 'No values found in source.' : 'Queue is empty.'),
+      });
+    }
+
+    // ── Collect literals to process (non-Sheets) ──────────────────────────────
+    const literals = await withSnowflake(async (conn) => {
+      if (isFilePipeline) {
+        // CSV / Excel — read distinct values from PIPELINE_FILE_ROWS.
+        return readFileDistinctValues(conn, pid, pipeline.column_name);
+      }
+      if (isInitial) {
+        // Pre-create the stream BEFORE scanning the source table so there is
+        // no gap between what the baseline scan sees and what the stream tracks.
+        // Values in the table at scan time  → caught by the baseline scan.
+        // Values inserted after this point  → caught by the stream on next poll.
+        const parts      = pipeline.table_fqn.split('.');
+        const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
+        const streamName = `STAND_DB.STAND_INTERNAL.PIPELINE_STREAM_${pid}`;
+        try {
+          await exec(conn, `
+            CREATE STREAM IF NOT EXISTS ${streamName}
+            ON TABLE ${tableRef}`);
+          console.log(`[ProcessQueue] Pipeline ${pid}: stream pre-created (${streamName})`);
+        } catch (streamErr: any) {
+          console.warn(`[ProcessQueue] Pipeline ${pid}: could not pre-create stream:`, streamErr?.message ?? streamErr);
+        }
         return fetchSourceLiterals(conn, pipeline);
       }
       return fetchQueueLiterals(conn, pid);
@@ -116,11 +206,14 @@ export async function POST(
         items_written: 0,
         literals_processed: 0,
         message: isInitial ? 'No values found in source table.' : 'Queue is empty.',
+        sheets_sync: null,
       });
     }
 
     // ── Run auto-group + LLM + direct export ─────────────────────────────────
+    broadcastPipelineEvent({ type: 'standardizing_started', pipeline_id: pid });
     const result = await bulkProcessPipelineQueue(pipeline, literals, apiKey);
+    broadcastPipelineEvent({ type: 'standardizing_finished', pipeline_id: pid });
 
     // ── Update pipeline state ────────────────────────────────────────────────
     await withSnowflake(async (conn) => {
@@ -169,14 +262,15 @@ export async function POST(
     // Export table refresh is handled inside runOpExportDirect after writes commit.
 
     return Response.json({
-      ok:                 true,
-      run_id:             result.run_id,
-      groups_created:     result.groups_created,
-      items_written:      result.items_written,
-      lookup_matched:     result.lookup_matched,
-      llm_grouped:        result.llm_grouped,
-      literals_processed: result.literals_processed,
-      pipeline_advanced:  isInitial,
+      ok:                  true,
+      run_id:              result.run_id,
+      groups_created:      result.groups_created,
+      items_written:       result.items_written,
+      lookup_matched:      result.lookup_matched,
+      llm_grouped:         result.llm_grouped,
+      literals_processed:  result.literals_processed,
+      pipeline_advanced:   isInitial,
+      sheets_sync:         null,
     });
   } catch (err) {
     return snowflakeErrorResponse(err, 'Failed to process pipeline queue');

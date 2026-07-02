@@ -16,6 +16,10 @@ async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   });
 }
 
+function quoteIdent(ident: string): string {
+  return `"${String(ident).replace(/"/g, '""')}"`;
+}
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
@@ -43,9 +47,25 @@ export async function GET(
       if (!pRows.length) return Response.json({ error: 'Pipeline not found' }, { status: 404 });
 
       const domain_id: number | null = (pRows[0] as any).DOMAIN_ID ?? (pRows[0] as any).domain_id ?? null;
+      const table_fqn   = String((pRows[0] as any).TABLE_FQN   ?? (pRows[0] as any).table_fqn   ?? '');
+      const column_name = String((pRows[0] as any).COLUMN_NAME ?? (pRows[0] as any).column_name ?? '');
       const domainFilter = domain_id != null
         ? `AND lam.domain_id = ${Number(domain_id)}`
         : `AND lam.domain_id IS NULL`;
+
+      // Scope to THIS table/column: only mappings whose (normalized) value actually
+      // appears in the pipeline's source column — not every mapping in the domain.
+      const parts = table_fqn.split('.').map(s => s.trim()).filter(Boolean);
+      let colScopeFilter = '';
+      if (parts.length === 3 && column_name) {
+        const tableRef = parts.map(quoteIdent).join('.');
+        const colRef   = quoteIdent(column_name);
+        colScopeFilter = `AND lam.normalized_value IN (
+          SELECT PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+          FROM ${tableRef}
+          WHERE ${colRef} IS NOT NULL
+        )`;
+      }
 
       const searchFilter = search
         ? `AND (LOWER(lam.literal_value) LIKE LOWER('%' || ? || '%') OR LOWER(aan.alias_name) LIKE LOWER('%' || ? || '%'))`
@@ -64,6 +84,7 @@ export async function GET(
            ON aan.alias_id = lam.alias_id
          WHERE 1=1
            ${domainFilter}
+           ${colScopeFilter}
            ${searchFilter}
          ORDER BY lam.confirmed_at DESC
          LIMIT ${limit}`,
@@ -77,12 +98,12 @@ export async function GET(
         confirmed_at:  (r as any).CONFIRMED_AT ?? (r as any).confirmed_at ?? null,
       }));
 
-      // Total count for the domain (regardless of search)
+      // Total count for this table/column (regardless of search)
       const countRows = await exec(
         conn,
         `SELECT COUNT(*) AS cnt
          FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-         WHERE 1=1 ${domainFilter}`,
+         WHERE 1=1 ${domainFilter} ${colScopeFilter}`,
       );
       const total = Number((countRows[0] as any).CNT ?? (countRows[0] as any).cnt ?? 0);
 

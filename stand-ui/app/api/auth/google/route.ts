@@ -24,10 +24,13 @@ export async function GET(request: NextRequest) {
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: [
+      'openid',
+      'email',
+      'profile',
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive.file',
     ],
-    state: Buffer.from(JSON.stringify({ returnTo })).toString('base64url'),
+    state: Buffer.from(JSON.stringify({ returnTo, sheetsOnly: true })).toString('base64url'),
     prompt: 'consent',
   });
 

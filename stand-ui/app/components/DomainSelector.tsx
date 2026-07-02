@@ -1,13 +1,19 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import CreateDomainModal from './CreateDomainModal';
 
 export interface Domain {
-  domain_id:    number;
-  name:         string;
-  usage_count:  number;
-  last_used_at: string | null;
-  created_at:   string | null;
+  domain_id:             number;
+  name:                  string;
+  description:           string | null;
+  standardization_rules: string | null;  // JSON array of free-text rule strings
+  convention_type:       string | null;  // null | 'regex' | 'examples' | 'natural'
+  convention_value:      string | null;
+  convention_rules:      string | null;  // JSON of structured naming rules
+  usage_count:           number;
+  last_used_at:          string | null;
+  created_at:            string | null;
 }
 
 interface DomainSelectorProps {
@@ -208,6 +214,7 @@ export default function DomainSelector({ isAdmin, value, onChange }: DomainSelec
   const [loading,    setLoading]    = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [creating,   setCreating]   = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingId,  setEditingId]  = useState<number | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
@@ -305,6 +312,12 @@ export default function DomainSelector({ isAdmin, value, onChange }: DomainSelec
   if (domains.length <= PILL_THRESHOLD) {
     return (
       <div>
+        {showCreateModal && (
+          <CreateDomainModal
+            onClose={() => setShowCreateModal(false)}
+            onCreated={(d) => { handleCreated(d); setShowCreateModal(false); }}
+          />
+        )}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           {domains.map(d => {
             const selected = value?.domain_id === d.domain_id;
@@ -369,7 +382,7 @@ export default function DomainSelector({ isAdmin, value, onChange }: DomainSelec
           {/* New domain pill button */}
           {!creating && (
             <button
-              onClick={() => setCreating(true)}
+              onClick={() => setShowCreateModal(true)}
               style={{
                 display:         'inline-flex',
                 alignItems:      'center',
@@ -408,6 +421,12 @@ export default function DomainSelector({ isAdmin, value, onChange }: DomainSelec
 
   return (
     <div ref={dropRef} style={{ position: 'relative' }}>
+      {showCreateModal && (
+        <CreateDomainModal
+          onClose={() => setShowCreateModal(false)}
+          onCreated={(d) => { handleCreated(d); setShowCreateModal(false); }}
+        />
+      )}
       {/* Trigger button */}
       <button
         onClick={() => setDropOpen(o => !o)}
@@ -519,7 +538,7 @@ export default function DomainSelector({ isAdmin, value, onChange }: DomainSelec
               <CreateForm onCreated={d => { handleCreated(d); setDropOpen(false); }} onCancel={() => setCreating(false)} />
             ) : (
               <button
-                onClick={() => setCreating(true)}
+                onClick={() => setShowCreateModal(true)}
                 style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: 13, fontWeight: 500, width: '100%', padding: '2px 0' }}
               >
                 <span style={{ fontSize: 16 }}>+</span>

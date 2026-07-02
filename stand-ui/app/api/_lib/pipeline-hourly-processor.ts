@@ -19,12 +19,24 @@ import { withSnowflake } from './snowflake';
 import { saveOpRunState, loadOpRunState, type OpRunState } from './op-auto-group';
 import { runAutoGroupForRun } from './op-auto-group-run';
 import { runOpExportDirect } from './op-export';
-import { beginStandardization, endStandardization } from './pipeline-coordination';
+import { refreshExportTable, updatePipelineMappedCount } from './export-table';
+import { beginStandardization, endStandardization, isPipelineStandardizing } from './pipeline-coordination';
+import { broadcastPipelineEvent } from './pipeline-broadcaster';
 
 const HOUR_MS = 60 * 60 * 1_000;
 
 /** Run standardization when queue size is strictly greater than this value. */
 export const QUEUE_STANDARDIZE_THRESHOLD = 25;
+
+/**
+ * Max number of previously-unmapped source values the reconciliation sweep
+ * queues per pipeline per pass.  The baseline scan caps at 5 000 distinct
+ * values and the APPEND_ONLY stream only emits post-setup inserts, so any
+ * pre-existing distinct tail beyond the cap is invisible to both.  This sweep
+ * trickles that tail into the queue in batches so a huge backlog is absorbed
+ * over successive hourly passes rather than in one oversized standardization.
+ */
+const RECONCILE_QUEUE_BATCH = 5_000;
 
 const processingPipelineIds = new Set<number>();
 
@@ -41,6 +53,23 @@ async function exec(connection: any, sqlText: string, binds?: any[]): Promise<an
   });
 }
 
+function quoteIdent(ident: string): string {
+  return `"${String(ident).replace(/"/g, '""')}"`;
+}
+
+function isSimpleIdent(s: string): boolean {
+  // Permissive: any non-empty name quoteIdent can safely wrap (spaces, hyphens,
+  // leading digits, Unicode letters are all valid quoted identifiers). Reject
+  // only control chars and quotes/backslash, which could break out of a quoted
+  // identifier or a string literal built elsewhere.
+  if (!s) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 32 || c === 127 || c === 34 || c === 39 || c === 92) return false;
+  }
+  return true;
+}
+
 export interface PipelineForProcessing {
   pipeline_id:      number;
   table_fqn:        string;
@@ -48,6 +77,10 @@ export interface PipelineForProcessing {
   export_table_fqn: string | null;
   domain_id:        number | null;
   domain_name:      string | null;
+  status:           string;
+  source_type:      string;
+  file_source_meta: any;
+  file_export_meta: any;
 }
 
 export async function fetchPipelineById(pipelineId: number): Promise<PipelineForProcessing | null> {
@@ -60,6 +93,10 @@ export async function fetchPipelineById(pipelineId: number): Promise<PipelineFor
          p.column_name,
          p.export_table_fqn,
          p.domain_id,
+         p.status,
+         p.source_type,
+         p.file_source_meta,
+         p.file_export_meta,
          d.name AS domain_name
        FROM STAND_DB.STAND_INTERNAL.PIPELINES p
        LEFT JOIN STAND_DB.STAND_INTERNAL.DOMAINS d ON d.domain_id = p.domain_id
@@ -78,6 +115,10 @@ export async function fetchPipelineById(pipelineId: number): Promise<PipelineFor
         ? Number(r.DOMAIN_ID ?? r.domain_id)
         : null,
       domain_name:      r.DOMAIN_NAME ?? r.domain_name ?? null,
+      status:           String(r.STATUS ?? r.status ?? ''),
+      source_type:      String(r.SOURCE_TYPE ?? r.source_type ?? 'snowflake'),
+      file_source_meta: r.FILE_SOURCE_META ?? r.file_source_meta ?? null,
+      file_export_meta: r.FILE_EXPORT_META ?? r.file_export_meta ?? null,
     };
   });
 }
@@ -92,10 +133,13 @@ async function fetchPipelinesWithQueue(): Promise<PipelineForProcessing[]> {
          p.column_name,
          p.export_table_fqn,
          p.domain_id,
+         p.status,
          d.name AS domain_name
        FROM STAND_DB.STAND_INTERNAL.PIPELINES p
        LEFT JOIN STAND_DB.STAND_INTERNAL.DOMAINS d ON d.domain_id = p.domain_id
        WHERE p.status = 'active'
+         AND p.mode = 'auto'
+         AND (p.source_type = 'snowflake' OR p.source_type IS NULL)
          AND EXISTS (
            SELECT 1 FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE q
            WHERE q.pipeline_id = p.pipeline_id
@@ -111,8 +155,197 @@ async function fetchPipelinesWithQueue(): Promise<PipelineForProcessing[]> {
         ? Number(r.DOMAIN_ID ?? r.domain_id)
         : null,
       domain_name:      r.DOMAIN_NAME ?? r.domain_name ?? null,
+      status:           String(r.STATUS ?? r.status ?? ''),
+      source_type:      'snowflake',
+      file_source_meta: null,
+      file_export_meta: null,
     }));
   });
+}
+
+/** All active pipelines, regardless of whether they currently have queued items. */
+async function fetchAllActivePipelines(): Promise<PipelineForProcessing[]> {
+  return await withSnowflake(async (conn) => {
+    const rows = await exec(
+      conn,
+      `SELECT
+         p.pipeline_id,
+         p.table_fqn,
+         p.column_name,
+         p.export_table_fqn,
+         p.domain_id,
+         p.status,
+         d.name AS domain_name
+       FROM STAND_DB.STAND_INTERNAL.PIPELINES p
+       LEFT JOIN STAND_DB.STAND_INTERNAL.DOMAINS d ON d.domain_id = p.domain_id
+       WHERE p.status = 'active'
+         AND (p.source_type = 'snowflake' OR p.source_type IS NULL)
+       ORDER BY p.pipeline_id`,
+    );
+    return rows.map((r) => ({
+      pipeline_id:      Number(r.PIPELINE_ID      ?? r.pipeline_id),
+      table_fqn:        String(r.TABLE_FQN         ?? r.table_fqn        ?? ''),
+      column_name:      String(r.COLUMN_NAME       ?? r.column_name      ?? ''),
+      export_table_fqn: r.EXPORT_TABLE_FQN ?? r.export_table_fqn ?? null,
+      domain_id:        (r.DOMAIN_ID ?? r.domain_id) != null
+        ? Number(r.DOMAIN_ID ?? r.domain_id)
+        : null,
+      domain_name:      r.DOMAIN_NAME ?? r.domain_name ?? null,
+      status:           String(r.STATUS ?? r.status ?? ''),
+      source_type:      'snowflake',
+      file_source_meta: null,
+      file_export_meta: null,
+    }));
+  });
+}
+
+/**
+ * Queue previously-unmapped source values that the stream never captured.
+ *
+ * Finds distinct non-null source values that are neither mapped in
+ * LITERAL_ALIAS_MATCHES (for this pipeline's domain) nor already in the queue,
+ * and inserts up to RECONCILE_QUEUE_BATCH of them into PIPELINE_QUEUE with their
+ * full source row count as the initial frequency.  Pure detection — does not
+ * standardize — so it is safe to run for manual-mode pipelines too (the owner
+ * still triggers standardization).  Returns the number of values newly queued.
+ */
+export async function reconcilePipelineQueue(
+  pipeline: { pipeline_id: number; table_fqn: string; column_name: string; domain_id: number | null },
+): Promise<number> {
+  const { pipeline_id: pid, table_fqn, column_name, domain_id } = pipeline;
+
+  // Skip if a standardization run is in flight — it is actively mutating the
+  // queue and LITERAL_ALIAS_MATCHES, so a concurrent scan would race.
+  if (isPipelineStandardizing(pid)) return 0;
+
+  const parts = String(table_fqn).split('.').map((p) => p.trim());
+  if (parts.length !== 3 || !parts.every(isSimpleIdent) || !isSimpleIdent(column_name)) {
+    console.warn(`[Reconcile] Pipeline ${pid}: invalid table/column identifier — skipping`);
+    return 0;
+  }
+
+  const tableRef   = parts.map(quoteIdent).join('.');
+  const colRef     = quoteIdent(column_name);
+  const domainCond = domain_id != null
+    ? `AND lam.domain_id = ${Number(domain_id)}`
+    : `AND lam.domain_id IS NULL`;
+
+  return await withSnowflake(async (conn) => {
+    const [beforeRow] = await exec(
+      conn,
+      `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+      [pid],
+    );
+    const queueBefore = Number(beforeRow?.CNT ?? beforeRow?.cnt ?? 0);
+
+    // The NOT EXISTS guard against the queue (in addition to WHEN NOT MATCHED)
+    // ensures the LIMIT budget is spent only on genuinely-new values, so every
+    // pass makes forward progress instead of re-selecting already-queued rows.
+    await exec(conn, `
+      MERGE INTO STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE AS tgt
+      USING (
+        SELECT ANY_VALUE(TO_VARCHAR(src.${colRef})) AS literal_value,
+               COUNT(*)                             AS source_frequency
+        FROM ${tableRef} src
+        LEFT JOIN STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
+          ON lam.normalized_value = PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+          ${domainCond}
+        WHERE src.${colRef} IS NOT NULL
+          AND lam.literal_value IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE q
+            WHERE q.pipeline_id = ${pid}
+              AND PRISM_NORMALIZE(q.literal_value) = PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+          )
+        GROUP BY PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+        LIMIT ${RECONCILE_QUEUE_BATCH}
+      ) AS recon
+        ON tgt.pipeline_id = ${pid} AND PRISM_NORMALIZE(tgt.literal_value) = PRISM_NORMALIZE(recon.literal_value)
+      WHEN NOT MATCHED THEN INSERT (pipeline_id, literal_value, source_frequency)
+        VALUES (${pid}, recon.literal_value, recon.source_frequency)`);
+
+    const [afterRow] = await exec(
+      conn,
+      `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+      [pid],
+    );
+    const queueAfter = Number(afterRow?.CNT ?? afterRow?.cnt ?? 0);
+    const added      = Math.max(0, queueAfter - queueBefore);
+
+    if (added > 0) {
+      await exec(
+        conn,
+        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
+         SET queue_size = ?, updated_at = CURRENT_TIMESTAMP()
+         WHERE pipeline_id = ?`,
+        [queueAfter, pid],
+      );
+      broadcastPipelineEvent({ type: 'metrics_updated' });
+      console.log(`[Reconcile] Pipeline ${pid}: queued ${added} previously-unmapped value(s) (queue: ${queueAfter})`);
+    }
+
+    return added;
+  });
+}
+
+/**
+ * Run the reconciliation scan across all active pipelines.  Runs ahead of the
+ * standardization sweep so any newly-surfaced tail values are present in the
+ * queue when fetchPipelinesWithQueue picks the auto-mode pipelines up.
+ *
+ * Also rebuilds each pipeline's export (or recomputes its mapped count) as a
+ * safety net: mass source changes the stream can't reliably surface — TRUNCATE,
+ * bulk reload, Time-Travel restore/UNDROP — converge here, so rows no longer in
+ * the source drop out of the export even if no per-row delete event was seen.
+ */
+export async function runReconciliationSweep(): Promise<void> {
+  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') return;
+
+  const pipelines = await fetchAllActivePipelines();
+  if (pipelines.length === 0) return;
+
+  console.log(`[Reconcile] Scanning ${pipelines.length} active pipeline(s) for unmapped source values…`);
+
+  // 1) Per-column detection — queue any unmapped source values the stream missed.
+  let total = 0;
+  for (const p of pipelines) {
+    try {
+      total += await reconcilePipelineQueue(p);
+    } catch (e) {
+      console.error(`[Reconcile] Pipeline ${p.pipeline_id}: failed:`, e);
+    }
+  }
+
+  // 2) Safety export rebuild — ONCE per export file (a rebuild covers every
+  //    column sharing it), not once per column. Skip any export file that has a
+  //    column mid-standardization (that run rebuilds its own export and would race).
+  const busyExports = new Set<string>();
+  for (const p of pipelines) {
+    if (p.export_table_fqn && isPipelineStandardizing(p.pipeline_id)) busyExports.add(p.export_table_fqn);
+  }
+  const rebuiltExports = new Set<string>();
+  for (const p of pipelines) {
+    if (!p.table_fqn || !p.column_name) continue;
+    try {
+      if (p.export_table_fqn) {
+        if (busyExports.has(p.export_table_fqn) || rebuiltExports.has(p.export_table_fqn)) continue;
+        // Re-check immediately before starting the rebuild — standardization may
+        // have begun since we computed busyExports at the top of the loop.
+        if (isPipelineStandardizing(p.pipeline_id)) {
+          busyExports.add(p.export_table_fqn); // block siblings of this export too
+          continue;
+        }
+        rebuiltExports.add(p.export_table_fqn);
+        await refreshExportTable(p.table_fqn, p.column_name, p.export_table_fqn, p.domain_id, p.pipeline_id);
+      } else {
+        if (isPipelineStandardizing(p.pipeline_id)) continue;
+        await updatePipelineMappedCount(p.table_fqn, p.column_name, p.domain_id, p.pipeline_id);
+      }
+    } catch (e) {
+      console.error(`[Reconcile] Pipeline ${p.pipeline_id}: safety export rebuild failed:`, e);
+    }
+  }
+  console.log(`[Reconcile] Sweep complete — ${total} value(s) queued across all pipelines`);
 }
 
 export async function fetchQueueLiterals(
@@ -130,10 +363,32 @@ export async function fetchQueueLiterals(
   return rows.map((r) => String(r.LITERAL_VALUE ?? r.literal_value ?? '')).filter(Boolean);
 }
 
+/** Fetch queued literals with their accumulated source row counts. */
+export async function fetchQueueLiteralsWithFreq(
+  connection: any,
+  pipelineId: number,
+): Promise<Array<{ literal_value: string; source_frequency: number }>> {
+  const rows = await exec(
+    connection,
+    `SELECT literal_value, source_frequency
+     FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
+     WHERE pipeline_id = ?
+     ORDER BY detected_at NULLS LAST, literal_value`,
+    [pipelineId],
+  );
+  return rows
+    .map((r) => ({
+      literal_value:    String(r.LITERAL_VALUE    ?? r.literal_value    ?? ''),
+      source_frequency: Number(r.SOURCE_FREQUENCY ?? r.source_frequency ?? 1),
+    }))
+    .filter((r) => r.literal_value);
+}
+
 export async function createRunFromQueue(
   connection: any,
   pipeline: PipelineForProcessing,
   literals: string[],
+  frequencies?: Map<string, number>,
 ): Promise<number> {
   const conceptKey = pipeline.domain_name?.trim() || 'mobile_carrier';
   const nonce = `hourly_${pipeline.pipeline_id}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -161,7 +416,7 @@ export async function createRunFromQueue(
     items:     literals.map((lv, idx) => ({
       run_item_id:         idx + 1,
       literal_value:       lv,
-      source_frequency:    1,
+      source_frequency:    frequencies?.get(lv) ?? 1,
       matched_from_lookup: false,
     })),
     groups:    [],
@@ -254,7 +509,7 @@ export async function bulkProcessPipelineQueue(
     throw new Error(`Pipeline ${pipeline.pipeline_id} is already being processed — try again in a moment.`);
   }
   processingPipelineIds.add(pipeline.pipeline_id);
-  beginStandardization();
+  beginStandardization(pipeline.pipeline_id);
 
   try {
     return await withSnowflake(async (conn) => {
@@ -269,6 +524,8 @@ export async function bulkProcessPipelineQueue(
       if (exportedLits.length > 0) {
         const exportResult = await runOpExportDirect(runId);
         items_written = exportResult.items_written;
+        await removeExportedFromQueue(conn, pipeline.pipeline_id, exportedLits);
+        broadcastPipelineEvent({ type: 'metrics_updated' });
       }
 
       return {
@@ -283,7 +540,7 @@ export async function bulkProcessPipelineQueue(
     });
   } finally {
     processingPipelineIds.delete(pipeline.pipeline_id);
-    endStandardization();
+    endStandardization(pipeline.pipeline_id);
   }
 }
 
@@ -293,37 +550,42 @@ export async function bulkProcessPipelineQueue(
 export async function processPipelineQueue(
   pipeline: PipelineForProcessing,
   reason:   'hourly' | 'threshold' = 'hourly',
+  opts:     { beginEndStandardization?: boolean } = {},
 ): Promise<void> {
+  const { beginEndStandardization = true } = opts;
   const tag = reason === 'threshold' ? 'Queue' : 'Hourly';
   if (processingPipelineIds.has(pipeline.pipeline_id)) {
     console.log(`[${tag}] Pipeline ${pipeline.pipeline_id}: already processing — skip`);
     return;
   }
   processingPipelineIds.add(pipeline.pipeline_id);
-  beginStandardization();
+  if (beginEndStandardization) beginStandardization(pipeline.pipeline_id);
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn(`[${tag}] ANTHROPIC_API_KEY not set — skipping pipeline ${pipeline.pipeline_id}`);
     processingPipelineIds.delete(pipeline.pipeline_id);
-    endStandardization();
+    if (beginEndStandardization) endStandardization(pipeline.pipeline_id);
     return;
   }
 
   try {
     await withSnowflake(async (connection) => {
-      const literals = await fetchQueueLiterals(connection, pipeline.pipeline_id);
-      if (literals.length === 0) {
+      const queueItems = await fetchQueueLiteralsWithFreq(connection, pipeline.pipeline_id);
+      if (queueItems.length === 0) {
         console.log(`[${tag}] Pipeline ${pipeline.pipeline_id}: queue empty — skip`);
         return;
       }
+
+      const literals = queueItems.map(q => q.literal_value);
+      const frequencies = new Map(queueItems.map(q => [q.literal_value, q.source_frequency]));
 
       console.log(
         `[${tag}] Pipeline ${pipeline.pipeline_id} (${pipeline.domain_name ?? 'no domain'}): ` +
         `standardizing ${literals.length} queued value(s)…`,
       );
 
-      const runId = await createRunFromQueue(connection, pipeline, literals);
+      const runId = await createRunFromQueue(connection, pipeline, literals, frequencies);
 
       await runAutoGroupForRun(connection, runId, apiKey, { writeBreakdown: false });
 
@@ -345,51 +607,83 @@ export async function processPipelineQueue(
       }
 
       const exportResult = await runOpExportDirect(runId);
+      // runOpExportDirect already rebuilds the export table and updates total_mapped
+      // internally (errors caught non-fatally there).  No second rebuild needed here.
       await removeExportedFromQueue(connection, pipeline.pipeline_id, exportedLiterals);
+
+      // For pipelines without an export table, increment total_mapped by the
+      // source_frequency sum of exported literals (runOpExportDirect skips this path).
+      if (!pipeline.export_table_fqn) {
+        const exportedFreqSum = exportedLiterals.reduce(
+          (sum, lit) => sum + (frequencies.get(lit) ?? 1),
+          0,
+        );
+        if (exportedFreqSum > 0) {
+          await exec(
+            connection,
+            `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
+             SET total_mapped = total_mapped + ?,
+                 updated_at   = CURRENT_TIMESTAMP()
+             WHERE pipeline_id = ?`,
+            [exportedFreqSum, pipeline.pipeline_id],
+          );
+        }
+      }
+
+      broadcastPipelineEvent({ type: 'metrics_updated' });
 
       console.log(
         `[${tag}] Pipeline ${pipeline.pipeline_id}: run ${runId} complete — ` +
         `${exportResult.items_written} mapping(s) written, ` +
         `${literals.length - exportedLiterals.length} left ungrouped in queue`,
       );
-      // Export table refresh is handled inside runOpExportDirect after writes commit.
     });
   } catch (e) {
     console.error(`[${tag}] Pipeline ${pipeline.pipeline_id}: failed:`, e);
   } finally {
     processingPipelineIds.delete(pipeline.pipeline_id);
-    endStandardization();
+    if (beginEndStandardization) endStandardization(pipeline.pipeline_id);
   }
 }
 
 /**
- * After a poll updates the queue, run standardization if the queue now exceeds
- * the threshold. Only fires when new items were added or the queue just crossed
- * the threshold — avoids re-running every 30 s while the queue stays large.
+ * Standardize every column of one table together, as a single cycle. All of the
+ * table's columns are marked "standardizing" up front (so the table card animates
+ * as one unit with no flicker between columns) and then each column's queue is
+ * processed in turn. Columns with empty queues are skipped by processPipelineQueue.
  */
-export async function maybeTriggerQueueStandardization(
-  pipelineId:   number,
-  queueBefore:  number,
-  queueAfter:   number,
-  newlyQueued:  number,
+export async function standardizeTable(
+  columns: PipelineForProcessing[],
+  reason:  'hourly' | 'threshold' = 'hourly',
 ): Promise<void> {
-  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') return;
-  if (queueAfter <= QUEUE_STANDARDIZE_THRESHOLD) return;
-
-  const crossedThreshold = queueBefore <= QUEUE_STANDARDIZE_THRESHOLD && queueAfter > QUEUE_STANDARDIZE_THRESHOLD;
-  const grewWhileOver    = queueAfter > QUEUE_STANDARDIZE_THRESHOLD && newlyQueued > 0;
-  if (!crossedThreshold && !grewWhileOver) return;
-
-  const pipeline = await fetchPipelineById(pipelineId);
-  if (!pipeline) return;
-
-  console.log(
-    `[Queue] Pipeline ${pipelineId}: queue at ${queueAfter} (>${QUEUE_STANDARDIZE_THRESHOLD}) — triggering standardization`,
-  );
-  await processPipelineQueue(pipeline, 'threshold');
+  if (columns.length === 0) return;
+  // Mark the whole table standardizing before touching any column so the card
+  // stays lit for the entire batch (beginStandardization only flips the animation
+  // state; processPipelineQueue still manages its own processing lock).
+  for (const c of columns) beginStandardization(c.pipeline_id);
+  try {
+    for (const c of columns) {
+      await processPipelineQueue(c, reason, { beginEndStandardization: false });
+    }
+  } finally {
+    // Unmark every column — covers ones whose queue was empty and were skipped
+    // by processPipelineQueue without toggling their own state.
+    for (const c of columns) endStandardization(c.pipeline_id);
+  }
 }
 
-/** Run standardization for all pipelines that have queued items. */
+/** Group pipelines by their source table. */
+function groupByTable(pipelines: PipelineForProcessing[]): Map<string, PipelineForProcessing[]> {
+  const map = new Map<string, PipelineForProcessing[]>();
+  for (const p of pipelines) {
+    const arr = map.get(p.table_fqn) ?? [];
+    arr.push(p);
+    map.set(p.table_fqn, arr);
+  }
+  return map;
+}
+
+/** Run standardization for all pipelines that have queued items, grouped by table. */
 export async function runHourlyStandardization(): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -397,15 +691,25 @@ export async function runHourlyStandardization(): Promise<void> {
     return;
   }
 
+  // Surface any pre-existing source values the stream never captured (e.g. the
+  // distinct tail beyond the baseline scan cap) into the queue first, so the
+  // standardization sweep below picks them up.
+  await runReconciliationSweep().catch((e) =>
+    console.error('[Hourly] Reconciliation sweep failed:', e),
+  );
+
   const pipelines = await fetchPipelinesWithQueue();
   if (pipelines.length === 0) {
     console.log('[Hourly] No pipelines with queued items');
     return;
   }
 
-  console.log(`[Hourly] Starting standardization for ${pipelines.length} pipeline(s)…`);
-  for (const pipeline of pipelines) {
-    await processPipelineQueue(pipeline, 'hourly');
+  // Standardize a table's columns together (one cycle per table), not per column.
+  const byTable = groupByTable(pipelines);
+  console.log(`[Hourly] Starting standardization for ${pipelines.length} column(s) across ${byTable.size} table(s)…`);
+  for (const [table, cols] of byTable) {
+    console.log(`[Hourly] Table ${table}: standardizing ${cols.length} column(s) together`);
+    await standardizeTable(cols, 'hourly');
   }
   console.log('[Hourly] Standardization pass complete');
 }

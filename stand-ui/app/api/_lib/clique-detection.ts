@@ -178,6 +178,8 @@ export interface FinalGroup {
   member_ids: number[];
   /** true when this group contains exactly one item (a former singleton). */
   is_singleton: boolean;
+  /** LLM-proposed canonical (real-world) name for the group, if any. */
+  proposed_name?: string | null;
   anchor_member_ids: number[];
   absorbed_member_ids: number[];
   merged_from_group_ids: string[];

@@ -10,6 +10,7 @@ export async function GET() {
 
   return Response.json({
     authenticated: true,
+    accountId:     session.accountId,
     role:          session.role,
     email:         session.email,
     name:          session.name,

@@ -36,7 +36,7 @@ export default async function RootLayout({
           <>
             {/* Top-left: Prism home link */}
             <Link
-              href="/home"
+              href="/home?tab=connect"
               style={{
                 position:    'fixed',
                 top:         16,
@@ -48,17 +48,17 @@ export default async function RootLayout({
                 textDecoration: 'none',
               }}
             >
-              <svg width="28" height="22" viewBox="0 0 28 22" fill="none" aria-hidden="true">
+              <svg width="44" height="34" viewBox="0 0 28 22" fill="none" aria-hidden="true">
                 <polygon points="0,0 0,22 14,11" fill="#1A1A2E" />
                 <polygon points="28,0 28,22 14,11" fill="#378ADD" />
                 <circle cx="14" cy="11" r="1.4" fill="white" />
               </svg>
               <span
                 style={{
-                  fontSize:   15,
+                  fontSize:   23,
                   fontWeight: 600,
                   color:      '#1A1A2E',
-                  letterSpacing: '-0.2px',
+                  letterSpacing: '-0.3px',
                 }}
               >
                 Prism

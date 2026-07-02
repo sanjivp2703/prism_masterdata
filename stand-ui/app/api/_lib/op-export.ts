@@ -25,6 +25,8 @@ import { withSnowflake } from './snowflake';
 import { loadOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
 import { initBaseline, hasBaseline } from './auto-export-seen';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
+import { broadcastPipelineEvent } from './pipeline-broadcaster';
+import { appendTiming } from './timing';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -167,6 +169,68 @@ async function upsertApprovedAlias(
 }
 
 /**
+ * Bulk version of upsertApprovedAlias: upsert MANY alias names in a single
+ * MERGE, then fetch all their alias_ids in a single SELECT — 2 round-trips
+ * total instead of 2 per name. Returns aliasName → alias_id.
+ *
+ * This is the hot path during pipeline-creation commit, where a baseline can
+ * carry hundreds of distinct canonical names; the old per-name loop made that
+ * many sequential Snowflake round-trips, which dominated the "writing to
+ * Snowflake" wait.
+ */
+async function bulkUpsertApprovedAliases(
+  connection: any,
+  aliasNames: string[],
+  domainId:   number | null,
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  const names  = Array.from(new Set(aliasNames)).filter((n) => n != null && n !== '');
+  if (names.length === 0) return result;
+
+  const domainFilter  = domainId != null ? `AND t.domain_id = ${Number(domainId)}` : `AND t.domain_id IS NULL`;
+  const selectFilter  = domainId != null ? `AND domain_id = ${Number(domainId)}`   : `AND domain_id IS NULL`;
+  const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
+
+  // Upsert every distinct name at once. The source is deduped (Set) so no
+  // "multiple source rows matched" error on the MERGE.
+  const valuePlaceholders = names.map(() => '(?)').join(', ');
+  await exec(
+    connection,
+    `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES AS t
+     USING (SELECT column1 AS alias_name FROM VALUES ${valuePlaceholders}) AS s
+       ON t.alias_name = s.alias_name ${domainFilter}
+     WHEN MATCHED THEN UPDATE SET
+       t.usage_count  = t.usage_count + 1,
+       t.last_used_at = CURRENT_TIMESTAMP()
+     WHEN NOT MATCHED THEN INSERT (alias_name, domain_id, usage_count, last_used_at)
+       VALUES (s.alias_name, ${domainLiteral}, 1, CURRENT_TIMESTAMP())`,
+    names,
+  );
+
+  // Fetch every alias_id in one round-trip.
+  const inPlaceholders = names.map(() => '?').join(', ');
+  const rows = await exec(
+    connection,
+    `SELECT alias_name, alias_id
+     FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+     WHERE alias_name IN (${inPlaceholders}) ${selectFilter}`,
+    names,
+  );
+  for (const r of rows) {
+    const name = String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '');
+    const id   = Number((r as any).ALIAS_ID   ?? (r as any).alias_id   ?? 0);
+    if (name && id) result.set(name, id);
+  }
+
+  // Safety net: anything the bulk SELECT somehow missed falls back to the
+  // single-name path so the caller always gets a complete map.
+  for (const name of names) {
+    if (!result.has(name)) result.set(name, await upsertApprovedAlias(connection, name, domainId));
+  }
+  return result;
+}
+
+/**
  * Upsert a literal → alias mapping using the integer alias_id FK.
  * Renames to the parent alias never require touching this table.
  */
@@ -187,13 +251,13 @@ async function upsertLiteralMatch(
     `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES AS t
      USING (SELECT ? AS literal_value, ${Number(aliasId)} AS alias_id,
                    ${domainLiteral} AS domain_id, ? AS run_id) AS s
-       ON t.literal_value = s.literal_value ${domainFilter}
+       ON t.normalized_value = PRISM_NORMALIZE(s.literal_value) ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
        t.alias_id     = s.alias_id,
        t.run_id       = s.run_id,
        t.confirmed_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (literal_value, alias_id, domain_id, run_id, confirmed_at)
-       VALUES (s.literal_value, s.alias_id, s.domain_id, s.run_id, CURRENT_TIMESTAMP())`,
+     WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
+       VALUES (s.literal_value, PRISM_NORMALIZE(s.literal_value), s.alias_id, s.domain_id, s.run_id, CURRENT_TIMESTAMP())`,
     [literalValue, runId],
   );
 }
@@ -236,13 +300,13 @@ async function bulkUpsertLiteralMatches(
               column3 AS run_id
        FROM VALUES ${placeholders}
      ) AS s
-       ON t.literal_value = s.literal_value ${domainFilter}
+       ON t.normalized_value = PRISM_NORMALIZE(s.literal_value) ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
        t.alias_id     = s.alias_id,
        t.run_id       = s.run_id,
        t.confirmed_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (literal_value, alias_id, domain_id, run_id, confirmed_at)
-       VALUES (s.literal_value, s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
+     WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
+       VALUES (s.literal_value, PRISM_NORMALIZE(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
     binds,
   );
 }
@@ -475,6 +539,7 @@ function buildValidationUserTurn(
 async function callValidationLLM(apiKey: string, userTurn: string): Promise<string> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method:  'POST',
+    signal:  AbortSignal.timeout(120_000),
     headers: {
       'Content-Type':      'application/json',
       'x-api-key':          apiKey,
@@ -559,12 +624,9 @@ async function writeAllDecisions(
   }
 
   // ── Upsert approved alias names first, collecting alias_ids ───────────────
+  // One bulk MERGE + one SELECT for ALL names (was 2 round-trips per name).
   const finalAliasNames = new Set(finalAlias.values());
-  const aliasIdMap = new Map<string, number>(); // aliasName → alias_id
-  for (const aliasName of finalAliasNames) {
-    const aliasId = await upsertApprovedAlias(connection, aliasName, domainId);
-    aliasIdMap.set(aliasName, aliasId);
-  }
+  const aliasIdMap = await bulkUpsertApprovedAliases(connection, [...finalAliasNames], domainId);
 
   // ── Write all literal→alias matches in one bulk MERGE ────────────────────
   // A single MERGE statement is atomic in Snowflake (no transaction needed)
@@ -744,8 +806,9 @@ function writeValidationAudit(
 
     const projectRoot = path.resolve(process.cwd(), '..');
     const outPath = path.join(projectRoot, `validation_audit_run_${runId}.json`);
-    fs.writeFileSync(outPath, JSON.stringify(audit, null, 2), 'utf8');
-    console.log(`[op-export] Validation audit written → ${outPath}`);
+    fs.promises.writeFile(outPath, JSON.stringify(audit, null, 2), 'utf8')
+      .then(() => console.log(`[op-export] Validation audit written → ${outPath}`))
+      .catch((writeErr) => console.warn('[op-export] Could not write validation audit JSON:', writeErr));
   } catch (writeErr) {
     console.warn('[op-export] Could not write validation audit JSON:', writeErr);
   }
@@ -781,10 +844,12 @@ async function runWriteAndValidatePass(
       let caseBGroups: CaseBGroup[] = [];
 
       if (caseAItems.length > 0 || rawCaseBGroups.length > 0) {
+        const _valStart = Date.now();
         caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups, exportDomainId);
         userTurn    = buildValidationUserTurn(caseAItems, caseBGroups);
         rawText     = await callValidationLLM(apiKey, userTurn);
         decisions   = tryParseJson<ValidationResponse>(rawText);
+        appendTiming(`[Timing] accept.validation_llm: ${Date.now() - _valStart}ms (${caseAItems.length} caseA, ${rawCaseBGroups.length} caseB)`);
 
         if (!decisions) {
           console.error(`[op-export] Run ${runId}: failed to parse validation LLM response.\nRaw: ${rawText.slice(0, 800)}`);
@@ -804,43 +869,36 @@ async function runWriteAndValidatePass(
       }
 
       // Step 4: write everything (normal items + Case A/B decisions) in one pass.
+      const _writeStart = Date.now();
       await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions, exportDomainId);
+      appendTiming(`[Timing] accept.write_decisions: ${Date.now() - _writeStart}ms (lookup + alias upserts)`);
+      const _rebuildStart = Date.now();
 
-      // ── Premium mode: seed baseline + rebuild export table ───────────────
-      // Runs AFTER writeAllDecisions has committed so that:
-      //   • The Redis baseline reflects only the values written in this run.
-      //   • refreshExportTable reads the fully-committed LITERAL_ALIAS_MATCHES
-      //     rows — not an in-progress write — so the export table is complete.
+      // ── Premium mode: rebuild all domain pipelines + clean queue ─────────
+      // Runs AFTER writeAllDecisions has committed so:
+      //   • refreshExportTable reads the fully-committed LITERAL_ALIAS_MATCHES rows.
+      //   • Queue items that are now standardized are removed from PIPELINE_QUEUE.
+      //   • PIPELINES.total_mapped / total_source_values are updated for every
+      //     active pipeline in the domain (manual standardization can affect any
+      //     pipeline watching the same domain column).
+      //
+      // All steps are awaited (not fire-and-forget) so the UI sees consistent
+      // metrics the moment the export request returns.
       if (process.env.NEXT_PUBLIC_APP_MODE === 'premium') {
         try {
-          // Single query: run metadata + matching pipeline export config.
-          const runMetaRows = await exec(
+          // Collect the set of literals that were just written to LITERAL_ALIAS_MATCHES.
+          const standardizedLiterals = state.groups.flatMap((g) => g.items.map((gi) => gi.literal_value));
+
+          // Seed Redis auto-export baseline from the run's source table (once only).
+          const runSourceRows = await exec(
             connection,
-            `SELECT r.source_relation,
-                    r.source_column,
-                    p.pipeline_id,
-                    p.export_table_fqn
-             FROM STAND_DB.STAND_INTERNAL.RUNS r
-             LEFT JOIN STAND_DB.STAND_INTERNAL.PIPELINES p
-               ON  p.table_fqn   = r.source_relation
-               AND p.column_name = r.source_column
-               AND (
-                 (p.domain_id IS NULL AND r.domain_id IS NULL) OR
-                 p.domain_id = r.domain_id
-               )
-             WHERE r.run_id = ?
-             LIMIT 1`,
+            `SELECT source_relation, source_column FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ? LIMIT 1`,
             [runId],
           );
-          if (runMetaRows.length > 0) {
-            const row            = runMetaRows[0] as any;
-            const tableFqn       = String(row.SOURCE_RELATION    ?? row.source_relation    ?? '');
-            const columnName     = String(row.SOURCE_COLUMN      ?? row.source_column      ?? '');
-            const exportTableFqn = (row.EXPORT_TABLE_FQN ?? row.export_table_fqn) as string | null;
-            const pipelineId     = (row.PIPELINE_ID     ?? row.pipeline_id) != null
-              ? Number(row.PIPELINE_ID ?? row.pipeline_id) : null;
-
-            // Seed Redis baseline if this is the first export for this source.
+          if (runSourceRows.length > 0) {
+            const r          = runSourceRows[0] as any;
+            const tableFqn   = String(r.SOURCE_RELATION ?? r.source_relation ?? '');
+            const columnName = String(r.SOURCE_COLUMN   ?? r.source_column   ?? '');
             if (tableFqn && columnName) {
               const alreadySet = await hasBaseline(tableFqn, columnName);
               if (!alreadySet) {
@@ -851,21 +909,107 @@ async function runWriteAndValidatePass(
                 );
               }
             }
+          }
 
-            // Rebuild export table / update total_mapped now that all matches are committed.
-            if (exportTableFqn && pipelineId != null) {
-              refreshExportTable(tableFqn, columnName, exportTableFqn, exportDomainId, pipelineId).catch(err => {
-                console.error(`[op-export] Export table refresh failed for run ${runId}:`, err);
-              });
-            } else if (pipelineId != null && tableFqn && columnName) {
-              // No export table — still update total_mapped with the source row count.
-              updatePipelineMappedCount(tableFqn, columnName, exportDomainId, pipelineId).catch(err => {
-                console.warn(`[op-export] Could not update total_mapped for pipeline ${pipelineId}:`, err);
-              });
+          // Find all pipelines in this domain (include pending_baseline + paused so
+          // that metrics are written even when the initial-run export fires before
+          // the pipeline has been advanced to active).
+          const domainCond = exportDomainId != null
+            ? `p.domain_id = ${Number(exportDomainId)}`
+            : `p.domain_id IS NULL`;
+          const domainPipelines = await exec(
+            connection,
+            `SELECT p.pipeline_id, p.table_fqn, p.column_name, p.export_table_fqn, p.status
+             FROM STAND_DB.STAND_INTERNAL.PIPELINES p
+             WHERE p.status IN ('active', 'paused', 'pending_baseline') AND ${domainCond}
+             ORDER BY p.pipeline_id`,
+          );
+
+          for (const pRow of domainPipelines) {
+            const pipelineId     = Number((pRow as any).PIPELINE_ID      ?? (pRow as any).pipeline_id);
+            const tableFqn       = String((pRow as any).TABLE_FQN         ?? (pRow as any).table_fqn       ?? '');
+            const colName        = String((pRow as any).COLUMN_NAME       ?? (pRow as any).column_name     ?? '');
+            const exportTableFqn = ((pRow as any).EXPORT_TABLE_FQN ?? (pRow as any).export_table_fqn) as string | null;
+            const pStatus        = String((pRow as any).STATUS ?? (pRow as any).status ?? '');
+
+            if (!tableFqn || !colName) continue;
+
+            try {
+              // Step A: update metrics, and rebuild the export table ONLY for pipelines
+              // that are already live. A pending_baseline/paused pipeline must not have
+              // its export table populated until the user explicitly starts it from the
+              // activation card ("Begin Pipeline Standardization") — which flips it to
+              // 'active' and builds the export then. Until then we only refresh metrics
+              // (total_mapped / total_source_values) so the activation card is accurate.
+              if (exportTableFqn && pStatus === 'active') {
+                await refreshExportTable(tableFqn, colName, exportTableFqn, exportDomainId, pipelineId);
+              } else {
+                await updatePipelineMappedCount(tableFqn, colName, exportDomainId, pipelineId);
+              }
+            } catch (metricErr) {
+              console.warn(`[op-export] Metric refresh failed for pipeline ${pipelineId}:`, metricErr);
+            }
+
+            // Step B: remove newly-standardized items from this pipeline's queue
+            // and update queue_size / last_queue_empty_at atomically.
+            if (standardizedLiterals.length > 0) {
+              try {
+                const queueHitRows = await exec(
+                  connection,
+                  `SELECT literal_value FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
+                   WHERE pipeline_id = ?
+                     AND literal_value IN (${standardizedLiterals.map(() => '?').join(', ')})`,
+                  [pipelineId, ...standardizedLiterals],
+                );
+                const toRemove = queueHitRows.map((r: any) => String(r.LITERAL_VALUE ?? r.literal_value ?? '')).filter(Boolean);
+
+                if (toRemove.length > 0) {
+                  await exec(
+                    connection,
+                    `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
+                     WHERE pipeline_id = ? AND literal_value IN (${toRemove.map(() => '?').join(', ')})`,
+                    [pipelineId, ...toRemove],
+                  );
+                }
+
+                // Update queue_size (and last_queue_empty_at if now empty) regardless.
+                const [qRow] = await exec(
+                  connection,
+                  `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+                  [pipelineId],
+                );
+                const remaining = Number((qRow as any)?.CNT ?? (qRow as any)?.cnt ?? 0);
+                const setClauses = ['queue_size = ?', 'updated_at = CURRENT_TIMESTAMP()'];
+                const updateBinds: any[] = [remaining];
+                if (remaining === 0) setClauses.push('last_queue_empty_at = CURRENT_TIMESTAMP()');
+                updateBinds.push(pipelineId);
+                await exec(
+                  connection,
+                  `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES SET ${setClauses.join(', ')} WHERE pipeline_id = ?`,
+                  updateBinds,
+                );
+
+                if (toRemove.length > 0) {
+                  console.log(
+                    `[op-export] Pipeline ${pipelineId}: ${toRemove.length} item(s) removed from queue ` +
+                    `(${remaining} remaining)`,
+                  );
+                }
+              } catch (queueErr) {
+                console.warn(`[op-export] Queue cleanup failed for pipeline ${pipelineId}:`, queueErr);
+              }
             }
           }
+
+          appendTiming(`[Timing] accept.export_rebuild+metrics: ${Date.now() - _rebuildStart}ms (${domainPipelines.length} domain pipeline(s))`);
+
+          // The write+export+metric refresh above runs in this background pass —
+          // AFTER the export route already returned 200 to the client. Tell the UI
+          // to refetch so the pipeline cards show the updated standardized counts
+          // without a manual reload.
+          broadcastPipelineEvent({ type: 'metrics_updated' });
         } catch (premiumErr) {
-          // Non-fatal — baseline / export table can be rebuilt on next cycle.
+          // Non-fatal — metrics can be corrected on the next poll / refresh.
           console.warn('[op-export] Failed in premium post-write steps:', premiumErr);
         }
       }
@@ -938,6 +1082,7 @@ export async function runOpExport(
   runId:         number,
   apiKey:        string,
   currentStatus: string,
+  opts?:         { awaitWrite?: boolean },
 ): Promise<ExportResult> {
   // Step 1 — read state blob.
   const state = await loadOpRunState(connection, runId);
@@ -962,10 +1107,19 @@ export async function runOpExport(
       [runId],
     );
 
-    // Steps 3–4 — fire and forget. Opens its own Snowflake connection.
-    runWriteAndValidatePass(runId, state, caseAItems, rawCaseBGroups, apiKey).catch((err) => {
-      console.error(`[op-export] Background write+validate failed for run ${runId}:`, err);
+    // Steps 3–4 — opens its own Snowflake connection.
+    // Normally fire-and-forget so the user gets a fast export confirmation, with
+    // the lookup writes + export rebuild + metric refresh completing in the
+    // background. When `awaitWrite` is set (initial pipeline creation / the
+    // multi-column wizard) we await it instead, so the caller does not navigate
+    // to the pipelines view until standardization is committed and metrics are
+    // current. For a brand-new pipeline there are no lookup matches yet, so there
+    // is no Case A/B validation LLM call — the await is just the DB writes +
+    // export rebuild (a few seconds), not an LLM round-trip.
+    const writePass = runWriteAndValidatePass(runId, state, caseAItems, rawCaseBGroups, apiKey).catch((err) => {
+      console.error(`[op-export] ${opts?.awaitWrite ? 'Awaited' : 'Background'} write+validate failed for run ${runId}:`, err);
     });
+    if (opts?.awaitWrite) await writePass;
   }
 
   return { items_written, aliases_updated };
@@ -1019,8 +1173,11 @@ export async function runOpExportDirect(
 
     const result = await writeAllDecisions(connection, runId, state, [], [], null, domainId);
 
-    // ── Rebuild export table / update total_mapped once writes have committed ──
-    // Runs only in premium mode (pipelines only exist there).
+    // ── Rebuild export table + update metrics once writes have committed ───────
+    // Awaited (not fire-and-forget) so that PIPELINES.total_mapped /
+    // total_source_values and the export table are always in sync before the
+    // caller removes items from PIPELINE_QUEUE.
+    // Only runs in premium mode (pipelines only exist there).
     if (process.env.NEXT_PUBLIC_APP_MODE === 'premium' && metaRow) {
       const exportTableFqn = (metaRow.EXPORT_TABLE_FQN ?? metaRow.export_table_fqn) as string | null;
       const tableFqn       = String(metaRow.PIPELINE_TABLE_FQN   ?? metaRow.pipeline_table_fqn   ?? '');
@@ -1028,14 +1185,16 @@ export async function runOpExportDirect(
       const pipelineId     = (metaRow.PIPELINE_ID ?? metaRow.pipeline_id) != null
         ? Number(metaRow.PIPELINE_ID ?? metaRow.pipeline_id) : null;
 
-      if (exportTableFqn && pipelineId != null) {
-        refreshExportTable(tableFqn, colName, exportTableFqn, domainId, pipelineId).catch(err => {
-          console.error(`[op-export] Export table refresh failed for run ${runId}:`, err);
-        });
-      } else if (pipelineId != null && tableFqn && colName) {
-        updatePipelineMappedCount(tableFqn, colName, domainId, pipelineId).catch(err => {
-          console.warn(`[op-export] Could not update total_mapped for pipeline ${pipelineId}:`, err);
-        });
+      try {
+        if (exportTableFqn && pipelineId != null) {
+          await refreshExportTable(tableFqn, colName, exportTableFqn, domainId, pipelineId);
+        } else if (pipelineId != null && tableFqn && colName) {
+          await updatePipelineMappedCount(tableFqn, colName, domainId, pipelineId);
+        }
+        broadcastPipelineEvent({ type: 'metrics_updated' });
+      } catch (err) {
+        // Non-fatal — metrics can be corrected on the next poll / refresh.
+        console.error(`[op-export] Metric update failed for run ${runId}:`, err);
       }
     }
 

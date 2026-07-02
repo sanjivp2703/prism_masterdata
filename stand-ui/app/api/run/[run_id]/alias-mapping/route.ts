@@ -11,6 +11,7 @@ type AliasMap = Record<
       run_item_id: number;
       literal_value: string;
       confidence_score: number | null;
+      needs_review?: boolean;
     }>;
   }
 >;
@@ -55,9 +56,12 @@ export async function GET(
           itemIdMap.set(item.literal_value, item.run_item_id ?? (idx + 1));
         });
 
-        // Populate a bucket per group.
+        // Populate a bucket per group. Singleton groups the LLM couldn't place
+        // carry needs_review=true (self-mapped + written to the lookup, so the
+        // pipeline queue stays empty) — flag their items so the UI highlights them.
         for (const group of state.groups) {
           const key = `g_${group.group_id}`;
+          const groupNeedsReview = group.needs_review === true;
           aliasMap[key] = {
             group_id:     group.group_id,
             display_name: group.alias_name,
@@ -65,24 +69,32 @@ export async function GET(
               run_item_id:     itemIdMap.get(gi.literal_value) ?? 0,
               literal_value:   gi.literal_value,
               confidence_score: null,
+              ...(groupNeedsReview ? { needs_review: true } : {}),
             })),
           };
         }
 
-        // Build ungrouped bucket.
-        const ungroupedItems = state.ungrouped.map((u) => ({
-          run_item_id:     itemIdMap.get(u.literal_value) ?? 0,
-          literal_value:   u.literal_value,
-          confidence_score: null,
-        }));
+        // Ungrouped items become singleton review groups instead of a drop zone.
+        // Each item gets its own group (keyed by run_item_id) with needs_review=true
+        // so the UI can highlight them and prompt the user to confirm or move them.
+        for (const u of state.ungrouped) {
+          const run_item_id = itemIdMap.get(u.literal_value) ?? 0;
+          const key = `__review_${run_item_id}__`;
+          aliasMap[key] = {
+            group_id:     null,
+            display_name: u.literal_value,
+            items: [{
+              run_item_id,
+              literal_value:    u.literal_value,
+              confidence_score: null,
+              needs_review:     true,
+            }],
+          };
+        }
 
-        aliasMap[UNGROUPED_KEY] = {
-          group_id:     null,
-          display_name: '',
-          items:        ungroupedItems,
-        };
+        // Empty ungrouped bucket for backwards compatibility with any code that reads it.
+        aliasMap[UNGROUPED_KEY] = { group_id: null, display_name: '', items: [] };
       } else {
-        // No state yet — return an empty ungrouped bucket so the UI renders.
         aliasMap[UNGROUPED_KEY] = { group_id: null, display_name: '', items: [] };
       }
 

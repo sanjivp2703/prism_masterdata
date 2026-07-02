@@ -12,7 +12,16 @@ function parseFqn(fqn: string) {
 }
 
 function isSimpleIdent(s: string) {
-  return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(s);
+  // Permissive: any non-empty name quoteIdent can safely wrap (spaces, hyphens,
+  // leading digits, Unicode letters are all valid quoted identifiers). Reject
+  // only control chars and quotes/backslash, which could break out of a quoted
+  // identifier or a string literal built elsewhere.
+  if (!s) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 32 || c === 127 || c === 34 || c === 39 || c === 92) return false;
+  }
+  return true;
 }
 
 async function exec(connection: any, sqlText: string, binds?: any[]) {

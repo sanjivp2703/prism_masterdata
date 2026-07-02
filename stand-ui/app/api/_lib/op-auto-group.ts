@@ -15,6 +15,8 @@
 
 import 'server-only';
 
+import { normalizeLiteral } from './normalize';
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -47,6 +49,10 @@ export interface OpGroup {
   alias_name_source: 'lookup_validated' | 'llm_proposed' | 'user_override';
   confidence:        'h' | 'm' | 'l';
   from_lookup_chunk: boolean;
+  /** Singleton groups the LLM couldn't confidently place — self-mapped and
+   *  surfaced in yellow for the user to confirm/rename. Still written to the
+   *  lookup so no value is left unmapped (keeps the pipeline queue empty). */
+  needs_review?:     boolean;
   items:             OpGroupItem[];
 }
 
@@ -364,7 +370,13 @@ async function fetchLookupMatches(
 ): Promise<Map<string, string>> {
   if (literals.length === 0) return new Map();
 
-  const placeholders = literals.map(() => '?').join(', ');
+  // Match on the normalized form so casing/whitespace/Unicode variants resolve
+  // to the same stored mapping. The returned map is keyed by the normalized
+  // value (PRISM_NORMALIZE); callers look up with normalizeLiteral(literal).
+  const normLiterals = Array.from(new Set(literals.map(normalizeLiteral))).filter(Boolean);
+  if (normLiterals.length === 0) return new Map();
+
+  const placeholders = normLiterals.map(() => '?').join(', ');
   // domain_id is denormalized onto LITERAL_ALIAS_MATCHES for fast filtering;
   // alias_name is retrieved via JOIN since it lives only on APPROVED_ALIAS_NAMES.
   const domainFilter = domainId != null
@@ -373,20 +385,20 @@ async function fetchLookupMatches(
 
   const rows = await exec(
     connection,
-    `SELECT lam.literal_value, aan.alias_name
+    `SELECT lam.normalized_value AS norm_key, aan.alias_name
      FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
      JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan
        ON lam.alias_id = aan.alias_id
-     WHERE lam.literal_value IN (${placeholders})
+     WHERE lam.normalized_value IN (${placeholders})
      ${domainFilter}`,
-    literals,
+    normLiterals,
   );
 
   const result = new Map<string, string>();
   for (const row of rows) {
-    const lv = String((row as any).LITERAL_VALUE ?? (row as any).literal_value ?? '');
-    const an = String((row as any).ALIAS_NAME    ?? (row as any).alias_name    ?? '');
-    if (lv && an) result.set(lv, an);
+    const key = String((row as any).NORM_KEY   ?? (row as any).norm_key   ?? '');
+    const an  = String((row as any).ALIAS_NAME ?? (row as any).alias_name ?? '');
+    if (key && an) result.set(key, an);
   }
   return result;
 }
@@ -502,7 +514,7 @@ export async function runOpAutoGroup(
   const unmatchedItems: OpStateItem[] = [];
 
   for (const item of items) {
-    const alias = lookupMap.get(item.literal_value);
+    const alias = lookupMap.get(normalizeLiteral(item.literal_value));
     if (alias !== undefined) {
       matchedItems.push({ ...item, matched_from_lookup: true, alias_name: alias });
     } else {
@@ -626,7 +638,7 @@ export async function runOpAutoGroup(
 
   // Reflect lookup results back into the top-level items array.
   const updatedItems: OpStateItem[] = items.map((item) => {
-    const alias = lookupMap.get(item.literal_value);
+    const alias = lookupMap.get(normalizeLiteral(item.literal_value));
     return alias !== undefined
       ? { ...item, matched_from_lookup: true, alias_name: alias }
       : item;

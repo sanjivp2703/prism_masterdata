@@ -3,10 +3,13 @@ import GlobalStandardizationsClient from './GlobalStandardizationsClient';
 export default async function GlobalStandardizationsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ domain_id?: string }>;
+  searchParams: Promise<{ domain_id?: string; pipeline_ids?: string }>;
 }) {
-  const { domain_id } = await searchParams;
-  const domainId = domain_id ? Number(domain_id) : null;
+  const { domain_id, pipeline_ids } = await searchParams;
+  const domainId    = domain_id    ? Number(domain_id)    : null;
+  const pipelineIds = pipeline_ids
+    ? pipeline_ids.split(',').map(Number).filter(n => Number.isFinite(n) && n > 0)
+    : undefined;
 
   return (
     <div
@@ -34,7 +37,7 @@ export default async function GlobalStandardizationsPage({
         </div>
 
         {/* ── Main content ─────────────────────────────────────────────────── */}
-        <GlobalStandardizationsClient domainId={domainId} />
+        <GlobalStandardizationsClient domainId={domainId} pipelineIds={pipelineIds} />
       </div>
     </div>
   );

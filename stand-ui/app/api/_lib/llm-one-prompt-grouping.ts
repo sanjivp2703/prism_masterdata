@@ -33,12 +33,36 @@ import fs   from 'fs';
 import path from 'path';
 import type { RunItemForPairing } from './pairscore';
 import type { FinalGroup } from './clique-detection';
+import {
+  type ConventionRules,
+  describeConventionRules,
+  applyConventionRules,
+  validateConventionViolations,
+} from './convention-rules';
+import { appendTiming } from './timing';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-export const GROUPING_MODEL_ID = 'claude-sonnet-4-6' as const;
+// Tiered models. Chunk grouping is the bulk, parallel work (clustering ~25 short
+// strings) — a fast/cheap model handles it well. The merge pass and the
+// name-correction calls are low-volume but judgment-heavy (cross-chunk entity
+// reconciliation, canonical naming, convention adherence) — keep the stronger
+// model there. Both are env-overridable for A/B testing.
+const CHUNK_MODEL_ID = process.env.PRISM_CHUNK_MODEL || 'claude-haiku-4-5-20251001';
+const MERGE_MODEL_ID = process.env.PRISM_MERGE_MODEL || 'claude-sonnet-4-6';
+// Kept for the breakdown's model label and any external reference.
+export const GROUPING_MODEL_ID = MERGE_MODEL_ID;
+// Label for the breakdown when the two tiers differ.
+const MODEL_LABEL = CHUNK_MODEL_ID === MERGE_MODEL_ID ? CHUNK_MODEL_ID : `${CHUNK_MODEL_ID} + ${MERGE_MODEL_ID}`;
+
+// Per-model pricing (USD per token) so the cost estimate stays accurate when the
+// chunk + merge passes run on different models. Unknown models fall back to Sonnet.
+const MODEL_PRICING: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number }> = {
+  'claude-sonnet-4-6':            { in: 3.00, out: 15.00, cacheRead: 0.30, cacheWrite: 3.75 },
+  'claude-haiku-4-5-20251001':    { in: 1.00, out:  5.00, cacheRead: 0.10, cacheWrite: 1.25 },
+};
 
 /**
  * Max items per LLM call.  Derived from token-budget analysis in the file
@@ -52,6 +76,14 @@ const MAX_ITEMS_PER_CHUNK = 25;
  * (≈2 500 tokens worst-case output) with headroom for verbose reasoning.
  */
 const MAX_OUTPUT_TOKENS = 8_192;
+
+/**
+ * Max chunk LLM calls in flight at once. Chunks run in batches of this size —
+ * each batch dispatched in parallel, the next batch starts once it finishes —
+ * so a very large run never fires hundreds of simultaneous Anthropic requests
+ * (which hit concurrency / rate limits and 429s). Env-overridable.
+ */
+const CHUNK_CONCURRENCY = Math.max(1, Number(process.env.PRISM_CHUNK_CONCURRENCY) || 20);
 
 // Confidence band → numeric score stored in RUN_ITEMS.confidence_score.
 // Accepts both the compact single-char form ("h"/"m"/"l") used in the new
@@ -184,18 +216,94 @@ can drag items together. Over-clustering is harder to fix.
 Items with no peer in the batch should be their own singleton group. Items that
 are genuinely ambiguous between multiple groups should be left unassigned.
 
+NAMING — for each group's proposed_name, output the name a well-informed person
+would actually use for that real-world entity, drawing on your world knowledge.
+This is NOT "pick the best string from the inputs":
+- FIRST check the EXISTING CANONICAL NAMES list (if provided in the user message).
+  If a group refers to the same entity as one of those names, reuse that name
+  EXACTLY — verbatim, same spelling and casing — so it stays consistent with what
+  is already approved. Only when no existing name fits do you create a new one.
+- Identify what entity the group refers to, then write its canonical, commonly-used
+  name — even if that exact spelling is not among the inputs (e.g. inputs "vz",
+  "VZW", "verizon wireless inc" → "Verizon").
+- Prefer the full, commonly-used name over an acronym or code. Use an acronym ONLY
+  when the acronym is genuinely how the entity is normally referred to in the real
+  world (e.g. "IBM", "AT&T", "NASA", "UPS") — not just because an acronym happens to
+  appear in the inputs. If a fuller name is how people usually refer to it, use that.
+- Use the entity's standard capitalization and spelling; expand abbreviations and
+  fix obvious truncations or misspellings.
+- Do not append legal suffixes (Inc., LLC, Corp.) unless they are part of the
+  common name.
+- Only if you genuinely cannot identify the entity, fall back to the clearest
+  representative input value rather than guessing.
+
 Respond only with valid JSON matching the output schema. No text outside the JSON.
 
 CONCEPT: {concept_name}
 DEFINITION: {concept_definition}`;
 
+// ── Naming convention ───────────────────────────────────────────────────────
+// A domain may require auto-standardized canonical names to follow a convention:
+// a regex/examples/natural-language directive and/or a set of structured rules.
+export interface NamingConvention {
+  type:  'regex' | 'examples' | 'natural' | null;
+  value: string;
+  rules?: ConventionRules | null;
+}
+
+/** Prompt block listing mandatory standardization rules for this domain. */
+function buildStandardizationRulesBlock(rules: string[] | null | undefined): string {
+  if (!rules || rules.length === 0) return '';
+  return (
+    `\n\nSTANDARDIZATION RULES (MANDATORY) — apply these rules when deciding how to\n` +
+    `group values and choose canonical names. Every grouping decision MUST respect\n` +
+    `all of the following:\n` +
+    rules.map(r => `  - ${r}`).join('\n')
+  );
+}
+
+/** Prompt block instructing the model to follow the domain's naming convention. */
+function buildConventionBlock(conv: NamingConvention | null | undefined): string {
+  if (!conv) return '';
+  let block = '';
+  if (conv.value.trim()) {
+    if (conv.type === 'regex') {
+      block += (
+        `\n\nNAMING CONVENTION (MANDATORY) — every proposed_name you output MUST fully\n` +
+        `match this regular expression (the whole name, anchored start-to-end):\n` +
+        `    ${conv.value}\n` +
+        `Produce only names that satisfy it exactly. If a name would not match, rewrite\n` +
+        `it until it does while still naming the correct entity.`
+      );
+    } else if (conv.type === 'examples') {
+      const list = conv.value.split('\n').map(s => s.trim()).filter(Boolean).map(e => `  - ${e}`).join('\n');
+      block += (
+        `\n\nNAMING CONVENTION — canonical names in this domain follow the form of these\n` +
+        `examples. Match their casing, spelling style, and formatting:\n${list}`
+      );
+    } else if (conv.type === 'natural') {
+      block += `\n\nNAMING CONVENTION — canonical names in this domain must follow this rule:\n${conv.value}`;
+    }
+  }
+  const ruleLines = describeConventionRules(conv.rules);
+  if (ruleLines.length > 0) {
+    block += `\n\nNAMING RULES (MANDATORY) — every proposed_name MUST follow ALL of these:\n` +
+      ruleLines.map(l => `  - ${l}`).join('\n');
+  }
+  return block;
+}
+
 function buildSystemPrompt(
   conceptName: string,
   conceptDefinition: string,
+  convention?: NamingConvention | null,
+  standardizationRules?: string[] | null,
 ): string {
   return SYSTEM_PROMPT_TEMPLATE
-    .replace('{concept_name}',       conceptName)
-    .replace('{concept_definition}', conceptDefinition || '(no definition provided)');
+    .replace('{concept_name}',       conceptName || '(not specified)')
+    .replace('{concept_definition}', conceptDefinition || '(no definition provided)')
+    + buildStandardizationRulesBlock(standardizationRules)
+    + buildConventionBlock(convention);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +326,23 @@ function buildItemBlock(idx: number, item: RunItemForPairing): string {
   );
 }
 
-function buildUserTurn(chunkItems: RunItemForPairing[], conceptName: string): string {
+function buildExistingNamesBlock(existingAliasNames: string[]): string {
+  if (!existingAliasNames.length) return '';
+  const list = existingAliasNames.map((n) => `- "${n.replace(/"/g, '\\"')}"`).join('\n');
+  return (
+    `EXISTING CANONICAL NAMES (already approved in this domain). If a group refers\n` +
+    `to the same real-world entity as one of these, reuse that name EXACTLY —\n` +
+    `same spelling and casing — instead of inventing a new variant:\n` +
+    list +
+    `\n\n`
+  );
+}
+
+function buildUserTurn(
+  chunkItems: RunItemForPairing[],
+  conceptName: string,
+  existingAliasNames: string[] = [],
+): string {
   const N          = chunkItems.length;
   const itemBlocks = chunkItems.map((item, i) => buildItemBlock(i + 1, item)).join('\n\n');
 
@@ -232,6 +356,7 @@ function buildUserTurn(chunkItems: RunItemForPairing[], conceptName: string): st
     `- normalized_tokens: tokens after stopword removal\n` +
     `- is_pure_acronym: ≤5 chars, all uppercase — may abbreviate a longer form in this batch\n` +
     `- normalized_tokens_empty: every token was a stopword — rely on literal_value\n\n` +
+    buildExistingNamesBlock(existingAliasNames) +
     `ITEMS TO GROUP:\n\n` +
     itemBlocks +
     '\n\n---\n\n' +
@@ -240,7 +365,9 @@ function buildUserTurn(chunkItems: RunItemForPairing[], conceptName: string): st
     `Schema:\n` +
     `- "g": array of groups. Each group is a 3-element array:\n` +
     `    [0] item_indices — array of 1-based item numbers belonging to this group\n` +
-    `    [1] proposed_name — canonical name string, or null if unclear\n` +
+    `    [1] proposed_name — the entity's real-world canonical name (see NAMING\n` +
+    `        in the system prompt): prefer the common full name over acronyms;\n` +
+    `        may differ from any input string; null only if truly unidentifiable\n` +
     `    [2] confidence — "h" (high), "m" (medium), or "l" (low)\n` +
     `- "u": flat array of item indices that are genuinely ambiguous and cannot\n` +
     `       be placed in any group (omit singletons from here — put them in "g")\n\n` +
@@ -278,6 +405,7 @@ async function callChunkLLM(
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       'Content-Type':      'application/json',
       'x-api-key':          apiKey,
@@ -285,7 +413,7 @@ async function callChunkLLM(
       'anthropic-beta':     'prompt-caching-2024-07-31',
     },
     body: JSON.stringify({
-      model:       GROUPING_MODEL_ID,
+      model:       CHUNK_MODEL_ID,
       max_tokens:  MAX_OUTPUT_TOKENS,
       temperature: 0,
       system:      [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }],
@@ -374,16 +502,25 @@ function tryParseMergeJson(text: string): MergeEntry[] | null {
   return null;
 }
 
-function buildMergeSystemPrompt(conceptName: string, conceptDefinition: string): string {
+function buildMergeSystemPrompt(conceptName: string, conceptDefinition: string, convention?: NamingConvention | null, standardizationRules?: string[] | null): string {
   return (
     `You are reviewing proposed groups from an entity-resolution clustering run.\n` +
     `Items were split into chunks and clustered independently. Some groups across\n` +
     `different chunks may refer to the same real-world entity and should be merged.\n\n` +
     `Only merge when confident they refer to the same entity. When uncertain,\n` +
     `leave them separate — a human reviewer will reconcile.\n\n` +
+    `For each merge, set merged_name to the entity's real-world canonical name\n` +
+    `using your world knowledge — the name a well-informed person would use, not\n` +
+    `just one of the proposed names. If an EXISTING CANONICAL NAMES list is given\n` +
+    `and the merged group matches one of those entities, reuse that name EXACTLY.\n` +
+    `Otherwise prefer the common full name over an acronym or code; use an acronym\n` +
+    `only when that is genuinely how the entity is normally referred to (e.g. "IBM",\n` +
+    `"AT&T"). It may differ from any proposed_name shown.\n\n` +
     `Respond only with valid JSON. No text outside the JSON.\n\n` +
-    `CONCEPT: ${conceptName}\n` +
-    `DEFINITION: ${conceptDefinition || '(no definition provided)'}`
+    `CONCEPT: ${conceptName || '(not specified)'}\n` +
+    `DEFINITION: ${conceptDefinition || '(no definition provided)'}` +
+    buildStandardizationRulesBlock(standardizationRules) +
+    buildConventionBlock(convention)
   );
 }
 
@@ -391,6 +528,7 @@ function buildMergeUserTurn(
   groups: FinalGroup[],
   confidenceScores: Map<number, number>,
   runItemById: Map<number, RunItemForPairing>,
+  existingAliasNames: string[] = [],
 ): string {
   const groupBlocks = groups.map((g, i) => {
     // Up to 3 representative literal values.
@@ -404,9 +542,11 @@ function buildMergeUserTurn(
       Math.max(g.member_ids.length, 1);
     const confBand = avgScore >= 0.85 ? 'high' : avgScore >= 0.55 ? 'medium' : 'low';
 
-    // Use the first representative as the proposed name (NameScore will pick
-    // the best canonical name at commit time; this is just for context).
-    const proposedName = reps[0] ?? '';
+    // Show the chunk LLM's real-world canonical name when it has one, so the
+    // merge step reasons over good names; fall back to a representative input.
+    const proposedName = (g.proposed_name && g.proposed_name.trim())
+      ? g.proposed_name.trim()
+      : (reps[0] ?? '');
 
     return (
       `GROUP ${i + 1}:\n` +
@@ -417,6 +557,7 @@ function buildMergeUserTurn(
   }).join('\n\n');
 
   return (
+    buildExistingNamesBlock(existingAliasNames) +
     `PROPOSED GROUPS:\n\n` +
     groupBlocks +
     `\n\n---\n\n` +
@@ -448,13 +589,17 @@ async function callMergeLLM(
   conceptName: string,
   conceptDefinition: string,
   apiKey: string,
+  existingAliasNames: string[] = [],
+  convention?: NamingConvention | null,
+  standardizationRules?: string[] | null,
 ): Promise<{ parsed: MergeEntry[]; raw_text: string; system_text: string; user_text: string; stop_reason: string; llm_elapsed_ms: number; llm_usage: LLMUsage }> {
-  const systemText = buildMergeSystemPrompt(conceptName, conceptDefinition);
-  const userText   = buildMergeUserTurn(groups, confidenceScores, runItemById);
+  const systemText = buildMergeSystemPrompt(conceptName, conceptDefinition, convention, standardizationRules);
+  const userText   = buildMergeUserTurn(groups, confidenceScores, runItemById, existingAliasNames);
 
   const callStart = Date.now();
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       'Content-Type':     'application/json',
       'x-api-key':         apiKey,
@@ -462,7 +607,7 @@ async function callMergeLLM(
       'anthropic-beta':    'prompt-caching-2024-07-31',
     },
     body: JSON.stringify({
-      model:       GROUPING_MODEL_ID,
+      model:       MERGE_MODEL_ID,
       max_tokens:  2048,
       temperature: 0,
       system:      [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }],
@@ -516,6 +661,110 @@ async function callMergeLLM(
   };
 }
 
+/** Anchored matcher for a regex naming convention (whole-string match). */
+function buildAnchoredRegex(src: string): RegExp | null {
+  try { return new RegExp(`^(?:${src})$`); } catch { return null; }
+}
+
+/**
+ * Ask the model to rewrite a set of canonical names so each satisfies ALL of the
+ * given requirements. Returns temp_group_id → fixed_name for whatever it returns.
+ */
+async function callNameFixLLM(
+  failing: { temp_group_id: string; reps: string[]; current: string | null | undefined }[],
+  requirements: string[],
+  conceptName: string,
+  apiKey: string,
+): Promise<Map<string, string>> {
+  const system =
+    `You fix canonical entity names so they conform to required formatting rules.\n` +
+    `Respond ONLY with JSON: {"names":[["GROUP_ID","fixed_name"], ...]}. No other text.\n\n` +
+    `Every fixed_name MUST satisfy ALL of these requirements:\n` +
+    requirements.map(r => `  - ${r}`).join('\n') + `\n\n` +
+    `Keep naming the same real-world entity the values refer to; only adjust\n` +
+    `formatting, casing, punctuation, or spelling so the name satisfies the rules.\n\n` +
+    `CONCEPT: ${conceptName}`;
+  const user =
+    `Rewrite each group's canonical name to match the pattern:\n` +
+    failing.map(f =>
+      `- id: "${f.temp_group_id}" | current: ${f.current ? `"${f.current.replace(/"/g, '\\"')}"` : '(none)'} | values: ${f.reps.map(r => `"${r.replace(/"/g, '\\"')}"`).join(', ')}`,
+    ).join('\n');
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    signal: AbortSignal.timeout(120_000),
+    headers: {
+      'Content-Type':     'application/json',
+      'x-api-key':         apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model:       MERGE_MODEL_ID,
+      max_tokens:  1024,
+      temperature: 0,
+      system,
+      messages:    [{ role: 'user', content: user }],
+    }),
+  });
+  if (!res.ok) throw new Error(`[one-prompt-grouping] Name-fix LLM error ${res.status}`);
+  const apiBody = await res.json() as { content?: Array<{ type: string; text?: string }> };
+  const rawText = (apiBody.content ?? [])
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text).join('\n');
+  const out = new Map<string, string>();
+  let parsed: { names?: Array<[string, string]> } | null = null;
+  try {
+    const cleaned = rawText.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    parsed = JSON.parse(cleaned);
+  } catch { parsed = null; }
+  for (const entry of parsed?.names ?? []) {
+    if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string') {
+      out.set(entry[0], entry[1].trim());
+    }
+  }
+  return out;
+}
+
+/**
+ * Deterministic pre-merge: collapse groups that share the SAME proposed_name
+ * (case-insensitive, whitespace-normalized) — the common cross-chunk case where
+ * the model names the same entity identically in different chunks. Removes those
+ * duplicates without an LLM call, shrinking (or eliminating) the merge prompt.
+ * Nameless safety-net singletons (proposed_name == null) are never auto-merged.
+ */
+function mergeIdenticalProposedNames(groups: FinalGroup[]): { groups: FinalGroup[]; collapsed: number } {
+  const byKey = new Map<string, FinalGroup[]>();
+  const passthrough: FinalGroup[] = [];
+  for (const g of groups) {
+    const name = (g.proposed_name ?? '').trim().replace(/\s+/g, ' ');
+    if (!name) { passthrough.push(g); continue; }
+    const key = name.toLowerCase();
+    const arr = byKey.get(key);
+    if (arr) arr.push(g); else byKey.set(key, [g]);
+  }
+  const out: FinalGroup[] = [];
+  let collapsed = 0;
+  for (const arr of byKey.values()) {
+    if (arr.length === 1) { out.push(arr[0]); continue; }
+    // Keep the largest group's name/casing; union the member ids.
+    const sorted    = [...arr].sort((a, b) => b.member_ids.length - a.member_ids.length);
+    const head      = sorted[0];
+    const memberIds = Array.from(new Set(arr.flatMap(g => g.member_ids)));
+    out.push({
+      ...head,
+      member_ids:            memberIds,
+      is_singleton:          memberIds.length === 1,
+      anchor_member_ids:     memberIds,
+      absorbed_member_ids:   [],
+      merged_from_group_ids: arr.map(g => g.temp_group_id),
+      avg_internal_score:    0,
+      min_internal_score:    0,
+    });
+    collapsed += arr.length - 1;
+  }
+  return { groups: [...out, ...passthrough], collapsed };
+}
+
 /**
  * Apply the merge plan returned by the Chunk Merging Prompt.
  *
@@ -550,10 +799,16 @@ function applyMerges(
     for (const idx of indices) consumed.add(idx);
 
     const toMerge = indices.map((idx) => groups[idx - 1]);
+    // Name precedence: the merge LLM's merged_name wins; else the first member
+    // group that already had a proposed name.
+    const mergedName = (typeof merge[1] === 'string' && merge[1].trim())
+      ? merge[1].trim()
+      : (toMerge.map((g) => g.proposed_name).find((n) => n && n.trim()) ?? null);
     result.push({
       temp_group_id:         `llm_merge_${nextTempId++}`,
       member_ids:            toMerge.flatMap((g) => g.member_ids),
       is_singleton:          toMerge.flatMap((g) => g.member_ids).length === 1,
+      proposed_name:         mergedName,
       anchor_member_ids:     toMerge.flatMap((g) => g.anchor_member_ids),
       absorbed_member_ids:   toMerge.flatMap((g) => g.absorbed_member_ids),
       merged_from_group_ids: toMerge.flatMap((g) => [g.temp_group_id, ...g.merged_from_group_ids]),
@@ -574,16 +829,35 @@ function applyMerges(
 // Cost estimation
 // ---------------------------------------------------------------------------
 
-function estimateCostUSD(usage: {
+type Usage = {
   input_tokens: number; output_tokens: number;
   cache_read_input_tokens: number; cache_creation_input_tokens: number;
-}): number {
+};
+
+/** Price one model's usage with its own per-token rates (falls back to Sonnet). */
+function priceUsage(usage: Usage, modelId: string): number {
+  const p = MODEL_PRICING[modelId] ?? MODEL_PRICING['claude-sonnet-4-6'];
   return (
-    usage.input_tokens                * (3.00  / 1_000_000) +
-    usage.output_tokens               * (15.00 / 1_000_000) +
-    usage.cache_read_input_tokens     * (0.30  / 1_000_000) +
-    usage.cache_creation_input_tokens * (3.75  / 1_000_000)
+    usage.input_tokens                * (p.in        / 1_000_000) +
+    usage.output_tokens               * (p.out       / 1_000_000) +
+    usage.cache_read_input_tokens     * (p.cacheRead  / 1_000_000) +
+    usage.cache_creation_input_tokens * (p.cacheWrite / 1_000_000)
   );
+}
+
+/**
+ * Total cost across the two tiers: chunk usage priced at the chunk model, merge
+ * usage at the merge model. `total` is the combined usage; `merge` is just the
+ * merge pass (so chunk usage = total − merge).
+ */
+function estimateTieredCostUSD(total: Usage, merge: Usage): number {
+  const chunk: Usage = {
+    input_tokens:                Math.max(0, total.input_tokens                - merge.input_tokens),
+    output_tokens:               Math.max(0, total.output_tokens               - merge.output_tokens),
+    cache_read_input_tokens:     Math.max(0, total.cache_read_input_tokens     - merge.cache_read_input_tokens),
+    cache_creation_input_tokens: Math.max(0, total.cache_creation_input_tokens - merge.cache_creation_input_tokens),
+  };
+  return priceUsage(chunk, CHUNK_MODEL_ID) + priceUsage(merge, MERGE_MODEL_ID);
 }
 
 // ---------------------------------------------------------------------------
@@ -677,14 +951,11 @@ export interface OnePromptBreakdown {
  * Best-effort — any filesystem error is only logged, never thrown.
  */
 export function writeOnePromptBreakdown(runId: number, breakdown: OnePromptBreakdown): void {
-  try {
-    const projectRoot = path.resolve(process.cwd(), '..');
-    const outPath     = path.join(projectRoot, `one_prompt_breakdown_run_${runId}.json`);
-    fs.writeFileSync(outPath, JSON.stringify(breakdown, null, 2), 'utf8');
-    console.log(`[one-prompt-grouping] Breakdown written → ${outPath}`);
-  } catch (err) {
+  const projectRoot = path.resolve(process.cwd(), '..');
+  const outPath     = path.join(projectRoot, `one_prompt_breakdown_run_${runId}.json`);
+  fs.promises.writeFile(outPath, JSON.stringify(breakdown, null, 2), 'utf8').catch((err) => {
     console.warn('[one-prompt-grouping] Could not write breakdown JSON:', err);
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +1006,9 @@ export async function runOnePromptGrouping(
   items: RunItemForPairing[],
   conceptName: string,
   conceptDefinition: string,
+  existingAliasNames: string[] = [],
+  convention: NamingConvention | null = null,
+  standardizationRules: string[] | null = null,
 ): Promise<OnePromptGroupingResult> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('[one-prompt-grouping] ANTHROPIC_API_KEY is not set.');
@@ -757,7 +1031,7 @@ export async function runOnePromptGrouping(
     chunk_count:        0,
     breakdown: {
       meta: {
-        run_id: 0, generated_at: new Date().toISOString(), model: GROUPING_MODEL_ID,
+        run_id: 0, generated_at: new Date().toISOString(), model: MODEL_LABEL,
         concept_name: conceptName, concept_definition: conceptDefinition,
         total_items: 0, chunk_count: 0, max_items_per_chunk: MAX_ITEMS_PER_CHUNK,
         total_groups_before_merge: 0, total_groups_after_merge: 0,
@@ -775,7 +1049,7 @@ export async function runOnePromptGrouping(
   };
   if (items.length === 0) return EMPTY;
 
-  const systemText = buildSystemPrompt(conceptName, conceptDefinition);
+  const systemText = buildSystemPrompt(conceptName, conceptDefinition, convention, standardizationRules);
 
   // ── Split into chunks of MAX_ITEMS_PER_CHUNK ─────────────────────────────
   const chunks: RunItemForPairing[][] = [];
@@ -783,33 +1057,43 @@ export async function runOnePromptGrouping(
     chunks.push(items.slice(i, i + MAX_ITEMS_PER_CHUNK));
   }
 
-  // ── Dispatch all chunks in parallel ──────────────────────────────────────
-  const chunkResults = await Promise.all(
-    chunks.map((chunk, chunkIdx) => {
-      const userText   = buildUserTurn(chunk, conceptName);
-      const chunkLabel = `chunk ${chunkIdx + 1}/${chunks.length}, ${chunk.length} items`;
-      return callChunkLLM(apiKey, systemText, userText, chunkLabel).catch((err: unknown) => {
-        // Parse/API failure for one chunk: degrade to all-singletons rather than
-        // aborting the whole run.  Items will appear ungrouped and can be merged
-        // manually by the user.
-        console.warn(
-          `[one-prompt-grouping] ${chunkLabel} failed — falling back to singletons. Error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        const syntheticParsed: LLMResponse = {
-          g: chunk.map((_, i) => [[i + 1], null, 'l'] as LLMResponseGroup),
-          u: [],
-        };
-        return {
-          parsed:        syntheticParsed,
-          raw_text:      '',
-          user_turn:     userText,
-          stop_reason:   'parse_error',
-          llm_elapsed_ms: 0,
-          llm_usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-        } satisfies ChunkCallResult;
-      });
-    })
-  );
+  // ── Dispatch chunks in parallel, capped at CHUNK_CONCURRENCY at a time ────
+  // Each batch of up to CHUNK_CONCURRENCY chunks runs in parallel; the next batch
+  // starts only once the current one settles. Keeps results in chunk order.
+  const dispatchChunk = (chunk: RunItemForPairing[], chunkIdx: number): Promise<ChunkCallResult> => {
+    const userText   = buildUserTurn(chunk, conceptName, existingAliasNames);
+    const chunkLabel = `chunk ${chunkIdx + 1}/${chunks.length}, ${chunk.length} items`;
+    return callChunkLLM(apiKey, systemText, userText, chunkLabel).catch((err: unknown) => {
+      // Parse/API failure for one chunk: degrade to all-singletons rather than
+      // aborting the whole run.  Items will appear ungrouped and can be merged
+      // manually by the user.
+      console.warn(
+        `[one-prompt-grouping] ${chunkLabel} failed — falling back to singletons. Error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      const syntheticParsed: LLMResponse = {
+        g: chunk.map((_, i) => [[i + 1], null, 'l'] as LLMResponseGroup),
+        u: [],
+      };
+      return {
+        parsed:        syntheticParsed,
+        raw_text:      '',
+        user_turn:     userText,
+        stop_reason:   'parse_error',
+        llm_elapsed_ms: 0,
+        llm_usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      } satisfies ChunkCallResult;
+    });
+  };
+
+  const chunksStart = Date.now();
+  const chunkResults: ChunkCallResult[] = [];
+  for (let start = 0; start < chunks.length; start += CHUNK_CONCURRENCY) {
+    const batch = chunks.slice(start, start + CHUNK_CONCURRENCY);
+    const batchResults = await Promise.all(batch.map((chunk, j) => dispatchChunk(chunk, start + j)));
+    chunkResults.push(...batchResults);
+  }
+  const batchCount = Math.ceil(chunks.length / CHUNK_CONCURRENCY);
+  appendTiming(`[Timing] grouping.llm_chunks: ${Date.now() - chunksStart}ms (${chunks.length} chunk(s), ${batchCount} batch(es) of ≤${CHUNK_CONCURRENCY})`);
 
   // ── Merge results ─────────────────────────────────────────────────────────
   let   groups:           FinalGroup[]               = [];
@@ -821,7 +1105,10 @@ export async function runOnePromptGrouping(
 
   // Aggregate usage
   let llm_elapsed_ms = 0;
-  const llm_usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const llm_usage  = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  // Merge-pass usage tracked separately so cost can price chunk vs merge at their
+  // (possibly different) model rates — see estimateTieredCostUSD.
+  const mergeUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
 
   for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
     const chunk  = chunks[chunkIdx];
@@ -844,6 +1131,7 @@ export async function runOnePromptGrouping(
         temp_group_id:         tempGroupId,
         member_ids:            memberIds,
         is_singleton:          memberIds.length === 1,
+        proposed_name:         typeof g[1] === 'string' && g[1].trim() ? g[1].trim() : null,
         anchor_member_ids:     memberIds,
         absorbed_member_ids:   [],
         merged_from_group_ids: [],
@@ -874,6 +1162,7 @@ export async function runOnePromptGrouping(
           temp_group_id:         tempGroupId,
           member_ids:            [item.run_item_id],
           is_singleton:          true,
+          proposed_name:         null, // safety-net singleton — no LLM name; falls back to a representative
           anchor_member_ids:     [item.run_item_id],
           absorbed_member_ids:   [],
           merged_from_group_ids: [],
@@ -922,19 +1211,34 @@ export async function runOnePromptGrouping(
 
   const groupsBeforeMerge = groups.length;
 
+  // ── Deterministic pre-merge (no LLM) ──────────────────────────────────────
+  // Collapse identically-named groups across chunks first; this often removes
+  // all cross-chunk duplicates, leaving the LLM merge to handle only the
+  // genuinely ambiguous (differently-named) remainder — or skipping it entirely.
+  if (chunks.length > 1 && groups.length > 1) {
+    const detStart = Date.now();
+    const det = mergeIdenticalProposedNames(groups);
+    groups = det.groups;
+    appendTiming(
+      `[Timing] grouping.deterministic_merge: ${Date.now() - detStart}ms ` +
+      `(collapsed ${det.collapsed} duplicate group(s) → ${groups.length} remaining)`,
+    );
+  }
+
   // ── Chunk Merging Prompt ──────────────────────────────────────────────────
-  // Only runs when 2+ chunks were dispatched.  One sequential LLM call
-  // receives all proposed groups (with up to 3 representatives each) and
-  // returns merge entries.  Failures are non-fatal: pre-merge groups stand.
+  // Only runs when 2+ chunks were dispatched AND >1 group survives the
+  // deterministic pre-merge.  One sequential LLM call receives the remaining
+  // proposed groups and returns merge entries.  Failures are non-fatal.
   let mergeBreakdown: OnePromptMergeBreakdown = { ...emptyMergeBreakdown };
 
   if (chunks.length > 1 && groups.length > 1) {
+    const mergeStart = Date.now();
     const runItemById = new Map(items.map((item) => [item.run_item_id, item]));
     mergeBreakdown.ran = true;
     try {
       const mergeResult = await callMergeLLM(
         groups, confidence_scores, runItemById,
-        conceptName, conceptDefinition, apiKey,
+        conceptName, conceptDefinition, apiKey, existingAliasNames, convention, standardizationRules,
       );
 
       const groupsBefore = groups.length;
@@ -949,6 +1253,10 @@ export async function runOnePromptGrouping(
       llm_usage.output_tokens              += mergeResult.llm_usage.output_tokens;
       llm_usage.cache_read_input_tokens    += mergeResult.llm_usage.cache_read_input_tokens;
       llm_usage.cache_creation_input_tokens += mergeResult.llm_usage.cache_creation_input_tokens;
+      mergeUsage.input_tokens               += mergeResult.llm_usage.input_tokens;
+      mergeUsage.output_tokens              += mergeResult.llm_usage.output_tokens;
+      mergeUsage.cache_read_input_tokens    += mergeResult.llm_usage.cache_read_input_tokens;
+      mergeUsage.cache_creation_input_tokens += mergeResult.llm_usage.cache_creation_input_tokens;
 
       const mergesApplied = groupsBefore - groups.length;
 
@@ -969,6 +1277,7 @@ export async function runOnePromptGrouping(
         `[one-prompt-grouping] Chunk Merging Prompt: ${mergeResult.parsed.length} merge(s), ` +
         `${groups.length} groups remaining.`,
       );
+      appendTiming(`[Timing] grouping.llm_merge: ${Date.now() - mergeStart}ms (ran)`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       mergeBreakdown.error = errMsg;
@@ -976,16 +1285,88 @@ export async function runOnePromptGrouping(
         '[one-prompt-grouping] Chunk Merging Prompt failed — proceeding with un-merged groups:',
         err,
       );
+      appendTiming(`[Timing] grouping.llm_merge: ${Date.now() - mergeStart}ms (failed)`);
     }
+  } else if (chunks.length > 1) {
+    appendTiming(`[Timing] grouping.llm_merge: 0ms (skipped — deterministic pre-merge left ${groups.length} group(s))`);
   }
 
   // ── Assemble breakdown ────────────────────────────────────────────────────
   const runItemById = new Map(items.map((item) => [item.run_item_id, item]));
+
+  // ── Naming convention enforcement (regex + structured rules) ──────────────
+  // 1. Deterministically normalize every name for the mechanical rules (case,
+  //    spaces, special chars, suffixes, …). 2. Validate the regex + constraints
+  //    (word count, length). 3. Non-conforming names get up to 2 correction
+  //    rounds; any still failing have their groups dropped (items → unassigned),
+  //    so the lookup only ever receives names that satisfy the convention.
+  const hasRegex = convention?.type === 'regex' && !!convention.value.trim();
+  const hasRules = !!convention?.rules && Object.keys(convention.rules).length > 0;
+  const enforceStart = Date.now();
+  if (hasRegex || hasRules) {
+    const anchored = hasRegex ? buildAnchoredRegex(convention!.value) : null;
+    const rules: ConventionRules | null = convention?.rules ?? null;
+    const normalize = (n: string | null | undefined): string | null =>
+      n == null ? null : (hasRules ? applyConventionRules(n, rules) : n);
+    const violations = (n: string | null | undefined): string[] => {
+      if (!n) return ['empty'];
+      const out: string[] = [];
+      if (anchored && !anchored.test(n)) out.push(`must match ${convention!.value}`);
+      out.push(...validateConventionViolations(n, rules));
+      return out;
+    };
+    const requirements: string[] = [];
+    if (hasRegex) requirements.push(`fully match this regular expression (anchored start-to-end): ${convention!.value}`);
+    requirements.push(...describeConventionRules(rules));
+
+    // Apply deterministic normalization to every group's name up front.
+    for (const g of groups) {
+      const norm = normalize(g.proposed_name);
+      if (norm != null) g.proposed_name = norm;
+    }
+    let failing = groups.filter((g) => violations(g.proposed_name).length > 0);
+    for (let round = 0; round < 2 && failing.length > 0; round++) {
+      try {
+        const fixes = await callNameFixLLM(
+          failing.map((g) => ({
+            temp_group_id: g.temp_group_id,
+            reps:          g.member_ids.slice(0, 3).map((id) => runItemById.get(id)?.literal_value ?? String(id)),
+            current:       g.proposed_name,
+          })),
+          requirements, conceptName, apiKey,
+        );
+        for (const g of failing) {
+          const fixed = fixes.get(g.temp_group_id);
+          if (fixed) {
+            const norm = normalize(fixed) ?? fixed;
+            if (violations(norm).length === 0) g.proposed_name = norm;
+          }
+        }
+      } catch (e) {
+        console.warn('[one-prompt-grouping] name-fix call failed:', e);
+        break;
+      }
+      failing = groups.filter((g) => violations(g.proposed_name).length > 0);
+    }
+    if (failing.length > 0) {
+      const failIds = new Set(failing.map((g) => g.temp_group_id));
+      for (const g of failing) for (const id of g.member_ids) unassigned_ids.push(id);
+      groups = groups.filter((g) => !failIds.has(g.temp_group_id));
+      console.warn(
+        `[one-prompt-grouping] naming convention: ${failing.length} group(s) left ` +
+        `unstandardized (could not satisfy the rules).`,
+      );
+    }
+  }
+  if (hasRegex || hasRules) {
+    appendTiming(`[Timing] grouping.convention_enforcement: ${Date.now() - enforceStart}ms`);
+  }
+
   const breakdown: OnePromptBreakdown = {
     meta: {
       run_id:                      0, // caller fills in the real run_id via writeOnePromptBreakdown
       generated_at:                new Date().toISOString(),
-      model:                       GROUPING_MODEL_ID,
+      model:                       MODEL_LABEL,
       concept_name:                conceptName,
       concept_definition:          conceptDefinition,
       total_items:                 items.length,
@@ -996,7 +1377,7 @@ export async function runOnePromptGrouping(
       multi_member_groups:         groups.filter((g) => !g.is_singleton).length,
       singleton_groups:            groups.filter((g) =>  g.is_singleton).length,
       unassigned_count:            unassigned_ids.length,
-      estimated_cost_usd:          estimateCostUSD(llm_usage),
+      estimated_cost_usd:          estimateTieredCostUSD(llm_usage, mergeUsage),
       llm_elapsed_ms,
       total_input_tokens:          llm_usage.input_tokens,
       total_output_tokens:         llm_usage.output_tokens,
@@ -1024,7 +1405,7 @@ export async function runOnePromptGrouping(
     confidence_scores,
     unassigned_ids,
     llm_elapsed_ms,
-    estimated_cost_usd: estimateCostUSD(llm_usage),
+    estimated_cost_usd: estimateTieredCostUSD(llm_usage, mergeUsage),
     llm_usage,
     chunk_count: chunks.length,
     breakdown,

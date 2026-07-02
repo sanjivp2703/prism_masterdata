@@ -5,7 +5,7 @@ import snowflake from 'snowflake-sdk';
 
 type SnowflakeConnection = ReturnType<typeof snowflake.createConnection>;
 
-function getOptionalEnv(name: string): string | undefined {
+export function getOptionalEnv(name: string): string | undefined {
   const v = process.env[name];
   if (!v) return undefined;
   const trimmed = v.trim();
@@ -126,6 +126,98 @@ export async function withSnowflake<T>(
   fn: (connection: SnowflakeConnection) => Promise<T>
 ): Promise<T> {
   const connection = createSnowflakeConnection();
+  try {
+    await connect(connection);
+    return await fn(connection);
+  } finally {
+    await destroy(connection);
+  }
+}
+
+// ── Per-account Snowflake config ──────────────────────────────────────────────
+
+interface AccountSfConfig {
+  account:    string;
+  username:   string;
+  warehouse:  string;
+  role?:      string;
+  password?:  string;
+  privateKey?: string;
+}
+
+// In-process cache: accountId → config (null = no custom config, use env vars)
+const _accountSfConfigCache = new Map<number, AccountSfConfig | null>();
+
+function createConnectionFromConfig(cfg: AccountSfConfig): SnowflakeConnection {
+  const privateKey = cfg.privateKey
+    ? (cfg.privateKey.includes('\\n') ? cfg.privateKey.replace(/\\n/g, '\n') : cfg.privateKey)
+    : undefined;
+  const authenticator = privateKey ? 'SNOWFLAKE_JWT' : undefined;
+  const database = getOptionalEnv('SNOWFLAKE_DATABASE') ?? 'STAND_DB';
+  const schema   = getOptionalEnv('SNOWFLAKE_SCHEMA')   ?? 'STAND_INTERNAL';
+
+  return snowflake.createConnection({
+    account:   cfg.account,
+    username:  cfg.username,
+    warehouse: cfg.warehouse,
+    database,
+    schema,
+    ...(cfg.role        ? { role: cfg.role }               : {}),
+    ...(authenticator   ? { authenticator }                 : {}),
+    ...(privateKey
+      ? { privateKey }
+      : { password: cfg.password ?? '' }),
+  } as any);
+}
+
+export function invalidateAccountSfConfig(accountId: number): void {
+  _accountSfConfigCache.delete(accountId);
+}
+
+async function loadAccountSfConfig(accountId: number): Promise<AccountSfConfig | null> {
+  return withSnowflake(async (conn) => {
+    const rows: any[] = await new Promise((resolve, reject) => {
+      conn.execute({
+        sqlText: `SELECT sf_account, sf_user, sf_warehouse, sf_role, sf_password, sf_private_key
+                  FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE account_id = ? LIMIT 1`,
+        binds: [accountId],
+        complete: (err: any, _s: any, r: any[] | undefined) => err ? reject(err) : resolve(r ?? []),
+      });
+    });
+    if (!rows.length) return null;
+    const r = rows[0];
+    const acc = r.SF_ACCOUNT ?? r.sf_account;
+    if (!acc) return null;
+    return {
+      account:    String(acc),
+      username:   String(r.SF_USER      ?? r.sf_user      ?? ''),
+      warehouse:  String(r.SF_WAREHOUSE ?? r.sf_warehouse ?? ''),
+      role:       r.SF_ROLE        ?? r.sf_role        ?? undefined,
+      password:   r.SF_PASSWORD    ?? r.sf_password    ?? undefined,
+      privateKey: r.SF_PRIVATE_KEY ?? r.sf_private_key ?? undefined,
+    };
+  });
+}
+
+export async function withSnowflakeForAccount<T>(
+  accountId: number | null | undefined,
+  fn: (connection: SnowflakeConnection) => Promise<T>
+): Promise<T> {
+  if (!accountId) return withSnowflake(fn);
+
+  if (!_accountSfConfigCache.has(accountId)) {
+    try {
+      const cfg = await loadAccountSfConfig(accountId);
+      _accountSfConfigCache.set(accountId, cfg);
+    } catch {
+      _accountSfConfigCache.set(accountId, null);
+    }
+  }
+
+  const cfg = _accountSfConfigCache.get(accountId) ?? null;
+  if (!cfg) return withSnowflake(fn);
+
+  const connection = createConnectionFromConfig(cfg);
   try {
     await connect(connection);
     return await fn(connection);

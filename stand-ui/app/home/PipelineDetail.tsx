@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import type { Pipeline } from './PipelinesView';
+import { useState, useEffect, useRef } from 'react';
+import type { Pipeline, PipelineGroup } from './PipelinesView';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -19,9 +19,20 @@ interface QueueItem {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Snowflake returns timestamps like "2024-01-15 10:30:00.000" with no timezone.
+// Without coercion, browsers parse the space-separated form as LOCAL time, so
+// all displayed times are off by the user's UTC offset. Force UTC by normalizing
+// to ISO-T format + appending Z when there's no timezone suffix.
+function parseUtc(iso: string): Date {
+  let s = iso.trim();
+  if (/^\d{4}-\d{2}-\d{2} /.test(s)) s = s.replace(' ', 'T');
+  if (!s.endsWith('Z') && !/[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z';
+  return new Date(s);
+}
+
 function relativeTime(iso: string | null): string {
   if (!iso) return '—';
-  const d = new Date(iso);
+  const d = parseUtc(iso);
   if (isNaN(d.getTime())) return '—';
   const s = Math.floor((Date.now() - d.getTime()) / 1000);
   if (s < 5)  return 'just now';
@@ -36,9 +47,14 @@ function relativeTime(iso: string | null): string {
 
 function fmtDate(iso: string | null): string {
   if (!iso) return '—';
-  const d = new Date(iso);
+  const d = parseUtc(iso);
   if (isNaN(d.getTime())) return '—';
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function tableShort(fqn: string): string {
+  const parts = fqn.split('.');
+  return parts[parts.length - 1] ?? fqn;
 }
 
 function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
@@ -59,55 +75,53 @@ function PulseDot({ color = '#16a34a' }: { color?: string }) {
   );
 }
 
-/** Circular progress ring — fills clockwise from 12 o'clock as pct goes 0→100. */
-function RefreshRing({ pct }: { pct: number }) {
+/** Circular progress ring — fills clockwise from 12 o'clock as pct goes 0→100.
+ *  There is NO reset animation: when pct DROPS (cycle end / wrap, or switching to a
+ *  held state) the transition is suppressed so the ring snaps instantly instead of
+ *  animating a retract. The cycle end is masked by the scanning state taking over.
+ *  mode: 'normal' = blue counting, 'scanning' = teal held at 0%, 'standardizing' = amber held at 100%. */
+function RefreshRing({ pct, mode = 'normal' }: { pct: number; mode?: 'normal' | 'scanning' | 'standardizing' }) {
   const r = 15;
   const cx = 20, cy = 20;
   const circumference = 2 * Math.PI * r;
   const offset = circumference * (1 - Math.max(0, Math.min(1, pct / 100)));
+  const arcColor = mode === 'standardizing' ? '#D97706' : mode === 'scanning' ? '#0891B2' : 'var(--accent)';
+
+  // Only animate while the ring is FILLING (pct rising). Any drop — the 100→0 wrap,
+  // or normal→scanning/standardizing — snaps with no transition, so the reset
+  // retract the user asked to remove never plays. (State, not a ref, so we never
+  // read a ref during render; the extra render is harmless for a tiny SVG.)
+  const [prevPct, setPrevPct] = useState(pct);
+  const filling = pct >= prevPct;
+  useEffect(() => { setPrevPct(pct); }, [pct]);
+
   return (
     <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
-      {/* Track */}
       <circle cx={cx} cy={cy} r={r} stroke="var(--border)" strokeWidth="2.5" />
-      {/* Progress arc */}
       <circle
         cx={cx} cy={cy} r={r}
-        stroke="var(--accent)"
+        stroke={arcColor}
         strokeWidth="2.5"
         strokeLinecap="round"
         strokeDasharray={circumference}
         strokeDashoffset={offset}
         transform={`rotate(-90 ${cx} ${cy})`}
-        style={{ transition: 'stroke-dashoffset 1s linear' }}
+        style={{ transition: (mode === 'normal' && filling) ? 'stroke-dashoffset 1s linear' : 'none' }}
       />
     </svg>
   );
 }
-
-// ── Tab: Activity ─────────────────────────────────────────────────────────────
 
 // Inline SVG icons for the timeline (replaces emojis)
 function IcoCreated()     { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="2" y="3" width="10" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2"/><path d="M5 2v2M9 2v2M2 6h10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
 function IcoPolled()      { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.2"/><path d="M7 4.5V7l2 1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
 function IcoStandardized(){ return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.2"/><path d="M4.5 7l2 2 3-3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
 function IcoFound()       { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4" stroke="currentColor" strokeWidth="1.2"/><path d="M9.5 9.5l2.5 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
-function IcoMapped()      { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2 5l3-2 4 2 3-2v6l-3 2-4-2-3 2V5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/><path d="M5 3v6M9 5v6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
-function IcoQueue()       { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2 4h10M2 7h7M2 10h5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
 
-interface PipelineStats {
-  source_row_count:       number;
-  standardized_row_count: number;
-  needs_standardization:  number;
-}
+// ── Tab: Activity ─────────────────────────────────────────────────────────────
 
-function ActivityTab({ pipeline: initialPipeline }: { pipeline: Pipeline }) {
-  // Keep a local copy of the pipeline row so we can refresh last_polled_at
-  // independently of the parent's 30 s fetch cycle.
-  const [pipeline, setPipeline] = useState<Pipeline>(initialPipeline);
-  // Sync if the parent passes a newer snapshot (e.g. on domain re-fetch)
-  useEffect(() => { setPipeline(initialPipeline); }, [initialPipeline]);
-
-  const isLive = pipeline.status === 'active';
+function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp = false, cycleResetMs = 0 }: { group: PipelineGroup; isStandardizing?: boolean; isScanning?: boolean; cycleResetMs?: number }) {
+  const isLive = group.status === 'active';
 
   // Client-side 1 s ticker for the countdown ring
   const [now, setNow] = useState(() => Date.now());
@@ -117,101 +131,57 @@ function ActivityTab({ pipeline: initialPipeline }: { pipeline: Pipeline }) {
     return () => clearInterval(t);
   }, [isLive]);
 
-  // Independently re-fetch this pipeline row every 15 s so last_polled_at
-  // stays current without waiting for the parent PipelinesView's 30 s cycle.
-  const refreshPipelineRow = useCallback(async () => {
-    if (!isLive) return;
-    try {
-      const res  = await fetch('/api/pipelines');
-      const body = await res.json().catch(() => ({}));
-      const updated = (body.pipelines ?? []).find(
-        (p: Pipeline) => p.pipeline_id === pipeline.pipeline_id,
-      );
-      if (updated) setPipeline(updated);
-    } catch { /* ignore — stale data is acceptable */ }
-  }, [isLive, pipeline.pipeline_id]);
-
-  useEffect(() => {
-    if (!isLive) return;
-    const t = setInterval(refreshPipelineRow, 15_000);
-    return () => clearInterval(t);
-  }, [isLive, refreshPipelineRow]);
-
-  // Countdown from last_polled_at
-  const lastPollMs       = pipeline.last_polled_at ? new Date(pipeline.last_polled_at).getTime() : null;
-  const secondsSince     = lastPollMs != null ? Math.max(0, Math.floor((now - lastPollMs) / 1_000)) : null;
+  // Countdown anchor — wraps 0→100 every 30 s.
+  // We count from the LATER of last_polled_at (server timestamp, refreshed via the
+  // metrics_updated refetch) and cycleResetMs (a client-clock timestamp set the
+  // instant scanning/standardizing FINISHES). The reset event arrives before the
+  // async refetch lands, so without this the ring would briefly show the stale
+  // pre-cycle position (e.g. ~16% for a 5 s scan) and snap back to 0 — the
+  // "continue a little, reset, continue" jank. Anchoring to the reset kills it.
+  const lastPollMs       = group.last_polled_at ? new Date(group.last_polled_at).getTime() : null;
+  const anchorMs         = Math.max(lastPollMs ?? 0, cycleResetMs) || null;
+  const secondsSince     = anchorMs != null ? Math.max(0, Math.floor((now - anchorMs) / 1_000)) : null;
   const secondsUntilNext = secondsSince != null ? Math.max(0, 30 - secondsSince) : null;
-  // Ring fills from 0→100 over 30 s, then resets and fills again if overdue
-  const ringPct = secondsSince != null ? (secondsSince % 30) / 30 * 100 : 0;
+  const ringPct          = secondsSince != null ? (secondsSince % 30) / 30 * 100 : 0;
 
-  // Live source-table stats (fetched once on mount, refreshed every 30 s)
-  const [stats,      setStats]      = useState<PipelineStats | null>(null);
-  const [statsError, setStatsError] = useState(false);
+  // Scanning is event-driven: the poller emits scanning_started/finished around the
+  // classification of new stream data, and PipelinesView turns that into this prop.
+  // The ring holds at the START of the cycle (0%) for the whole check — it never
+  // advances-then-snaps-back. Standardization (amber) takes precedence.
+  const isScanning = scanningProp && !isStandardizing;
 
-  const fetchStats = useCallback(async () => {
-    try {
-      const res  = await fetch(`/api/pipelines/${pipeline.pipeline_id}/stats`);
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) { setStatsError(true); return; }
-      setStats(body);
-      setStatsError(false);
-    } catch { setStatsError(true); }
-  }, [pipeline.pipeline_id]);
-
-  useEffect(() => {
-    fetchStats();
-    const interval = setInterval(fetchStats, 30_000);
-    return () => clearInterval(interval);
-  }, [fetchStats]);
-
-  // Milestones (timeline rows below the stat cards)
-  const milestones: { Icon: () => JSX.Element; label: string; value: string; highlight?: boolean }[] = [
-    { Icon: IcoCreated,      label: 'Created',           value: fmtDate(pipeline.created_at) },
-    { Icon: IcoPolled,       label: 'Last updated',      value: pipeline.last_polled_at ? fmtDate(pipeline.last_polled_at) : 'Never' },
-    { Icon: IcoStandardized, label: 'Last standardized', value: pipeline.last_queue_empty_at ? fmtDate(pipeline.last_queue_empty_at) : (pipeline.created_at ? fmtDate(pipeline.created_at) : '—'), highlight: true },
-    { Icon: IcoFound,        label: 'Values detected',   value: pipeline.total_new_values.toLocaleString() },
+  const milestones: { Icon: () => React.JSX.Element; label: string; value: string; highlight?: boolean }[] = [
+    { Icon: IcoCreated,      label: 'Created',           value: fmtDate(group.created_at) },
+    { Icon: IcoPolled,       label: 'Last updated',      value: group.last_polled_at ? fmtDate(group.last_polled_at) : 'Never' },
+    { Icon: IcoStandardized, label: 'Last standardized', value: group.last_queue_empty_at ? fmtDate(group.last_queue_empty_at) : (group.created_at ? fmtDate(group.created_at) : '—'), highlight: true },
   ];
 
-  // ── Stat card sub-component ────────────────────────────────────────────────
   function StatCard({
     value, label, tooltip,
     bg = 'var(--page-bg)', border = 'var(--border)', valueColor = 'var(--text-primary)',
   }: {
-    value:      string;
-    label:      string;
-    tooltip:    string;
-    bg?:        string;
-    border?:    string;
-    valueColor?: string;
+    value: string; label: string; tooltip: string;
+    bg?: string; border?: string; valueColor?: string;
   }) {
     const [hovered, setHovered] = useState(false);
+    const hideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const show = () => { clearTimeout(hideTimer.current); setHovered(true); };
+    const hide = () => { hideTimer.current = setTimeout(() => setHovered(false), 300); };
     return (
       <div
         className="rounded-button p-3 relative cursor-default"
         style={{ backgroundColor: bg, border: `0.5px solid ${border}` }}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
+        onMouseEnter={show}
+        onMouseLeave={hide}
       >
-        <p className="text-lg font-semibold leading-none mb-1" style={{ color: valueColor }}>
-          {value}
-        </p>
+        <p className="text-lg font-semibold leading-none mb-1" style={{ color: valueColor }}>{value}</p>
         <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{label}</p>
-
-        {/* Tooltip */}
         {hovered && (
           <div
-            className="absolute z-50 text-[11px] leading-relaxed rounded-button shadow-lg px-3 py-2 pointer-events-none"
-            style={{
-              bottom: 'calc(100% + 6px)',
-              left: '50%',
-              transform: 'translateX(-50%)',
-              minWidth: 200,
-              maxWidth: 260,
-              backgroundColor: 'var(--surface)',
-              border: '0.5px solid var(--border)',
-              color: 'var(--text-secondary)',
-              whiteSpace: 'normal',
-            }}
+            className="absolute z-50 text-[11px] leading-relaxed rounded-button shadow-lg px-3 py-2"
+            style={{ bottom: 'calc(100% + 6px)', left: '50%', transform: 'translateX(-50%)', minWidth: 200, maxWidth: 280, backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)', color: 'var(--text-secondary)', whiteSpace: 'normal' }}
+            onMouseEnter={show}
+            onMouseLeave={hide}
           >
             {tooltip}
           </div>
@@ -220,94 +190,136 @@ function ActivityTab({ pipeline: initialPipeline }: { pipeline: Pipeline }) {
     );
   }
 
-  const sourceVal  = stats ? stats.source_row_count.toLocaleString()       : '—';
-  const stdVal     = stats ? stats.standardized_row_count.toLocaleString() : '—';
-  const unstdCount = stats ? Math.max(0, stats.source_row_count - stats.standardized_row_count) : null;
-  const unstdVal   = unstdCount != null ? unstdCount.toLocaleString() : '—';
-  const hasUnstd   = unstdCount != null && unstdCount > 0;
+  // Aggregated across all columns in the card.
+  const hasMetrics  = group.total_source_values > 0;
+  const sourceVal   = hasMetrics ? group.total_source_values.toLocaleString() : '—';
+  const stdVal      = hasMetrics ? group.total_mapped.toLocaleString() : '—';
+  const unstdCount  = Math.max(0, group.total_source_values - group.total_mapped);
+  const unstdVal    = hasMetrics ? unstdCount.toLocaleString() : '—';
+  const hasUnstd    = hasMetrics && unstdCount > 0;
 
   return (
     <div>
-      {/* ── Live update status (active pipelines only) ────────────────── */}
+      {/* ── Live update status (active cards only) ────────────────────── */}
       {isLive && (
         <div className="mb-4 pb-4" style={{ borderBottom: '0.5px solid var(--border)' }}>
           <div className="flex items-center gap-3">
-            <RefreshRing pct={ringPct} />
+            <RefreshRing
+              pct={isStandardizing ? 100 : isScanning ? 0 : ringPct}
+              mode={isStandardizing ? 'standardizing' : isScanning ? 'scanning' : 'normal'}
+            />
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-1.5 mb-0.5">
-                <PulseDot color="#16a34a" />
-                <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Live</span>
-                <span className="text-xs" style={{ color: 'var(--text-muted)' }}>· refreshes every 30s</span>
-              </div>
-              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                {secondsUntilNext === null
-                  ? 'Waiting for first update…'
-                  : secondsUntilNext === 0
-                  ? secondsSince != null && secondsSince > 60
-                    ? `Last updated ${Math.floor(secondsSince / 60)}m ago`
-                    : 'Polling…'
-                  : `Next refresh in ${secondsUntilNext}s`}
-              </p>
+              {isStandardizing ? (
+                <>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <PulseDot color="#D97706" />
+                    <span className="text-xs font-medium" style={{ color: '#92400E' }}>Standardizing data</span>
+                  </div>
+                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Polling paused — resumes when complete</p>
+                </>
+              ) : isScanning ? (
+                <>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <PulseDot color="#0891B2" />
+                    <span className="text-xs font-medium" style={{ color: '#0E7490' }}>Checking for new values</span>
+                  </div>
+                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Identifying new values — cycle resumes when done</p>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <PulseDot color="#16a34a" />
+                    <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Live</span>
+                    <span className="text-xs" style={{ color: 'var(--text-muted)' }}>· refreshes every 30s</span>
+                  </div>
+                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    {secondsUntilNext === null
+                      ? 'Waiting for first update…'
+                      : `Next refresh in ${secondsUntilNext}s`}
+                  </p>
+                </>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* ── 3 stat cards — shown for all pipeline statuses ───────────── */}
+      {/* ── 3 stat cards — aggregated across columns ──────────────────── */}
       <div className="mb-5 pb-5" style={{ borderBottom: '0.5px solid var(--border)' }}>
-        {statsError ? (
-          <p className="text-[11px] text-center py-2" style={{ color: 'var(--text-muted)' }}>
-            Could not load source stats
-          </p>
-        ) : (
-          <div className="grid grid-cols-3 gap-2">
-            <StatCard
-              value={sourceVal}
-              label="Source Values"
-              tooltip={`Total non-null rows in ${pipeline.table_fqn}.${pipeline.column_name} — includes duplicate occurrences, not just unique values.`}
-              bg="var(--page-bg)"
-              border="var(--border)"
-            />
-            <StatCard
-              value={stdVal}
-              label="Standardized"
-              tooltip={`Source rows whose value has a confirmed canonical mapping — counts every row, not just distinct values. Standardized + Unstandardized = Source Values.`}
-              bg="var(--accent-tint)"
-              border="var(--accent-border)"
-              valueColor="var(--text-primary)"
-            />
-            <StatCard
-              value={unstdVal}
-              label="Unstandardized"
-              tooltip={`Source rows whose value has no confirmed mapping yet — i.e. Source Values minus Standardized. Includes values currently in the queue.`}
-              bg={hasUnstd ? '#FFFBEB' : 'var(--page-bg)'}
-              border={hasUnstd ? '#FDE68A' : 'var(--border)'}
-              valueColor={hasUnstd ? '#92400E' : 'var(--text-muted)'}
-            />
-          </div>
-        )}
+        <div className="grid grid-cols-3 gap-2">
+          <StatCard
+            value={sourceVal}
+            label="Source Values"
+            tooltip={`Number of values in ${group.columns.map(c => c.column_name).join(', ')} (including nulls, which are automatically standardized)`}
+            bg="var(--page-bg)" border="var(--border)"
+          />
+          <StatCard
+            value={stdVal}
+            label="Standardized"
+            tooltip={`Number of values standardized in ${group.export_table_fqn ?? 'the export table'}`}
+            bg="var(--accent-tint)" border="var(--accent-border)" valueColor="var(--text-primary)"
+          />
+          <StatCard
+            value={unstdVal}
+            label="Unstandardized"
+            tooltip={`Number of values in ${tableShort(group.table_fqn)} unconfirmed to be standardized and thus not in ${group.export_table_fqn ?? 'the export table'}`}
+            bg={hasUnstd ? '#FFFBEB' : 'var(--page-bg)'}
+            border={hasUnstd ? '#FDE68A' : 'var(--border)'}
+            valueColor={hasUnstd ? '#92400E' : 'var(--text-muted)'}
+          />
+        </div>
       </div>
+
+      {/* ── Per-column breakdown (multi-column only) ──────────────────── */}
+      {group.columns.length > 1 && <div className="mb-5 pb-5" style={{ borderBottom: '0.5px solid var(--border)' }}>
+        <p className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-muted)' }}>Columns</p>
+        <div className="rounded-button border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}>
+          {/* Header row */}
+          <div
+            className="grid text-[10px] font-semibold uppercase tracking-wide px-3 py-2"
+            style={{ gridTemplateColumns: '1fr 90px 56px 130px', gap: 8, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--accent-border)', backgroundColor: 'var(--surface)' }}
+          >
+            <span>Column</span>
+            <span>Domain</span>
+            <span>Mode</span>
+            <span className="text-right">Standardized</span>
+          </div>
+          {group.columns.map((c, i) => {
+            const cUnstd = Math.max(0, (c.total_source_values || 0) - (c.total_mapped || 0));
+            return (
+              <div
+                key={`${c.pipeline_id}_${c.column_name}`}
+                className="grid items-center px-3 py-2.5"
+                style={{ gridTemplateColumns: '1fr 90px 56px 130px', gap: 8, borderTop: i > 0 ? '0.5px solid var(--accent-border)' : undefined }}
+              >
+                <span className="text-xs font-medium font-mono truncate" style={{ color: 'var(--text-primary)' }}>{c.column_name}</span>
+                <span className="text-[10px] truncate" style={{ color: 'var(--accent)' }}>{c.domain_name ?? '—'}</span>
+                <span
+                  className="text-[9px] font-medium uppercase tracking-wide px-1.5 py-0.5 rounded self-start whitespace-nowrap"
+                  style={{ backgroundColor: c.mode === 'auto' ? '#F5F3FF' : 'var(--surface)', color: c.mode === 'auto' ? '#7C3AED' : 'var(--text-muted)', border: `0.5px solid ${c.mode === 'auto' ? '#DDD6FE' : 'var(--border)'}` }}
+                >
+                  {c.mode}
+                </span>
+                <span className="text-[11px] tabular-nums text-right" style={{ color: 'var(--text-muted)' }}>
+                  <span style={{ color: '#15803D', fontWeight: 500 }}>{(c.total_mapped || 0).toLocaleString()}</span>
+                  {' / '}{(c.total_source_values || 0).toLocaleString()}
+                  {cUnstd > 0 && <span style={{ color: '#92400E' }}> · {cUnstd} left</span>}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>}
 
       {/* ── Milestones ────────────────────────────────────────────────── */}
       <div className="flex flex-col" style={{ gap: 1 }}>
         {milestones.map(({ Icon, label, value, highlight }) => (
-          <div
-            key={label}
-            className="flex items-center justify-between py-2.5 px-1"
-            style={{ borderBottom: '0.5px solid var(--border)' }}
-          >
+          <div key={label} className="flex items-center justify-between py-2.5 px-1" style={{ borderBottom: '0.5px solid var(--border)' }}>
             <div className="flex items-center gap-2.5">
-              <span style={{ color: highlight ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0, display: 'flex' }}>
-                <Icon />
-              </span>
+              <span style={{ color: highlight ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0, display: 'flex' }}><Icon /></span>
               <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>{label}</span>
             </div>
-            <span
-              className="text-xs font-mono"
-              style={{ color: highlight ? 'var(--accent)' : 'var(--text-primary)', fontWeight: highlight ? 500 : 400 }}
-            >
-              {value}
-            </span>
+            <span className="text-xs font-mono" style={{ color: highlight ? 'var(--accent)' : 'var(--text-primary)', fontWeight: highlight ? 500 : 400 }}>{value}</span>
           </div>
         ))}
       </div>
@@ -315,45 +327,49 @@ function ActivityTab({ pipeline: initialPipeline }: { pipeline: Pipeline }) {
   );
 }
 
-// ── Tab: Mappings ─────────────────────────────────────────────────────────────
+// ── Tab: Mappings (one section per column) ──────────────────────────────────────
 
-function MappingsTab({ pipeline }: { pipeline: Pipeline }) {
-  const [mappings,  setMappings]  = useState<Mapping[]>([]);
+/** Confirmed mappings + pending queue for a single column. Search is internal per-column. */
+function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; showHeading: boolean }) {
+  const [mappings,   setMappings]   = useState<Mapping[]>([]);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
-  const [total,     setTotal]     = useState(0);
-  const [search,    setSearch]    = useState('');
-  const [loading,   setLoading]   = useState(true);
-  const [error,     setError]     = useState<string | null>(null);
+  const [total,      setTotal]      = useState(0);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState<string | null>(null);
+  const [search,     setSearch]     = useState('');
 
-  const fetchMappings = useCallback(async (q: string) => {
-    setLoading(true);
-    try {
-      const params = new URLSearchParams({ limit: '500' });
-      if (q) params.set('search', q);
-      const [mRes, qRes] = await Promise.all([
-        fetch(`/api/pipelines/${pipeline.pipeline_id}/mappings?${params}`),
-        fetch(`/api/pipelines/${pipeline.pipeline_id}/queue`),
-      ]);
-      const [mBody, qBody] = await Promise.all([mRes.json().catch(() => ({})), qRes.json().catch(() => ({}))]);
-      if (!mRes.ok) throw new Error(mBody?.error ?? `HTTP ${mRes.status}`);
-      setMappings(mBody.mappings ?? []);
-      setTotal(mBody.total ?? 0);
-      setQueueItems(qBody.items ?? []);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load mappings');
-    } finally {
-      setLoading(false);
-    }
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      try {
+        const [mRes, qRes] = await Promise.all([
+          fetch(`/api/pipelines/${pipeline.pipeline_id}/mappings?limit=500`),
+          fetch(`/api/pipelines/${pipeline.pipeline_id}/queue`),
+        ]);
+        const [mBody, qBody] = await Promise.all([mRes.json().catch(() => ({})), qRes.json().catch(() => ({}))]);
+        if (!mRes.ok) throw new Error(mBody?.error ?? `HTTP ${mRes.status}`);
+        if (cancelled) return;
+        setMappings(mBody.mappings ?? []);
+        setTotal(mBody.total ?? 0);
+        setQueueItems(qBody.items ?? []);
+        setError(null);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load mappings');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, [pipeline.pipeline_id]);
 
-  useEffect(() => { fetchMappings(''); }, [fetchMappings]);
-
-  // Debounce search
-  useEffect(() => {
-    const t = setTimeout(() => fetchMappings(search), 300);
-    return () => clearTimeout(t);
-  }, [search, fetchMappings]);
+  const q = search.trim().toLowerCase();
+  const filteredMappings = q
+    ? mappings.filter(m => m.literal_value.toLowerCase().includes(q) || m.alias_name.toLowerCase().includes(q))
+    : mappings;
+  const filteredQueue = q
+    ? queueItems.filter(i => i.literal_value.toLowerCase().includes(q))
+    : queueItems;
 
   function exportCsv() {
     const rows = [
@@ -366,118 +382,92 @@ function MappingsTab({ pipeline }: { pipeline: Pipeline }) {
     ];
     const blob = new Blob([rows.map(r => r.join(',')).join('\n')], { type: 'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-    a.download = `${pipeline.table_fqn}_${pipeline.column_name}_mappings.csv`; a.click();
+    a.download = `${tableShort(pipeline.table_fqn)}_${pipeline.column_name}_mappings.csv`; a.click();
   }
 
-  const filteredQueue = search
-    ? queueItems.filter(i => i.literal_value.toLowerCase().includes(search.toLowerCase()))
-    : queueItems;
+  const csvButton = mappings.length > 0 ? (
+    <button
+      onClick={exportCsv}
+      className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors flex items-center gap-1 shrink-0"
+      style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent' }}
+      onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }}
+      onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}
+      title="Export this column's mappings as CSV"
+    >
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+        <path d="M6 1v7M3 5.5L6 9l3-3.5M2 10h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      Export CSV
+    </button>
+  ) : null;
+
+  const searchBox = (
+    <div className="relative">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none" style={{ position: 'absolute', left: 7, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', pointerEvents: 'none' }}>
+        <circle cx="5.5" cy="5.5" r="4" stroke="currentColor" strokeWidth="1.3" />
+        <path d="M9 9l3 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      </svg>
+      <input
+        type="text"
+        value={search}
+        onChange={e => setSearch(e.target.value)}
+        placeholder="Search…"
+        className="text-xs rounded-button border-[0.5px] outline-none pl-6 pr-3 py-1 w-36"
+        style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+      />
+    </div>
+  );
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-3 gap-3">
-        <div className="flex items-center gap-3">
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            {total.toLocaleString()} confirmed · {queueItems.length} pending
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {mappings.length > 0 && (
-            <button
-              onClick={exportCsv}
-              className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors flex items-center gap-1"
-              style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent' }}
-              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }}
-              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}
-              title="Export mappings as CSV"
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                <path d="M6 1v7M3 5.5L6 9l3-3.5M2 10h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Export CSV
-            </button>
+      {/* Header row: column name + count on left, search + CSV on right */}
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-baseline gap-2 min-w-0 flex-1">
+          {showHeading && (
+            <>
+              <span className="text-xs font-semibold font-mono truncate" style={{ color: 'var(--text-primary)' }}>{pipeline.column_name}</span>
+              {pipeline.domain_name && <span className="text-[10px]" style={{ color: 'var(--accent)' }}>{pipeline.domain_name}</span>}
+              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{total.toLocaleString()} confirmed · {queueItems.length} pending</span>
+            </>
           )}
-          <div className="relative">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }}>
-              <circle cx="5.5" cy="5.5" r="4" stroke="currentColor" strokeWidth="1.3" />
-              <path d="M9 9l3 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-            </svg>
-            <input
-              type="text"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              placeholder="Search mappings…"
-              className="text-xs rounded-button border-[0.5px] outline-none pl-7 pr-3 py-1.5 w-44"
-              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
-            />
-          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {searchBox}
+          {csvButton}
         </div>
       </div>
 
-      {loading && <div className="flex justify-center py-8"><Spinner /></div>}
-      {error   && <p className="text-xs py-4 text-center" style={{ color: 'var(--confidence-low)' }}>{error}</p>}
+      {loading && <div className="flex justify-center py-6"><Spinner /></div>}
+      {error   && <p className="text-xs py-3 text-center" style={{ color: 'var(--confidence-low)' }}>{error}</p>}
 
-      {!loading && !error && mappings.length === 0 && queueItems.length === 0 && (
-        <p className="text-xs py-6 text-center" style={{ color: 'var(--text-muted)' }}>
-          {search ? 'No mappings match your search.' : 'No confirmed mappings yet.'}
+      {!loading && !error && filteredMappings.length === 0 && filteredQueue.length === 0 && (
+        <p className="text-xs py-5 text-center" style={{ color: 'var(--text-muted)' }}>
+          {q ? 'No mappings match your search.' : 'No confirmed mappings yet.'}
         </p>
       )}
 
-      {!loading && !error && (mappings.length > 0 || filteredQueue.length > 0) && (
-        <div
-          className="rounded-card border-[0.5px] overflow-hidden"
-          style={{ borderColor: 'var(--border)' }}
-        >
-          {/* Header */}
+      {!loading && !error && (filteredMappings.length > 0 || filteredQueue.length > 0) && (
+        <div className="rounded-card border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)' }}>
           <div
             className="grid text-[11px] font-medium px-3 py-2"
-            style={{
-              gridTemplateColumns: '1fr 1fr auto',
-              backgroundColor: 'var(--accent-tint)',
-              color: 'var(--text-secondary)',
-              borderBottom: '0.5px solid var(--border)',
-              gap: 8,
-            }}
+            style={{ gridTemplateColumns: '1fr 1fr auto', backgroundColor: 'var(--accent-tint)', color: 'var(--text-secondary)', borderBottom: '0.5px solid var(--border)', gap: 8 }}
           >
             <span>Raw value</span>
             <span>Canonical name</span>
             <span>Status</span>
           </div>
-          <div style={{ maxHeight: 340, overflowY: 'auto' }}>
-            {/* Pending queue items — shown at the top */}
+          <div style={{ maxHeight: 300, overflowY: 'auto' }}>
             {filteredQueue.map((qi, i) => (
-              <div
-                key={`q-${qi.literal_value}`}
-                className="grid px-3 py-2 text-xs items-center"
-                style={{
-                  gridTemplateColumns: '1fr 1fr auto',
-                  borderTop: i > 0 ? '0.5px solid var(--border)' : undefined,
-                  backgroundColor: '#FFFBEB',
-                  gap: 8,
-                }}
-              >
+              <div key={`q-${qi.literal_value}`} className="grid px-3 py-2 text-xs items-center"
+                style={{ gridTemplateColumns: '1fr 1fr auto', borderTop: i > 0 ? '0.5px solid var(--border)' : undefined, backgroundColor: '#FFFBEB', gap: 8 }}>
                 <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }} title={qi.literal_value}>{qi.literal_value}</span>
                 <span className="text-[11px]" style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>pending standardization</span>
-                <span
-                  className="text-[11px] font-medium px-1.5 py-0.5 rounded-full whitespace-nowrap"
-                  style={{ backgroundColor: '#FEF9C3', color: '#A16207' }}
-                >
-                  In queue
-                </span>
+                <span className="text-[11px] font-medium px-1.5 py-0.5 rounded-pill whitespace-nowrap" style={{ backgroundColor: '#FEF9C3', color: '#A16207' }}>In queue</span>
               </div>
             ))}
-            {/* Confirmed mappings */}
-            {mappings.map((m, i) => (
-              <div
-                key={`m-${m.literal_value}`}
-                className="grid px-3 py-2 text-xs items-center"
-                style={{
-                  gridTemplateColumns: '1fr 1fr auto',
-                  borderTop: (i > 0 || filteredQueue.length > 0) ? '0.5px solid var(--border)' : undefined,
-                  backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent',
-                  gap: 8,
-                }}
-              >
+            {filteredMappings.map((m, i) => (
+              <div key={`m-${m.literal_value}`} className="grid px-3 py-2 text-xs items-center"
+                style={{ gridTemplateColumns: '1fr 1fr auto', borderTop: (i > 0 || filteredQueue.length > 0) ? '0.5px solid var(--border)' : undefined, backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent', gap: 8 }}>
                 <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }} title={m.literal_value}>{m.literal_value}</span>
                 <span className="truncate font-medium" style={{ color: 'var(--accent)' }} title={m.alias_name}>{m.alias_name}</span>
                 <span className="text-[11px] whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{relativeTime(m.confirmed_at)}</span>
@@ -490,64 +480,130 @@ function MappingsTab({ pipeline }: { pipeline: Pipeline }) {
   );
 }
 
-// ── Tab: Queue ────────────────────────────────────────────────────────────────
+function MappingsTab({ group }: { group: PipelineGroup }) {
+  // Group columns by domain (domain_id + domain_name).
+  type DomainGroup = { domainId: number | null; domainName: string | null; columns: Pipeline[] };
+  const domainGroups: DomainGroup[] = [];
+  for (const col of group.columns) {
+    const existing = domainGroups.find(d => d.domainId === col.domain_id);
+    if (existing) existing.columns.push(col);
+    else domainGroups.push({ domainId: col.domain_id, domainName: col.domain_name, columns: [col] });
+  }
 
-function QueueTab({ pipeline }: { pipeline: Pipeline }) {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+
+  function toggleDomain(key: string) {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  }
+
+  return (
+    <div>
+
+      <div className="rounded-card border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+        {domainGroups.map((dg, idx) => {
+          const key = String(dg.domainId ?? '__none__');
+          const isOpen = expanded.has(key);
+          const totalMapped = dg.columns.reduce((s, c) => s + c.total_mapped, 0);
+          const totalQueue  = dg.columns.reduce((s, c) => s + c.queue_size, 0);
+          return (
+            <div key={key} style={{ borderTop: idx > 0 ? '0.5px solid var(--border)' : undefined }}>
+              {/* Domain header row */}
+              <button
+                className="w-full flex items-center gap-3 px-4 py-3 text-left transition-colors"
+                style={{ backgroundColor: isOpen ? 'var(--page-bg)' : 'var(--surface)' }}
+                onClick={() => toggleDomain(key)}
+                onMouseEnter={e => { if (!isOpen) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
+                onMouseLeave={e => { if (!isOpen) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
+              >
+                <svg
+                  width="11" height="11" viewBox="0 0 12 12" fill="none"
+                  style={{ color: 'var(--text-muted)', flexShrink: 0, transition: 'transform 0.15s', transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}
+                >
+                  <path d="M4 2.5l4 3.5-4 3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+
+                <span className="text-sm font-semibold flex-1 text-left truncate" style={{ color: 'var(--text-primary)' }}>
+                  {dg.domainName ?? 'No domain'}
+                </span>
+
+                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {totalMapped.toLocaleString()} standardized
+                  {totalQueue > 0 && <span style={{ color: '#B45309' }}> · {totalQueue} pending</span>}
+                </span>
+              </button>
+
+              {/* Expanded content */}
+              {isOpen && (
+                <div className="px-4 pb-4 pt-1" style={{ borderTop: '0.5px solid var(--border-subtle)', backgroundColor: 'var(--page-bg)' }}>
+                  <div className="flex flex-col gap-5 pt-3">
+                    {dg.columns.map(c => (
+                      <ColumnMappingsSection key={`${c.pipeline_id}_${c.column_name}`} pipeline={c} showHeading={dg.columns.length > 1} />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Tab: Queue (one section per column) ─────────────────────────────────────────
+
+function ColumnQueueSection({ pipeline, showHeading }: { pipeline: Pipeline; showHeading: boolean }) {
   const [items,   setItems]   = useState<QueueItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       try {
         const res  = await fetch(`/api/pipelines/${pipeline.pipeline_id}/queue`);
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
-        setItems(body.items ?? []);
+        if (!cancelled) setItems(body.items ?? []);
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to load queue');
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load queue');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
+    return () => { cancelled = true; };
   }, [pipeline.pipeline_id]);
 
   return (
     <div>
-      <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-        Values detected by polling that are waiting to be standardized.
-      </p>
+      {showHeading && (
+        <div className="flex items-baseline gap-2 mb-2 min-w-0">
+          <span className="text-xs font-semibold font-mono truncate" style={{ color: 'var(--text-primary)' }}>{pipeline.column_name}</span>
+          <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{items.length} pending</span>
+        </div>
+      )}
 
-      {loading && <div className="flex justify-center py-8"><Spinner /></div>}
-      {error   && <p className="text-xs py-4 text-center" style={{ color: 'var(--confidence-low)' }}>{error}</p>}
+      {loading && <div className="flex justify-center py-6"><Spinner /></div>}
+      {error   && <p className="text-xs py-3 text-center" style={{ color: 'var(--confidence-low)' }}>{error}</p>}
 
       {!loading && !error && items.length === 0 && (
-        <div className="flex flex-col items-center gap-2 py-8">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true" style={{ opacity: 0.25 }}>
-            <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="2" />
-            <path d="M10 16l4 4 8-8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          <p className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>Queue is empty</p>
-          <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>All detected values have been standardized.</p>
-        </div>
+        <p className="text-xs py-4 text-center" style={{ color: 'var(--text-muted)' }}>Queue is empty — all detected values standardized.</p>
       )}
 
       {!loading && !error && items.length > 0 && (
         <div className="rounded-card border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)' }}>
-          <div
-            className="grid text-[11px] font-medium px-3 py-2"
-            style={{ gridTemplateColumns: '1fr auto', backgroundColor: 'var(--accent-tint)', color: 'var(--text-secondary)', borderBottom: '0.5px solid var(--border)' }}
-          >
+          <div className="grid text-[11px] font-medium px-3 py-2" style={{ gridTemplateColumns: '1fr auto', backgroundColor: 'var(--accent-tint)', color: 'var(--text-secondary)', borderBottom: '0.5px solid var(--border)' }}>
             <span>Value</span>
             <span>Waiting</span>
           </div>
-          <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 240, overflowY: 'auto' }}>
             {items.map((item, i) => (
-              <div
-                key={item.literal_value}
-                className="grid px-3 py-2 text-xs items-center"
-                style={{ gridTemplateColumns: '1fr auto', borderTop: i > 0 ? '0.5px solid var(--border)' : undefined, backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent' }}
-              >
+              <div key={item.literal_value} className="grid px-3 py-2 text-xs items-center"
+                style={{ gridTemplateColumns: '1fr auto', borderTop: i > 0 ? '0.5px solid var(--border)' : undefined, backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent' }}>
                 <span className="font-mono" style={{ color: 'var(--text-primary)' }}>{item.literal_value}</span>
                 <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{relativeTime(item.detected_at)}</span>
               </div>
@@ -559,33 +615,51 @@ function QueueTab({ pipeline }: { pipeline: Pipeline }) {
   );
 }
 
+function QueueTab({ group }: { group: PipelineGroup }) {
+  const multi = group.columns.length > 1;
+  return (
+    <div>
+      <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
+        Values detected by polling that are waiting to be standardized.
+      </p>
+      <div className="flex flex-col gap-5">
+        {group.columns.map(c => (
+          <ColumnQueueSection key={`${c.pipeline_id}_${c.column_name}`} pipeline={c} showHeading={multi} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Tab: Settings ─────────────────────────────────────────────────────────────
 
 interface SettingsTabProps {
-  pipeline:      Pipeline;
-  onUpdate:      (updated: Partial<Pipeline>) => void;
-  onDelete:      () => void;
+  group:          PipelineGroup;
+  onUpdateMember: (p: Pipeline, patch: Partial<Pipeline>) => void;
+  onDeleteMember: (p: Pipeline) => void;
+  onDeleteGroup:  () => void;
 }
 
-function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
-  const [name,            setName]            = useState(pipeline.name ?? '');
-  const [mode,            setMode]            = useState<'auto' | 'manual'>(pipeline.mode as 'auto' | 'manual');
-  const [exportTableFqn,  setExportTableFqn]  = useState(pipeline.export_table_fqn ?? '');
-  const [saving,          setSaving]          = useState(false);
-  const [saved,           setSaved]           = useState(false);
-  const [refreshing,      setRefreshing]      = useState(false);
-  const [refreshResult,   setRefreshResult]   = useState<{ ok: boolean; rows?: number; error?: string } | null>(null);
+function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: SettingsTabProps) {
+  const [name,           setName]           = useState(group.name ?? '');
+  const [mode,           setMode]           = useState<'auto' | 'manual'>(group.mode === 'manual' ? 'manual' : 'auto');
+  const [exportTableFqn, setExportTableFqn] = useState(group.export_table_fqn ?? '');
+  const [saving,         setSaving]         = useState(false);
+  const [saved,          setSaved]          = useState(false);
+  const [refreshing,     setRefreshing]     = useState(false);
+  const [refreshResult,  setRefreshResult]  = useState<{ ok: boolean; rows?: number; error?: string } | null>(null);
 
   async function handleSave() {
     setSaving(true);
     try {
       const exportVal = exportTableFqn.trim() || null;
-      await fetch(`/api/pipelines/${pipeline.pipeline_id}`, {
-        method:  'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ name: name || null, mode, export_table_fqn: exportVal }),
-      });
-      onUpdate({ name: name || null, mode, export_table_fqn: exportVal });
+      // Config applies to every column in the card.
+      await Promise.all(group.columns.map(c =>
+        fetch(`/api/pipelines/${c.pipeline_id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name || null, mode, export_table_fqn: exportVal }),
+        }).catch(() => {})));
+      for (const c of group.columns) onUpdateMember(c, { name: name || null, mode, export_table_fqn: exportVal });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } finally {
@@ -597,25 +671,17 @@ function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
     setRefreshing(true);
     setRefreshResult(null);
     try {
-      const res  = await fetch(`/api/pipelines/${pipeline.pipeline_id}/refresh-export`, { method: 'POST' });
+      // The export table is shared — rebuilding from any member rebuilds it all.
+      const res  = await fetch(`/api/pipelines/${group.columns[0].pipeline_id}/refresh-export`, { method: 'POST' });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setRefreshResult({ ok: false, error: body?.error ?? `HTTP ${res.status}` });
-      } else {
-        setRefreshResult({ ok: true, rows: body.rows_written });
-        setTimeout(() => setRefreshResult(null), 6000);
-      }
+      if (!res.ok) setRefreshResult({ ok: false, error: body?.error ?? `HTTP ${res.status}` });
+      else { setRefreshResult({ ok: true, rows: body.rows_written }); setTimeout(() => setRefreshResult(null), 6000); }
     } catch (e) {
       setRefreshResult({ ok: false, error: e instanceof Error ? e.message : 'Unknown error' });
     } finally {
       setRefreshing(false);
     }
   }
-
-  const tableShort = (() => {
-    const parts = pipeline.table_fqn.split('.');
-    return parts[parts.length - 1] ?? pipeline.table_fqn;
-  })();
 
   return (
     <div className="flex flex-col gap-5">
@@ -625,65 +691,63 @@ function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
         <div className="flex flex-col gap-1.5">
           <div className="flex justify-between text-xs">
             <span style={{ color: 'var(--text-muted)' }}>Table</span>
-            <span className="font-mono" style={{ color: 'var(--text-primary)' }}>{tableShort}</span>
+            <span className="font-mono" style={{ color: 'var(--text-primary)' }}>{tableShort(group.table_fqn)}</span>
           </div>
-          <div className="flex justify-between text-xs">
-            <span style={{ color: 'var(--text-muted)' }}>Column</span>
-            <span className="font-mono" style={{ color: 'var(--text-primary)' }}>{pipeline.column_name}</span>
-          </div>
-          {pipeline.domain_name && (
-            <div className="flex justify-between text-xs">
-              <span style={{ color: 'var(--text-muted)' }}>Domain</span>
-              <span style={{ color: 'var(--accent)', fontWeight: 500 }}>{pipeline.domain_name}</span>
-            </div>
-          )}
-          {pipeline.export_table_fqn && (
+          {group.export_table_fqn && (
             <div className="flex justify-between text-xs gap-4">
               <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>Export table</span>
-              <span
-                className="font-mono truncate text-right"
-                style={{ color: 'var(--text-primary)' }}
-                title={pipeline.export_table_fqn}
-              >
-                {pipeline.export_table_fqn}
-              </span>
+              <span className="font-mono truncate text-right" style={{ color: 'var(--text-primary)' }} title={group.export_table_fqn}>{group.export_table_fqn}</span>
             </div>
           )}
+        </div>
+
+        {/* Columns with per-column delete */}
+        <p className="text-xs font-medium mt-3 mb-2" style={{ color: 'var(--text-secondary)' }}>Columns ({group.columns.length})</p>
+        <div className="flex flex-col gap-1">
+          {group.columns.map(c => (
+            <div key={`${c.pipeline_id}_${c.column_name}`} className="flex items-center justify-between text-xs rounded-button px-2 py-1.5" style={{ backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)' }}>
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }}>{c.column_name}</span>
+                {c.domain_name && <span className="text-[10px]" style={{ color: 'var(--accent)' }}>{c.domain_name}</span>}
+              </div>
+              <button
+                onClick={() => { if (confirm(`Stop standardizing column "${c.column_name}"? This removes it from the pipeline.`)) onDeleteMember(c); }}
+                className="w-5 h-5 flex items-center justify-center rounded transition-colors flex-shrink-0"
+                style={{ color: 'var(--text-muted)', backgroundColor: 'transparent', border: 'none' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
+                title="Remove this column"
+              >
+                <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+              </button>
+            </div>
+          ))}
         </div>
       </div>
 
       <div style={{ borderTop: '0.5px solid var(--border)' }} />
 
-      {/* Editable fields */}
+      {/* Editable fields — apply to all columns */}
       <div>
         <p className="text-xs font-medium mb-3" style={{ color: 'var(--text-secondary)' }}>Configuration</p>
         <div className="flex flex-col gap-3">
           <div>
             <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Name</label>
             <input
-              type="text"
-              value={name}
-              onChange={e => setName(e.target.value)}
-              placeholder={`${tableShort}.${pipeline.column_name}`}
+              type="text" value={name} onChange={e => setName(e.target.value)}
+              placeholder={tableShort(group.table_fqn)}
               className="w-full text-xs px-3 py-2 rounded-button border-[0.5px] outline-none"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             />
-            <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>Leave blank to auto-generate from table.column</p>
+            <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>Card label — applies to the whole table pipeline.</p>
           </div>
           <div>
             <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Mode</label>
             <div className="flex gap-2">
               {(['auto', 'manual'] as const).map(m => (
-                <button
-                  key={m}
-                  onClick={() => setMode(m)}
+                <button key={m} onClick={() => setMode(m)}
                   className="flex-1 py-1.5 text-xs font-medium rounded-button border-[0.5px] transition-colors"
-                  style={{
-                    borderColor:     mode === m ? 'var(--accent)' : 'var(--border)',
-                    backgroundColor: mode === m ? 'var(--accent-tint)' : 'transparent',
-                    color:           mode === m ? 'var(--accent)' : 'var(--text-muted)',
-                  }}
-                >
+                  style={{ borderColor: mode === m ? 'var(--accent)' : 'var(--border)', backgroundColor: mode === m ? 'var(--accent-tint)' : 'transparent', color: mode === m ? 'var(--accent)' : 'var(--text-muted)' }}>
                   {m === 'auto' ? 'Auto' : 'Manual'}
                 </button>
               ))}
@@ -694,40 +758,25 @@ function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
           </div>
 
           <div>
-            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>
-              Export table
-            </label>
+            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Export table</label>
             <input
-              type="text"
-              value={exportTableFqn}
-              onChange={e => setExportTableFqn(e.target.value)}
+              type="text" value={exportTableFqn} onChange={e => setExportTableFqn(e.target.value)}
               placeholder="DB.SCHEMA.TABLE_STANDARDIZED"
               className="w-full text-xs px-3 py-2 rounded-button border-[0.5px] outline-none font-mono"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             />
             <p className="text-[11px] mt-1 leading-relaxed" style={{ color: 'var(--text-hint)' }}>
-              Snowflake table that mirrors the source table with standardized values.
-              Only rows with confirmed mappings are included; rebuilt on every standardization pass.
+              Shared destination table for every column in this pipeline. Rebuilt on every standardization pass.
             </p>
 
-            {/* Manual refresh */}
-            {(pipeline.export_table_fqn || exportTableFqn.trim()) && (
+            {(group.export_table_fqn || exportTableFqn.trim()) && (
               <div className="mt-2">
-                <button
-                  type="button"
-                  onClick={handleRefreshExport}
-                  disabled={refreshing}
+                <button type="button" onClick={handleRefreshExport} disabled={refreshing}
                   className="text-[11px] font-medium px-2.5 py-1.5 rounded-button border-[0.5px] transition-colors flex items-center gap-1.5 disabled:opacity-50"
                   style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent' }}
                   onMouseEnter={e => { if (!refreshing) { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; } }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}
-                >
-                  {refreshing ? (
-                    <>
-                      <Spinner className="w-3 h-3" />
-                      Rebuilding…
-                    </>
-                  ) : (
+                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}>
+                  {refreshing ? (<><Spinner className="w-3 h-3" />Rebuilding…</>) : (
                     <>
                       <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
                         <path d="M10 6A4 4 0 112.5 3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
@@ -737,44 +786,33 @@ function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
                     </>
                   )}
                 </button>
-
                 {refreshResult && (
-                  <p
-                    className="text-[11px] mt-1.5"
-                    style={{ color: refreshResult.ok ? '#15803D' : 'var(--confidence-low)' }}
-                  >
-                    {refreshResult.ok
-                      ? `✓ Done — ${refreshResult.rows?.toLocaleString() ?? 0} row(s) written`
-                      : `✗ ${refreshResult.error}`}
+                  <p className="text-[11px] mt-1.5" style={{ color: refreshResult.ok ? '#15803D' : 'var(--confidence-low)' }}>
+                    {refreshResult.ok ? `✓ Done — ${refreshResult.rows?.toLocaleString() ?? 0} row(s) written` : `✗ ${refreshResult.error}`}
                   </p>
                 )}
               </div>
             )}
           </div>
         </div>
-        <button
-          onClick={handleSave}
-          disabled={saving}
+        <button onClick={handleSave} disabled={saving}
           className="mt-3 w-full py-1.5 text-xs font-medium rounded-button text-white transition-colors disabled:opacity-50"
-          style={{ backgroundColor: saved ? '#16a34a' : 'var(--accent)' }}
-        >
+          style={{ backgroundColor: saved ? '#16a34a' : 'var(--accent)' }}>
           {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save changes'}
         </button>
       </div>
 
       <div style={{ borderTop: '0.5px solid var(--border)' }} />
 
-      {/* Danger zone */}
+      {/* Danger zone — deletes the whole card */}
       <div>
         <p className="text-xs font-medium mb-3" style={{ color: '#DC2626' }}>Danger zone</p>
-        <button
-          onClick={onDelete}
+        <button onClick={onDeleteGroup}
           className="w-full py-1.5 text-xs font-medium rounded-button border-[0.5px] transition-colors"
           style={{ borderColor: '#FECACA', color: '#DC2626', backgroundColor: '#FEF2F2' }}
           onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEE2E2'; }}
-          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEF2F2'; }}
-        >
-          Delete pipeline
+          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEF2F2'; }}>
+          Delete pipeline{group.columns.length > 1 ? ` (${group.columns.length} columns)` : ''}
         </button>
         <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-muted)' }}>
           Removes the pipeline configuration. Historical mappings are preserved in the domain.
@@ -789,13 +827,17 @@ function SettingsTab({ pipeline, onUpdate, onDelete }: SettingsTabProps) {
 type DetailTab = 'activity' | 'mappings' | 'queue' | 'settings';
 
 interface Props {
-  pipeline:    Pipeline;
-  initialTab?: DetailTab;
-  onUpdate:    (updated: Partial<Pipeline>) => void;
-  onDelete:    () => void;
+  group:            PipelineGroup;
+  initialTab?:      DetailTab;
+  isStandardizing?: boolean;
+  isScanning?:      boolean;
+  cycleResetMs?:    number;
+  onUpdateMember:   (p: Pipeline, patch: Partial<Pipeline>) => void;
+  onDeleteMember:   (p: Pipeline) => void;
+  onDeleteGroup:    () => void;
 }
 
-export default function PipelineDetail({ pipeline, initialTab = 'activity', onUpdate, onDelete }: Props) {
+export default function PipelineDetail({ group, initialTab = 'activity', isStandardizing = false, isScanning = false, cycleResetMs = 0, onUpdateMember, onDeleteMember, onDeleteGroup }: Props) {
   const [tab, setTab] = useState<DetailTab>(initialTab);
 
   // Sync when the parent changes the tab (e.g. clicking "Mapping" button on the row)
@@ -803,8 +845,8 @@ export default function PipelineDetail({ pipeline, initialTab = 'activity', onUp
 
   const TABS: { id: DetailTab; label: string }[] = [
     { id: 'activity', label: 'Activity' },
-    { id: 'mappings', label: `Mappings` },
-    { id: 'queue',    label: `Queue${pipeline.queue_size > 0 ? ` (${pipeline.queue_size})` : ''}` },
+    { id: 'mappings', label: 'Mappings' },
+    { id: 'queue',    label: `Queue${group.queue_size > 0 ? ` (${group.queue_size})` : ''}` },
     { id: 'settings', label: 'Settings' },
   ];
 
@@ -818,11 +860,7 @@ export default function PipelineDetail({ pipeline, initialTab = 'activity', onUp
               key={id}
               onClick={() => setTab(id)}
               className="px-4 py-2.5 text-xs font-medium transition-colors"
-              style={{
-                color:        tab === id ? 'var(--accent)' : 'var(--text-muted)',
-                borderBottom: `2px solid ${tab === id ? 'var(--accent)' : 'transparent'}`,
-                marginBottom: '-0.5px',
-              }}
+              style={{ color: tab === id ? 'var(--accent)' : 'var(--text-muted)', borderBottom: `2px solid ${tab === id ? 'var(--accent)' : 'transparent'}`, marginBottom: '-0.5px' }}
             >
               {label}
             </button>
@@ -831,10 +869,10 @@ export default function PipelineDetail({ pipeline, initialTab = 'activity', onUp
 
         {/* Tab content */}
         <div style={{ padding: '16px 0 20px' }}>
-          {tab === 'activity' && <ActivityTab pipeline={pipeline} />}
-          {tab === 'mappings' && <MappingsTab pipeline={pipeline} />}
-          {tab === 'queue'    && <QueueTab    pipeline={pipeline} />}
-          {tab === 'settings' && <SettingsTab pipeline={pipeline} onUpdate={onUpdate} onDelete={onDelete} />}
+          {tab === 'activity' && <ActivityTab group={group} isStandardizing={isStandardizing} isScanning={isScanning} cycleResetMs={cycleResetMs} />}
+          {tab === 'mappings' && <MappingsTab group={group} />}
+          {tab === 'queue'    && <QueueTab    group={group} />}
+          {tab === 'settings' && <SettingsTab group={group} onUpdateMember={onUpdateMember} onDeleteMember={onDeleteMember} onDeleteGroup={onDeleteGroup} />}
         </div>
       </div>
     </div>

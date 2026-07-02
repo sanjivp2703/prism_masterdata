@@ -1,7 +1,9 @@
 import { NextRequest } from 'next/server';
 import { google } from 'googleapis';
+import type { Credentials } from 'google-auth-library';
 import { withSnowflake } from '@/app/api/_lib/snowflake';
 import { buildSessionCookie, type SessionPayload } from '@/app/api/_lib/session';
+import { applyGrants } from '@/app/api/_lib/grants';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -44,6 +46,7 @@ export async function GET(request: NextRequest) {
 
   let returnTo    = '/home';
   let isLogin     = false;
+  let sheetsOnly  = false;
   let inviteToken: string | null = null;
 
   if (state) {
@@ -51,13 +54,14 @@ export async function GET(request: NextRequest) {
       const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
       if (typeof decoded.returnTo    === 'string')  returnTo    = decoded.returnTo;
       if (decoded.isLogin            === true)       isLogin     = true;
+      if (decoded.sheetsOnly         === true)       sheetsOnly  = true;
       if (typeof decoded.inviteToken === 'string')  inviteToken = decoded.inviteToken;
     } catch { /* ignore */ }
   }
 
   // Exchange code for tokens
   const oauth2Client = getOAuth2Client();
-  let tokens: Awaited<ReturnType<typeof oauth2Client.getToken>>['tokens'];
+  let tokens: Credentials;
   try {
     ({ tokens } = await oauth2Client.getToken(code));
   } catch {
@@ -70,6 +74,13 @@ export async function GET(request: NextRequest) {
   if (tokens.access_token)  headers.append('Set-Cookie', `google_access_token=${tokens.access_token}; ${SHEETS_COOKIE_OPTS}`);
   if (tokens.refresh_token) headers.append('Set-Cookie', `google_refresh_token=${tokens.refresh_token}; ${SHEETS_COOKIE_OPTS}`);
   if (tokens.expiry_date)   headers.append('Set-Cookie', `google_token_expiry=${tokens.expiry_date}; ${SHEETS_COOKIE_OPTS}`);
+
+  // Sheets-only re-auth: the user's Prism session is already valid.
+  // Just refresh the Sheets tokens and return — no account lookup needed.
+  if (sheetsOnly) {
+    headers.set('Location', returnTo);
+    return new Response(null, { status: 302, headers });
+  }
 
   // Fetch Google profile
   let profile: { id?: string | null; email?: string | null; name?: string | null; picture?: string | null };
@@ -92,7 +103,7 @@ export async function GET(request: NextRequest) {
   const adminEmail = (process.env.ADMIN_EMAIL ?? '').toLowerCase().trim();
 
   try {
-    const { accountId, role } = await withSnowflake(async (conn) => {
+    const { accountId, role, isNew } = await withSnowflake(async (conn) => {
       // ── Case 1: existing account ──────────────────────────────────────────
       const existing = await exec(
         conn,
@@ -109,7 +120,7 @@ export async function GET(request: NextRequest) {
            WHERE google_id = ?`,
           [name, pictureUrl, googleId],
         );
-        return { accountId: id, role: r };
+        return { accountId: id, role: r, isNew: false };
       }
 
       // ── Case 2: invite flow ───────────────────────────────────────────────
@@ -154,7 +165,11 @@ export async function GET(request: NextRequest) {
            WHERE invitation_id = ?`,
           [Number(col(invites[0], 'invitation_id'))],
         );
-        return { accountId: Number(col(created[0], 'account_id')), role: invitedRole };
+        // Auto-apply grants using the system Snowflake user so the service role
+        // has correct privileges from day one. Errors are swallowed — the user can
+        // re-apply via Settings → Snowflake connection if anything is missing.
+        await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
+        return { accountId: Number(col(created[0], 'account_id')), role: invitedRole, isNew: true };
       }
 
       // ── Case 3: bootstrap admin ───────────────────────────────────────────
@@ -173,7 +188,8 @@ export async function GET(request: NextRequest) {
           [nonce],
         );
         if (!created.length) throw new Error('Could not retrieve admin account_id');
-        return { accountId: Number(col(created[0], 'account_id')), role: 'admin' as const };
+        await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
+        return { accountId: Number(col(created[0], 'account_id')), role: 'admin' as const, isNew: true };
       }
 
       throw Object.assign(new Error('no_access'), { code: 'NO_ACCESS' });
@@ -182,7 +198,15 @@ export async function GET(request: NextRequest) {
     const sessionPayload: SessionPayload = { accountId, googleId, email, name, pictureUrl, role };
     headers.append('Set-Cookie', await buildSessionCookie(sessionPayload));
 
-    const redirectTo = isLogin ? returnTo : `${returnTo}${returnTo.includes('?') ? '&' : '?'}gauth=success`;
+    // New accounts go to /setup to optionally configure their Snowflake connection.
+    let redirectTo: string;
+    if (isNew) {
+      redirectTo = `/setup?next=${encodeURIComponent(returnTo)}`;
+    } else if (isLogin) {
+      redirectTo = returnTo;
+    } else {
+      redirectTo = `${returnTo}${returnTo.includes('?') ? '&' : '?'}gauth=success`;
+    }
     headers.set('Location', redirectTo);
     return new Response(null, { status: 302, headers });
 

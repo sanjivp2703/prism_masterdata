@@ -1,5 +1,6 @@
 import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
 import { runOpExport } from '@/app/api/_lib/op-export';
+import { appendTiming } from '@/app/api/_lib/timing';
 import {
   loadOpRunState,
   saveOpRunState,
@@ -113,11 +114,21 @@ export async function POST(
   let newGroups:        Array<{ temp_group_id: number; alias_name_literal_value: string }> = [];
   let moves:            Array<{ run_item_id: number; group_id: number | null }> = [];
   let aliasNameChanges: Array<{ group_id: number; alias_name_literal_value: string }> = [];
+  // When true, block the response until the lookup writes + export rebuild +
+  // metric refresh are committed (used by the pipeline-creation wizard so it
+  // doesn't open the pipelines view before standardization finishes).
+  let waitForWrite = false;
+  // When true (premium review wizard), DON'T write to the lookup here — just
+  // persist the reviewed state and mark the run approved. The slow lookup upserts
+  // are deferred to the "Begin Pipeline Standardization" step (commit endpoint).
+  let deferWrite = false;
   try {
     const body = await request.json().catch(() => ({}));
     if (Array.isArray(body?.new_groups))          newGroups        = body.new_groups;
     if (Array.isArray(body?.moves))               moves            = body.moves;
     if (Array.isArray(body?.alias_name_changes))  aliasNameChanges = body.alias_name_changes;
+    if (body?.wait === true)                      waitForWrite     = true;
+    if (body?.defer === true)                     deferWrite       = true;
   } catch { /* no body — fire-and-forget callers */ }
 
   try {
@@ -146,7 +157,44 @@ export async function POST(
         }
       }
 
-      const result = await runOpExport(connection, runId, apiKey, runStatus);
+      // ── Deferred mode: persist the approval, write nothing to the lookup ──────
+      // The lookup upserts (the slow part) happen later at the "Begin Pipeline
+      // Standardization" step via the commit-standardizations endpoint. Here we
+      // just mark the run approved and return its pipeline so the activation card
+      // can drive the commit. The pipeline stays pending_baseline (hidden from the
+      // pipelines list) until Begin commits + activates it.
+      if (deferWrite) {
+        await exec(
+          connection,
+          `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
+          [runId],
+        );
+        const pipelineRows = await exec(
+          connection,
+          `SELECT p.pipeline_id
+           FROM STAND_DB.STAND_INTERNAL.PIPELINES p
+           JOIN STAND_DB.STAND_INTERNAL.RUNS r ON r.run_id = ?
+           WHERE p.table_fqn = r.source_relation
+             AND (
+               -- Sheets: one pipeline per tab stores all columns; match by table_fqn only.
+               p.source_type = 'sheets'
+               OR (
+                 p.column_name = r.source_column
+                 AND ((p.domain_id IS NULL AND r.domain_id IS NULL) OR p.domain_id = r.domain_id)
+               )
+             )
+           LIMIT 1`,
+          [runId],
+        );
+        const pid = pipelineRows.length
+          ? Number((pipelineRows[0] as any).PIPELINE_ID ?? (pipelineRows[0] as any).pipeline_id)
+          : null;
+        return Response.json({ deferred: true, pipeline_id: pid }, { status: 200 });
+      }
+
+      const _acceptStart = Date.now();
+      const result = await runOpExport(connection, runId, apiKey, runStatus, { awaitWrite: waitForWrite });
+      appendTiming(`[Timing] accept.runOpExport_TOTAL: ${Date.now() - _acceptStart}ms (run ${runId}, awaitWrite=${waitForWrite})`);
 
       // Clear the queue for the matching pipeline (look up by source + domain)
       try {
@@ -155,11 +203,13 @@ export async function POST(
           `SELECT p.pipeline_id
            FROM STAND_DB.STAND_INTERNAL.PIPELINES p
            JOIN STAND_DB.STAND_INTERNAL.RUNS r ON r.run_id = ?
-           WHERE p.table_fqn   = r.source_relation
-             AND p.column_name = r.source_column
+           WHERE p.table_fqn = r.source_relation
              AND (
-               (p.domain_id IS NULL AND r.domain_id IS NULL) OR
-               p.domain_id = r.domain_id
+               p.source_type = 'sheets'
+               OR (
+                 p.column_name = r.source_column
+                 AND ((p.domain_id IS NULL AND r.domain_id IS NULL) OR p.domain_id = r.domain_id)
+               )
              )
            LIMIT 1`,
           [runId],

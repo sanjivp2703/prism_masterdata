@@ -23,6 +23,8 @@ import {
   type PipelineForProcessing,
 } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
+import { readFileDistinctValues } from '@/app/api/_lib/op-file-pipeline';
+import { appendTiming } from '@/app/api/_lib/timing';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -45,10 +47,12 @@ async function fetchSourceLiterals(
   if (parts.length !== 3) return [];
   const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
   const colRef   = quoteIdent(pipeline.column_name);
+  // Dedup by the normalized form; ANY_VALUE keeps a representative original.
   const rows = await exec(conn, `
-    SELECT DISTINCT ${colRef} AS val
+    SELECT ANY_VALUE(${colRef}) AS val
     FROM ${tableRef}
     WHERE ${colRef} IS NOT NULL
+    GROUP BY PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
   return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter(Boolean);
@@ -77,12 +81,34 @@ export async function POST(
   }
 
   try {
+    const _t0 = Date.now();
     const pipeline = await fetchPipelineById(pid);
     if (!pipeline) {
       return Response.json({ error: `Pipeline ${pid} not found` }, { status: 404 });
     }
+    appendTiming(`[Timing] initial-run.fetch_pipeline: ${Date.now() - _t0}ms (pipeline ${pid})`);
 
-    const literals = await withSnowflake((conn) => fetchSourceLiterals(conn, pipeline));
+    const _scanStart    = Date.now();
+    const isFilePipeline = pipeline.source_type && pipeline.source_type !== 'snowflake';
+
+    const literals = isFilePipeline
+      ? await withSnowflake(async (conn) => readFileDistinctValues(conn, pid, pipeline.column_name))
+      : await withSnowflake(async (conn) => {
+          // Pre-create the stream BEFORE scanning so there's no gap between what the
+          // review run sees and what the stream tracks once the pipeline is activated.
+          const parts = pipeline.table_fqn.split('.');
+          if (parts.length === 3) {
+            const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
+            const streamName = `STAND_DB.STAND_INTERNAL.PIPELINE_STREAM_${pid}`;
+            try {
+              await exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${tableRef}`);
+            } catch (streamErr: any) {
+              console.warn(`[InitialRun] Pipeline ${pid}: could not pre-create stream:`, streamErr?.message ?? streamErr);
+            }
+          }
+          return fetchSourceLiterals(conn, pipeline);
+        });
+    appendTiming(`[Timing] initial-run.source_scan: ${Date.now() - _scanStart}ms (${literals.length} distinct value(s))`);
 
     // Empty source table — advance directly to paused, no run needed.
     if (literals.length === 0) {
@@ -100,10 +126,15 @@ export async function POST(
 
     // Create run and run auto-group for initial suggestions.
     const runId = await withSnowflake(async (conn) => {
+      const _runStart = Date.now();
       const id = await createRunFromQueue(conn, pipeline, literals);
+      appendTiming(`[Timing] initial-run.create_run: ${Date.now() - _runStart}ms (run ${id})`);
+      const _agStart = Date.now();
       await runAutoGroupForRun(conn, id, apiKey, { writeBreakdown: false });
+      appendTiming(`[Timing] initial-run.auto_group_total: ${Date.now() - _agStart}ms`);
       return id;
     });
+    appendTiming(`[Timing] initial-run.TOTAL: ${Date.now() - _t0}ms (pipeline ${pid}, run ${runId})`);
 
     return Response.json({ run_id: runId });
   } catch (err) {

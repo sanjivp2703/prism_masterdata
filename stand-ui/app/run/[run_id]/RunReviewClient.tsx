@@ -2,8 +2,22 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { DomainScopeNotice, DomainChangeConfirmModal, UndoButton } from '@/app/components/DomainChangeWarning';
 
 const UNGROUPED_KEY = '__UNGROUPED__';
+
+// ── Multi-column standardization wizard ────────────────────────────────────────
+// When a pipeline is created with more than one column, AutoExportHome seeds this
+// in sessionStorage so the run page walks the user through each column's
+// standardization in order (stepper + back/continue) rather than leaving the
+// remaining columns as pending_baseline.
+const COL_WIZARD_KEY = 'prism_ae_col_wizard';
+interface ColWizard {
+  kind?: 'create' | 'standardize'; // create → review run from full source; standardize → from the queue (manual mode)
+  pids: number[];            // pipeline_id per column, in order
+  cols: string[];            // column name per column (stepper labels)
+  runs: (number | null)[];   // review run_id per column once created (null = not yet)
+}
 
 type AliasMap = Record<
   string,
@@ -14,6 +28,7 @@ type AliasMap = Record<
       run_item_id: number;
       literal_value: string;
       confidence_score: number | null;
+      needs_review?: boolean;
     }>;
   }
 >;
@@ -51,11 +66,6 @@ function getStatusLabel(status: string | undefined): string {
     case 'created':   return 'Created';
     default:          return 'In review';
   }
-}
-
-function formatElapsed(secs: number): string {
-  if (secs >= 60) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
-  return `${secs}s`;
 }
 
 function CheckmarkIcon() {
@@ -147,30 +157,60 @@ export default function RunReviewClient({
   const [exportResult, setExportResult] = useState<any>(null);
   const [copiedSql, setCopiedSql] = useState(false);
 
-  const [grouping, setGrouping] = useState(false);
-  const [groupingError, setGroupingError] = useState<string | null>(null);
-  const [groupingResult, setGroupingResult] = useState<{
-    groups_created: number;
-    items_committed: number;
-    elapsed_secs: number;
-    llm_elapsed_secs: number | null;
-    estimated_cost_usd: number;
-    chunk_count: number | null;
-  } | null>(null);
-  const [groupingProgress, setGroupingProgress] = useState<{
-    phase: 'loading' | 'llm_scoring' | 'computing' | 'saving' | 'done';
-    sub_phase: string;
-    items_total: number;
-    groups_found: number;
-    progress_pct: number;
-    llm_calls_made: number;
-    llm_calls_total: number;
-    estimated_cost_usd: number;
-    llm_elapsed_ms?: number;
-    deterministic_elapsed_ms?: number;
-  } | null>(null);
-  const [groupingStartedAt, setGroupingStartedAt] = useState<number | null>(null);
-  const [groupingElapsed, setGroupingElapsed] = useState(0);
+  // ── Column wizard (multi-column pipeline creation) ──────────────────────────
+  const [wizard, setWizard] = useState<ColWizard | null>(null);
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(COL_WIZARD_KEY);
+      if (!raw) { setWizard(null); return; }
+      const w = JSON.parse(raw) as ColWizard;
+      // Only keep the wizard if this run actually belongs to it.
+      if (Array.isArray(w?.runs) && w.runs.includes(Number(runId))) setWizard(w);
+      else setWizard(null);
+    } catch { setWizard(null); }
+  }, [runId]);
+
+  const colIndex   = wizard ? wizard.runs.indexOf(Number(runId)) : -1;
+  const inWizard   = wizard != null && wizard.pids.length > 1 && colIndex >= 0;
+  const isLastCol  = inWizard && colIndex === wizard!.pids.length - 1;
+
+  // Prefetch the NEXT column's review run in the background while the user reviews
+  // THIS one, so "Accept & continue" reuses it (advanceWizardForward checks
+  // runs[next]) and navigates instantly instead of building it on click.
+  const prefetchedRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    if (!inWizard || colIndex < 0) return;
+    const next = colIndex + 1;
+    if (next >= wizard!.pids.length) return;          // last column — nothing ahead
+    if (wizard!.runs[next] != null) return;           // already built
+    const nextPid = wizard!.pids[next];
+    if (prefetchedRef.current.has(nextPid)) return;   // already attempted this column
+    prefetchedRef.current.add(nextPid);
+
+    const route = wizard!.kind === 'standardize'
+      ? `/api/pipelines/${nextPid}/standardize-run`
+      : `/api/pipelines/${nextPid}/create-initial-run`;
+    let cancelled = false;
+    // Small delay so the CURRENT column's page (its alias-mapping fetch) gets
+    // priority; the user spends far longer reviewing than this head start costs.
+    const timer = setTimeout(async () => {
+      try {
+        const res  = await fetch(route, { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (cancelled || !res.ok || !body?.run_id) return;  // empty/all-null column → built on demand at accept
+        const builtRunId = Number(body.run_id);
+        setWizard(prev => {
+          if (!prev) return prev;
+          const runs = [...prev.runs];
+          runs[next] = builtRunId;
+          const updated = { ...prev, runs };
+          try { sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(updated)); } catch { /* ignore */ }
+          return updated;
+        });
+      } catch { /* best-effort — advanceWizardForward will build it on demand */ }
+    }, 700);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [inWizard, colIndex, wizard]);
 
 
   const [sfExportModalOpen, setSfExportModalOpen] = useState(false);
@@ -181,10 +221,26 @@ export default function RunReviewClient({
 
   const [undoStack, setUndoStack] = useState<Snapshot[]>([]);
   const [redoStack, setRedoStack] = useState<Snapshot[]>([]);
+  const [confirmAcceptOpen, setConfirmAcceptOpen] = useState(false);
   const historyHandlersRef = useRef<{ undo: () => void; redo: () => void }>({
     undo: () => {},
     redo: () => {},
   });
+
+  // Wall-clock timer: from the Accept click to the next page navigating away.
+  // Reported to /api/timing (server-side log) via sendBeacon, which survives the
+  // navigation. Temporary profiling aid.
+  const acceptStartRef = useRef<number | null>(null);
+  function reportAcceptNav() {
+    const t0 = acceptStartRef.current;
+    if (t0 == null) return;
+    acceptStartRef.current = null;
+    const ms = Date.now() - t0;
+    try {
+      const blob = new Blob([JSON.stringify({ label: 'accept.click_to_next_page', ms })], { type: 'application/json' });
+      navigator.sendBeacon('/api/timing', blob);
+    } catch { /* ignore */ }
+  }
 
   // ── Download Mapping modal ────────────────────────────────────────────
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
@@ -205,6 +261,12 @@ export default function RunReviewClient({
 
   useEffect(() => {
     let cancelled = false;
+
+    // Reset export state — when the column wizard navigates between runs the
+    // component stays mounted, so stale `exporting`/error flags must be cleared.
+    setExporting(false);
+    setExportResult(null);
+    setExportError(null);
 
     async function loadAliasMapping() {
       setLoadingAliasMap(true);
@@ -242,15 +304,6 @@ export default function RunReviewClient({
     loadAliasMapping();
     return () => { cancelled = true; };
   }, [runId]);
-
-
-  useEffect(() => {
-    if (!grouping || groupingStartedAt === null) return;
-    const id = setInterval(() => {
-      setGroupingElapsed(Math.floor((Date.now() - groupingStartedAt) / 1000));
-    }, 1000);
-    return () => clearInterval(id);
-  }, [grouping, groupingStartedAt]);
 
   // ── History ───────────────────────────────────────────────────────────────
 
@@ -330,6 +383,11 @@ export default function RunReviewClient({
   const entries = useMemo(() => {
     const e = Object.entries(uiAliasMap || {}) as Array<[string, AliasMap[string]]>;
     e.sort((a, b) => {
+      // Groups that still need review float to the very top of the list.
+      const aReview = a[1]?.items?.some(i => i.needs_review) ? 1 : 0;
+      const bReview = b[1]?.items?.some(i => i.needs_review) ? 1 : 0;
+      if (aReview !== bReview) return bReview - aReview;
+
       const ag = a[1]?.group_id;
       const bg = b[1]?.group_id;
       if (ag == null && bg == null) return 0;
@@ -346,7 +404,6 @@ export default function RunReviewClient({
     () => entries.filter(([aliasName]) => aliasName !== UNGROUPED_KEY),
     [entries]
   );
-  const ungrouped = uiAliasMap?.[UNGROUPED_KEY] || null;
 
   const initialItemMeta = useMemo(() => {
     const meta = new Map<number, { initial_group_id: number | null; confidence_score: number | null }>();
@@ -361,7 +418,10 @@ export default function RunReviewClient({
 
   const totalGroups = groupEntries.length;
   const uncheckedCount = totalGroups - checkedAliases.size;
-  const ungroupedCount = (ungrouped?.items || []).length;
+  const reviewItems = useMemo(() =>
+    Object.values(uiAliasMap ?? {}).flatMap(g => g.items).filter(i => i.needs_review),
+  [uiAliasMap]);
+  const reviewCount = reviewItems.length;
 
   // ── Group mutations ───────────────────────────────────────────────────────
 
@@ -583,11 +643,16 @@ export default function RunReviewClient({
     setUiAliasMap((prev) => {
       if (!prev) return prev;
       const next: AliasMap = structuredClone(prev);
-      const existingUngrouped = next[UNGROUPED_KEY]?.items || [];
-      const existingIds = new Set<number>(existingUngrouped.map((it) => Number(it.run_item_id)));
-      const mergedUngrouped = [...existingUngrouped, ...itemsToMove.filter((it) => !existingIds.has(it.run_item_id))];
-      next[UNGROUPED_KEY] = { group_id: null, display_name: '', items: mergedUngrouped };
       delete next[aliasName];
+      // Create a singleton review group for each displaced item
+      for (const it of itemsToMove) {
+        const key = `__review_${it.run_item_id}__`;
+        next[key] = {
+          group_id:     null,
+          display_name: String(it.literal_value),
+          items: [{ ...it, needs_review: true }],
+        };
+      }
       return next;
     });
 
@@ -606,75 +671,6 @@ export default function RunReviewClient({
     if (editingAliasKey === aliasName) cancelRename();
     if (dragOverAliasName === aliasName) setDragOverAliasName(null);
     if (openMenuForAliasName === aliasName) setOpenMenuForAliasName(null);
-  }
-
-  async function doGroupUnassigned() {
-    const startedAt = Date.now();
-    setGrouping(true);
-    setGroupingError(null);
-    setGroupingResult(null);
-    setGroupingProgress(null);
-    setGroupingStartedAt(startedAt);
-    setGroupingElapsed(0);
-
-    const ungroupedIds = (ungrouped?.items || []).map((it) => it.run_item_id);
-
-    try {
-      setGroupingProgress({
-        phase: 'llm_scoring',
-        sub_phase: `1-Prompt LLM grouping (${ungroupedIds.length} items)…`,
-        items_total: ungroupedIds.length,
-        groups_found: 0,
-        progress_pct: 10,
-        llm_calls_made: 0,
-        llm_calls_total: 1,
-        estimated_cost_usd: 0,
-        llm_elapsed_ms: 0,
-        deterministic_elapsed_ms: 0,
-      });
-
-      const res = await fetch(`/api/run/${runId}/auto-group`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ run_item_ids: ungroupedIds }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg = body?.error || 'Grouping failed';
-        const detail = typeof body?.details === 'string' && body.details.trim() ? body.details.trim() : '';
-        throw new Error(detail ? `${msg}: ${detail}` : msg);
-      }
-
-      const finalElapsed = Math.floor((Date.now() - startedAt) / 1000);
-      setGroupingResult({
-        groups_created:     body?.data?.groups_created    ?? 0,
-        items_committed:    body?.data?.items_committed   ?? 0,
-        elapsed_secs:       finalElapsed,
-        llm_elapsed_secs:   typeof body?.data?.llm_elapsed_ms === 'number'
-          ? Math.floor(body.data.llm_elapsed_ms / 1000) : null,
-        estimated_cost_usd: body?.data?.estimated_cost_usd ?? 0,
-        chunk_count:        typeof body?.data?.chunk_count === 'number' ? body.data.chunk_count : null,
-      });
-
-      const refreshed = await fetch(`/api/run/${runId}/alias-mapping`, { cache: 'no-store' });
-      const refreshedBody = await refreshed.json().catch(() => ({}));
-      if (refreshed.ok) {
-        const data = (refreshedBody?.data || {}) as AliasMap;
-        setAliasMap(data);
-        setUiAliasMap(structuredClone(data));
-        setPendingMoves({});
-        setPendingAliasNames({});
-        setCheckedAliases(new Set());
-        setUndoStack([]);
-        setRedoStack([]);
-      }
-    } catch (e) {
-      setGroupingError(e instanceof Error ? e.message : 'Grouping failed');
-    } finally {
-      setGrouping(false);
-      setGroupingProgress(null);
-      setGroupingStartedAt(null);
-    }
   }
 
   async function doExport() {
@@ -723,7 +719,20 @@ export default function RunReviewClient({
     }
   }
 
+  // Accepting writes to the domain-wide lookup. If the user edited the proposed
+  // standardizations (any undo history), confirm first that this affects every
+  // table with a pipeline in the domain; an unedited accept goes straight through.
+  function requestAcceptStandardizations() {
+    if (isAutoExport && undoStack.length > 0) {
+      setConfirmAcceptOpen(true);
+      return;
+    }
+    void doAcceptStandardizations();
+  }
+
   async function doAcceptStandardizations() {
+    setConfirmAcceptOpen(false);
+    acceptStartRef.current = Date.now();
     setExporting(true);
     setExportError(null);
     try {
@@ -731,6 +740,10 @@ export default function RunReviewClient({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          // Defer the lookup writes — just persist this column's reviewed groups
+          // and mark it approved. The actual upserts happen at "Begin Pipeline
+          // Standardization", behind a progress bar, so accepting each column is fast.
+          defer: true,
           new_groups: Object.entries(uiAliasMap || {})
             .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
             .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
@@ -746,15 +759,101 @@ export default function RunReviewClient({
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || 'Failed to accept standardizations');
 
-      // If a pipeline_id came back, stash it so the home page shows the activation card
-      if (body?.pipeline_id) {
-        localStorage.setItem('prism_ae_pending_pipeline_id', String(body.pipeline_id));
+      // Multi-column wizard: move on to the next column instead of going home.
+      if (inWizard) {
+        const advanced = await advanceWizardForward();
+        if (advanced) return; // navigated to the next column's run
+        // No further columns with data — finish.
       }
 
-      router.push('/home');
+      // Fall back to the wizard's pipeline_id when the export couldn't resolve it
+      // (e.g. multi-column Sheets where only the first column matches pipeline.column_name).
+      const effectivePid = body?.pipeline_id ?? (wizard ? wizard.pids[0] : undefined);
+      await finishWizard(effectivePid);
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Failed to accept standardizations');
       setExporting(false);
+    }
+  }
+
+  // ── Wizard navigation ───────────────────────────────────────────────────────
+
+  /** Clear the wizard and return to home (optionally surfacing the activation card). */
+  async function finishWizard(pipelineId?: number | string) {
+    try { sessionStorage.removeItem(COL_WIZARD_KEY); } catch { /* ignore */ }
+    const pid = pipelineId ? Number(pipelineId) : null;
+    if (pid && Number.isFinite(pid) && pid > 0) {
+      localStorage.setItem('prism_ae_pending_pipeline_id', String(pid));
+      // Pre-fetch pipeline data while still on the run page so the home page can
+      // show the activation card instantly without its own Snowflake round-trip.
+      try {
+        const r    = await fetch('/api/pipelines');
+        const body = await r.json();
+        const all  = (body.pipelines ?? []) as any[];
+        const pl   = all.find((p: any) => p.pipeline_id === pid);
+        if (pl) {
+          const siblings = all
+            .filter((p: any) => p.table_fqn === pl.table_fqn &&
+              (pl.export_table_fqn ? p.export_table_fqn === pl.export_table_fqn : true))
+            .sort((a: any, b: any) => a.pipeline_id - b.pipeline_id);
+          sessionStorage.setItem('prism_ae_activation_data', JSON.stringify({ pl, siblings }));
+        }
+      } catch { /* non-fatal — home page falls back to its own fetch */ }
+    }
+    reportAcceptNav();
+    router.push('/home');
+  }
+
+  /**
+   * Move to the next column that has data. Reuses an already-created review run
+   * when one exists, otherwise builds it via create-initial-run. Columns whose
+   * source is empty (run_id === null) are skipped. Returns true if it navigated.
+   */
+  async function advanceWizardForward(): Promise<boolean> {
+    if (!wizard) return false;
+    const cur = wizard.runs.indexOf(Number(runId));
+    const w: ColWizard = { ...wizard, runs: [...wizard.runs] };
+
+    for (let next = cur + 1; next < w.pids.length; next++) {
+      // Already have a run for this column — just open it.
+      if (w.runs[next] != null) {
+        sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
+        reportAcceptNav();
+        router.push(`/run/${w.runs[next]}`);
+        return true;
+      }
+      // Build the review run for this column — from the queue for a 'standardize'
+      // wizard (manual mode), or from the full source for a 'create' wizard.
+      const route = w.kind === 'standardize'
+        ? `/api/pipelines/${w.pids[next]}/standardize-run`
+        : `/api/pipelines/${w.pids[next]}/create-initial-run`;
+      const res  = await fetch(route, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok && body?.run_id) {
+        w.runs[next] = Number(body.run_id);
+        sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
+        reportAcceptNav();
+        router.push(`/run/${body.run_id}`);
+        return true;
+      }
+      // Empty source (run_id: null) or a soft error — skip this column and try the next.
+      w.runs[next] = null;
+    }
+    // Persist any skips we recorded so a later Back pass doesn't retry them.
+    sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
+    return false;
+  }
+
+  /** Go back to the previous already-standardized column (no export). */
+  function goToPreviousColumn() {
+    if (!wizard) return;
+    const cur = wizard.runs.indexOf(Number(runId));
+    for (let prev = cur - 1; prev >= 0; prev--) {
+      const rid = wizard.runs[prev];
+      if (rid != null) {
+        router.push(`/run/${rid}`);
+        return;
+      }
     }
   }
 
@@ -972,6 +1071,48 @@ export default function RunReviewClient({
 
   return (
     <div onClick={() => setOpenMenuForAliasName(null)}>
+      {/* ── Column wizard stepper (multi-column pipeline creation) ──────── */}
+      {inWizard && (
+        <div
+          className="rounded-card border-[0.5px] px-6 py-4 mb-4 flex items-center justify-between"
+          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+        >
+          <div className="flex items-center gap-2">
+            {wizard!.cols.map((_, i) => {
+              const done    = i < colIndex;
+              const current = i === colIndex;
+              return (
+                <div key={i} className="flex items-center gap-2">
+                  <span
+                    className="inline-flex items-center justify-center rounded-full text-xs font-medium transition-colors"
+                    style={{
+                      width: 24,
+                      height: 24,
+                      backgroundColor: current ? 'var(--accent)' : done ? 'var(--accent-tint)' : 'var(--page-bg)',
+                      color:           current ? 'white' : done ? 'var(--accent-strong)' : 'var(--text-hint)',
+                      border:          current ? 'none' : '0.5px solid var(--border)',
+                    }}
+                  >
+                    {i + 1}
+                  </span>
+                  {i < wizard!.cols.length - 1 && (
+                    <span style={{ width: 18, height: '0.5px', backgroundColor: 'var(--border)' }} />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-sm" style={{ color: 'var(--text-muted)' }}>
+            Column{' '}
+            <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>{colIndex + 1}</span>
+            {' '}of {wizard!.pids.length}
+            {wizard!.cols[colIndex] && (
+              <span style={{ color: 'var(--text-secondary)' }}> · {wizard!.cols[colIndex]}</span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── White surface card ─────────────────────────────────────────── */}
       <div
         className="rounded-card border-[0.5px] p-6"
@@ -1013,18 +1154,39 @@ export default function RunReviewClient({
               {totalGroups}
             </span>
 
+            <UndoButton onUndo={() => historyHandlersRef.current.undo()} disabled={exporting || undoStack.length === 0} />
+
             {isAutoExport ? (
-              <button
-                type="button"
-                onClick={() => void doAcceptStandardizations()}
-                disabled={exporting || loadingAliasMap || !!aliasMapError}
-                className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{ backgroundColor: 'var(--accent)' }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
-              >
-                {exporting ? 'Saving…' : 'Accept Standardizations'}
-              </button>
+              <>
+                {inWizard && colIndex > 0 && (
+                  <button
+                    type="button"
+                    onClick={goToPreviousColumn}
+                    disabled={exporting}
+                    className="px-4 py-1.5 rounded-button text-sm font-medium border-[0.5px] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
+                  >
+                    Back
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={requestAcceptStandardizations}
+                  disabled={exporting || loadingAliasMap || !!aliasMapError}
+                  className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{ backgroundColor: 'var(--accent)' }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
+                >
+                  {exporting
+                    ? 'Saving…'
+                    : inWizard && !isLastCol
+                      ? 'Accept & continue'
+                      : 'Accept Standardizations'}
+                </button>
+              </>
             ) : (
               <>
                 <button
@@ -1059,6 +1221,17 @@ export default function RunReviewClient({
           </div>
         </div>
 
+        {/* Domain-wide scope notice (premium: accepting writes to the shared lookup) */}
+        {isAutoExport && <DomainScopeNotice style={{ marginBottom: 20 }} />}
+
+        <DomainChangeConfirmModal
+          open={confirmAcceptOpen}
+          busy={exporting}
+          confirmLabel="Accept for all tables"
+          body="You changed the proposed standardizations. Accepting writes them to the shared lookup for this domain, so every other table with a pipeline in this domain will standardize using these mappings too."
+          onCancel={() => setConfirmAcceptOpen(false)}
+          onConfirm={() => void doAcceptStandardizations()}
+        />
 
         {/* Export error */}
         {exportError && (
@@ -1103,6 +1276,25 @@ export default function RunReviewClient({
             style={{ backgroundColor: '#FFFBEB', borderColor: '#FDE68A', color: '#92400E' }}
           >
             {renameError}
+          </div>
+        )}
+
+        {/* ── Needs-review callout (top of page) — message only ─────────── */}
+        {reviewCount > 0 && (
+          <div
+            className="flex items-start gap-2.5 rounded-button border-[0.5px] px-4 py-3.5 mb-5 text-sm"
+            style={{ backgroundColor: '#FEFCE8', borderColor: '#FDE68A', color: '#78350F' }}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="flex-shrink-0 mt-0.5" aria-hidden="true">
+              <path d="M8 2L14.5 13.5H1.5L8 2Z" stroke="#D97706" strokeWidth="1.3" strokeLinejoin="round" />
+              <path d="M8 6v3.5" stroke="#D97706" strokeWidth="1.3" strokeLinecap="round" />
+              <circle cx="8" cy="11.5" r="0.7" fill="#D97706" />
+            </svg>
+            <span>
+              <strong className="font-semibold">{reviewCount} value{reviewCount !== 1 ? 's' : ''} need your review</strong>
+              {' — '}highlighted in yellow at the top. The AI wasn&apos;t confident about these groupings.
+              Drag them into the correct group or accept as-is.
+            </span>
           </div>
         )}
 
@@ -1287,7 +1479,11 @@ export default function RunReviewClient({
                                     })
                                   }
                                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill cursor-move text-xs"
-                                  style={{
+                                  style={it.needs_review ? {
+                                    backgroundColor: '#FEF9C3',
+                                    border: '0.5px solid #FDE047',
+                                    color: '#713F12',
+                                  } : {
                                     backgroundColor: 'var(--border-subtle)',
                                     border: '0.5px solid var(--border)',
                                     color: 'var(--text-secondary)',
@@ -1401,199 +1597,6 @@ export default function RunReviewClient({
                 <span className="text-base leading-none">+</span>
                 Add a group
               </button>
-            </div>
-
-            {/* ── Divider ──────────────────────────────────────────────── */}
-            <div
-              className="border-t-[0.5px] my-6"
-              style={{ borderColor: 'var(--border-subtle)' }}
-            />
-
-            {/* ── Ungrouped items section ──────────────────────────────── */}
-            <div>
-              {/* Header */}
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-                    Ungrouped items
-                  </span>
-                  {ungroupedCount > 0 && (
-                    <span className="text-sm" style={{ color: 'var(--text-muted)' }}>
-                      {ungroupedCount} value{ungroupedCount !== 1 ? 's' : ''} need{ungroupedCount === 1 ? 's' : ''} a home
-                    </span>
-                  )}
-                </div>
-
-                <div className="flex items-center gap-3">
-                  {/* Auto-group button */}
-                  <button
-                    type="button"
-                    onClick={() => void doGroupUnassigned()}
-                    disabled={grouping || ungroupedCount === 0}
-                    className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    style={{ backgroundColor: 'var(--accent)' }}
-                    onMouseEnter={(e) => { if (!grouping && ungroupedCount > 0) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
-                  >
-                    {grouping ? 'Grouping…' : 'Auto-group'}
-                  </button>
-                </div>
-              </div>
-
-              {/* Grouping error */}
-              {groupingError && (
-                <div
-                  className="rounded-button border-[0.5px] px-4 py-3 mb-3 text-sm"
-                  style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA', color: 'var(--confidence-low)' }}
-                >
-                  {groupingError}
-                </div>
-              )}
-
-              {/* Grouping progress */}
-              {grouping && (
-                <div
-                  className="rounded-button border-[0.5px] px-4 py-3 mb-3 space-y-2"
-                  style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)' }}
-                >
-                  <div className="flex items-center justify-between text-sm font-medium" style={{ color: 'var(--accent-strong)' }}>
-                    <span>
-                      {!groupingProgress
-                        ? 'Starting…'
-                        : groupingProgress.phase === 'llm_scoring'
-                        ? groupingProgress.sub_phase
-                        : groupingProgress.phase === 'saving'
-                        ? `Saving — ${groupingProgress.sub_phase}`
-                        : groupingProgress.phase === 'loading'
-                        ? groupingProgress.sub_phase
-                        : `${groupingProgress.sub_phase}${groupingProgress.items_total > 0 ? ` (${groupingProgress.items_total} items)` : ''}`}
-                    </span>
-                    <span className="flex items-center gap-3 tabular-nums text-xs" style={{ color: 'var(--accent)' }}>
-                      <span>{formatElapsed(groupingElapsed)}</span>
-                      {groupingProgress?.phase === 'llm_scoring' && (groupingProgress.llm_elapsed_ms ?? 0) > 0 && (
-                        <span style={{ color: 'var(--text-muted)' }}>LLM {formatElapsed(Math.floor((groupingProgress.llm_elapsed_ms ?? 0) / 1000))}</span>
-                      )}
-                      <span className="font-semibold text-sm">
-                        {groupingProgress ? `${groupingProgress.progress_pct}%` : '…'}
-                      </span>
-                    </span>
-                  </div>
-                  <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--accent-border)' }}>
-                    <div
-                      className="h-full rounded-full transition-all duration-500 ease-out"
-                      style={{
-                        backgroundColor: 'var(--accent)',
-                        width: groupingProgress ? `${groupingProgress.progress_pct}%` : '0%',
-                      }}
-                    />
-                  </div>
-                  {groupingProgress && (
-                    <div className="flex items-center justify-between text-xs tabular-nums" style={{ color: 'var(--accent)' }}>
-                      <span>
-                        {groupingProgress.phase === 'llm_scoring' && groupingProgress.llm_calls_total > 0
-                          ? `${groupingProgress.llm_calls_made.toLocaleString()} / ${groupingProgress.llm_calls_total.toLocaleString()} pair comparisons`
-                          : groupingProgress.groups_found > 0
-                          ? `${groupingProgress.groups_found} group${groupingProgress.groups_found !== 1 ? 's' : ''} found so far`
-                          : 'Scanning…'}
-                      </span>
-                      {groupingProgress.estimated_cost_usd > 0 && (
-                        <span>
-                          ~${groupingProgress.estimated_cost_usd < 0.01
-                            ? groupingProgress.estimated_cost_usd.toFixed(4)
-                            : groupingProgress.estimated_cost_usd.toFixed(3)} USD
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Grouping result */}
-              {groupingResult && !grouping && (
-                <div
-                  className="rounded-button border-[0.5px] px-4 py-3 mb-3 text-sm"
-                  style={{ backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' }}
-                >
-                  <p className="font-medium" style={{ color: 'var(--confidence-high)' }}>
-                    Created {groupingResult.groups_created} group{groupingResult.groups_created !== 1 ? 's' : ''} from {groupingResult.items_committed} item{groupingResult.items_committed !== 1 ? 's' : ''}.
-                  </p>
-                  <div className="flex items-center gap-4 mt-1 text-xs tabular-nums" style={{ color: 'var(--confidence-high)' }}>
-                    <span>⏱ total {formatElapsed(groupingResult.elapsed_secs)}</span>
-                    {groupingResult.llm_elapsed_secs !== null && groupingResult.llm_elapsed_secs > 0 && (
-                      <span>LLM {formatElapsed(groupingResult.llm_elapsed_secs)}</span>
-                    )}
-                    {groupingResult.chunk_count !== null && groupingResult.chunk_count > 1 && (
-                      <span>{groupingResult.chunk_count} parallel chunks</span>
-                    )}
-                    {groupingResult.estimated_cost_usd > 0 && (
-                      <span>~${groupingResult.estimated_cost_usd < 0.01
-                        ? groupingResult.estimated_cost_usd.toFixed(4)
-                        : groupingResult.estimated_cost_usd.toFixed(3)} USD</span>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Ungrouped drop zone */}
-              <div
-                className="rounded-row border-[0.5px] border-dashed px-4 py-4 min-h-[60px]"
-                style={dragOverAliasName === UNGROUPED_KEY
-                  ? { backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent)' }
-                  : { backgroundColor: 'var(--border-subtle)', borderColor: 'var(--border)' }
-                }
-                onDragOver={(e) => onDragOverAlias(e, UNGROUPED_KEY)}
-                onDrop={(e) => onDropOnAlias(e, UNGROUPED_KEY)}
-                onDragLeave={(e) => onDragLeaveAlias(e, UNGROUPED_KEY)}
-              >
-                {ungroupedCount > 0 ? (
-                  <div className="flex flex-wrap gap-2">
-                    {(ungrouped?.items || []).map((it) => {
-                      const meta = initialItemMeta.get(it.run_item_id);
-                      const initialGroupId = meta?.initial_group_id ?? null;
-                      const initialScore = meta?.confidence_score ?? null;
-                      const pending = pendingMoves[it.run_item_id];
-
-                      const showScore =
-                        initialGroupId === null &&
-                        typeof initialScore === 'number' &&
-                        Number.isFinite(initialScore) &&
-                        (pending === undefined || pending === null);
-
-                      return (
-                        <span
-                          key={it.run_item_id}
-                          draggable
-                          onDragStart={(e) =>
-                            onDragStart(e, {
-                              type: 'item',
-                              fromAliasName: UNGROUPED_KEY,
-                              run_item_id: it.run_item_id,
-                              literal_value: String(it.literal_value),
-                            })
-                          }
-                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-pill cursor-grab text-xs"
-                          style={{
-                            backgroundColor: 'var(--surface)',
-                            border: '0.5px solid var(--border)',
-                            color: 'var(--text-secondary)',
-                          }}
-                        >
-                          {String(it.literal_value)}
-                          {showScore && (
-                            <span className={`text-[10px] font-medium ${confidenceColorClass(initialScore!)}`}>
-                              {formatConfidence(initialScore!)}
-                            </span>
-                          )}
-                        </span>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="text-sm text-center" style={{ color: 'var(--text-muted)' }}>
-                    Drag items here to leave them ungrouped
-                  </p>
-                )}
-              </div>
             </div>
           </>
         )}

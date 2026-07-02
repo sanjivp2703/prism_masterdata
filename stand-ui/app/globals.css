@@ -30,13 +30,15 @@ html {
   --confidence-med:   #BA7517;
   --confidence-low:   #A32D2D;
 
-  /* Border radius */
-  --radius-card:          14px;
-  --radius-button:        8px;
-  --radius-toggle-option: 6px;
-  --radius-pill:          20px;
+  /* Border radius — hard-edge: near-square corners for a technical,
+     professional-software feel. Avatars/status dots stay round via their own
+     50%/rounded-full styling (not these tokens). */
+  --radius-card:          3px;
+  --radius-button:        2px;
+  --radius-toggle-option: 2px;
+  --radius-pill:          2px;
   --radius-checkbox:      50%;
-  --radius-row:           10px;
+  --radius-row:           2px;
 
   /* Spacing */
   --page-padding-x:   40px;

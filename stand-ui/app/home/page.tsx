@@ -2,7 +2,7 @@
 
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, Suspense } from 'react';
 import { getAppMode } from '@/app/api/_lib/feature-flags';
 import AutoExportHome from './AutoExportHome';
 
@@ -191,7 +191,7 @@ async function parseUploadedFile(file: File, sheetName?: string): Promise<Parsed
 // ── Page ───────────────────────────────────────────────────────────────────
 export default function HomePage() {
   // ── Mode gate ──────────────────────────────────────────────────────────
-  if (getAppMode() === 'premium') return <AutoExportHome />;
+  if (getAppMode() === 'premium') return <Suspense><AutoExportHome /></Suspense>;
 
   const router = useRouter();
 
@@ -477,9 +477,9 @@ export default function HomePage() {
           {isAdmin !== false && (
           <Link
             href="/invite"
-            style={{ visibility: isAdmin === true ? 'visible' : 'hidden' }}
             className="inline-flex items-center gap-2 text-sm font-medium rounded-[8px] px-3.5 py-2 border-[0.5px] transition-colors"
             style={{
+              visibility: isAdmin === true ? 'visible' : 'hidden',
               borderColor: 'var(--accent-border)',
               backgroundColor: 'var(--accent-tint)',
               color: 'var(--accent)',

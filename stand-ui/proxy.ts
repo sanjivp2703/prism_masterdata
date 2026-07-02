@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 
-// Run in Node.js so SESSION_SECRET and full crypto are always available.
-export const runtime = 'nodejs';
+// The proxy always runs on the Node.js runtime in Next.js 16, so SESSION_SECRET
+// and full crypto are available. Route segment config (e.g. `export const
+// runtime`) is not allowed in this file.
 
 // Paths that are always accessible without a session
 function isPublicPath(pathname: string): boolean {

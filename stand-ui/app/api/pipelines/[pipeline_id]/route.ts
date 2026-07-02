@@ -8,6 +8,7 @@ import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake'
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { dropPipelineStream } from '@/app/api/_lib/pipeline-poller';
 import { refreshExportTable } from '@/app/api/_lib/export-table';
+import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -61,9 +62,14 @@ export async function PATCH(
   if (body?.status !== undefined && ['active', 'paused', 'pending_baseline'].includes(body.status)) {
     setClauses.push('status = ?');
     binds.push(body.status);
-    // Automatically stamp last_polled_at when transitioning to active
-    if (body.status === 'active' && body?.last_polled_at === undefined) {
-      setClauses.push('last_polled_at = CURRENT_TIMESTAMP()');
+    // Resuming clears any block reason; the next healthy poll would clear it too,
+    // but doing it here avoids showing a stale message in the gap before that poll.
+    if (body.status === 'active') {
+      setClauses.push('status_message = NULL');
+      // Automatically stamp last_polled_at when transitioning to active
+      if (body?.last_polled_at === undefined) {
+        setClauses.push('last_polled_at = CURRENT_TIMESTAMP()');
+      }
     }
   }
   if (body?.last_polled_at !== undefined) {
@@ -136,6 +142,21 @@ export async function PATCH(
       });
     }
 
+    // On re-activation, recover any source values that arrived while the
+    // pipeline was paused.  The APPEND_ONLY stream may have gone stale (and be
+    // recreated empty) over a long pause, so reconcile from the source table
+    // directly instead of waiting for the next hourly sweep.  Fire-and-forget.
+    if (pfe) {
+      reconcilePipelineQueue({
+        pipeline_id: pid,
+        table_fqn:   pfe.table_fqn,
+        column_name: pfe.column_name,
+        domain_id:   pfe.domain_id,
+      }).catch(err => {
+        console.error(`[Reconcile] Reactivation reconcile failed for pipeline ${pid}:`, err);
+      });
+    }
+
     return httpResponse;
   } catch (err) {
     return snowflakeErrorResponse(err, 'Failed to update pipeline');
@@ -162,11 +183,21 @@ export async function DELETE(
 
   try {
     const response = await withSnowflake(async (conn) => {
-      await exec(
+      // For Sheets pipelines: all columns for the same tab share the same
+      // table_fqn (created in one batch). Delete all siblings so the per-tab
+      // duplicate check doesn't block re-creation after a delete.
+      const fqnRows = await exec(
         conn,
-        `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE pipeline_id = ?`,
+        `SELECT table_fqn, source_type FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE pipeline_id = ?`,
         [pid],
       );
+      const fqn        = String(fqnRows[0]?.TABLE_FQN ?? fqnRows[0]?.table_fqn ?? '');
+      const sourceType = String(fqnRows[0]?.SOURCE_TYPE ?? fqnRows[0]?.source_type ?? '');
+      if (fqn && sourceType === 'sheets') {
+        await exec(conn, `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE table_fqn = ?`, [fqn]);
+      } else {
+        await exec(conn, `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE pipeline_id = ?`, [pid]);
+      }
       return Response.json({ ok: true });
     });
 

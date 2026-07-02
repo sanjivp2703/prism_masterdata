@@ -1,18 +1,19 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { DomainScopeNotice, DomainChangeConfirmModal, UndoButton } from '@/app/components/DomainChangeWarning';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const UNGROUPED_KEY = '__UNGROUPED__';
 
-// Indigo accent used throughout this page to differentiate from run-review blue.
-const INDIGO = {
-  accent:      '#6366F1',
-  strong:      '#4338CA',
-  tint:        '#EEF2FF',
-  border:      '#C7D2FE',
-  badgeText:   '#3730A3',
+const BLUE = {
+  accent:    'var(--accent)',
+  strong:    'var(--accent-strong)',
+  tint:      'var(--accent-tint)',
+  border:    'var(--accent-border)',
+  badgeText: 'var(--accent-strong)',
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -27,7 +28,6 @@ type DragPayload =
 
 type Snapshot = {
   uiAliasMap:        GlobalAliasMap;
-  checkedAliases:    Set<string>;
   nextTempGroupId:   number;
 };
 
@@ -71,13 +71,6 @@ function computeDelta(
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function CheckmarkIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-      <path d="M2.5 7L5.5 10L11.5 4" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
 
 function DragDots() {
   return (
@@ -104,13 +97,31 @@ function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function GlobalStandardizationsClient({ domainId }: { domainId?: number | null }) {
-  const [aliasMap,    setAliasMap]    = useState<GlobalAliasMap | null>(null);
-  const [uiAliasMap,  setUiAliasMap]  = useState<GlobalAliasMap | null>(null);
-  const [loadError,   setLoadError]   = useState<string | null>(null);
-  const [loading,     setLoading]     = useState(true);
+export default function GlobalStandardizationsClient({
+  domainId,
+  pipelineIds,
+}: {
+  domainId?: number | null;
+  pipelineIds?: number[];
+}) {
+  const [aliasMap,      setAliasMap]      = useState<GlobalAliasMap | null>(null);
+  const [uiAliasMap,   setUiAliasMap]   = useState<GlobalAliasMap | null>(null);
+  const [loadError,    setLoadError]    = useState<string | null>(null);
+  const [loading,      setLoading]      = useState(true);
+  const [loadingMessage, setLoadingMessage] = useState('Loading standardizations…');
 
-  const [checkedAliases,  setCheckedAliases]  = useState<Set<string>>(new Set());
+  // Queue / filtered view state
+  const [originalQueueItems,  setOriginalQueueItems]  = useState<Set<string>>(new Set());
+  const [showQueueOnly,       setShowQueueOnly]       = useState(false);
+  const [acceptedQueue,       setAcceptedQueue]       = useState(false);
+
+  // Accept state
+  const [acceptSuccess,       setAcceptSuccess]       = useState(false);
+  const acceptTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [saveProgress,  setSaveProgress]  = useState(0);
+  const progressTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
+
+
   const [nextTempGroupId, setNextTempGroupId] = useState(-1);
 
   const [editingAliasKey,   setEditingAliasKey]   = useState<string | null>(null);
@@ -124,6 +135,22 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   const [undoStack, setUndoStack] = useState<Snapshot[]>([]);
   const [redoStack, setRedoStack] = useState<Snapshot[]>([]);
   const historyRef = useRef<{ undo: () => void; redo: () => void }>({ undo: () => {}, redo: () => {} });
+
+  // Confirm gate: any write to the lookup affects the whole domain, so saveChanges
+  // pauses on a confirm modal whose resolution it awaits before committing.
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const confirmResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  function askDomainChangeConfirm(): Promise<boolean> {
+    return new Promise((resolve) => { confirmResolveRef.current = resolve; setConfirmOpen(true); });
+  }
+  function resolveDomainChangeConfirm(ok: boolean) {
+    setConfirmOpen(false);
+    const r = confirmResolveRef.current;
+    confirmResolveRef.current = null;
+    r?.(ok);
+  }
+
+  const router = useRouter();
 
   // Drag state
   const dragPayloadRef = useRef<DragPayload | null>(null);
@@ -144,38 +171,107 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   const [sheetsError,      setSheetsError]       = useState<string | null>(null);
   const [sheetsUrl,        setSheetsUrl]         = useState<string | null>(null);
 
-  // ── Load ──────────────────────────────────────────────────────────────────
+  // ── Load ─────────────────────────────────────────────────────────────────
+
+  async function loadAliasMap(cancelled: () => boolean): Promise<GlobalAliasMap | null> {
+    const url = domainId != null
+      ? `/api/global-standardizations?domain_id=${domainId}`
+      : '/api/global-standardizations';
+    const res  = await fetch(url, { cache: 'no-store' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body?.error || 'Failed to load global standardizations');
+    if (cancelled()) return null;
+    return (body?.data || {}) as GlobalAliasMap;
+  }
+
+  function applyAliasMap(data: GlobalAliasMap) {
+    setAliasMap(data);
+    setUiAliasMap(structuredClone(data));
+    setEditingAliasKey(null);
+    setUndoStack([]);
+    setRedoStack([]);
+  }
 
   useEffect(() => {
-    let cancelled = false;
-    async function load() {
+    let isCancelled = false;
+    const cancelled = () => isCancelled;
+
+    async function init() {
       setLoading(true);
+      setLoadingMessage('Loading standardizations…');
       setLoadError(null);
       try {
-        const url = domainId != null
-          ? `/api/global-standardizations?domain_id=${domainId}`
-          : '/api/global-standardizations';
-        const res  = await fetch(url, { cache: 'no-store' });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body?.error || 'Failed to load global standardizations');
-        if (!cancelled) {
-          const data = (body?.data || {}) as GlobalAliasMap;
-          setAliasMap(data);
-          setUiAliasMap(structuredClone(data));
-          setCheckedAliases(new Set());
-          setEditingAliasKey(null);
-          setUndoStack([]);
-          setRedoStack([]);
-        }
+        // 1. Load confirmed alias map from DB
+        const data = await loadAliasMap(cancelled);
+        if (!data || cancelled()) return;
+        applyAliasMap(data);
+
+        // 2. If no pipeline context, done
+        if (!pipelineIds || pipelineIds.length === 0) return;
+
+        // 3. Fetch queue literals for all pipelines
+        const queueResults = await Promise.all(
+          pipelineIds.map(pid =>
+            fetch(`/api/pipelines/${pid}/queue`)
+              .then(r => r.json().catch(() => ({ items: [] })))
+              .then((b: { items?: { literal_value: string }[] }) => b.items ?? [])
+              .catch(() => [] as { literal_value: string }[]),
+          ),
+        );
+        if (cancelled()) return;
+        const allLiterals = queueResults.flat().map(i => i.literal_value);
+        if (allLiterals.length === 0) return;
+
+        setOriginalQueueItems(new Set(allLiterals));
+        setShowQueueOnly(true);
+
+        // 4. Run LLM grouping on queue items (display only — no DB write yet)
+        setLoadingMessage(`Analyzing ${allLiterals.length} new value${allLiterals.length !== 1 ? 's' : ''}…`);
+        const proposeResults = await Promise.all(
+          pipelineIds.map(pid =>
+            fetch(`/api/pipelines/${pid}/propose-groupings`, { method: 'POST' })
+              .then(r => r.json().catch(() => ({ groups: [] })))
+              .catch(() => ({ groups: [] })) as Promise<{ groups: { alias_name: string; items: string[]; review_items: string[] }[] }>,
+          ),
+        );
+        if (cancelled()) return;
+
+        // Merge proposed groups into uiAliasMap.
+        // run_id=-1 = proposed (confident), run_id=-2 = proposed (needs review — yellow)
+        setUiAliasMap(prev => {
+          const next = structuredClone(prev ?? data);
+          const allExisting = new Set(
+            Object.values(next).flatMap(g => g.items.map(i => i.literal_value)),
+          );
+          for (const result of proposeResults) {
+            for (const group of (result.groups ?? [])) {
+              const alias       = group.alias_name;
+              const reviewSet   = new Set(group.review_items ?? []);
+              if (!next[alias]) next[alias] = { items: [] };
+              for (const lv of group.items) {
+                if (!allExisting.has(lv)) {
+                  next[alias].items.push({
+                    literal_value: lv,
+                    run_id:        reviewSet.has(lv) ? -2 : -1,
+                    confirmed_at:  '',
+                  });
+                  allExisting.add(lv);
+                }
+              }
+            }
+          }
+          return next;
+        });
       } catch (e) {
-        if (!cancelled) setLoadError(e instanceof Error ? e.message : 'Failed to load');
+        if (!cancelled()) setLoadError(e instanceof Error ? e.message : 'Failed to load');
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled()) setLoading(false);
       }
     }
-    load();
-    return () => { cancelled = true; };
-  }, []);
+
+    void init();
+    return () => { isCancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── History ───────────────────────────────────────────────────────────────
 
@@ -183,14 +279,12 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
     if (!uiAliasMap) return null;
     return {
       uiAliasMap:      structuredClone(uiAliasMap),
-      checkedAliases:  new Set(checkedAliases),
       nextTempGroupId,
     };
   }
 
   function applySnapshot(snap: Snapshot) {
     setUiAliasMap(snap.uiAliasMap);
-    setCheckedAliases(snap.checkedAliases);
     setNextTempGroupId(snap.nextTempGroupId);
     setEditingAliasKey(null);
     setEditingAliasValue('');
@@ -273,11 +367,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
       delete next[oldKey];
       return next;
     });
-    setCheckedAliases((prev) => {
-      const next = new Set(prev);
-      if (next.has(oldKey)) { next.delete(oldKey); next.add(newKey); }
-      return next;
-    });
     setEditingAliasKey(null);
     setEditingAliasValue('');
     setRenameError(null);
@@ -307,17 +396,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
       const ungrouped = next[UNGROUPED_KEY] ?? { items: [] };
       next[UNGROUPED_KEY] = { items: [...ungrouped.items, ...(group?.items ?? [])] };
       delete next[key];
-      return next;
-    });
-    setCheckedAliases((prev) => { const n = new Set(prev); n.delete(key); return n; });
-  }
-
-  // ── Toggle check ──────────────────────────────────────────────────────────
-
-  function toggle(key: string) {
-    setCheckedAliases((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key); else next.add(key);
       return next;
     });
   }
@@ -391,7 +469,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
         delete next[fromAliasName];
         return next;
       });
-      setCheckedAliases((prev) => { const n = new Set(prev); n.delete(fromAliasName); return n; });
     }
   }
 
@@ -401,20 +478,119 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
     if (!uiAliasMap) return [];
     return Object.entries(uiAliasMap)
       .filter(([k]) => k !== UNGROUPED_KEY)
-      .sort(([a], [b]) => a.localeCompare(b));
+      .sort(([a, ga], [b, gb]) => {
+        // Groups with items still needing review float to the top.
+        const aReview = ga.items.some(i => i.run_id === -2) ? 1 : 0;
+        const bReview = gb.items.some(i => i.run_id === -2) ? 1 : 0;
+        if (aReview !== bReview) return bReview - aReview;
+        return a.localeCompare(b);
+      });
   }, [uiAliasMap]);
 
-  const ungrouped     = uiAliasMap?.[UNGROUPED_KEY];
-  const ungroupedCount = ungrouped?.items.length ?? 0;
-  const totalGroups   = groupEntries.length;
+  // When showing only queue items, filter to groups that contain at least one
+  // literal that was in the queue at page load.
+  const displayedGroupEntries = useMemo(() => {
+    if (!showQueueOnly || originalQueueItems.size === 0) return groupEntries;
+    return groupEntries.filter(([, group]) =>
+      group.items.some(item => originalQueueItems.has(item.literal_value)),
+    );
+  }, [groupEntries, showQueueOnly, originalQueueItems]);
 
-  // ── Save changes to DB ────────────────────────────────────────────────────
+  const ungrouped      = uiAliasMap?.[UNGROUPED_KEY];
+  const ungroupedCount = ungrouped?.items.length ?? 0;
+  const totalGroups    = groupEntries.length;
+
+  // ── Accept (save changes to DB) ──────────────────────────────────────────
+
+  const hasChanges = useMemo(() => {
+    if (!aliasMap || !uiAliasMap) return false;
+    // Proposed items (run_id=-1 confident, run_id=-2 needs review) are unsaved
+    const hasProposed = Object.values(uiAliasMap).some(g => g.items.some(i => i.run_id < 0));
+    if (hasProposed) return true;
+    const { item_moves, deleted_literals } = computeDelta(aliasMap, uiAliasMap);
+    return Object.keys(item_moves).length > 0 || deleted_literals.length > 0;
+  }, [aliasMap, uiAliasMap]);
+
+  async function handleAccept() {
+    setSaveError(null);
+    try {
+      // Collect proposed items (run_id=-1) — these come from LLM grouping of queue items
+      const new_items: Record<string, string[]> = {};
+      for (const [alias, { items }] of Object.entries(uiAliasMap ?? {})) {
+        if (alias === UNGROUPED_KEY) continue;
+        for (const item of items) {
+          if (item.run_id < 0) {
+            if (!new_items[alias]) new_items[alias] = [];
+            new_items[alias].push(item.literal_value);
+          }
+        }
+      }
+
+      // Collect manual edits to existing (confirmed) mappings
+      const { item_moves, deleted_literals } = computeDelta(aliasMap!, uiAliasMap!);
+
+      const hasNewItems = Object.keys(new_items).length > 0;
+      const hasDelta    = Object.keys(item_moves).length > 0 || deleted_literals.length > 0;
+
+      if (!hasNewItems && !hasDelta) return;
+
+      // Only prompt domain-change confirm when touching existing mappings.
+      // Ask BEFORE setting saving=true so the modal button shows "Apply" not "Applying…".
+      if (hasDelta) {
+        const confirmed = await askDomainChangeConfirm();
+        if (!confirmed) return;
+      }
+
+      setSaving(true);
+      setSaveProgress(0);
+
+      // Animate progress bar from 0 → 80% while the request is in flight
+      if (progressTimer.current) clearInterval(progressTimer.current);
+      progressTimer.current = setInterval(() => {
+        setSaveProgress(p => p < 80 ? p + 2 : p);
+      }, 60);
+
+      const res = await fetch('/api/global-standardizations', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          new_items,
+          domain_id:               domainId,
+          pipeline_ids_to_dequeue: hasNewItems && pipelineIds?.length ? pipelineIds : [],
+          item_moves,
+          deleted_literals,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error || 'Failed to accept');
+
+      // Jump to 100% and navigate after a brief moment so the user sees completion
+      if (progressTimer.current) clearInterval(progressTimer.current);
+      setSaveProgress(100);
+      setAcceptedQueue(true);
+      await new Promise(r => setTimeout(r, 400));
+      const dest = domainId != null
+        ? `/home?tab=standardizations&open_domain_id=${domainId}`
+        : '/home?tab=standardizations';
+      router.push(dest);
+    } catch (e) {
+      if (progressTimer.current) clearInterval(progressTimer.current);
+      setSaveProgress(0);
+      setSaveError(e instanceof Error ? e.message : 'Failed to accept');
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function saveChanges(): Promise<boolean> {
     if (!aliasMap || !uiAliasMap) return false;
     const { item_moves, deleted_literals } = computeDelta(aliasMap, uiAliasMap);
     const hasDelta = Object.keys(item_moves).length > 0 || deleted_literals.length > 0;
     if (!hasDelta) return true; // nothing to save
+
+    // Editing pre-existing standardizations is domain-wide — confirm before writing.
+    const confirmed = await askDomainChangeConfirm();
+    if (!confirmed) return false;
 
     setSaving(true);
     setSaveError(null);
@@ -440,8 +616,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   // ── Export: CSV (client-side) ─────────────────────────────────────────────
 
   async function doCsvExport() {
-    const saved = await saveChanges();
-    if (!saved) return;
     if (!uiAliasMap) return;
 
     const lines: string[] = ['canonical_name,raw_value'];
@@ -467,8 +641,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   // ── Export: Excel (client-side) ───────────────────────────────────────────
 
   async function doExcelExport() {
-    const saved = await saveChanges();
-    if (!saved) return;
     if (!uiAliasMap) return;
 
     const XLSX   = await import('xlsx');
@@ -495,9 +667,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   // ── Export: Google Sheets ─────────────────────────────────────────────────
 
   async function doSheetsExport() {
-    const saved = await saveChanges();
-    if (!saved) return;
-
     setSheetsLoading(true);
     setSheetsError(null);
     setSheetsUrl(null);
@@ -525,9 +694,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
   // ── Export: Snowflake table ───────────────────────────────────────────────
 
   async function doSnowflakeExport() {
-    const saved = await saveChanges();
-    if (!saved) return;
-
     setSfExporting(true);
     setSfExportError(null);
     setSfExportResult(null);
@@ -573,21 +739,67 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
             </h2>
             <span
               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill text-xs font-medium"
-              style={{ backgroundColor: INDIGO.tint, color: INDIGO.badgeText }}
+              style={{ backgroundColor: BLUE.tint, color: BLUE.badgeText }}
             >
-              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: INDIGO.accent }} />
+              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: BLUE.accent }} />
               Domain Library
             </span>
           </div>
 
           <div className="flex items-center gap-3">
             <span className="text-sm" style={{ color: 'var(--text-muted)' }}>
-              <span className="font-medium" style={{ color: INDIGO.accent }}>{totalGroups}</span>
+              <span className="font-medium" style={{ color: BLUE.accent }}>{totalGroups}</span>
               {' groups · '}
-              <span className="font-medium" style={{ color: INDIGO.accent }}>{totalItems}</span>
+              <span className="font-medium" style={{ color: BLUE.accent }}>{totalItems}</span>
               {' values'}
             </span>
 
+            {originalQueueItems.size > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowQueueOnly(v => !v)}
+                className="px-3 py-1.5 rounded-button text-xs font-medium border-[0.5px] transition-colors"
+                style={showQueueOnly
+                  ? { backgroundColor: BLUE.accent, color: 'white', borderColor: BLUE.accent }
+                  : { backgroundColor: 'var(--surface)', color: BLUE.accent, borderColor: BLUE.border }
+                }
+                onMouseEnter={e => { if (!showQueueOnly) (e.currentTarget as HTMLButtonElement).style.backgroundColor = BLUE.tint; }}
+                onMouseLeave={e => { if (!showQueueOnly) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
+              >
+                {showQueueOnly ? 'Show all' : `Proposed (${originalQueueItems.size > 99 ? '99+' : originalQueueItems.size})`}
+              </button>
+            )}
+
+            <UndoButton onUndo={() => historyRef.current.undo()} disabled={saving || undoStack.length === 0} />
+
+            {/* Accept — writes queue + edits to the lookup table */}
+            <button
+              type="button"
+              onClick={() => void handleAccept()}
+              disabled={loading || !!loadError || saving || !hasChanges}
+              className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-button text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{
+                backgroundColor: acceptSuccess ? '#16a34a' : BLUE.accent,
+                color: 'white',
+              }}
+              onMouseEnter={(e) => { if (!saving && hasChanges) (e.currentTarget as HTMLButtonElement).style.backgroundColor = acceptSuccess ? '#15803d' : BLUE.strong; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = acceptSuccess ? '#16a34a' : BLUE.accent; }}
+            >
+              {saving ? (
+                <><Spinner className="w-3.5 h-3.5" /> Saving…</>
+              ) : acceptSuccess ? (
+                <>
+                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                    <path d="M2.5 7L5.5 10L11.5 4" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  Accepted
+                </>
+              ) : (
+                'Accept'
+              )}
+            </button>
+
+            {/* Export */}
             <button
               type="button"
               onClick={() => {
@@ -599,15 +811,48 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                 setExportModalOpen(true);
               }}
               disabled={loading || !!loadError}
-              className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ backgroundColor: INDIGO.accent }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = INDIGO.strong; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = INDIGO.accent; }}
+              className="px-4 py-1.5 rounded-button text-sm font-medium border-[0.5px] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ backgroundColor: 'var(--surface)', color: BLUE.accent, borderColor: BLUE.border }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = BLUE.tint; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
             >
               Export
             </button>
           </div>
         </div>
+
+        {/* Progress bar — shown while applying standardizations */}
+        {saving && (
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>Applying standardizations…</span>
+              <span className="text-xs tabular-nums" style={{ color: 'var(--text-muted)' }}>{saveProgress}%</span>
+            </div>
+            <div className="w-full rounded-full overflow-hidden" style={{ height: 6, backgroundColor: 'var(--accent-tint)', border: '0.5px solid var(--accent-border)' }}>
+              <div
+                style={{
+                  height: '100%',
+                  width: `${saveProgress}%`,
+                  backgroundColor: 'var(--accent)',
+                  borderRadius: 9999,
+                  transition: saveProgress === 100 ? 'width 0.2s ease-out' : 'width 0.06s linear',
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Domain-wide scope notice */}
+        <DomainScopeNotice style={{ marginBottom: 16 }} />
+
+        <DomainChangeConfirmModal
+          open={confirmOpen}
+          busy={saving}
+          confirmLabel="Apply to all tables"
+          body="You're editing this domain's standardizations. Saving writes to the shared lookup, so every table with a pipeline in this domain will standardize using these mappings too."
+          onCancel={() => resolveDomainChangeConfirm(false)}
+          onConfirm={() => resolveDomainChangeConfirm(true)}
+        />
 
         {/* Save error banner */}
         {saveError && (
@@ -629,11 +874,37 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
           </div>
         )}
 
+        {/* Review notice — shown when any proposed items need human sign-off */}
+        {!loading && !loadError && (() => {
+          const reviewCount = Object.values(uiAliasMap ?? {})
+            .flatMap(g => g.items)
+            .filter(i => i.run_id === -2).length;
+          if (reviewCount === 0) return null;
+          return (
+            <div
+              className="flex items-start gap-2.5 rounded-button border-[0.5px] px-4 py-3 mb-4 text-sm"
+              style={{ backgroundColor: '#FEFCE8', borderColor: '#FDE68A', color: '#78350F' }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="flex-shrink-0 mt-0.5" aria-hidden="true">
+                <path d="M8 2L14.5 13.5H1.5L8 2Z" stroke="#D97706" strokeWidth="1.3" strokeLinejoin="round" />
+                <path d="M8 6v3.5" stroke="#D97706" strokeWidth="1.3" strokeLinecap="round" />
+                <circle cx="8" cy="11.5" r="0.7" fill="#D97706" />
+              </svg>
+              <span>
+                <strong className="font-semibold">{reviewCount} value{reviewCount !== 1 ? 's' : ''} need your review</strong>
+                {' — '}highlighted in yellow at the top. The AI wasn&apos;t confident about these groupings.
+                Drag them into the correct group or rename them before accepting.
+              </span>
+            </div>
+          );
+        })()}
+
         {/* ── Loading / error / content ──────────────────────────────────── */}
         {loading ? (
-          <p className="text-sm italic py-4" style={{ color: 'var(--text-muted)' }}>
-            Loading domain standardizations…
-          </p>
+          <div className="flex items-center gap-2 py-4" style={{ color: 'var(--text-muted)' }}>
+            <Spinner className="w-4 h-4" />
+            <span className="text-sm italic">{loadingMessage}</span>
+          </div>
         ) : loadError ? (
           <div
             className="rounded-button border-[0.5px] px-4 py-3 text-sm"
@@ -646,9 +917,8 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
             {/* ── Column headers ──────────────────────────────────────────── */}
             <div
               className="grid items-center mb-1 pb-2 border-b-[0.5px]"
-              style={{ gridTemplateColumns: '36px 36px 180px 1fr 32px', borderColor: 'var(--border-subtle)' }}
+              style={{ gridTemplateColumns: '36px 180px 1fr 32px', borderColor: 'var(--border-subtle)' }}
             >
-              <div />
               <div />
               <div className="px-3 text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-hint)' }}>
                 Canonical name
@@ -661,14 +931,15 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
 
             {/* ── Group rows ──────────────────────────────────────────────── */}
             <div>
-              {groupEntries.length === 0 && (
+              {displayedGroupEntries.length === 0 && (
                 <p className="text-sm italic py-4 text-center" style={{ color: 'var(--text-muted)' }}>
-                  No domain standardizations yet. Accept a run to populate them.
+                  {showQueueOnly
+                    ? 'No groupings found for the new values.'
+                    : 'No domain standardizations yet. Accept a run to populate them.'}
                 </p>
               )}
 
-              {groupEntries.map(([aliasName, group], idx) => {
-                const isChecked     = checkedAliases.has(aliasName);
+              {displayedGroupEntries.map(([aliasName, group], idx) => {
                 const isGroupDragOver =
                   dragOverAliasName === aliasName &&
                   draggingGroupName !== null &&
@@ -685,10 +956,10 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                     <div
                       className="grid items-start py-[13px] rounded-row transition-colors"
                       style={{
-                        gridTemplateColumns: '36px 36px 180px 1fr 32px',
+                        gridTemplateColumns: '36px 180px 1fr 32px',
                         opacity: isBeingDragged ? 0.4 : 1,
                         ...(isDragOver
-                          ? { backgroundColor: INDIGO.tint, borderLeft: `2px solid ${INDIGO.accent}`, paddingLeft: 10 }
+                          ? { backgroundColor: BLUE.tint, borderLeft: `2px solid ${BLUE.accent}`, paddingLeft: 10 }
                           : {}),
                       }}
                       onMouseEnter={(e) => {
@@ -701,23 +972,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                       onDrop={(e) => onDropOnAlias(e, aliasName)}
                       onDragLeave={(e) => onDragLeaveAlias(e, aliasName)}
                     >
-                      {/* Col 1: Checkbox */}
-                      <div className="flex justify-center pt-0.5">
-                        <button
-                          type="button"
-                          onClick={() => toggle(aliasName)}
-                          aria-label={isChecked ? 'Unmark group' : 'Mark group'}
-                          className="w-[26px] h-[26px] rounded-full flex items-center justify-center flex-shrink-0 transition-colors"
-                          style={isChecked
-                            ? { backgroundColor: INDIGO.accent, border: 'none' }
-                            : { backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)' }
-                          }
-                        >
-                          {isChecked && <CheckmarkIcon />}
-                        </button>
-                      </div>
-
-                      {/* Col 2: Drag handle */}
+                      {/* Col 1: Drag handle */}
                       <div className="flex justify-center pt-1.5">
                         {editingAliasKey !== aliasName && (
                           <span
@@ -739,7 +994,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                         title={editingAliasKey !== aliasName ? 'Double-click to rename' : undefined}
                       >
                         {isGroupDragOver ? (
-                          <span className="text-xs font-medium" style={{ color: INDIGO.strong }}>
+                          <span className="text-xs font-medium" style={{ color: BLUE.strong }}>
                             Merge into &ldquo;{aliasName}&rdquo;
                           </span>
                         ) : editingAliasKey === aliasName ? (
@@ -754,7 +1009,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                             }}
                             className="w-full px-2 py-1 text-sm rounded-[6px] border-[0.5px] outline-none"
                             style={{
-                              borderColor:     INDIGO.accent,
+                              borderColor:     BLUE.accent,
                               backgroundColor: 'var(--surface)',
                               color:           'var(--text-primary)',
                             }}
@@ -770,7 +1025,10 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                       <div className="px-2">
                         {group.items.length > 0 ? (
                           <div className="flex flex-wrap gap-1.5">
-                            {group.items.map((item, itemIdx) => (
+                            {group.items.map((item, itemIdx) => {
+                              const needsReview = item.run_id === -2;
+                              const isProposed  = item.run_id === -1;
+                              return (
                               <span
                                 key={`${aliasName}:${itemIdx}:${item.literal_value}`}
                                 draggable
@@ -782,15 +1040,18 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                                   })
                                 }
                                 className="inline-flex items-center px-2.5 py-1 rounded-pill cursor-move text-xs"
-                                style={{
-                                  backgroundColor: 'var(--border-subtle)',
-                                  border:          `0.5px solid var(--border)`,
-                                  color:           'var(--text-secondary)',
-                                }}
+                                title={needsReview ? 'Needs review — AI wasn\'t confident. Drag to correct group or accept as-is.' : isProposed ? 'Proposed — click Accept to confirm' : undefined}
+                                style={needsReview
+                                  ? { backgroundColor: '#FEF9C3', border: '0.5px solid #FDE047', color: '#713F12' }
+                                  : isProposed
+                                  ? { backgroundColor: '#FFFBEB', border: '0.5px solid #FDE68A', color: '#92400E' }
+                                  : { backgroundColor: 'var(--border-subtle)', border: '0.5px solid var(--border)', color: 'var(--text-secondary)' }
+                                }
                               >
                                 {item.literal_value}
                               </span>
-                            ))}
+                              );
+                            })}
                           </div>
                         ) : (
                           <span className="text-xs italic" style={{ color: 'var(--text-hint)' }}>
@@ -865,8 +1126,8 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                 type="button"
                 onClick={addGroup}
                 className="mt-3 flex items-center gap-1.5 text-sm transition-colors px-2 py-1 rounded-button"
-                style={{ color: INDIGO.accent }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = INDIGO.tint; }}
+                style={{ color: BLUE.accent }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = BLUE.tint; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
               >
                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
@@ -876,52 +1137,6 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
               </button>
             )}
 
-            {/* ── Ungrouped / removal zone ─────────────────────────────────── */}
-            <div className="mt-5">
-              <p className="text-[10px] font-medium uppercase tracking-wider mb-2" style={{ color: 'var(--text-hint)' }}>
-                Remove from domain library
-              </p>
-              <div
-                className="rounded-row border-[0.5px] border-dashed px-4 py-4 min-h-[60px]"
-                style={dragOverAliasName === UNGROUPED_KEY
-                  ? { backgroundColor: '#FFF1F2', borderColor: '#FDA4AF' }
-                  : { backgroundColor: 'var(--border-subtle)', borderColor: 'var(--border)' }
-                }
-                onDragOver={(e) => onDragOverAlias(e, UNGROUPED_KEY)}
-                onDrop={(e) => onDropOnAlias(e, UNGROUPED_KEY)}
-                onDragLeave={(e) => onDragLeaveAlias(e, UNGROUPED_KEY)}
-              >
-                {ungroupedCount > 0 ? (
-                  <div className="flex flex-wrap gap-2">
-                    {(ungrouped?.items || []).map((item, itemIdx) => (
-                      <span
-                        key={`ungrouped:${itemIdx}:${item.literal_value}`}
-                        draggable
-                        onDragStart={(e) =>
-                          onDragStart(e, {
-                            type: 'item',
-                            fromAliasName: UNGROUPED_KEY,
-                            literal_value: item.literal_value,
-                          })
-                        }
-                        className="inline-flex items-center px-3.5 py-1.5 rounded-pill cursor-grab text-xs line-through"
-                        style={{
-                          backgroundColor: 'var(--surface)',
-                          border:          '0.5px solid #FDA4AF',
-                          color:           '#9F1239',
-                        }}
-                      >
-                        {item.literal_value}
-                      </span>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-sm text-center" style={{ color: 'var(--text-muted)' }}>
-                    Drag values here to remove them from the domain library on export
-                  </p>
-                )}
-              </div>
-            </div>
           </>
         )}
       </div>
@@ -976,17 +1191,17 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
               </div>
             )}
 
-            {/* Ungrouped warning */}
-            {ungroupedCount > 0 && (
+            {/* Unsaved changes notice */}
+            {hasChanges && (
               <div
                 className="rounded-button border-[0.5px] px-3 py-2.5 mb-4 text-sm"
-                style={{ backgroundColor: '#FFF7ED', borderColor: '#FED7AA', color: '#92400E' }}
+                style={{ backgroundColor: BLUE.tint, borderColor: BLUE.border, color: BLUE.badgeText }}
               >
-                {ungroupedCount} value{ungroupedCount !== 1 ? 's' : ''} will be removed from the domain library on export.
+                You have unsaved changes. Click <strong>Accept</strong> first to include them in server-side exports (Sheets, Snowflake).
               </div>
             )}
 
-            <div className="flex flex-col gap-0.5">
+<div className="flex flex-col gap-0.5">
               {/* Excel */}
               <button
                 type="button"
@@ -996,7 +1211,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                 onMouseEnter={(e) => { if (!saving) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
               >
-                <div className="w-8 h-8 rounded-button flex items-center justify-center flex-shrink-0" style={{ backgroundColor: INDIGO.tint, color: INDIGO.accent }}>
+                <div className="w-8 h-8 rounded-button flex items-center justify-center flex-shrink-0" style={{ backgroundColor: BLUE.tint, color: BLUE.accent }}>
                   {saving ? <Spinner className="w-4 h-4" /> : (
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                       <path d="M3 2h7l3 3v9a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
@@ -1020,7 +1235,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                 onMouseEnter={(e) => { if (!saving) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
               >
-                <div className="w-8 h-8 rounded-button flex items-center justify-center flex-shrink-0" style={{ backgroundColor: INDIGO.tint, color: INDIGO.accent }}>
+                <div className="w-8 h-8 rounded-button flex items-center justify-center flex-shrink-0" style={{ backgroundColor: BLUE.tint, color: BLUE.accent }}>
                   {saving ? <Spinner className="w-4 h-4" /> : (
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                       <path d="M3 2h7l3 3v9a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
@@ -1120,7 +1335,7 @@ export default function GlobalStandardizationsClient({ domainId }: { domainId?: 
                     backgroundColor: 'var(--surface)',
                     color:           'var(--text-primary)',
                   }}
-                  onFocus={(e) => { e.currentTarget.style.borderColor = INDIGO.accent; }}
+                  onFocus={(e) => { e.currentTarget.style.borderColor = BLUE.accent; }}
                   onBlur={(e) =>  { e.currentTarget.style.borderColor = 'var(--border)'; }}
                 />
                 {sfExportResult && (
