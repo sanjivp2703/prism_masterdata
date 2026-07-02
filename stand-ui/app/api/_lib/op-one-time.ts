@@ -25,7 +25,7 @@ import {
 import { runOnePromptGrouping, type NamingConvention } from './llm-one-prompt-grouping';
 import { hasAnyRule } from './convention-rules';
 import { pickBestAliasName } from './namescore';
-import type { RunItemForPairing } from './pairscore';
+import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
 
 // ---------------------------------------------------------------------------

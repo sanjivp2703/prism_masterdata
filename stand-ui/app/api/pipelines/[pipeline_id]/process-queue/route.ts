@@ -19,7 +19,6 @@
 import { cookies } from 'next/headers';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { premiumModeGuard } from '@/app/api/_lib/feature-flags';
 import { broadcastPipelineEvent } from '@/app/api/_lib/pipeline-broadcaster';
 import {
   fetchPipelineById,
@@ -75,9 +74,6 @@ export async function POST(
   const gAccessToken  = cookieStore.get('google_access_token')?.value;
   const gRefreshToken = cookieStore.get('google_refresh_token')?.value;
   const gTokenExpiry  = cookieStore.get('google_token_expiry')?.value;
-
-  const modeBlocked = premiumModeGuard();
-  if (modeBlocked) return modeBlocked;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);

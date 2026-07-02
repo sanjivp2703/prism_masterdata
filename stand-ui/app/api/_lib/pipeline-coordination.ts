@@ -19,10 +19,6 @@ export function isPipelineStandardizing(pipelineId: number): boolean {
   return standardizingPipelines.has(pipelineId);
 }
 
-/** @deprecated Use isPipelineStandardizing(pipelineId) instead. */
-export function isPollingPaused(): boolean {
-  return standardizingPipelines.size > 0;
-}
 
 /** Call when starting auto-group + export for a specific pipeline. */
 export function beginStandardization(pipelineId?: number): void {

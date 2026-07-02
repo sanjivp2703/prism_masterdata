@@ -2,7 +2,6 @@ import { cookies } from 'next/headers';
 import { google } from 'googleapis';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { premiumModeGuard } from '@/app/api/_lib/feature-flags';
 import { insertFileRows, readFileDistinctValues } from '@/app/api/_lib/op-file-pipeline';
 import { fetchPipelineById, createRunFromQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
@@ -107,9 +106,6 @@ export async function POST(request: Request) {
   const cookieStore = await cookies();
   const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
   if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const modeBlocked = premiumModeGuard();
-  if (modeBlocked) return modeBlocked;
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return Response.json({ error: 'ANTHROPIC_API_KEY is not configured.' }, { status: 500 });

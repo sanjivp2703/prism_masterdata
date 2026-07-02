@@ -299,8 +299,6 @@ export async function reconcilePipelineQueue(
  * the source drop out of the export even if no per-row delete event was seen.
  */
 export async function runReconciliationSweep(): Promise<void> {
-  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') return;
-
   const pipelines = await fetchAllActivePipelines();
   if (pipelines.length === 0) return;
 
@@ -494,10 +492,6 @@ export async function bulkProcessPipelineQueue(
   literals: string[],
   apiKey:   string,
 ): Promise<BulkQueueResult> {
-  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') {
-    throw new Error('Bulk pipeline processing is only available in Premium mode.');
-  }
-
   if (literals.length === 0) {
     return {
       run_id: 0, groups_created: 0, items_written: 0,
@@ -724,11 +718,8 @@ function msUntilNextHour(): number {
 
 /**
  * Schedule hourly standardization at the top of each clock hour.
- * Only runs when NEXT_PUBLIC_APP_MODE is premium.
  */
 export function startHourlyProcessor(): void {
-  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') return;
-
   const g = global as typeof globalThis & { __hourlyProcessorStarted?: boolean };
   if (g.__hourlyProcessorStarted) return;
   g.__hourlyProcessorStarted = true;

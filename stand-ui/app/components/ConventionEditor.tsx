@@ -7,7 +7,7 @@ import { RULE_GROUPS, hasAnyRule, type ConventionRules, type RuleGroup } from '@
 // The editor keeps separate text per tab so switching tabs restores what was
 // typed. `rules` holds the structured single-select selections.
 
-export type ConvType = 'none' | 'regex' | 'examples' | 'natural';
+type ConvType = 'none' | 'regex' | 'examples' | 'natural';
 
 export interface ConventionDraft {
   type:     ConvType;
@@ -21,7 +21,7 @@ export function emptyConventionDraft(): ConventionDraft {
   return { type: 'none', regex: '', examples: '', natural: '', rules: {} };
 }
 
-export function conventionDraftActiveValue(d: ConventionDraft): string {
+function conventionDraftActiveValue(d: ConventionDraft): string {
   return d.type === 'regex' ? d.regex : d.type === 'examples' ? d.examples : d.type === 'natural' ? d.natural : '';
 }
 

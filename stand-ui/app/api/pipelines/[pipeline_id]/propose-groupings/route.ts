@@ -11,13 +11,12 @@
 import { cookies } from 'next/headers';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { premiumModeGuard } from '@/app/api/_lib/feature-flags';
 import { fetchPipelineById, fetchQueueLiterals } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runOnePromptGrouping } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { normalizeLiteral } from '@/app/api/_lib/normalize';
 import { sanitizeConventionRules, hasAnyRule } from '@/app/api/_lib/convention-rules';
 import { pickBestAliasName } from '@/app/api/_lib/namescore';
-import type { RunItemForPairing } from '@/app/api/_lib/pairscore';
+import type { RunItemForPairing } from '@/app/api/_lib/grouping-types';
 import type { NamingConvention } from '@/app/api/_lib/llm-one-prompt-grouping';
 
 function safeJsonParse(s: string): unknown {
@@ -40,9 +39,6 @@ export async function POST(
   const cookieStore = await cookies();
   const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
   if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const modeBlocked = premiumModeGuard();
-  if (modeBlocked) return modeBlocked;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);

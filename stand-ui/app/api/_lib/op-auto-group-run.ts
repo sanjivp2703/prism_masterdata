@@ -22,7 +22,7 @@ function safeJsonParse(s: string): unknown {
 }
 import { pickBestAliasName } from './namescore';
 import { normalizeLiteral } from './normalize';
-import type { RunItemForPairing } from './pairscore';
+import type { RunItemForPairing } from './grouping-types';
 
 async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {

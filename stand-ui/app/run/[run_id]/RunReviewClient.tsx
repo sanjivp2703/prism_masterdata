@@ -137,7 +137,7 @@ export default function RunReviewClient({
   initialRunStatus?: string;
 }) {
   const router = useRouter();
-  const isAutoExport = process.env.NEXT_PUBLIC_APP_MODE === 'premium';
+  const isAutoExport = true; // single-tier product — pipeline mode is the only mode
 
   const [aliasMap, setAliasMap] = useState<AliasMap | null>(null);
   const [uiAliasMap, setUiAliasMap] = useState<AliasMap | null>(null);

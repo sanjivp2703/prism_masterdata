@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import type { Domain } from '@/app/components/DomainSelector';
+import type { Domain } from '@/app/components/domain-types';
 import CompactDomainPicker from '@/app/components/CompactDomainPicker';
 
 export type FileSourceType = 'csv' | 'excel' | 'sheets';

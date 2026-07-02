@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import type { Domain } from './DomainSelector';
+import type { Domain } from './domain-types';
 import ConventionEditor, {
   emptyConventionDraft, conventionDraftToConvention, conventionRegexValid,
   type ConventionDraft,

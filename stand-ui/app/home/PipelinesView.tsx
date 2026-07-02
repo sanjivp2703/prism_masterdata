@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation';
 import PipelineDetail from './PipelineDetail';
 import CompactDomainPicker from '@/app/components/CompactDomainPicker';
 import ExportLookupModal from '@/app/components/ExportLookupModal';
-import type { Domain } from '@/app/components/DomainSelector';
+import type { Domain } from '@/app/components/domain-types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

@@ -134,12 +134,3 @@ export function broadcastGlobalAlert(
   broadcastPipelineEvent({ type: 'alert', level, scope: 'global', message, ttl_ms: ttlMs });
 }
 
-/** Transient per-pipeline toast without changing status (informational notices). */
-export function broadcastPipelineAlert(
-  pipelineId: number,
-  message:    string,
-  level:      AlertLevel = 'warning',
-  ttlMs:      number = DEFAULT_TTL_MS,
-): void {
-  broadcastPipelineEvent({ type: 'alert', level, scope: 'pipeline', pipeline_id: pipelineId, message, ttl_ms: ttlMs });
-}

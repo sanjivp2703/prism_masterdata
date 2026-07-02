@@ -231,38 +231,6 @@ async function bulkUpsertApprovedAliases(
 }
 
 /**
- * Upsert a literal → alias mapping using the integer alias_id FK.
- * Renames to the parent alias never require touching this table.
- */
-async function upsertLiteralMatch(
-  connection:   any,
-  literalValue: string,
-  aliasId:      number,
-  domainId:     number | null,
-  runId:        number,
-): Promise<void> {
-  const domainFilter  = domainId != null
-    ? `AND t.domain_id = ${Number(domainId)}`
-    : `AND t.domain_id IS NULL`;
-  const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
-
-  await exec(
-    connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES AS t
-     USING (SELECT ? AS literal_value, ${Number(aliasId)} AS alias_id,
-                   ${domainLiteral} AS domain_id, ? AS run_id) AS s
-       ON t.normalized_value = PRISM_NORMALIZE(s.literal_value) ${domainFilter}
-     WHEN MATCHED THEN UPDATE SET
-       t.alias_id     = s.alias_id,
-       t.run_id       = s.run_id,
-       t.confirmed_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
-       VALUES (s.literal_value, PRISM_NORMALIZE(s.literal_value), s.alias_id, s.domain_id, s.run_id, CURRENT_TIMESTAMP())`,
-    [literalValue, runId],
-  );
-}
-
-/**
  * Bulk-upsert all literal → alias mappings for a run in a single MERGE statement.
  *
  * A single Snowflake MERGE is inherently atomic (no transaction needed) and
@@ -884,7 +852,7 @@ async function runWriteAndValidatePass(
       //
       // All steps are awaited (not fire-and-forget) so the UI sees consistent
       // metrics the moment the export request returns.
-      if (process.env.NEXT_PUBLIC_APP_MODE === 'premium') {
+      {
         try {
           // Collect the set of literals that were just written to LITERAL_ALIAS_MATCHES.
           const standardizedLiterals = state.groups.flatMap((g) => g.items.map((gi) => gi.literal_value));
@@ -1177,8 +1145,7 @@ export async function runOpExportDirect(
     // Awaited (not fire-and-forget) so that PIPELINES.total_mapped /
     // total_source_values and the export table are always in sync before the
     // caller removes items from PIPELINE_QUEUE.
-    // Only runs in premium mode (pipelines only exist there).
-    if (process.env.NEXT_PUBLIC_APP_MODE === 'premium' && metaRow) {
+    if (metaRow) {
       const exportTableFqn = (metaRow.EXPORT_TABLE_FQN ?? metaRow.export_table_fqn) as string | null;
       const tableFqn       = String(metaRow.PIPELINE_TABLE_FQN   ?? metaRow.pipeline_table_fqn   ?? '');
       const colName        = String(metaRow.PIPELINE_COLUMN_NAME  ?? metaRow.pipeline_column_name  ?? '');

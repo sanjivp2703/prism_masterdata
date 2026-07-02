@@ -492,13 +492,11 @@ export async function pollOnePipeline(
       // statements see the same stream data when wrapped in BEGIN/COMMIT.
       //
       // Step 1 — classify (non-consuming SELECT)
-      // Step 2 — snapshot queue count before consuming
-      // Step 3 — consuming MERGE (advances stream offset on COMMIT)
+      // Step 2 — consuming MERGE (advances stream offset on COMMIT)
 
       await exec(connection, 'BEGIN');
       let txCommitted = false;
       let streamRows: any[] = [];
-      let queueBefore = 0;
       // NOTE: hasDeletes is the function-scoped var (hoisted above) — it's read
       // after this callback by the export rebuild, so it must NOT be re-declared here.
 
@@ -548,13 +546,7 @@ export async function pollOnePipeline(
           console.log(`[Poller] Pipeline ${pid}: ${nullCnt} new row(s) with NULL "${column_name}" — will rebuild export to include them as-is`);
         }
 
-        // Step 2: Snapshot queue size before consuming (within same tx snapshot)
-        const [preMergeRow] = await exec(connection,
-          `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
-          [pid]);
-        queueBefore = Number(preMergeRow?.CNT ?? preMergeRow?.cnt ?? 0);
-
-        // Step 3: Consuming MERGE — push list B into PIPELINE_QUEUE (within tx)
+        // Step 2: Consuming MERGE — push list B into PIPELINE_QUEUE (within tx)
         // IMPORTANT: this DML always runs, even when listB is empty.  Referencing
         // the stream in ANY DML advances the stream offset on COMMIT — skipping this
         // would leave SYSTEM$STREAM_HAS_DATA true forever and re-count the same data
@@ -1004,8 +996,6 @@ async function pollOneTable(cols: PipelineRef[]): Promise<void> {
 // ── Background loop ───────────────────────────────────────────────────────────
 
 export function startPoller(): void {
-  if (process.env.NEXT_PUBLIC_APP_MODE !== 'premium') return;
-
   // Guard against hot-reload creating multiple intervals in development
   const g = global as any;
   if (g.__pipelinePollerStarted) return;

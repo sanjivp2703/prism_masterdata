@@ -1,7 +1,6 @@
 import { cookies } from 'next/headers';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { premiumModeGuard } from '@/app/api/_lib/feature-flags';
 import { readFilePipelineRowsForDownload } from '@/app/api/_lib/op-file-pipeline';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
@@ -30,9 +29,6 @@ export async function GET(
   const cookieStore = await cookies();
   const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
   if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
-  const modeBlocked = premiumModeGuard();
-  if (modeBlocked) return modeBlocked;
-
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
   if (!Number.isFinite(pid) || pid <= 0) {

@@ -12,7 +12,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import type { Domain } from './DomainSelector';
+import type { Domain } from './domain-types';
 import CreateDomainModal from './CreateDomainModal';
 
 export default function CompactDomainPicker({

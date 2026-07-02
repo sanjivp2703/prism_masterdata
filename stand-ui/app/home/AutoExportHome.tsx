@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import type { Domain } from '@/app/components/DomainSelector';
+import type { Domain } from '@/app/components/domain-types';
 import CompactDomainPicker from '@/app/components/CompactDomainPicker';
 import PipelinesView, { type Pipeline } from './PipelinesView';
 import StandardizationsView from './StandardizationsView';

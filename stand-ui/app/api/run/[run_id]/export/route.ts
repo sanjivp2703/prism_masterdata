@@ -5,7 +5,6 @@ import {
   loadOpRunState,
   saveOpRunState,
   type OpRunState,
-  type OpGroup,
 } from '@/app/api/_lib/op-auto-group';
 
 async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {

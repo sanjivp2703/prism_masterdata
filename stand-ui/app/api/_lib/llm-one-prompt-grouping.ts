@@ -31,8 +31,7 @@
 
 import fs   from 'fs';
 import path from 'path';
-import type { RunItemForPairing } from './pairscore';
-import type { FinalGroup } from './clique-detection';
+import type { RunItemForPairing, FinalGroup } from './grouping-types';
 import {
   type ConventionRules,
   describeConventionRules,

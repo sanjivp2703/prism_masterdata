@@ -6,7 +6,6 @@ import "./globals.css";
 import { decodeSession, SESSION_COOKIE_NAME } from "@/app/api/_lib/session";
 import UserMenu  from "@/app/components/UserMenu";
 import RoleBadge from "@/app/components/RoleBadge";
-import ModeBadge from "@/app/components/ModeBadge";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -77,7 +76,6 @@ export default async function RootLayout({
                 gap:        8,
               }}
             >
-              <ModeBadge />
               <RoleBadge role={session.role ?? 'user'} />
               <UserMenu
                 name={session.name}

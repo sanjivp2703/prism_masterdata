@@ -17,16 +17,6 @@ function parseVariant(v: any): Record<string, any> {
   try { return JSON.parse(String(v)); } catch { return {}; }
 }
 
-function colIndexToLetter(idx: number): string {
-  let s = '';
-  let n = idx + 1;
-  while (n > 0) {
-    const rem = (n - 1) % 26;
-    s = String.fromCharCode(65 + rem) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
-}
 
 export type SheetsSyncPipeline = {
   file_source_meta: any;

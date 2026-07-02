@@ -54,51 +54,6 @@ export async function initBaseline(
 }
 
 /**
- * Diffs `currentValues` against the persisted seen-set.
- *
- * Uses a Redis pipeline to check membership for every value in a single
- * round-trip, then SADDs any new values back in one call.
- *
- * Returns the list of values not previously seen, or null if Redis is
- * unavailable (caller should fall back to in-process logic).
- */
-export async function diffAndUpdate(
-  tableFqn: string,
-  columnName: string,
-  currentValues: string[],
-): Promise<string[] | null> {
-  const redis = getRedisClient();
-  if (!redis) return null;
-
-  try {
-    const key = seenKey(tableFqn, columnName);
-
-    if (currentValues.length === 0) return [];
-
-    // Pipeline: SISMEMBER for every value in one round-trip
-    const pipeline = redis.pipeline();
-    for (const v of currentValues) {
-      pipeline.sismember(key, v);
-    }
-    const results = await pipeline.exec();
-    if (!results) return null;
-
-    const newValues = currentValues.filter((_, i) => {
-      const [err, isMember] = results[i] as [Error | null, number];
-      return !err && isMember === 0;
-    });
-
-    if (newValues.length > 0) {
-      await redis.sadd(key, ...newValues);
-    }
-
-    return newValues;
-  } catch {
-    return null; // Redis error — caller degrades gracefully
-  }
-}
-
-/**
  * Deletes the seen-set for this source, resetting the baseline.
  * Call this when the user explicitly wants to start fresh.
  */
