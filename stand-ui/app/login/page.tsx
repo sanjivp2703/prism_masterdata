@@ -132,7 +132,15 @@ export default async function LoginPage({ searchParams }: Props) {
           className="mt-6 text-xs text-center"
           style={{ color: 'var(--text-hint)', maxWidth: 320 }}
         >
-          By signing in you agree to use Prism only for authorised internal purposes.
+          By signing in you agree to our{' '}
+          <a href="/terms" style={{ color: 'var(--text-hint)', textDecoration: 'underline' }}>
+            Terms
+          </a>{' '}
+          and{' '}
+          <a href="/privacy" style={{ color: 'var(--text-hint)', textDecoration: 'underline' }}>
+            Privacy policy
+          </a>
+          .
         </p>
       </div>
     </div>

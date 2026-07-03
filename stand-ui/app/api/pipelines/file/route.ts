@@ -2,7 +2,7 @@ import { cookies } from 'next/headers';
 import { google } from 'googleapis';
 import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { insertFileRows, readFileDistinctValues } from '@/app/api/_lib/op-file-pipeline';
+import { insertFileRows, readFileDistinctValues, readAllSheetRows } from '@/app/api/_lib/op-file-pipeline';
 import { fetchPipelineById, createRunFromQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
 import { encryptSecret } from '@/app/api/_lib/crypto';
@@ -319,12 +319,8 @@ export async function POST(request: Request) {
       try {
         const auth   = getOAuth2Client(gAccessToken, gRefreshToken, gTokenExpiry);
         const sheetsApi = google.sheets({ version: 'v4', auth });
-        const tabPrefix = sheet_tab_name ? `'${sheet_tab_name.replace(/'/g, "\\'")}'!` : '';
-        const srcRes = await sheetsApi.spreadsheets.values.get({
-          spreadsheetId: spreadsheet_id,
-          range: `${tabPrefix}A1:ZZZ10000`,
-        });
-        const allRows = srcRes.data.values ?? [];
+        // Paged read (correct A1 quote escaping) — no silent 10k-row truncation.
+        const allRows = await readAllSheetRows(sheetsApi, spreadsheet_id, sheet_tab_name);
         if (allRows.length >= 2) {
           const headerRow  = allRows[0].map(String);
           const dataRows   = allRows.slice(1);

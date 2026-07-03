@@ -22,6 +22,7 @@ import { runOpExportDirect } from './op-export';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 import { beginStandardization, endStandardization, isPipelineStandardizing } from './pipeline-coordination';
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
+import { pausePipelineWithMessage } from './pipeline-alerts';
 
 const HOUR_MS = 60 * 60 * 1_000;
 
@@ -39,6 +40,62 @@ export const QUEUE_STANDARDIZE_THRESHOLD = 25;
 const RECONCILE_QUEUE_BATCH = 5_000;
 
 const processingPipelineIds = new Set<number>();
+
+// ── Standardization failure backoff ──────────────────────────────────────────
+//
+// A persistently failing standardization used to retry every 30 s forever, each
+// attempt burning LLM tokens (errors were swallowed with the queue left intact,
+// so the threshold trigger re-fired every poll).  Track consecutive failures
+// per pipeline in memory: exponential backoff between retries, and after
+// MAX_CONSECUTIVE_FAILURES the pipeline is paused with an explanatory message.
+// Resuming the pipeline (or a process restart) clears the tracker.
+
+const MAX_CONSECUTIVE_FAILURES = 5;
+const MAX_BACKOFF_MS           = 60 * 60_000; // cap: 60 minutes
+
+interface StandardizationFailure {
+  count:         number;
+  nextAttemptAt: number; // epoch ms — skip standardization attempts before this
+}
+
+const standardizationFailures = new Map<number, StandardizationFailure>();
+
+/** True while a pipeline is inside its failure-backoff window — the poller's
+ *  threshold trigger and the hourly sweep both skip it until nextAttemptAt. */
+export function isStandardizationBackedOff(pipelineId: number): boolean {
+  const f = standardizationFailures.get(pipelineId);
+  return f != null && Date.now() < f.nextAttemptAt;
+}
+
+function clearStandardizationFailures(pipelineId: number): void {
+  standardizationFailures.delete(pipelineId);
+}
+
+async function recordStandardizationFailure(pipelineId: number, err: unknown): Promise<void> {
+  const count  = (standardizationFailures.get(pipelineId)?.count ?? 0) + 1;
+  const errMsg = String((err as any)?.message ?? err ?? 'unknown error').slice(0, 200);
+
+  if (count >= MAX_CONSECUTIVE_FAILURES) {
+    standardizationFailures.delete(pipelineId); // reset — a resume starts fresh
+    console.error(
+      `[Standardize] Pipeline ${pipelineId}: ${count} consecutive standardization failures — pausing pipeline. Latest error: ${errMsg}`,
+    );
+    await pausePipelineWithMessage(
+      pipelineId,
+      `Automatic standardization failed ${MAX_CONSECUTIVE_FAILURES} times in a row — paused. Latest error: ${errMsg}. Resume the pipeline to retry.`,
+    ).catch((pauseErr) =>
+      console.error(`[Standardize] Pipeline ${pipelineId}: failed to pause after repeated failures:`, pauseErr),
+    );
+    return;
+  }
+
+  const backoffMs = Math.min(2 ** count * 60_000, MAX_BACKOFF_MS);
+  standardizationFailures.set(pipelineId, { count, nextAttemptAt: Date.now() + backoffMs });
+  console.error(
+    `[Standardize] Pipeline ${pipelineId}: standardization failure ${count}/${MAX_CONSECUTIVE_FAILURES} — ` +
+    `backing off ${Math.round(backoffMs / 60_000)} min before retry. Error: ${errMsg}`,
+  );
+}
 
 async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -382,6 +439,26 @@ export async function fetchQueueLiteralsWithFreq(
     .filter((r) => r.literal_value);
 }
 
+function buildInitialQueueRunState(
+  literals: string[],
+  frequencies?: Map<string, number>,
+): OpRunState {
+  return {
+    status:    'created',
+    items:     literals.map((lv, idx) => ({
+      run_item_id:         idx + 1,
+      literal_value:       lv,
+      source_frequency:    frequencies?.get(lv) ?? 1,
+      matched_from_lookup: false,
+    })),
+    groups:    [],
+    ungrouped: literals.map((lv) => ({
+      literal_value:       lv,
+      matched_from_lookup: false,
+    })),
+  };
+}
+
 export async function createRunFromQueue(
   connection: any,
   pipeline: PipelineForProcessing,
@@ -390,6 +467,48 @@ export async function createRunFromQueue(
 ): Promise<number> {
   const conceptKey = pipeline.domain_name?.trim() || 'mobile_carrier';
   const nonce = `hourly_${pipeline.pipeline_id}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+  // Reuse the newest still-pending run from a previous failed attempt for this
+  // pipeline (a failed standardization leaves its run in 'created'/'running')
+  // instead of inserting a fresh RUNS row per retry.  The creation_nonce prefix
+  // `hourly_<pipeline_id>_` scopes the lookup to this pipeline; source columns
+  // are matched too as a belt-and-braces check.  Any lookup failure falls back
+  // to the plain insert below.
+  try {
+    const pendingRows = await exec(
+      connection,
+      `SELECT run_id FROM STAND_DB.STAND_INTERNAL.RUNS
+       WHERE creation_nonce LIKE ? ESCAPE '\\\\'
+         AND source_relation = ?
+         AND source_column   = ?
+         AND run_status IN ('created', 'running')
+       ORDER BY run_id DESC
+       LIMIT 1`,
+      [`hourly_${pipeline.pipeline_id}\\_%`, pipeline.table_fqn, pipeline.column_name],
+    );
+    if (pendingRows.length) {
+      const reuseId = Number(pendingRows[0].RUN_ID ?? pendingRows[0].run_id);
+      if (Number.isFinite(reuseId) && reuseId > 0) {
+        await exec(
+          connection,
+          `UPDATE STAND_DB.STAND_INTERNAL.RUNS
+           SET run_status = 'created', updated_at = CURRENT_TIMESTAMP()
+           WHERE run_id = ?`,
+          [reuseId],
+        );
+        await saveOpRunState(connection, reuseId, buildInitialQueueRunState(literals, frequencies));
+        console.log(
+          `[Standardize] Pipeline ${pipeline.pipeline_id}: reusing pending run ${reuseId} from a previous attempt`,
+        );
+        return reuseId;
+      }
+    }
+  } catch (reuseErr) {
+    console.warn(
+      `[Standardize] Pipeline ${pipeline.pipeline_id}: pending-run lookup failed — creating a new run instead:`,
+      reuseErr,
+    );
+  }
 
   await exec(
     connection,
@@ -409,21 +528,7 @@ export async function createRunFromQueue(
   }
   const runId = Number(runIdRows[0].RUN_ID ?? runIdRows[0].run_id);
 
-  const initialState: OpRunState = {
-    status:    'created',
-    items:     literals.map((lv, idx) => ({
-      run_item_id:         idx + 1,
-      literal_value:       lv,
-      source_frequency:    frequencies?.get(lv) ?? 1,
-      matched_from_lookup: false,
-    })),
-    groups:    [],
-    ungrouped: literals.map((lv) => ({
-      literal_value:       lv,
-      matched_from_lookup: false,
-    })),
-  };
-  await saveOpRunState(connection, runId, initialState);
+  await saveOpRunState(connection, runId, buildInitialQueueRunState(literals, frequencies));
   return runId;
 }
 
@@ -522,6 +627,10 @@ export async function bulkProcessPipelineQueue(
         broadcastPipelineEvent({ type: 'metrics_updated' });
       }
 
+      // A successful user-triggered bulk run also resets the failure tracker
+      // (the user explicitly retried and it worked).
+      clearStandardizationFailures(pipeline.pipeline_id);
+
       return {
         run_id:             runId,
         groups_created:     groupResult.groups_created,
@@ -550,6 +659,14 @@ export async function processPipelineQueue(
   const tag = reason === 'threshold' ? 'Queue' : 'Hourly';
   if (processingPipelineIds.has(pipeline.pipeline_id)) {
     console.log(`[${tag}] Pipeline ${pipeline.pipeline_id}: already processing — skip`);
+    return;
+  }
+  if (isStandardizationBackedOff(pipeline.pipeline_id)) {
+    const f = standardizationFailures.get(pipeline.pipeline_id);
+    console.log(
+      `[${tag}] Pipeline ${pipeline.pipeline_id}: in failure backoff ` +
+      `(${f?.count ?? '?'} consecutive failure(s)) — retry after ${new Date(f?.nextAttemptAt ?? 0).toISOString()}`,
+    );
     return;
   }
   processingPipelineIds.add(pipeline.pipeline_id);
@@ -589,13 +706,19 @@ export async function processPipelineQueue(
       ) ?? [];
 
       if (exportedLiterals.length === 0) {
-        console.warn(
+        console.error(
           `[${tag}] Pipeline ${pipeline.pipeline_id}: run ${runId} produced no groups — queue unchanged`,
         );
         await exec(
           connection,
           `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP() WHERE run_id = ?`,
           [runId],
+        );
+        // Counts toward the failure backoff: with the queue intact, the threshold
+        // trigger would otherwise re-fire this (token-burning) LLM pass every 30 s.
+        await recordStandardizationFailure(
+          pipeline.pipeline_id,
+          new Error('LLM grouping produced no groups — queue unchanged'),
         );
         return;
       }
@@ -626,6 +749,9 @@ export async function processPipelineQueue(
 
       broadcastPipelineEvent({ type: 'metrics_updated' });
 
+      // Full success — reset the consecutive-failure tracker.
+      clearStandardizationFailures(pipeline.pipeline_id);
+
       console.log(
         `[${tag}] Pipeline ${pipeline.pipeline_id}: run ${runId} complete — ` +
         `${exportResult.items_written} mapping(s) written, ` +
@@ -633,7 +759,8 @@ export async function processPipelineQueue(
       );
     });
   } catch (e) {
-    console.error(`[${tag}] Pipeline ${pipeline.pipeline_id}: failed:`, e);
+    console.error(`[${tag}] Pipeline ${pipeline.pipeline_id}: standardization failed:`, e);
+    await recordStandardizationFailure(pipeline.pipeline_id, e);
   } finally {
     processingPipelineIds.delete(pipeline.pipeline_id);
     if (beginEndStandardization) endStandardization(pipeline.pipeline_id);

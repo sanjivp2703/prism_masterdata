@@ -279,8 +279,11 @@ export async function refreshExportTable(
     while (sourceColsUpper.has(orderColName.toUpperCase())) orderColName = `_${orderColName}`;
 
     // ── Create / replace the export table ─────────────────────────────────
+    // COPY GRANTS preserves consumers' privileges (e.g. SELECT granted to
+    // downstream roles) across the rebuild — without it every CREATE OR REPLACE
+    // drops all grants on the export table.
     await exec(conn, `
-      CREATE OR REPLACE TABLE ${exportRef} AS
+      CREATE OR REPLACE TABLE ${exportRef} COPY GRANTS AS
       SELECT
         ${selectList},
         ROW_NUMBER() OVER (ORDER BY ${ordering.orderExpr}) AS ${quoteIdent(orderColName)}

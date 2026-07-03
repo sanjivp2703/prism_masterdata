@@ -1,8 +1,9 @@
 import 'server-only';
 
 import { google } from 'googleapis';
+import type { sheets_v4 } from 'googleapis';
 import { withSnowflake } from './snowflake';
-import { sqlStringLiteral } from './normalize';
+import { normalizeLiteral, sqlStringLiteral } from './normalize';
 import { decryptSecret } from './crypto';
 
 function execSql(conn: any, sqlText: string, binds: any[]): Promise<any[]> {
@@ -17,6 +18,92 @@ function execSql(conn: any, sqlText: string, binds: any[]): Promise<any[]> {
 function parseVariant(v: any): Record<string, any> {
   if (typeof v === 'object' && v !== null) return v as Record<string, any>;
   try { return JSON.parse(String(v)); } catch { return {}; }
+}
+
+/** Max rows per Google Sheets read/write call; larger sheets page in a loop. */
+const SHEETS_PAGE_ROWS = 10000;
+
+/**
+ * Escape a sheet/tab name for A1 notation. A1 escapes embedded single quotes
+ * by DOUBLING them (not backslash-escaping): `Bob's Tab` → `'Bob''s Tab'`.
+ */
+export function a1Sheet(tab: string): string {
+  return `'${tab.replace(/'/g, "''")}'`;
+}
+
+/** 1-indexed column number → A1 column letters (1 → A, 27 → AA). */
+function a1Col(n: number): string {
+  let s = '';
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/**
+ * Read ALL rows from a sheet tab, paging in SHEETS_PAGE_ROWS-row windows so
+ * sheets larger than a single page (the old hardcoded `A1:ZZZ10000` cap) are
+ * not silently truncated. Stops when a page comes back short or empty.
+ */
+export async function readAllSheetRows(
+  sheets: sheets_v4.Sheets,
+  spreadsheetId: string,
+  tabName: string,
+): Promise<any[][]> {
+  const prefix = tabName ? `${a1Sheet(tabName)}!` : '';
+  const all: any[][] = [];
+  let startRow = 1;
+  for (;;) {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${prefix}A${startRow}:ZZZ${startRow + SHEETS_PAGE_ROWS - 1}`,
+    });
+    const page = res.data.values ?? [];
+    all.push(...page);
+    if (page.length < SHEETS_PAGE_ROWS) break;
+    startRow += SHEETS_PAGE_ROWS;
+  }
+  return all;
+}
+
+/**
+ * Ensure the target tab has at least `minRows` rows so chunked values.update
+ * calls anchored past the current grid don't fail with "exceeds grid limits".
+ * Silently no-ops if the tab can't be resolved (the subsequent write surfaces
+ * any real failure).
+ */
+async function ensureSheetRows(
+  sheets: sheets_v4.Sheets,
+  spreadsheetId: string,
+  tabName: string,
+  minRows: number,
+): Promise<void> {
+  try {
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: 'sheets(properties(sheetId,title,gridProperties(rowCount)))',
+    });
+    const allSheets = meta.data.sheets ?? [];
+    const target = tabName
+      ? allSheets.find(s => s.properties?.title === tabName)
+      : allSheets[0];
+    const props = target?.properties;
+    if (!props || props.sheetId == null) return;
+    const current = props.gridProperties?.rowCount ?? 0;
+    if (current >= minRows) return;
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          appendDimension: { sheetId: props.sheetId, dimension: 'ROWS', length: minRows - current },
+        }],
+      },
+    });
+  } catch (err: any) {
+    console.warn('[ensureSheetRows] could not pre-size sheet:', err?.message ?? err);
+  }
 }
 
 
@@ -107,9 +194,12 @@ export async function syncSheetsColumn(
           JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
           WHERE lam.domain_id ${domainId != null ? '= ?' : 'IS NULL'}
         `, domainId != null ? [domainId] : []);
+        // Key by the normalized literal so lookups agree with the SQL-side
+        // PRISM_NORMALIZE join used for metrics (card and sheet stay in sync).
         const m: Record<string, string> = {};
         for (const r of mapRows) {
-          m[String(r.LITERAL_VALUE ?? r.literal_value ?? '')] = String(r.ALIAS_NAME ?? r.alias_name ?? '');
+          const lv = String(r.LITERAL_VALUE ?? r.literal_value ?? '');
+          m[normalizeLiteral(lv)] = String(r.ALIAS_NAME ?? r.alias_name ?? '');
         }
         map.set(colCfg.column_name.toLowerCase(), m);
       }
@@ -130,37 +220,61 @@ export async function syncSheetsColumn(
 
   try {
     const sheets    = google.sheets({ version: 'v4', auth: oauth2Client });
-    const tabPrefix = tabName ? `'${tabName.replace(/'/g, "\\'")}'!` : '';
-    const outTabPfx = outputTabName ? `'${outputTabName.replace(/'/g, "\\'")}'!` : '';
+    const outTabPfx = outputTabName ? `${a1Sheet(outputTabName)}!` : '';
 
-    // Read all source data.
-    const srcRes = await sheets.spreadsheets.values.get({
-      spreadsheetId, range: `${tabPrefix}A1:ZZZ10000`,
-    });
-    const allRows = srcRes.data.values ?? [];
+    // Read all source data (paged past the old 10k-row cap).
+    const allRows = await readAllSheetRows(sheets, spreadsheetId, tabName);
     if (allRows.length < 2) return { ok: true, sheets_updated_rows: 0 };
 
     const sourceHeaders = allRows[0].map(String);
     const dataRows      = allRows.slice(1);
 
-    // Recreate the entire output table: every standardized column gets its
-    // confirmed mapping applied; all other columns carry the raw source value.
-    const outputRows: string[][] = dataRows.map((row: string[]) =>
+    // Build the COMPLETE output grid in memory first: every standardized column
+    // gets its confirmed mapping applied (normalized lookup); all other columns
+    // carry the raw source value.
+    const outputRows: string[][] = dataRows.map((row: any[]) =>
       sourceHeaders.map((header: string, i: number) => {
         const rawVal = String(row[i] ?? '');
         const m      = colMappings.get(header.toLowerCase());
-        return (m && rawVal) ? (m[rawVal] ?? rawVal) : rawVal;
+        return (m && rawVal) ? (m[normalizeLiteral(rawVal)] ?? rawVal) : rawVal;
       }),
     );
+    const outputGrid = [sourceHeaders, ...outputRows];
 
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: outputSpreadsheetId, range: `${outTabPfx}A:ZZZ`,
-    });
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: outputSpreadsheetId, range: `${outTabPfx}A1`,
-      valueInputOption: 'RAW',
-      requestBody: { values: [sourceHeaders, ...outputRows] },
-    });
+    // Non-destructive write: overwrite in place with values.update, chunked to
+    // ≤ SHEETS_PAGE_ROWS rows per call, WITHOUT clearing first. If any chunk
+    // fails we abort (outer catch) and leave the remaining old content rather
+    // than an emptied output sheet.
+    if (outputGrid.length > SHEETS_PAGE_ROWS) {
+      await ensureSheetRows(sheets, outputSpreadsheetId, outputTabName, outputGrid.length);
+    }
+    for (let start = 0; start < outputGrid.length; start += SHEETS_PAGE_ROWS) {
+      const chunk = outputGrid.slice(start, start + SHEETS_PAGE_ROWS);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: outputSpreadsheetId,
+        range: `${outTabPfx}A${start + 1}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: chunk },
+      });
+    }
+
+    // Only AFTER a fully successful write: clear stale leftovers — rows below
+    // the new grid and columns to the right of the new width. Failures here are
+    // logged but don't fail the sync (the data itself is already written).
+    try {
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: outputSpreadsheetId,
+        range: `${outTabPfx}A${outputGrid.length + 1}:ZZZ`,
+      });
+      if (sourceHeaders.length > 0) {
+        await sheets.spreadsheets.values.clear({
+          spreadsheetId: outputSpreadsheetId,
+          range: `${outTabPfx}${a1Col(sourceHeaders.length + 1)}1:ZZZ`,
+        });
+      }
+    } catch (clearErr: any) {
+      console.warn('[syncSheetsColumn] trailing clear failed (data written OK):', clearErr?.message ?? clearErr);
+    }
 
     return { ok: true, sheets_updated_rows: dataRows.length };
   } catch (err: any) {
@@ -224,14 +338,12 @@ export async function refreshSheetsFileRows(
   oauth2Client.setCredentials({ refresh_token: refreshTokenPlain });
 
   try {
-    const sheets    = google.sheets({ version: 'v4', auth: oauth2Client });
-    const tabPrefix = sheet_tab_name ? `'${String(sheet_tab_name).replace(/'/g, "\\'")}'!` : '';
-    const srcRes    = await sheets.spreadsheets.values.get({
-      spreadsheetId: spreadsheet_id,
-      range: `${tabPrefix}A1:ZZZ10000`,
-    });
-
-    const allRows = srcRes.data.values ?? [];
+    const sheets  = google.sheets({ version: 'v4', auth: oauth2Client });
+    const allRows = await readAllSheetRows(
+      sheets,
+      String(spreadsheet_id),
+      sheet_tab_name ? String(sheet_tab_name) : '',
+    );
     console.log(`[refreshSheetsFileRows] Pipeline ${pipelineId}: read ${allRows.length} rows from sheet (incl. header)`);
     if (allRows.length < 2) {
       console.warn(`[refreshSheetsFileRows] Pipeline ${pipelineId}: sheet has < 2 rows — returning 0 metrics`);
@@ -322,12 +434,45 @@ export async function refreshSheetsFileRows(
     // Write per-column metrics into file_source_meta so the GET route's virtual
     // expansion can assign correct per-column values instead of duplicating the
     // aggregate to every virtual entry.
-    const updatedMeta = { ...meta, columns: updatedColumns };
-    await withSnowflake(async (conn) => execSql(conn,
-      `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-       SET file_source_meta = PARSE_JSON(?)
-       WHERE pipeline_id = ?`,
-      [JSON.stringify(updatedMeta), pipelineId]));
+    //
+    // Lost-update guard: `meta` was captured at cycle start — if a user added a
+    // column or re-authed (new refresh_token) mid-cycle, writing the stale copy
+    // back would revert their change. Re-SELECT the CURRENT meta and deep-merge
+    // only the per-column metrics computed above (matched by column_name) into
+    // the fresh copy; anything present in the fresh copy that the stale copy
+    // lacked (new columns, rotated refresh_token) is preserved untouched.
+    await withSnowflake(async (conn) => {
+      const freshRows = await execSql(conn, `
+        SELECT file_source_meta
+        FROM STAND_DB.STAND_INTERNAL.PIPELINES
+        WHERE pipeline_id = ?
+      `, [pipelineId]);
+      const freshMeta = freshRows.length > 0
+        ? parseVariant(freshRows[0].FILE_SOURCE_META ?? freshRows[0].file_source_meta ?? null)
+        : {};
+      const base = Object.keys(freshMeta).length > 0 ? freshMeta : meta;
+
+      const metricsByCol = new Map<string, Record<string, any>>();
+      for (const c of updatedColumns) {
+        const name = String(c.column_name ?? '');
+        if (name && c.total_source_values != null) metricsByCol.set(name, c);
+      }
+
+      const baseCols: any[] = Array.isArray(base.columns) ? base.columns : updatedColumns;
+      const mergedCols = baseCols.map((c: any) => {
+        const m = metricsByCol.get(String(c?.column_name ?? ''));
+        return m
+          ? { ...c, total_source_values: m.total_source_values, total_mapped: m.total_mapped }
+          : c;
+      });
+
+      const updatedMeta = { ...base, columns: mergedCols };
+      await execSql(conn,
+        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
+         SET file_source_meta = PARSE_JSON(?)
+         WHERE pipeline_id = ?`,
+        [JSON.stringify(updatedMeta), pipelineId]);
+    });
 
     const queueSize = Math.max(0, totalSourceValues - totalMapped);
     console.log(`[refreshSheetsFileRows] Pipeline ${pipelineId}: aggregate → totalSource=${totalSourceValues}, totalMapped=${totalMapped}, queue=${queueSize}`);
@@ -405,11 +550,13 @@ export async function readFilePipelineRowsForDownload(
     JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES aan ON aan.alias_id = lam.alias_id
     WHERE 1=1 ${domainFilter}
   `, []);
+  // Key by normalizeLiteral so the download matches the same values as the
+  // SQL-side PRISM_NORMALIZE joins used for metrics.
   const mappings = new Map<string, string>();
   for (const mr of mappingRows) {
     const lv = String(mr.LITERAL_VALUE ?? mr.literal_value ?? '');
     const an = String(mr.ALIAS_NAME    ?? mr.alias_name    ?? '');
-    mappings.set(lv.toLowerCase().trim(), an);
+    mappings.set(normalizeLiteral(lv), an);
   }
 
   const stdHeader   = `${columnName}_STANDARDIZED`;
@@ -417,7 +564,7 @@ export async function readFilePipelineRowsForDownload(
   const outRows     = fileRows.map((fr: any) => {
     const cd     = parseVariant(fr.COLUMN_DATA ?? fr.column_data);
     const rawVal = String(cd[columnName] ?? '');
-    const stdVal = mappings.get(rawVal.toLowerCase().trim()) ?? rawVal;
+    const stdVal = mappings.get(normalizeLiteral(rawVal)) ?? rawVal;
     return [...headers.map(h => String(cd[h] ?? '')), stdVal];
   });
 
