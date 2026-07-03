@@ -2,6 +2,36 @@ import { NextRequest } from 'next/server';
 import { cookies } from 'next/headers';
 import { google } from 'googleapis';
 import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { parseFqn, quoteIdent, isSimpleIdent } from '@/app/api/_lib/op-one-time';
+
+/**
+ * Validate and quote a user-supplied DB.SCHEMA.TABLE target so it can be
+ * safely interpolated into DDL. Unquoted parts are uppercased (matching
+ * Snowflake's resolution of unquoted identifiers); every part is then wrapped
+ * in double quotes. Rejects malformed FQNs and anything targeting Prism's
+ * internal schema.
+ */
+function buildSafeTargetFqn(rawFqn: string): { fqn: string } | { error: string } {
+  let parts: { db: string; schema: string; table: string };
+  try {
+    parts = parseFqn(rawFqn);
+  } catch {
+    return { error: 'Target table must be a fully qualified DB.SCHEMA.TABLE name.' };
+  }
+
+  const resolved = [parts.db, parts.schema, parts.table].map((p) => {
+    const m = /^"(.*)"$/.exec(p);
+    return m ? m[1].replace(/""/g, '"') : p.toUpperCase();
+  });
+
+  if (resolved.some((p) => !isSimpleIdent(p))) {
+    return { error: 'Target table name contains unsupported characters.' };
+  }
+  if (resolved[0] === 'STAND_DB' && resolved[1] === 'STAND_INTERNAL') {
+    return { error: 'Cannot export into the STAND_DB.STAND_INTERNAL schema.' };
+  }
+  return { fqn: resolved.map(quoteIdent).join('.') };
+}
 
 async function exec(connection: any, sqlText: string, binds?: any[]) {
   return new Promise<any[]>((resolve, reject) => {
@@ -25,7 +55,7 @@ function getOAuth2Client() {
 }
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
-const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}`;
+const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
 // ── POST /api/global-standardizations/export ──────────────────────────────────
 // Body: { format: 'sheets' | 'snowflake', snowflakeTableFqn?: string }
@@ -183,11 +213,23 @@ export async function POST(request: NextRequest) {
       : 'STAND_DB.STAND_INTERNAL.GLOBAL_CANONICAL_MAPPINGS';
     const targetFqn = snowflakeTableFqn?.trim() || defaultFqn;
 
+    // Never interpolate the raw string: parse, validate, and fully quote each
+    // part. The internal-schema block only applies to user-supplied targets —
+    // the legacy no-domain default deliberately lives in STAND_INTERNAL.
+    let safeFqn: string;
+    if (snowflakeTableFqn?.trim()) {
+      const built = buildSafeTargetFqn(targetFqn);
+      if ('error' in built) return Response.json({ error: built.error }, { status: 400 });
+      safeFqn = built.fqn;
+    } else {
+      safeFqn = targetFqn.split('.').map(quoteIdent).join('.');
+    }
+
     try {
       await withSnowflake(async (connection) => {
         await exec(
           connection,
-          `CREATE OR REPLACE TABLE ${targetFqn} AS
+          `CREATE OR REPLACE TABLE ${safeFqn} AS
            SELECT
              aan.alias_name    AS canonical_name,
              lam.literal_value AS raw_value,

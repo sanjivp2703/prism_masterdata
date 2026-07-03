@@ -25,3 +25,16 @@ export function normalizeLiteral(value: string | null | undefined): string {
   // collapse whitespace runs, trim, case-fold
   return out.replace(/\s+/g, ' ').trim().toLowerCase();
 }
+
+/**
+ * Escape a string for safe interpolation inside a single-quoted Snowflake SQL
+ * string literal (e.g. `column_data['<here>']`). Escapes backslashes FIRST,
+ * then single quotes — escaping quotes alone is bypassable via a trailing
+ * backslash (`foo\` + `'` → `foo\\'` breaks out of the literal).
+ *
+ * Prefer bind parameters wherever possible; use this only where the SQL shape
+ * requires literal interpolation (VARIANT key access, etc.).
+ */
+export function sqlStringLiteral(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}

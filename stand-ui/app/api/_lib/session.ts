@@ -8,10 +8,19 @@ export interface SessionPayload {
   name: string;
   pictureUrl: string | null;
   role: 'admin' | 'user';
+  /** Session version — must match ACCOUNTS.session_version to be accepted by
+   *  version-checked routes. Bumped server-side to revoke live sessions. */
+  v?: number;
+  /** Expiry (epoch ms). Set on encode; sessions without it are rejected. */
+  exp?: number;
 }
 
 export const SESSION_COOKIE_NAME = 'prism_session';
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// Mark cookies Secure in production (HTTPS); keep plain-http localhost dev working.
+const SECURE_SUFFIX = process.env.NODE_ENV === 'production' ? '; Secure' : '';
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
 
@@ -65,7 +74,12 @@ async function importKey(secret: string): Promise<CryptoKey> {
 // ── Public API ────────────────────────────────────────────────────────────
 
 export async function encodeSession(payload: SessionPayload): Promise<string> {
-  const data = encodePayload(payload);
+  const full: SessionPayload = {
+    ...payload,
+    v:   payload.v   ?? 1,
+    exp: payload.exp ?? Date.now() + SESSION_TTL_MS,
+  };
+  const data = encodePayload(full);
   const key  = await importKey(getSecret());
   const sig  = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
   return `${data}.${toBase64url(sig)}`;
@@ -85,7 +99,10 @@ export async function decodeSession(cookie: string): Promise<SessionPayload | nu
       new TextEncoder().encode(data),
     );
     if (!valid) return null;
-    return decodePayload(data);
+    const payload = decodePayload(data);
+    // No/invalid exp = treat as expired (forces one re-login after deploy).
+    if (typeof payload.exp !== 'number' || payload.exp < Date.now()) return null;
+    return payload;
   } catch {
     return null;
   }
@@ -93,9 +110,23 @@ export async function decodeSession(cookie: string): Promise<SessionPayload | nu
 
 export async function buildSessionCookie(payload: SessionPayload): Promise<string> {
   const value = await encodeSession(payload);
-  return `${SESSION_COOKIE_NAME}=${value}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}`;
+  return `${SESSION_COOKIE_NAME}=${value}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${SECURE_SUFFIX}`;
 }
 
 export function clearSessionCookie(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`;
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${SECURE_SUFFIX}`;
+}
+
+/**
+ * Sanitize a user/state-supplied post-auth redirect target.
+ * Only same-origin relative paths are allowed: must start with '/', must not
+ * be protocol-relative ('//…') or contain a backslash (browsers normalize
+ * '/\' to '//'). Anything else falls back to `fallback`.
+ */
+export function sanitizeReturnTo(value: unknown, fallback = '/home'): string {
+  if (typeof value !== 'string' || value.length === 0) return fallback;
+  if (!value.startsWith('/')) return fallback;
+  if (value.startsWith('//')) return fallback;
+  if (value.includes('\\')) return fallback;
+  return value;
 }

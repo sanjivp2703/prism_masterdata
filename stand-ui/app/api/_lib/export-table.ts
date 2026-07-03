@@ -19,6 +19,7 @@
 
 import 'server-only';
 import { withSnowflake } from './snowflake';
+import { sqlStringLiteral } from './normalize';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -427,7 +428,7 @@ async function updateFilePipelineMappedCount(
 
     if (source_fqn.startsWith('FILE:')) {
       // CSV/Excel: PIPELINE_FILE_ROWS holds all source rows for this pipeline.
-      const safeCol = column_name.replace(/'/g, "\\'");
+      const safeCol = sqlStringLiteral(column_name);
       const [statsRow] = await exec(conn, `
         WITH src AS (
           SELECT PRISM_NORMALIZE(column_data['${safeCol}']::VARCHAR) AS nv,

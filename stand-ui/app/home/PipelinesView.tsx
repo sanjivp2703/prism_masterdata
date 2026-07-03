@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import PipelineDetail from './PipelineDetail';
 import CompactDomainPicker from '@/app/components/CompactDomainPicker';
 import ExportLookupModal from '@/app/components/ExportLookupModal';
+import { showToast } from '@/app/components/Toast';
 import type { Domain } from '@/app/components/domain-types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -942,13 +943,35 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
   // ── Whole-card actions (loop over a card's member columns) ────────────────────
 
   async function patchMembers(members: Pipeline[], status: 'paused' | 'active') {
-    await Promise.all(members.map(m =>
-      fetch(`/api/pipelines/${m.pipeline_id}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
-      }).catch(() => {})));
+    if (members.length === 0) return;
+    // Optimistic flip; revert any member whose PATCH fails.
     const ids = new Set(members.map(m => m.pipeline_id));
+    const prevStatuses = new Map(members.map(m => [m.pipeline_id, m.status]));
     setPipelines(prev => prev.map(x => ids.has(x.pipeline_id) ? { ...x, status } : x));
+
+    const results = await Promise.all(members.map(async m => {
+      try {
+        const res = await fetch(`/api/pipelines/${m.pipeline_id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status }),
+        });
+        return { m, ok: res.ok };
+      } catch {
+        return { m, ok: false };
+      }
+    }));
+
+    const failed = results.filter(r => !r.ok);
+    if (failed.length > 0) {
+      const failedIds = new Set(failed.map(f => f.m.pipeline_id));
+      setPipelines(prev => prev.map(x =>
+        failedIds.has(x.pipeline_id)
+          ? { ...x, status: prevStatuses.get(x.pipeline_id) ?? x.status }
+          : x));
+      const verb  = status === 'paused' ? 'pause' : 'resume';
+      const what  = failed.length === 1 ? failed[0].m.column_name : `${failed.length} columns`;
+      showToast(`Couldn't ${verb} ${what}. Please try again.`, 'error');
+    }
   }
 
   async function handlePause(g: PipelineGroup) {
@@ -1008,6 +1031,10 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         const body = await res.json().catch(() => ({}));
         if (!res.ok) {
           console.error(`[ReviewWizard] Pipeline ${columns[i].pipeline_id} failed:`, body?.error);
+          showToast(
+            `Couldn't prepare ${columns[i].column_name} for review${body?.error ? `: ${body.error}` : '.'}`,
+            'error',
+          );
           setBusyKey(null);
           return;
         }
@@ -1033,6 +1060,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
       await fetchPipelines();
       setBusyKey(null);
     } catch {
+      showToast('Couldn’t start the review — check your connection and try again.', 'error');
       setBusyKey(null);
     }
   }
@@ -1060,8 +1088,17 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         if (seen.has(col.pipeline_id)) continue;
         seen.add(col.pipeline_id);
         try {
-          await fetch(`/api/pipelines/${col.pipeline_id}/process-queue`, { method: 'POST' });
-        } catch { /* non-fatal */ }
+          const res = await fetch(`/api/pipelines/${col.pipeline_id}/process-queue`, { method: 'POST' });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            showToast(
+              `Auto-standardize failed for ${col.column_name}${body?.error ? `: ${body.error}` : '.'}`,
+              'error',
+            );
+          }
+        } catch {
+          showToast(`Auto-standardize failed for ${col.column_name} — check your connection.`, 'error');
+        }
       }
     } finally {
       setAutoStdBusyKey(null);
@@ -1104,8 +1141,17 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         });
         const body = await res.json().catch(() => ({}));
         if (res.ok && body?.pipeline) created.push(body.pipeline as Pipeline);
-        else console.error(`[AddColumn] Failed for ${sel.column_name}:`, body?.error);
-      } catch (e) { console.error(`[AddColumn] ${sel.column_name}:`, e); }
+        else {
+          console.error(`[AddColumn] Failed for ${sel.column_name}:`, body?.error);
+          showToast(
+            `Couldn't add column ${sel.column_name}${body?.error ? `: ${body.error}` : '.'}`,
+            'error',
+          );
+        }
+      } catch (e) {
+        console.error(`[AddColumn] ${sel.column_name}:`, e);
+        showToast(`Couldn't add column ${sel.column_name} — check your connection.`, 'error');
+      }
     }
     if (created.length === 0) { setBusyKey(null); return; }
     await fetchPipelines();

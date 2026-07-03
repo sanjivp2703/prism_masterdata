@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { DomainScopeNotice, DomainChangeConfirmModal, UndoButton } from '@/app/components/DomainChangeWarning';
+import ToastHost, { showToast } from '@/app/components/Toast';
 
 const UNGROUPED_KEY = '__UNGROUPED__';
 
@@ -44,6 +45,101 @@ type Snapshot = {
   checkedAliases: Set<string>;
   nextTempGroupId: number;
 };
+
+// ── State-blob autosave types + patch mirror ─────────────────────────────────
+// The RUNS.state blob is the run's source of truth. The client keeps the blob
+// loaded at page load (baseState) and, when saving, applies the SAME pending-UI
+// patch the export path sends (new_groups / moves / alias_name_changes) so the
+// autosaved blob matches what the server computes at "Accept Standardizations".
+
+interface BlobGroup {
+  group_id:          number;
+  alias_name:        string;
+  alias_name_source: string;
+  confidence:        string;
+  from_lookup_chunk: boolean;
+  needs_review?:     boolean;
+  items:             Array<{ literal_value: string; matched_from_lookup: boolean }>;
+}
+
+interface RunStateBlob {
+  status:    string;
+  items:     Array<{ run_item_id?: number; literal_value: string; matched_from_lookup: boolean; [k: string]: unknown }>;
+  groups:    BlobGroup[];
+  ungrouped: Array<{ literal_value: string; matched_from_lookup: boolean }>;
+  rev?:      number;
+  [k: string]: unknown;
+}
+
+interface ExportPatch {
+  new_groups:         Array<{ temp_group_id: number; alias_name_literal_value: string }>;
+  moves:              Array<{ run_item_id: number; group_id: number | null }>;
+  alias_name_changes: Array<{ group_id: number; alias_name_literal_value: string }>;
+}
+
+// Client mirror of applyStatePatch in /api/run/[run_id]/export/route.ts.
+function applyStatePatchToBlob(state: RunStateBlob, patch: ExportPatch): RunStateBlob {
+  let groups    = (state.groups ?? []).map((g) => ({ ...g, items: [...(g.items ?? [])] }));
+  let ungrouped = [...(state.ungrouped ?? [])];
+  const items   = state.items ?? [];
+
+  // 1. Create new groups (client uses negative temp IDs).
+  const tempToReal = new Map<number, number>();
+  let nextGroupId = Math.max(0, ...groups.map((g) => g.group_id)) + 1;
+  for (const ng of patch.new_groups) {
+    const realId = nextGroupId++;
+    tempToReal.set(ng.temp_group_id, realId);
+    groups.push({
+      group_id:          realId,
+      alias_name:        ng.alias_name_literal_value,
+      alias_name_source: 'user_override',
+      confidence:        'h',
+      from_lookup_chunk: false,
+      items:             [],
+    });
+  }
+
+  // 2. Apply item moves.
+  for (const mv of patch.moves) {
+    const targetGroupId = typeof mv.group_id === 'number' && mv.group_id < 0
+      ? tempToReal.get(mv.group_id) ?? null
+      : mv.group_id;
+
+    const item = items.find((it) => it.run_item_id === mv.run_item_id);
+    if (!item) continue;
+    const { literal_value } = item;
+
+    for (const g of groups) {
+      g.items = g.items.filter((gi) => gi.literal_value !== literal_value);
+    }
+    ungrouped = ungrouped.filter((u) => u.literal_value !== literal_value);
+
+    if (targetGroupId === null) {
+      ungrouped.push({ literal_value, matched_from_lookup: item.matched_from_lookup });
+    } else {
+      const target = groups.find((g) => g.group_id === targetGroupId);
+      if (target) {
+        target.items.push({ literal_value, matched_from_lookup: item.matched_from_lookup });
+      }
+    }
+  }
+
+  // 3. Rename groups.
+  for (const chg of patch.alias_name_changes) {
+    const g = groups.find((gr) => gr.group_id === chg.group_id);
+    if (g) {
+      g.alias_name = chg.alias_name_literal_value;
+      g.alias_name_source = 'user_override';
+    }
+  }
+
+  // Drop empty groups created by moves.
+  groups = groups.filter((g) => g.items.length > 0);
+
+  return { ...state, groups, ungrouped };
+}
+
+const AUTOSAVE_INTERVAL_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +239,9 @@ export default function RunReviewClient({
   const [uiAliasMap, setUiAliasMap] = useState<AliasMap | null>(null);
   const [aliasMapError, setAliasMapError] = useState<string | null>(null);
   const [loadingAliasMap, setLoadingAliasMap] = useState(true);
+  // Bump to re-run the alias-mapping fetch (retry after a load failure, or
+  // reload server truth after an autosave conflict).
+  const [aliasMapReload, setAliasMapReload] = useState(0);
 
   const [checkedAliases, setCheckedAliases] = useState<Set<string>>(new Set());
   const [nextTempGroupId, setNextTempGroupId] = useState(-1);
@@ -156,6 +255,11 @@ export default function RunReviewClient({
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportResult, setExportResult] = useState<any>(null);
   const [copiedSql, setCopiedSql] = useState(false);
+
+  // Set when advancing the multi-column wizard fails to BUILD the next column's
+  // review run (server error / network) — distinct from a genuinely-empty column.
+  const [wizardAdvanceError, setWizardAdvanceError] = useState<{ column: string } | null>(null);
+  const [retryingAdvance, setRetryingAdvance] = useState(false);
 
   // ── Column wizard (multi-column pipeline creation) ──────────────────────────
   const [wizard, setWizard] = useState<ColWizard | null>(null);
@@ -178,6 +282,9 @@ export default function RunReviewClient({
   // THIS one, so "Accept & continue" reuses it (advanceWizardForward checks
   // runs[next]) and navigates instantly instead of building it on click.
   const prefetchedRef = useRef<Set<number>>(new Set());
+  // Superseded flag: once the user proceeds manually (advanceWizardForward), the
+  // delayed prefetch must never write its (possibly stale) wizard snapshot back.
+  const advanceInFlightRef = useRef(false);
   useEffect(() => {
     if (!inWizard || colIndex < 0) return;
     const next = colIndex + 1;
@@ -194,16 +301,28 @@ export default function RunReviewClient({
     // Small delay so the CURRENT column's page (its alias-mapping fetch) gets
     // priority; the user spends far longer reviewing than this head start costs.
     const timer = setTimeout(async () => {
+      if (advanceInFlightRef.current) return; // user already proceeded manually
       try {
         const res  = await fetch(route, { method: 'POST' });
         const body = await res.json().catch(() => ({}));
-        if (cancelled || !res.ok || !body?.run_id) return;  // empty/all-null column → built on demand at accept
+        if (cancelled || advanceInFlightRef.current || !res.ok || !body?.run_id) return;  // empty/all-null column → built on demand at accept
         const builtRunId = Number(body.run_id);
         setWizard(prev => {
           if (!prev) return prev;
-          const runs = [...prev.runs];
+          // Merge into the LATEST persisted wizard (not this closure's snapshot)
+          // so we never clobber a newer sessionStorage write with stale data.
+          let latest: ColWizard = prev;
+          try {
+            const raw = sessionStorage.getItem(COL_WIZARD_KEY);
+            if (raw) {
+              const parsed = JSON.parse(raw) as ColWizard;
+              if (Array.isArray(parsed?.runs)) latest = parsed;
+            }
+          } catch { /* fall back to prev */ }
+          if (latest.runs[next] != null) return prev;   // someone already set it
+          const runs = [...latest.runs];
           runs[next] = builtRunId;
-          const updated = { ...prev, runs };
+          const updated = { ...latest, runs };
           try { sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(updated)); } catch { /* ignore */ }
           return updated;
         });
@@ -265,8 +384,11 @@ export default function RunReviewClient({
     // Reset export state — when the column wizard navigates between runs the
     // component stays mounted, so stale `exporting`/error flags must be cleared.
     setExporting(false);
+    exportingRef.current = false;
     setExportResult(null);
     setExportError(null);
+    setWizardAdvanceError(null);
+    setRetryingAdvance(false);
 
     async function loadAliasMapping() {
       setLoadingAliasMap(true);
@@ -303,6 +425,139 @@ export default function RunReviewClient({
 
     loadAliasMapping();
     return () => { cancelled = true; };
+  }, [runId, aliasMapReload]);
+
+  // ── Autosave (RUNS.state blob) ─────────────────────────────────────────────
+  // A 30 s timer PUTs the full state blob (with optimistic-concurrency rev)
+  // whenever the user has unsaved changes; pagehide/beforeunload flush via
+  // sendBeacon. Suspended while an export is in flight.
+
+  const baseStateRef = useRef<RunStateBlob | null>(null);
+  const revRef       = useRef(0);
+  const dirtyRef     = useRef(false);
+  const savingRef    = useRef(false);
+  const exportingRef = useRef(false);
+
+  function markDirty() { dirtyRef.current = true; }
+
+  // Same request payload the export path sends — single source for both.
+  function buildExportPatch(): ExportPatch {
+    return {
+      new_groups: Object.entries(uiAliasMap || {})
+        .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
+        .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
+        .map(([alias_name_literal_value, g]) => ({
+          temp_group_id: g.group_id as number,
+          alias_name_literal_value,
+        })),
+      moves: Object.entries(pendingMoves).map(([run_item_id, group_id]) => ({
+        run_item_id: Number(run_item_id), group_id,
+      })),
+      alias_name_changes: Object.entries(pendingAliasNames).map(([group_id, alias_name_literal_value]) => ({
+        group_id: Number(group_id), alias_name_literal_value,
+      })),
+    };
+  }
+
+  function buildStateBlob(): RunStateBlob | null {
+    const base = baseStateRef.current;
+    if (!base) return null;
+    return applyStatePatchToBlob(base, buildExportPatch());
+  }
+  const buildStateBlobRef = useRef<() => RunStateBlob | null>(buildStateBlob);
+  buildStateBlobRef.current = buildStateBlob;
+
+  async function loadBaseState(): Promise<boolean> {
+    try {
+      const res  = await fetch(`/api/run/${runId}/state`, { cache: 'no-store' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return false;
+      const st = (body?.state ?? body?.data ?? null) as RunStateBlob | null;
+      if (st && typeof st === 'object') {
+        baseStateRef.current = st;
+        revRef.current = Number(st.rev ?? 0) || 0;
+        return true;
+      }
+    } catch { /* autosave stays disabled until the blob loads */ }
+    return false;
+  }
+  const loadBaseStateRef = useRef(loadBaseState);
+  loadBaseStateRef.current = loadBaseState;
+
+  useEffect(() => {
+    dirtyRef.current = false;
+    baseStateRef.current = null;
+    revRef.current = 0;
+    void loadBaseStateRef.current();
+  }, [runId]);
+
+  async function autosave() {
+    if (!dirtyRef.current || savingRef.current || exportingRef.current) return;
+    const blob = buildStateBlob();
+    if (!blob) return;
+    savingRef.current = true;
+    try {
+      const res = await fetch(`/api/run/${runId}/state`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state: blob, expectedRev: revRef.current }),
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        revRef.current = typeof body?.rev === 'number' ? body.rev : revRef.current + 1;
+        dirtyRef.current = false;
+      } else if (res.status === 409) {
+        // Someone else saved a newer state — take server truth (simplest safe
+        // resolution), warn, and rehydrate the review UI from it.
+        const body = await res.json().catch(() => ({}));
+        if (typeof body?.currentRev === 'number') revRef.current = body.currentRev;
+        await loadBaseStateRef.current();
+        dirtyRef.current = false;
+        showToast('This run was updated elsewhere — reloaded latest', 'info');
+        setAliasMapReload((n) => n + 1);
+      }
+      // Other failures: stay dirty and retry on the next tick.
+    } catch { /* network error — retry on the next tick */ }
+    finally { savingRef.current = false; }
+  }
+  const autosaveRef = useRef(autosave);
+  autosaveRef.current = autosave;
+
+  useEffect(() => {
+    const timer = setInterval(() => { void autosaveRef.current(); }, AUTOSAVE_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Flush unsaved changes when the page is being closed/hidden, and warn on
+  // accidental closes. sendBeacon can't read the response — acceptable.
+  useEffect(() => {
+    let lastBeaconAt = 0;
+    function flushBeacon() {
+      if (!dirtyRef.current || exportingRef.current) return;
+      if (Date.now() - lastBeaconAt < 1000) return; // pagehide + beforeunload double-fire
+      const blob = buildStateBlobRef.current();
+      if (!blob) return;
+      try {
+        lastBeaconAt = Date.now();
+        navigator.sendBeacon(
+          `/api/run/${runId}/state`,
+          new Blob([JSON.stringify({ state: blob, expectedRev: revRef.current })], { type: 'application/json' }),
+        );
+      } catch { /* best effort */ }
+    }
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (!dirtyRef.current || exportingRef.current) return;
+      flushBeacon();
+      e.preventDefault();
+      e.returnValue = '';
+    }
+    function onPageHide() { flushBeacon(); }
+    window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('pagehide', onPageHide);
+    };
   }, [runId]);
 
   // ── History ───────────────────────────────────────────────────────────────
@@ -335,6 +590,7 @@ export default function RunReviewClient({
   function pushHistory() {
     const snap = captureSnapshot();
     if (!snap) return;
+    markDirty();
     setUndoStack((prev) => [...prev, snap]);
     setRedoStack([]);
   }
@@ -345,6 +601,7 @@ export default function RunReviewClient({
     const current = captureSnapshot();
     if (current) setRedoStack((prev) => [...prev, current]);
     setUndoStack((prev) => prev.slice(0, -1));
+    markDirty();
     applySnapshot(snap);
   }
 
@@ -354,6 +611,7 @@ export default function RunReviewClient({
     const current = captureSnapshot();
     if (current) setUndoStack((prev) => [...prev, current]);
     setRedoStack((prev) => prev.slice(0, -1));
+    markDirty();
     applySnapshot(snap);
   }
 
@@ -363,6 +621,10 @@ export default function RunReviewClient({
     function onKeyDown(e: KeyboardEvent) {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
+      // Don't hijack undo/redo while typing — let the field's native
+      // text-editing history handle it.
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
       if (e.key === 'z' && !e.shiftKey) {
         e.preventDefault();
         historyHandlersRef.current.undo();
@@ -533,17 +795,19 @@ export default function RunReviewClient({
     catch { payload = null; }
     if (!payload) return;
 
-    pushHistory();
-
     if (payload.type === 'group') {
       const { fromAliasName } = payload;
+      // No-op drops (same target) must not arm the undo stack.
       if (fromAliasName === toAliasName || toAliasName === UNGROUPED_KEY) return;
+      pushHistory();
       mergeGroups(fromAliasName, toAliasName);
       return;
     }
 
     const { fromAliasName, run_item_id, literal_value } = payload;
+    // Dropping a chip back where it started is a no-op — don't arm undo/dirty.
     if (fromAliasName === toAliasName) return;
+    pushHistory();
 
     setPendingMoves((prev) => {
       const toGroupId = uiAliasMap?.[toAliasName]?.group_id;
@@ -675,6 +939,7 @@ export default function RunReviewClient({
 
   async function doExport() {
     setExporting(true);
+    exportingRef.current = true;
     setExportError(null);
     setExportResult(null);
     setCopiedSql(false);
@@ -683,18 +948,7 @@ export default function RunReviewClient({
       const res = await fetch(`/api/run/${runId}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          new_groups: Object.entries(uiAliasMap || {})
-            .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
-            .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
-            .map(([alias_name_literal_value, g]) => ({ temp_group_id: g.group_id, alias_name_literal_value })),
-          moves: Object.entries(pendingMoves).map(([run_item_id, group_id]) => ({
-            run_item_id: Number(run_item_id), group_id,
-          })),
-          alias_name_changes: Object.entries(pendingAliasNames).map(([group_id, alias_name_literal_value]) => ({
-            group_id: Number(group_id), alias_name_literal_value,
-          })),
-        }),
+        body: JSON.stringify(buildExportPatch()),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || 'Export failed');
@@ -702,6 +956,9 @@ export default function RunReviewClient({
       setExportResult(body?.data || null);
       setPendingMoves({});
       setPendingAliasNames({});
+      // The server persisted the patched state — autosave has nothing newer.
+      dirtyRef.current = false;
+      void loadBaseStateRef.current();
 
       const refreshed = await fetch(`/api/run/${runId}/alias-mapping`, { cache: 'no-store' });
       const refreshedBody = await refreshed.json().catch(() => ({}));
@@ -716,6 +973,7 @@ export default function RunReviewClient({
       setExportError(e instanceof Error ? e.message : 'Export failed');
     } finally {
       setExporting(false);
+      exportingRef.current = false;
     }
   }
 
@@ -734,7 +992,9 @@ export default function RunReviewClient({
     setConfirmAcceptOpen(false);
     acceptStartRef.current = Date.now();
     setExporting(true);
+    exportingRef.current = true;
     setExportError(null);
+    setWizardAdvanceError(null);
     try {
       const res = await fetch(`/api/run/${runId}/export`, {
         method: 'POST',
@@ -744,26 +1004,27 @@ export default function RunReviewClient({
           // and mark it approved. The actual upserts happen at "Begin Pipeline
           // Standardization", behind a progress bar, so accepting each column is fast.
           defer: true,
-          new_groups: Object.entries(uiAliasMap || {})
-            .filter(([aliasName]) => aliasName !== UNGROUPED_KEY)
-            .filter(([, g]) => typeof g?.group_id === 'number' && g.group_id < 0)
-            .map(([alias_name_literal_value, g]) => ({ temp_group_id: g.group_id, alias_name_literal_value })),
-          moves: Object.entries(pendingMoves).map(([run_item_id, group_id]) => ({
-            run_item_id: Number(run_item_id), group_id,
-          })),
-          alias_name_changes: Object.entries(pendingAliasNames).map(([group_id, alias_name_literal_value]) => ({
-            group_id: Number(group_id), alias_name_literal_value,
-          })),
+          ...buildExportPatch(),
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || 'Failed to accept standardizations');
 
+      // The server persisted the patched state — autosave has nothing newer.
+      dirtyRef.current = false;
+
       // Multi-column wizard: move on to the next column instead of going home.
       if (inWizard) {
-        const advanced = await advanceWizardForward();
-        if (advanced) return; // navigated to the next column's run
-        // No further columns with data — finish.
+        const outcome = await advanceWizardForward();
+        if (outcome === 'navigated') return; // navigated to the next column's run
+        if (outcome === 'error') {
+          // This column WAS accepted, but the next column's review run failed to
+          // build — stay here with an inline retry instead of skipping the column.
+          setExporting(false);
+          exportingRef.current = false;
+          return;
+        }
+        // 'done' — no further columns with data — finish.
       }
 
       // Fall back to the wizard's pipeline_id when the export couldn't resolve it
@@ -773,6 +1034,7 @@ export default function RunReviewClient({
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Failed to accept standardizations');
       setExporting(false);
+      exportingRef.current = false;
     }
   }
 
@@ -806,11 +1068,21 @@ export default function RunReviewClient({
 
   /**
    * Move to the next column that has data. Reuses an already-created review run
-   * when one exists, otherwise builds it via create-initial-run. Columns whose
-   * source is empty (run_id === null) are skipped. Returns true if it navigated.
+   * when one exists, otherwise builds it via create-initial-run.
+   *
+   * Outcomes:
+   *   'navigated' — opened the next column's run
+   *   'done'      — no further columns with data (genuinely-empty columns skipped)
+   *   'error'     — building a column's run FAILED (server/network). The failed
+   *                 column is NOT skipped and the failure is NOT persisted —
+   *                 wizardAdvanceError is set so the UI offers a retry.
+   *
+   * A column is only skipped when the API responds 200 with an explicit
+   * { run_id: null } (create-initial-run / standardize-run's empty-source shape).
    */
-  async function advanceWizardForward(): Promise<boolean> {
-    if (!wizard) return false;
+  async function advanceWizardForward(): Promise<'navigated' | 'done' | 'error'> {
+    if (!wizard) return 'done';
+    advanceInFlightRef.current = true; // supersede the background prefetch
     const cur = wizard.runs.indexOf(Number(runId));
     const w: ColWizard = { ...wizard, runs: [...wizard.runs] };
 
@@ -820,28 +1092,68 @@ export default function RunReviewClient({
         sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
         reportAcceptNav();
         router.push(`/run/${w.runs[next]}`);
-        return true;
+        return 'navigated';
       }
       // Build the review run for this column — from the queue for a 'standardize'
       // wizard (manual mode), or from the full source for a 'create' wizard.
       const route = w.kind === 'standardize'
         ? `/api/pipelines/${w.pids[next]}/standardize-run`
         : `/api/pipelines/${w.pids[next]}/create-initial-run`;
-      const res  = await fetch(route, { method: 'POST' });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok && body?.run_id) {
+      let res: Response | null = null;
+      try { res = await fetch(route, { method: 'POST' }); } catch { res = null; }
+      const body = res ? await res.json().catch(() => ({})) : {};
+
+      if (res?.ok && body?.run_id) {
         w.runs[next] = Number(body.run_id);
         sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
         reportAcceptNav();
         router.push(`/run/${body.run_id}`);
-        return true;
+        return 'navigated';
       }
-      // Empty source (run_id: null) or a soft error — skip this column and try the next.
-      w.runs[next] = null;
+
+      if (res?.ok && body && 'run_id' in body && body.run_id == null) {
+        // Explicit empty source ({ run_id: null }) — genuinely nothing to review.
+        // Record the skip and try the next column.
+        w.runs[next] = null;
+        continue;
+      }
+
+      // Server error or network failure — NOT an empty column. Persist only the
+      // genuine skips recorded so far, surface a retry, and don't advance.
+      sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
+      const colName = w.cols[next] ?? `column ${next + 1}`;
+      setWizardAdvanceError({ column: colName });
+      showToast(
+        body?.error
+          ? `Couldn't prepare "${colName}" for review: ${body.error}`
+          : `Couldn't prepare "${colName}" for review. Check your connection and retry.`,
+        'error',
+      );
+      return 'error';
     }
     // Persist any skips we recorded so a later Back pass doesn't retry them.
     sessionStorage.setItem(COL_WIZARD_KEY, JSON.stringify(w));
-    return false;
+    return 'done';
+  }
+
+  /** Retry advancing after a failed next-column build (this run stays accepted). */
+  async function retryWizardAdvance() {
+    if (retryingAdvance) return;
+    setRetryingAdvance(true);
+    try {
+      const outcome = await advanceWizardForward();
+      if (outcome === 'navigated') {
+        setWizardAdvanceError(null);
+        return;
+      }
+      if (outcome === 'done') {
+        setWizardAdvanceError(null);
+        await finishWizard(wizard ? wizard.pids[0] : undefined);
+      }
+      // 'error' — wizardAdvanceError already refreshed; stay for another retry.
+    } finally {
+      setRetryingAdvance(false);
+    }
   }
 
   /** Go back to the previous already-standardized column (no export). */
@@ -895,6 +1207,29 @@ export default function RunReviewClient({
 
   // ── Download Mapping helpers ─────────────────────────────────────────────
 
+  // Commit the current review state to the lookup (same export POST + body the
+  // "Accept Standardizations" path uses, minus `defer`). Awaited and checked —
+  // the spreadsheet export reads LITERAL_ALIAS_MATCHES, which is empty until
+  // this write lands. The backend is idempotent, so repeat calls are safe.
+  async function ensureExportWritten(): Promise<void> {
+    exportingRef.current = true; // suspend autosave while the export is in flight
+    try {
+      const res = await fetch(`/api/run/${runId}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildExportPatch()),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error || 'Export failed');
+      }
+      dirtyRef.current = false;
+      void loadBaseStateRef.current();
+    } finally {
+      exportingRef.current = false;
+    }
+  }
+
   async function openDownloadModal() {
     setDownloadModalOpen(true);
     setDownloadRows(null);
@@ -907,6 +1242,10 @@ export default function RunReviewClient({
     setGoogleSheetsError(null);
     setGoogleSheetsUrl(null);
     try {
+      // Write the mappings FIRST — export-mapping reads the lookup table, which
+      // has nothing for this run until the export commits.
+      await ensureExportWritten();
+
       const res  = await fetch(`/api/run/${runId}/export-mapping`);
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || 'Failed to load mapping');
@@ -915,7 +1254,9 @@ export default function RunReviewClient({
       setDownloadTitle(body.title       || null);
       setDownloadSourceColumn(body.sourceColumn ?? '');
     } catch (err) {
-      setDownloadError(err instanceof Error ? err.message : 'Failed to load mapping');
+      const msg = err instanceof Error ? err.message : 'Failed to load mapping';
+      setDownloadError(msg);
+      showToast(msg, 'error');
     } finally {
       setDownloadLoading(false);
     }
@@ -924,11 +1265,14 @@ export default function RunReviewClient({
   // ── Google Sheets export ─────────────────────────────────────────────────
 
   async function doGoogleSheetsExportWithConfig(inc: boolean) {
-    triggerOpExport();
     setGoogleSheetsLoading(true);
     setGoogleSheetsError(null);
     setGoogleSheetsUrl(null);
     try {
+      // Make sure the mappings are committed before exporting them (idempotent —
+      // usually already done when the download modal opened).
+      await ensureExportWritten();
+
       const res = await fetch(`/api/run/${runId}/export-to-google-sheets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -980,15 +1324,6 @@ export default function RunReviewClient({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── One-prompt backend write trigger ────────────────────────────────────
-  // Fires on the first download/export action to signal the user is done
-  // making corrections. The backend is idempotent — repeated calls are no-ops.
-  // Never blocks the download; errors are silently swallowed.
-
-  function triggerOpExport(): void {
-    fetch(`/api/run/${runId}/export`, { method: 'POST' }).catch(() => {});
-  }
-
   // ── CSV / Excel helpers ───────────────────────────────────────────────────
 
   function escapeCsv(val: string): string {
@@ -1028,8 +1363,8 @@ export default function RunReviewClient({
   }
 
   async function doCsvDownload() {
+    // The export was already committed (awaited) when the modal loaded its rows.
     if (!downloadRows) return;
-    triggerOpExport();
     const { headers: hdrs, rows } = buildExportData();
     const lines = [
       hdrs.map(h => escapeCsv(h)).join(','),
@@ -1045,8 +1380,8 @@ export default function RunReviewClient({
   }
 
   async function doExcelDownload() {
+    // The export was already committed (awaited) when the modal loaded its rows.
     if (!downloadRows) return;
-    triggerOpExport();
     const XLSX = await import('xlsx');
     const { headers: hdrs, rows } = buildExportData();
     const aoaData = [hdrs, ...rows.map(r => hdrs.map(h => r[h] ?? ''))];
@@ -1071,6 +1406,7 @@ export default function RunReviewClient({
 
   return (
     <div onClick={() => setOpenMenuForAliasName(null)}>
+      <ToastHost />
       {/* ── Column wizard stepper (multi-column pipeline creation) ──────── */}
       {inWizard && (
         <div
@@ -1243,6 +1579,29 @@ export default function RunReviewClient({
           </div>
         )}
 
+        {/* Wizard advance error — the NEXT column's review run failed to build.
+            This column is accepted; retry preparing the next one. */}
+        {wizardAdvanceError && (
+          <div
+            className="flex items-center justify-between gap-3 rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
+            style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA', color: 'var(--confidence-low)' }}
+          >
+            <span>
+              This column was accepted, but preparing <strong>{wizardAdvanceError.column}</strong> for review failed.
+              It has not been skipped.
+            </span>
+            <button
+              type="button"
+              onClick={() => void retryWizardAdvance()}
+              disabled={retryingAdvance}
+              className="px-3 py-1.5 rounded-button border-[0.5px] text-xs font-medium flex-shrink-0 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ borderColor: '#FECACA', backgroundColor: 'var(--surface)', color: 'var(--confidence-low)' }}
+            >
+              {retryingAdvance ? 'Retrying…' : 'Retry'}
+            </button>
+          </div>
+        )}
+
         {/* Export success — not shown in auto_export mode (we redirect instead) */}
         {!isAutoExport && exportResult?.view_fqn && (
           <div
@@ -1305,10 +1664,20 @@ export default function RunReviewClient({
           </p>
         ) : aliasMapError ? (
           <div
-            className="rounded-button border-[0.5px] px-4 py-3 text-sm"
+            className="flex items-center justify-between gap-3 rounded-button border-[0.5px] px-4 py-3 text-sm"
             style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA', color: 'var(--confidence-low)' }}
           >
-            {aliasMapError}
+            <span>{aliasMapError}</span>
+            <button
+              type="button"
+              onClick={() => setAliasMapReload((n) => n + 1)}
+              className="px-3 py-1.5 rounded-button border-[0.5px] text-xs font-medium flex-shrink-0 transition-colors"
+              style={{ borderColor: '#FECACA', backgroundColor: 'var(--surface)', color: 'var(--confidence-low)' }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEF2F2'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
+            >
+              Retry
+            </button>
           </div>
         ) : (
           <>

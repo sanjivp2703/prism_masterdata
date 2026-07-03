@@ -172,12 +172,15 @@ export function snowflakeErrorResponse(
 ): Response {
   const { message, code } = normalizeError(error);
 
+  // Full detail stays server-side only — never echo raw driver messages or SQL
+  // text back to the client.
+  console.error(`[snowflake] ${fallbackPublicMessage}:`, message, code != null ? `(code ${code})` : '');
+
   if (message.includes('A password must be specified')) {
     return Response.json(
       {
         error:
           'Snowflake auth is not configured. Set SNOWFLAKE_PRIVATE_KEY_PATH (recommended) to your private key file (rsa_key.p8), or set SNOWFLAKE_PASSWORD.',
-        details: message,
         code,
       },
       { status: 500 }
@@ -190,7 +193,6 @@ export function snowflakeErrorResponse(
       {
         error:
           'Snowflake login blocked by MFA (TOTP). Use key-pair auth (recommended) or a user exempt from MFA for API access.',
-        details: message,
         code,
       },
       { status: 401 }
@@ -206,7 +208,7 @@ export function snowflakeErrorResponse(
   }
 
   return Response.json(
-    { error: fallbackPublicMessage, details: message, code },
+    { error: fallbackPublicMessage, code },
     { status: 500 }
   );
 }

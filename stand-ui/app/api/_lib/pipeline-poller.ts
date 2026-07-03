@@ -19,6 +19,7 @@ import { QUEUE_STANDARDIZE_THRESHOLD, fetchPipelineById, processPipelineQueue, r
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 import { refreshSheetsFileRows } from './op-file-pipeline';
+import { sqlStringLiteral } from './normalize';
 import {
   pausePipelineWithMessage,
   clearPipelineStatusMessage,
@@ -864,7 +865,7 @@ async function pollOneFilePipeline(p: PipelineRef): Promise<void> {
 
       for (const col of columns) {
         if (!col.column_name) { updatedColumns.push(col); continue; }
-        const safeCol    = col.column_name.replace(/'/g, "\\'");
+        const safeCol    = sqlStringLiteral(col.column_name);
         const domainCond = col.domain_id != null
           ? `AND lam.domain_id = ${col.domain_id}`
           : 'AND lam.domain_id IS NULL';

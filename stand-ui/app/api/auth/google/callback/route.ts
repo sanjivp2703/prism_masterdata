@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { google } from 'googleapis';
 import type { Credentials } from 'google-auth-library';
 import { withSnowflake } from '@/app/api/_lib/snowflake';
-import { buildSessionCookie, type SessionPayload } from '@/app/api/_lib/session';
+import { buildSessionCookie, sanitizeReturnTo, type SessionPayload } from '@/app/api/_lib/session';
 import { applyGrants } from '@/app/api/_lib/grants';
 
 function getOAuth2Client() {
@@ -14,7 +14,7 @@ function getOAuth2Client() {
 }
 
 const SHEETS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
-const SHEETS_COOKIE_OPTS = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${SHEETS_COOKIE_MAX_AGE}`;
+const SHEETS_COOKIE_OPTS = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${SHEETS_COOKIE_MAX_AGE}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -52,7 +52,8 @@ export async function GET(request: NextRequest) {
   if (state) {
     try {
       const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-      if (typeof decoded.returnTo    === 'string')  returnTo    = decoded.returnTo;
+      // Open-redirect guard: only same-origin relative paths are honored.
+      if (typeof decoded.returnTo    === 'string')  returnTo    = sanitizeReturnTo(decoded.returnTo);
       if (decoded.isLogin            === true)       isLogin     = true;
       if (decoded.sheetsOnly         === true)       sheetsOnly  = true;
       if (typeof decoded.inviteToken === 'string')  inviteToken = decoded.inviteToken;
@@ -103,16 +104,17 @@ export async function GET(request: NextRequest) {
   const adminEmail = (process.env.ADMIN_EMAIL ?? '').toLowerCase().trim();
 
   try {
-    const { accountId, role, isNew } = await withSnowflake(async (conn) => {
+    const { accountId, role, isNew, sessionVersion } = await withSnowflake(async (conn) => {
       // ── Case 1: existing account ──────────────────────────────────────────
       const existing = await exec(
         conn,
-        `SELECT account_id, role FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE google_id = ?`,
+        `SELECT account_id, role, session_version FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE google_id = ?`,
         [googleId],
       );
       if (existing.length > 0) {
         const id = Number(col(existing[0], 'account_id'));
         const r  = safeRole(col(existing[0], 'role'));
+        const sv = Number(col(existing[0], 'session_version') ?? 1);
         await exec(
           conn,
           `UPDATE STAND_DB.STAND_INTERNAL.ACCOUNTS
@@ -120,7 +122,7 @@ export async function GET(request: NextRequest) {
            WHERE google_id = ?`,
           [name, pictureUrl, googleId],
         );
-        return { accountId: id, role: r, isNew: false };
+        return { accountId: id, role: r, isNew: false, sessionVersion: sv };
       }
 
       // ── Case 2: invite flow ───────────────────────────────────────────────
@@ -169,7 +171,7 @@ export async function GET(request: NextRequest) {
         // has correct privileges from day one. Errors are swallowed — the user can
         // re-apply via Settings → Snowflake connection if anything is missing.
         await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
-        return { accountId: Number(col(created[0], 'account_id')), role: invitedRole, isNew: true };
+        return { accountId: Number(col(created[0], 'account_id')), role: invitedRole, isNew: true, sessionVersion: 1 };
       }
 
       // ── Case 3: bootstrap admin ───────────────────────────────────────────
@@ -189,13 +191,13 @@ export async function GET(request: NextRequest) {
         );
         if (!created.length) throw new Error('Could not retrieve admin account_id');
         await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
-        return { accountId: Number(col(created[0], 'account_id')), role: 'admin' as const, isNew: true };
+        return { accountId: Number(col(created[0], 'account_id')), role: 'admin' as const, isNew: true, sessionVersion: 1 };
       }
 
       throw Object.assign(new Error('no_access'), { code: 'NO_ACCESS' });
     });
 
-    const sessionPayload: SessionPayload = { accountId, googleId, email, name, pictureUrl, role };
+    const sessionPayload: SessionPayload = { accountId, googleId, email, name, pictureUrl, role, v: sessionVersion };
     headers.append('Set-Cookie', await buildSessionCookie(sessionPayload));
 
     // New accounts go to /setup to optionally configure their Snowflake connection.

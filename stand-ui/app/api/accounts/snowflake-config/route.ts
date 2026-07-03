@@ -8,6 +8,8 @@ import {
   snowflakeErrorResponse,
 } from '@/app/api/_lib/snowflake';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+import { requireAdminSession } from '@/app/api/_lib/account-security';
+import { encryptSecret } from '@/app/api/_lib/crypto';
 import { applyGrants } from '@/app/api/_lib/grants';
 
 async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
@@ -81,9 +83,11 @@ export async function GET(_request: Request) {
  *   — wipes per-account config (falls back to env vars).
  */
 export async function POST(request: Request) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  // Admin only — saving or wiping workspace Snowflake credentials must not be
+  // possible for regular users. Also enforces the session-version check.
+  const auth = await requireAdminSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   let body: any;
   try { body = await request.json(); } catch { body = {}; }
@@ -124,6 +128,8 @@ export async function POST(request: Request) {
   }
 
   // ── Save credentials ──────────────────────────────────────────────────────
+  // Secrets are encrypted only at the moment of persistence — everything held
+  // in memory (e.g. the grants connection below) stays plaintext.
   try {
     await withSnowflake(async (conn) => {
       await exec(
@@ -132,7 +138,12 @@ export async function POST(request: Request) {
          SET sf_account = ?, sf_user = ?, sf_warehouse = ?,
              sf_role = ?, sf_password = ?, sf_private_key = ?
          WHERE account_id = ?`,
-        [sf_account, sf_user, sf_warehouse, sf_role, sf_password, sf_private_key, session.accountId],
+        [
+          sf_account, sf_user, sf_warehouse, sf_role,
+          sf_password    ? encryptSecret(sf_password)    : null,
+          sf_private_key ? encryptSecret(sf_private_key) : null,
+          session.accountId,
+        ],
       );
     });
     invalidateAccountSfConfig(session.accountId);

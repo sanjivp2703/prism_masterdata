@@ -5,6 +5,7 @@ import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { insertFileRows, readFileDistinctValues } from '@/app/api/_lib/op-file-pipeline';
 import { fetchPipelineById, createRunFromQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
+import { encryptSecret } from '@/app/api/_lib/crypto';
 
 function getOAuth2Client(accessToken?: string, refreshToken?: string, tokenExpiry?: string) {
   const c = new google.auth.OAuth2(
@@ -179,7 +180,9 @@ export async function POST(request: Request) {
       const file_source_meta = JSON.stringify({
         source_type, spreadsheet_url, spreadsheet_id, sheet_tab_name,
         columns: columns.map(c => ({ column_name: c.column_name, domain_id: c.domain_id })),
-        ...(gRefreshToken ? { refresh_token: gRefreshToken } : {}),
+        // Encrypted at rest; decrypted only at the moment of use (the poller's
+        // refreshSheetsFileRows). In-memory use below keeps the plaintext token.
+        ...(gRefreshToken ? { refresh_token: encryptSecret(gRefreshToken) } : {}),
       });
 
       // ── Check for duplicate tab pipeline ──────────────────────────────────

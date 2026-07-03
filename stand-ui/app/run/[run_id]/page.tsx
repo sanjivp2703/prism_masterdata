@@ -1,4 +1,5 @@
 import RunReviewClient from './RunReviewClient';
+import { getRunHeader } from '@/app/api/_lib/run-header';
 
 function humanizeDate(val: string | undefined | null): string {
   if (!val) return '—';
@@ -37,11 +38,9 @@ export default async function RunPage({
   let runData: any = null;
 
   try {
-    const response = await fetch(`http://localhost:8000/api/run/${run_id}`, { cache: 'no-store' });
-    if (response.ok) {
-      const result = await response.json();
-      runData = result.data;
-    }
+    // Direct Snowflake query (same SELECT as GET /api/run/[run_id]) — no HTTP
+    // round-trip to ourselves, works in any deployment.
+    runData = await getRunHeader(run_id);
   } catch {
     // Run data is optional — the client component handles the alias mapping independently.
   }

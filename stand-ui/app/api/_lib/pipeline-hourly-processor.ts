@@ -724,12 +724,21 @@ export function startHourlyProcessor(): void {
   if (g.__hourlyProcessorStarted) return;
   g.__hourlyProcessorStarted = true;
 
+  // Never let a rejected run tear down the scheduler: catch every invocation,
+  // and install the interval BEFORE the first run so a first-run failure can't
+  // prevent future runs from being scheduled.
+  const safeRun = () => {
+    runHourlyStandardization().catch((err) =>
+      console.error('[Hourly] run failed:', err),
+    );
+  };
+
   const scheduleNext = () => {
     const delay = msUntilNextHour();
     console.log(`[Hourly] Next pipeline standardization in ${Math.round(delay / 60_000)} min`);
-    setTimeout(async () => {
-      await runHourlyStandardization();
-      setInterval(runHourlyStandardization, HOUR_MS);
+    setTimeout(() => {
+      setInterval(safeRun, HOUR_MS);
+      safeRun();
     }, delay);
   };
 

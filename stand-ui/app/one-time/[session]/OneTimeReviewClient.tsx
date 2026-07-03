@@ -39,9 +39,14 @@ function toAliasMap(raw: any[]): AliasMap {
   return m;
 }
 
+/** Strip the internal `__n` dedup suffix toAliasMap adds for duplicate names. */
+function stripDedupSuffix(key: string): string {
+  return key.replace(/__\d+$/, '');
+}
+
 function aliasMapToGroups(m: AliasMap) {
   return Object.entries(m).map(([alias_name, g]) => ({
-    alias_name,
+    alias_name: stripDedupSuffix(alias_name),
     needs_review: g.needs_review,
     items: g.items.map(v => ({ literal_value: v })),
   }));
@@ -788,7 +793,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
                 const isItemDragOver   = dragOverAlias === aliasKey && draggingGroup === null;
                 const isDragOver       = isGroupDragOver || isItemDragOver;
                 const isBeingDragged   = draggingGroup === aliasKey;
-                const displayName      = aliasKey.startsWith('__new_') ? '' : aliasKey;
+                const displayName      = aliasKey.startsWith('__new_') ? '' : stripDedupSuffix(aliasKey);
 
                 return (
                   <div key={aliasKey}>

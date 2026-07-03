@@ -29,7 +29,7 @@ function getOAuth2Client() {
 }
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
-const COOKIE_OPTS = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}`;
+const COOKIE_OPTS = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
 // ── POST handler ──────────────────────────────────────────────────────────────
 

@@ -38,13 +38,18 @@ function suggestExport(tableFqn: string): string {
   return `${t}_STANDARDIZED`;
 }
 
-// Default domain (by name) for known demo columns. The matching Domain object is
-// resolved once /api/domains has loaded (domain IDs are autoincrement).
+// Demo-data mode: prefills the connect form with the seeded TEST_DB demo table.
+// Off by default so real customers see a clean empty form.
+const DEMO_DATA = process.env.NEXT_PUBLIC_PRISM_DEMO_DATA === 'true';
+
+// Default domain (by name) for known demo columns (demo mode only). The matching
+// Domain object is resolved once /api/domains has loaded (domain IDs are autoincrement).
 const DEFAULT_COLUMN_DOMAINS: Record<string, string> = {
   RAW_CARRIER_VALUE: 'Mobile Carrier',
   RAW_COMPANY_VALUE: 'Company Name',
 };
 function defaultDomainForColumn(columnName: string, domainsList: Domain[]): Domain | null {
+  if (!DEMO_DATA) return null;
   const target = DEFAULT_COLUMN_DOMAINS[columnName.trim().toUpperCase()];
   if (!target) return null;
   return domainsList.find(d => d.name === target) ?? null;
@@ -569,15 +574,17 @@ export default function AutoExportHome() {
   const [pipelineSourceType, setPipelineSourceType] = useState<'snowflake' | FileSourceType>('snowflake');
 
   // ── Connection form ───────────────────────────────────────────────────────
-  const DEFAULT_TABLE = 'TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS';
+  // Demo mode prefills the seeded demo table; otherwise start clean.
+  const DEFAULT_TABLE = DEMO_DATA ? 'TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS' : '';
 
   const [tableFqn,      setTableFqnRaw]  = useState(DEFAULT_TABLE);
-  const [exportTableFqn,    setExportTableFqnRaw]    = useState(suggestExport(DEFAULT_TABLE));
+  const [exportTableFqn,    setExportTableFqnRaw]    = useState(DEFAULT_TABLE ? suggestExport(DEFAULT_TABLE) : '');
   const [exportTableEdited, setExportTableEdited]    = useState(false);
-  const [columnEntries, setColumnEntries] = useState<ColumnEntry[]>([
-    mkEntry({ columnName: 'RAW_CARRIER_VALUE' }),
-    mkEntry({ columnName: 'RAW_COMPANY_VALUE' }),
-  ]);
+  const [columnEntries, setColumnEntries] = useState<ColumnEntry[]>(
+    DEMO_DATA
+      ? [mkEntry({ columnName: 'RAW_CARRIER_VALUE' }), mkEntry({ columnName: 'RAW_COMPANY_VALUE' })]
+      : [mkEntry({})],
+  );
 
   const [loadingStep,    setLoadingStep]    = useState<'idle' | 'validating' | 'processing'>('idle');
   const [setupProgress,  setSetupProgress]  = useState<{ current: number; total: number } | null>(null);
@@ -849,6 +856,10 @@ export default function AutoExportHome() {
     setExportConflict(null);
     setFormError(null);
 
+    // Declared outside the try so the catch can roll back partially-created
+    // pipelines (a failure at column 2 of 3 must not leave orphaned
+    // pending_baseline rows that collide with the user's retry).
+    const results: Pipeline[] = [];
     try {
       setLoadingStep('validating');
       const sourceRes  = await fetch(`/api/auto-export/source?table_fqn=${encodeURIComponent(table)}&column_name=${encodeURIComponent(columnEntries[0].columnName.trim())}`);
@@ -856,7 +867,6 @@ export default function AutoExportHome() {
       if (!sourceRes.ok) throw new Error(sourceBody?.error ?? 'Failed to reach table');
 
       setLoadingStep('processing');
-      const results: Pipeline[] = [];
 
       // Create each pipeline as 'pending_baseline' — NO auto-standardize. The user
       // reviews the initial grouping on the run page and accepts it before the
@@ -940,6 +950,17 @@ export default function AutoExportHome() {
         setPendingActivation(results[0]);
       }
     } catch (err) {
+      // Roll back pipelines created before the failure so a retry starts clean.
+      if (results.length > 0) {
+        await Promise.all(results.map(r =>
+          fetch(`/api/pipelines/${r.pipeline_id}`, { method: 'DELETE' }).catch(() => {})));
+      }
+      // Refresh the pipelines snapshot so the dupe check on retry sees reality.
+      try {
+        const plRes  = await fetch('/api/pipelines');
+        const plBody = await plRes.json().catch(() => ({}));
+        setExistingPipelines((plBody.pipelines ?? []) as Pipeline[]);
+      } catch { /* snapshot refresh is best-effort */ }
       setFormError(err instanceof Error ? err.message : 'Something went wrong.');
     } finally {
       setLoadingStep('idle');
@@ -1042,13 +1063,21 @@ export default function AutoExportHome() {
     setLoadingStep('idle');
   }
 
-  function handleActivatePipeline(p: Pipeline) {
-    fetch(`/api/pipelines/${p.pipeline_id}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'active' }),
-    }).catch(() => {});
-    sessionStorage.setItem('prism_ae_active_pid', String(p.pipeline_id));
-    setActivePipelineId(p.pipeline_id);
+  async function handleActivatePipeline(p: Pipeline) {
+    try {
+      const res = await fetch(`/api/pipelines/${p.pipeline_id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'active' }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b?.error ?? 'Failed to start the pipeline.');
+      }
+      sessionStorage.setItem('prism_ae_active_pid', String(p.pipeline_id));
+      setActivePipelineId(p.pipeline_id);
+    } catch (e) {
+      setBeginError(e instanceof Error ? e.message : 'Failed to start the pipeline.');
+    }
   }
 
   const canSubmit = !loading && !!tableFqn.trim() && !!exportTableFqn.trim() &&

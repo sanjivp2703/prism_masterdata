@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { google } from 'googleapis';
+import { sanitizeReturnTo } from '@/app/api/_lib/session';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -22,7 +23,7 @@ export async function GET(request: NextRequest) {
   }
 
   const { searchParams } = new URL(request.url);
-  const returnTo    = searchParams.get('returnTo')    || '/home';
+  const returnTo    = sanitizeReturnTo(searchParams.get('returnTo'), '/home');
   const inviteToken = searchParams.get('inviteToken') || null;
 
   const oauth2Client = getOAuth2Client();

@@ -230,6 +230,7 @@ CREATE OR REPLACE TABLE RUNS (
 -- ALTER TABLE ACCOUNTS ADD COLUMN IF NOT EXISTS sf_role        VARCHAR(200);
 -- ALTER TABLE ACCOUNTS ADD COLUMN IF NOT EXISTS sf_password    VARCHAR(2000);
 -- ALTER TABLE ACCOUNTS ADD COLUMN IF NOT EXISTS sf_private_key VARCHAR(8000);
+-- ALTER TABLE ACCOUNTS ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 1;
 
 -- ----------------------------------------------------------------------------
 -- APPROVED_ALIAS_NAMES
@@ -428,6 +429,9 @@ CREATE OR REPLACE TABLE ACCOUNTS (
     name            VARCHAR(500),
     picture_url     VARCHAR(2000),
     role            VARCHAR(20)     NOT NULL DEFAULT 'user',   -- 'admin' | 'user'
+    -- Bumped to revoke all of the account's live sessions (cookies carry the
+    -- version they were issued with; a mismatch rejects the session).
+    session_version INTEGER         NOT NULL DEFAULT 1,
     creation_nonce  VARCHAR(200),
     -- Per-account Snowflake configuration (nullable; falls back to env vars when NULL)
     sf_account      VARCHAR(500),

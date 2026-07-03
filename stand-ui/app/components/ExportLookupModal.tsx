@@ -77,6 +77,7 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
   const [busy,     setBusy]     = useState(false);
   const [error,    setError]    = useState<string | null>(null);
   const [success,  setSuccess]  = useState<string | null>(null);
+  const [sheetUrl, setSheetUrl] = useState<string | null>(null);
 
   async function handleExport() {
     if (resolvedDomainId == null) { setError('No domain selected.'); return; }
@@ -126,6 +127,9 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
         if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
 
         if (format === 'sheets' && body.url) {
+          // window.open after an await is often popup-blocked — keep the URL as
+          // a visible link in the success state so a blocked popup isn't a dead end.
+          setSheetUrl(body.url);
           window.open(body.url, '_blank');
           setSuccess(`Created Google Sheet with ${body.rows ?? 0} mappings.`);
         } else if (format === 'snowflake') {
@@ -243,7 +247,19 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
 
         {/* Error / Success */}
         {error && <p className="text-xs mb-3 px-2 py-1.5 rounded-button" style={{ color: '#DC2626', backgroundColor: '#FEF2F2' }}>{error}</p>}
-        {success && <p className="text-xs mb-3 px-2 py-1.5 rounded-button" style={{ color: '#15803D', backgroundColor: '#DCFCE7' }}>{success}</p>}
+        {success && (
+          <p className="text-xs mb-3 px-2 py-1.5 rounded-button" style={{ color: '#15803D', backgroundColor: '#DCFCE7' }}>
+            {success}
+            {sheetUrl && (
+              <>
+                {' '}
+                <a href={sheetUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#15803D', textDecoration: 'underline', fontWeight: 500 }}>
+                  Open sheet
+                </a>
+              </>
+            )}
+          </p>
+        )}
 
         {/* Actions */}
         <div className="flex items-center justify-end gap-2">

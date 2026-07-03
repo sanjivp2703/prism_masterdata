@@ -10,7 +10,19 @@ interface Props {
 
 export default function UserMenu({ name, email, pictureUrl }: Props) {
   const [open, setOpen] = useState(false);
+  const [role, setRole] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // The layout only passes name/email/picture — fetch the session role
+  // client-side so the Settings item can be admin-only.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/session', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled) setRole(d?.role ?? null); })
+      .catch(() => { /* no role → no Settings item */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Close on outside click
   useEffect(() => {
@@ -103,6 +115,31 @@ export default function UserMenu({ name, email, pictureUrl }: Props) {
               {email}
             </p>
           </div>
+
+          {/* Settings (admins only) */}
+          {role === 'admin' && (
+            <a
+              href="/settings"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '10px 16px',
+                fontSize: 13,
+                color: '#374151',
+                textDecoration: 'none',
+                transition: 'background-color 0.12s',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.backgroundColor = '#F9FAFB'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.backgroundColor = 'transparent'; }}
+            >
+              <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+                <circle cx="7.5" cy="7.5" r="2.2" stroke="currentColor" strokeWidth="1.4" />
+                <path d="M7.5 1.5v2M7.5 11.5v2M1.5 7.5h2M11.5 7.5h2M3.26 3.26l1.41 1.41M10.33 10.33l1.41 1.41M3.26 11.74l1.41-1.41M10.33 4.67l1.41-1.41" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+              Settings
+            </a>
+          )}
 
           {/* Sign out */}
           <a

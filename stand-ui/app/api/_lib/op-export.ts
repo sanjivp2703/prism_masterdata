@@ -1,17 +1,20 @@
 /**
- * One-Prompt Export Pipeline (Steps 1–4).
+ * One-Prompt Export Pipeline — WRITE-FIRST, VALIDATE-SECOND.
  *
  * Called after the user confirms and exports a run.
  *
  *   Step 1 — Read state blob            (sole source of truth)
  *   Step 2 — Detect validation cases    (Case A: item moved; Case B: group renamed)
- *   Step 3 — LLM validation pass        (async background; decides Case A/B outcomes)
- *   Step 4 — Write everything at once   (Case A/B per LLM decision; all other items
- *                                         written as-is; log decisions; mark run done)
+ *   Step 3 — WRITE all mappings FIRST   (user's choices at face value; run →
+ *                                         'completed' on success)
+ *   Step 4 — LLM validation amendment   (async; may flip Case A/B decisions and
+ *                                         update rows + VALIDATION_LOG afterwards)
  *
  * Steps 3–4 run in the background after the HTTP response is sent.
- * The run is immediately marked 'validating' to prevent double-export.
- * On LLM parse failure the run is marked 'failed' so it can be retried.
+ * The run is atomically marked 'validating' to prevent double-export.
+ * A validation LLM failure NEVER prevents or unwinds the write — the run stays
+ * 'completed' and `validation_status: 'failed'` is recorded in the state blob.
+ * Only a failure of the write itself marks the run 'failed' (which is retriable).
  *
  * Zero writes to RUN_ITEMS, RUN_GROUPS, RAW_VALUES, ALIAS_SUMMARY, TOKENS_SUMMARY.
  */
@@ -19,9 +22,11 @@
 import 'server-only';
 
 import fs   from 'node:fs';
+import os   from 'node:os';
 import path from 'node:path';
 
 import { withSnowflake } from './snowflake';
+import { normalizeLiteral } from './normalize';
 import { loadOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
 import { initBaseline, hasBaseline } from './auto-export-seen';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
@@ -42,6 +47,9 @@ const VALIDATION_MAX_TOKENS = 4_096;
 export interface ExportResult {
   items_written:    number;
   aliases_updated:  number;
+  /** true when another request already claimed/finished this run's export —
+   *  the counts are returned but no write pass was started. */
+  already_in_progress?: boolean;
 }
 
 interface CaseAItem {

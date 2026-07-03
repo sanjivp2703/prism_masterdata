@@ -71,8 +71,22 @@ export async function POST(request: Request) {
       database:  String(r.D ?? r.d ?? ''),
     });
   } catch (err: any) {
-    const msg = String(err?.message ?? err ?? 'Connection failed');
-    return Response.json({ ok: false, error: msg }, { status: 400 });
+    // Log the raw driver error server-side; return only the failure CLASS to
+    // the client (auth vs network vs other), never the raw message.
+    console.error('[test-snowflake] connection test failed:', err);
+    const raw  = String(err?.message ?? err ?? '');
+    const code = (err as any)?.code;
+    let error: string;
+    if (/incorrect username or password|password|jwt|private key|authenticat|390100|390144|mfa/i.test(raw)) {
+      error = 'Authentication failed. Check your username and password or private key.';
+    } else if (/enotfound|econn|etimedout|certificate|could not connect|network|account.*(not exist|not found)|404/i.test(raw)) {
+      error = 'Could not reach that Snowflake account. Check the account identifier and your network.';
+    } else if (/warehouse/i.test(raw)) {
+      error = 'Connected, but the warehouse could not be used. Check the warehouse name and its state.';
+    } else {
+      error = 'Connection failed. Check the account details and try again.';
+    }
+    return Response.json({ ok: false, error, code }, { status: 400 });
   } finally {
     await new Promise<void>((resolve) => {
       conn.destroy(() => resolve());

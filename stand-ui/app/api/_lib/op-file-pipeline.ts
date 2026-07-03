@@ -2,6 +2,8 @@ import 'server-only';
 
 import { google } from 'googleapis';
 import { withSnowflake } from './snowflake';
+import { sqlStringLiteral } from './normalize';
+import { decryptSecret } from './crypto';
 
 function execSql(conn: any, sqlText: string, binds: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
@@ -203,12 +205,23 @@ export async function refreshSheetsFileRows(
     return null;
   }
 
+  // Stored token may be encrypted at rest (enc:v1 format); decrypt only here,
+  // at the moment of use. Plaintext legacy rows pass through unchanged. The
+  // meta object keeps the stored form so write-backs never persist plaintext.
+  let refreshTokenPlain: string;
+  try {
+    refreshTokenPlain = decryptSecret(String(refresh_token));
+  } catch (err: any) {
+    console.warn(`[refreshSheetsFileRows] Pipeline ${pipelineId}: could not decrypt stored refresh_token:`, err?.message ?? err);
+    return null;
+  }
+
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID!,
     process.env.GOOGLE_CLIENT_SECRET!,
     process.env.GOOGLE_REDIRECT_URI!,
   );
-  oauth2Client.setCredentials({ refresh_token });
+  oauth2Client.setCredentials({ refresh_token: refreshTokenPlain });
 
   try {
     const sheets    = google.sheets({ version: 'v4', auth: oauth2Client });
@@ -273,7 +286,7 @@ export async function refreshSheetsFileRows(
         continue;
       }
 
-      const safeCol   = colName.replace(/'/g, "\\'");
+      const safeCol   = sqlStringLiteral(colName);
       const domainCond = domainId != null ? `AND lam.domain_id = ${domainId}` : 'AND lam.domain_id IS NULL';
 
       const rows = await withSnowflake(async (conn) => execSql(conn, `
@@ -354,7 +367,7 @@ export async function readFileDistinctValues(
   pipelineId: number,
   columnName: string,
 ): Promise<string[]> {
-  const safeCol = columnName.replace(/'/g, "\\'");
+  const safeCol = sqlStringLiteral(columnName);
   const rows = await execSql(conn, `
     SELECT ANY_VALUE(column_data['${safeCol}']::VARCHAR) AS val
     FROM STAND_DB.STAND_INTERNAL.PIPELINE_FILE_ROWS

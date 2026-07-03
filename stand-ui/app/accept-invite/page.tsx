@@ -34,7 +34,7 @@ interface Props {
   searchParams: Promise<{ token?: string; error?: string }>;
 }
 
-type InviteStatus = 'valid' | 'invalid' | 'expired' | 'already_accepted' | 'db_error';
+type InviteStatus = 'valid' | 'invalid' | 'expired' | 'revoked' | 'already_accepted' | 'db_error';
 
 export default async function AcceptInvitePage({ searchParams }: Props) {
   const { token, error: urlError } = await searchParams;
@@ -68,6 +68,7 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
       const expiresAt = new Date(row(rows[0], 'expires_at'));
 
       if (status === 'accepted') return 'already_accepted';
+      if (status === 'revoked') return 'revoked';
       if (status !== 'pending' || expiresAt < new Date()) return 'expired';
 
       invitedEmail = String(row(rows[0], 'invited_email'));
@@ -81,6 +82,7 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
     const messages: Record<string, string> = {
       invalid:          'This invitation link is invalid or has already been used.',
       expired:          'This invitation link has expired. Please ask the person who invited you to send a new one.',
+      revoked:          'This invitation was revoked. Ask your admin for a new one.',
       already_accepted: 'This invitation has already been accepted. Try signing in instead.',
       db_error:         'Could not verify your invitation at this time. Please try again shortly.',
     };

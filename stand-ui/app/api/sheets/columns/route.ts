@@ -10,7 +10,7 @@ function getOAuth2Client() {
 }
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
-const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}`;
+const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
 function extractSpreadsheetId(urlOrId: string): string | null {
   const match = urlOrId.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
@@ -95,7 +95,7 @@ export async function GET(request: Request) {
                       errMsg.toLowerCase().includes('token has been expired or revoked');
     if (isAuthErr) {
       // Clear stale tokens so the UI re-prompts Google auth.
-      const clearCookie = `HttpOnly; Path=/; SameSite=Lax; Max-Age=0`;
+      const clearCookie = `HttpOnly; Path=/; SameSite=Lax; Max-Age=0${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
       const h = new Headers({ 'Content-Type': 'application/json' });
       h.append('Set-Cookie', `google_access_token=; ${clearCookie}`);
       h.append('Set-Cookie', `google_refresh_token=; ${clearCookie}`);

@@ -8,6 +8,7 @@ import 'server-only';
 import {
   loadOpRunState,
   saveOpRunState,
+  saveOpRunStateWithRev,
   type OpRunState,
   type OpStateItem,
   type OpGroupItem,
@@ -34,6 +35,33 @@ async function exec(connection: any, sqlText: string, binds?: any[]): Promise<an
         else resolve(rows ?? []);
       },
     });
+  });
+}
+
+/**
+ * Backfill missing run_item_ids with sequential unique ids so legacy blobs
+ * (items without run_item_id) don't all collapse to id 0 and drop items.
+ * Prefers index+1; falls back to the next free id on collision. Mutates the
+ * items in place so the caller can persist them back into the blob.
+ */
+function ensureRunItemIds(items: OpStateItem[]): void {
+  const used = new Set<number>();
+  for (const it of items) {
+    if (typeof it.run_item_id === 'number' && it.run_item_id > 0) used.add(it.run_item_id);
+  }
+  let next = used.size > 0 ? Math.max(...used) + 1 : 1;
+  items.forEach((it, idx) => {
+    if (typeof it.run_item_id === 'number' && it.run_item_id > 0) return;
+    const candidate = idx + 1;
+    if (!used.has(candidate)) {
+      it.run_item_id = candidate;
+      used.add(candidate);
+    } else {
+      while (used.has(next)) next++;
+      it.run_item_id = next;
+      used.add(next);
+      next++;
+    }
   });
 }
 
@@ -145,18 +173,27 @@ export async function runAutoGroupForRun(
     }
   }
 
+  // Backfill missing run_item_ids (legacy blobs) with stable sequential ids;
+  // persisted back into the blob on save so they stay stable across passes.
+  ensureRunItemIds(state.items);
+
+  const alreadyGroupedLiterals = new Set(
+    state.groups.flatMap((g) => g.items.map((gi) => gi.literal_value)),
+  );
+
   let itemsToProcess: OpStateItem[];
   if (options.runItemIds && options.runItemIds.length > 0) {
     const requestedSet = new Set(options.runItemIds);
+    // Exclude items whose literal already sits in an existing group — otherwise
+    // a targeted re-group duplicates the literal into a second group.
     itemsToProcess = state.items.filter(
-      (it) => it.run_item_id != null && requestedSet.has(it.run_item_id),
+      (it) => it.run_item_id != null
+           && requestedSet.has(it.run_item_id)
+           && !alreadyGroupedLiterals.has(it.literal_value),
     );
   } else {
-    const groupedLiterals = new Set(
-      state.groups.flatMap((g) => g.items.map((gi) => gi.literal_value)),
-    );
     itemsToProcess = state.items.filter(
-      (it) => !groupedLiterals.has(it.literal_value),
+      (it) => !alreadyGroupedLiterals.has(it.literal_value),
     );
   }
 
@@ -211,19 +248,46 @@ export async function runAutoGroupForRun(
   let estimatedCost = 0;
   let chunkCount    = 0;
 
-  const pendingGroupMap = new Map<string, { items: OpGroupItem[]; from_lookup: boolean }>();
+  type Conf = 'h' | 'm' | 'l';
+  const CONF_RANK: Record<Conf, number> = { h: 3, m: 2, l: 1 };
+  const worseConf = (a: Conf, b: Conf): Conf => (CONF_RANK[a] <= CONF_RANK[b] ? a : b);
+  const bandFromScore = (s: number): Conf => (s >= 0.85 ? 'h' : s >= 0.55 ? 'm' : 'l');
+
+  const pendingGroupMap = new Map<string, { items: OpGroupItem[]; from_lookup: boolean; confidence: Conf }>();
+  // Normalized display-name → pendingGroupMap key, so an LLM group whose name
+  // normalizes equal to a lookup group's merges INTO the lookup group (the
+  // lookup alias_name always wins) instead of creating a case-variant duplicate.
+  const normNameIndex = new Map<string, string>();
+
+  const addToPendingGroup = (
+    displayName: string,
+    items:       OpGroupItem[],
+    fromLookup:  boolean,
+    confidence:  Conf,
+  ): void => {
+    const normKey     = normalizeLiteral(displayName) || displayName;
+    const existingKey = normNameIndex.get(normKey);
+    if (existingKey !== undefined) {
+      const entry = pendingGroupMap.get(existingKey)!;
+      entry.items.push(...items);
+      // Lookup groups keep 'h'; LLM-LLM merges keep the worse confidence.
+      if (!entry.from_lookup) entry.confidence = worseConf(entry.confidence, confidence);
+      return;
+    }
+    pendingGroupMap.set(displayName, { items: [...items], from_lookup: fromLookup, confidence });
+    normNameIndex.set(normKey, displayName);
+  };
 
   for (const item of matchedItems) {
     const alias = lookupMap.get(normalizeLiteral(item.literal_value))!;
-    const entry = pendingGroupMap.get(alias) ?? { items: [], from_lookup: true };
-    entry.items.push({ literal_value: item.literal_value, matched_from_lookup: true });
-    pendingGroupMap.set(alias, entry);
+    addToPendingGroup(alias, [{ literal_value: item.literal_value, matched_from_lookup: true }], true, 'h');
   }
 
   const ungroupedFromLLM: string[] = [];
+  const llmFailedLiterals: string[] = [];
   if (unmatchedItems.length > 0) {
     const runItems: RunItemForPairing[] = unmatchedItems.map((it) => ({
-      run_item_id:         it.run_item_id ?? 0,
+      run_item_id:         it.run_item_id!,
       literal_value:       it.literal_value,
       cleaned_value:       null,
       normalization_value: null,
@@ -245,9 +309,15 @@ export async function runAutoGroupForRun(
        ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
        LIMIT 200`,
     );
-    const existingAliasNames = existingAliasRows
+    const approvedAliasNames = existingAliasRows
       .map((r) => String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '').trim())
       .filter(Boolean);
+
+    // Include this run's lookup-group alias names so the merge/grouping prompts
+    // treat them as protected canonical names (lookup names always win) even if
+    // they fall outside the top-200 usage window.
+    const lookupAliasNames  = Array.from(new Set(lookupMap.values()));
+    const existingAliasNames = Array.from(new Set([...lookupAliasNames, ...approvedAliasNames]));
 
     const _groupStart = Date.now();
     const onePromptResult = await runOnePromptGrouping(runItems, effectiveConceptName, effectiveConceptDef, existingAliasNames, namingConvention, standardizationRules);
@@ -278,44 +348,70 @@ export async function runAutoGroupForRun(
 
       if (items.length === 0) continue;
 
-      const existing = pendingGroupMap.get(displayName);
-      if (existing) {
-        existing.items.push(...items);
-      } else {
-        pendingGroupMap.set(displayName, { items, from_lookup: false });
-      }
+      // Group confidence = band of the members' LLM confidence scores
+      // (the 'h|m|l' from the chunk output), not a hardcoded 'h'.
+      const memberScores = group.member_ids
+        .map((id) => onePromptResult.confidence_scores.get(id))
+        .filter((s): s is number => typeof s === 'number');
+      const avgScore = memberScores.length > 0
+        ? memberScores.reduce((a, b) => a + b, 0) / memberScores.length
+        : 0.5;
+
+      addToPendingGroup(displayName, items, false, bandFromScore(avgScore));
     }
 
     for (const id of onePromptResult.unassigned_ids ?? []) {
       const ri = runItemsById.get(id);
       if (ri) ungroupedFromLLM.push(ri.literal_value);
     }
+
+    // Items whose chunk LLM call failed even after retries — honest fallback
+    // singletons ('llm_failed', confidence 'l', needs_review), never normal groups.
+    for (const id of onePromptResult.failed_ids ?? []) {
+      const ri = runItemsById.get(id);
+      if (ri) llmFailedLiterals.push(ri.literal_value);
+    }
   }
 
-  const existingMaxGroupId = Math.max(0, ...state.groups.map((g) => g.group_id));
-  let nextGroupId = existingMaxGroupId + 1;
-
-  const newGroups: OpGroup[] = [...pendingGroupMap.entries()].map(([aliasName, info]) => ({
-    group_id:          nextGroupId++,
+  // Group specs — group_ids are assigned at persist time against the FRESH blob
+  // so concurrent writers can't produce colliding ids.
+  type GroupSpec = Omit<OpGroup, 'group_id'>;
+  const newGroupSpecs: GroupSpec[] = [...pendingGroupMap.entries()].map(([aliasName, info]) => ({
     alias_name:        aliasName,
-    alias_name_source: (info.from_lookup ? 'lookup_validated' : 'llm_proposed') as
-      'lookup_validated' | 'llm_proposed',
-    confidence:        'h' as const,
+    alias_name_source: info.from_lookup ? ('lookup_validated' as const) : ('llm_proposed' as const),
+    // Lookup groups stay 'h'; LLM groups carry the LLM's own confidence band.
+    confidence:        info.from_lookup ? ('h' as const) : info.confidence,
     from_lookup_chunk: info.from_lookup,
     items:             info.items,
   }));
+
+  const specLiterals = new Set(newGroupSpecs.flatMap((g) => g.items.map((gi) => gi.literal_value)));
+
+  // Items whose chunk LLM call FAILED (even after retries): honest fallback
+  // singletons — self-mapped, confidence 'l', needs_review, source 'llm_failed'.
+  // Never presented as confident groupings.
+  for (const lv of llmFailedLiterals) {
+    if (specLiterals.has(lv)) continue;
+    specLiterals.add(lv);
+    newGroupSpecs.push({
+      alias_name:        lv,
+      alias_name_source: 'llm_failed',
+      confidence:        'l',
+      from_lookup_chunk: false,
+      needs_review:      true,
+      items:             [{ literal_value: lv, matched_from_lookup: false }],
+    });
+  }
 
   // Items the LLM couldn't confidently place become their OWN singleton group,
   // self-mapped (canonical = the raw value) and flagged needs_review. This keeps
   // EVERY processed value written to the lookup — nothing is left ungrouped and
   // unmapped — so a freshly committed pipeline starts with an empty queue, while
   // these still surface in yellow for the user to confirm or rename.
-  const groupedLiterals = new Set(newGroups.flatMap((g) => g.items.map((gi) => gi.literal_value)));
   for (const lv of ungroupedFromLLM) {
-    if (groupedLiterals.has(lv)) continue;
-    groupedLiterals.add(lv);
-    newGroups.push({
-      group_id:          nextGroupId++,
+    if (specLiterals.has(lv)) continue;
+    specLiterals.add(lv);
+    newGroupSpecs.push({
       alias_name:        lv,
       alias_name_source: 'llm_proposed',
       confidence:        'l',
@@ -325,37 +421,80 @@ export async function runAutoGroupForRun(
     });
   }
 
-  const updatedItems = state.items.map((item) => {
-    const alias = lookupMap.get(normalizeLiteral(item.literal_value));
-    return alias !== undefined
-      ? { ...item, matched_from_lookup: true, alias_name: alias }
-      : item;
-  });
-
   const processedLiterals = new Set(itemsToProcess.map((it) => it.literal_value));
 
-  // Only previously-ungrouped items that weren't reprocessed this pass stay
-  // ungrouped; everything processed now lives in a group (real or singleton).
-  const newUngrouped = state.ungrouped.filter((u) => !processedLiterals.has(u.literal_value));
+  // ── Rev-safe persist ───────────────────────────────────────────────────────
+  // Re-load the current blob immediately before writing and apply this pass's
+  // changes (groups / ungrouped / status / lookup item annotations) to the FRESH
+  // blob, then save guarded on the blob's rev. Retry once on conflict; as a last
+  // resort force-write the rebased state so the (paid) LLM result isn't dropped.
+  const buildMergedState = (fresh: OpRunState): { merged: OpRunState; appended: number } => {
+    ensureRunItemIds(fresh.items);
 
-  const newState: OpRunState = {
-    status:    'running',
-    items:     updatedItems,
-    groups:    [...state.groups, ...newGroups],
-    ungrouped: newUngrouped,
+    const freshGrouped = new Set(fresh.groups.flatMap((g) => g.items.map((gi) => gi.literal_value)));
+    let nextGroupId = Math.max(0, ...fresh.groups.map((g) => g.group_id)) + 1;
+    const appendGroups: OpGroup[] = [];
+    for (const spec of newGroupSpecs) {
+      // Skip literals that landed in a group since we started (e.g. user drag).
+      const itemsLeft = spec.items.filter((gi) => !freshGrouped.has(gi.literal_value));
+      if (itemsLeft.length === 0) continue;
+      for (const gi of itemsLeft) freshGrouped.add(gi.literal_value);
+      appendGroups.push({ ...spec, group_id: nextGroupId++, items: itemsLeft });
+    }
+
+    const updatedItems = fresh.items.map((item) => {
+      const alias = lookupMap.get(normalizeLiteral(item.literal_value));
+      return alias !== undefined
+        ? { ...item, matched_from_lookup: true, alias_name: alias }
+        : item;
+    });
+
+    // Only previously-ungrouped items that weren't reprocessed this pass stay
+    // ungrouped; everything processed now lives in a group (real or singleton).
+    const newUngrouped = fresh.ungrouped.filter(
+      (u) => !processedLiterals.has(u.literal_value) && !freshGrouped.has(u.literal_value),
+    );
+
+    return {
+      merged: {
+        ...fresh,
+        status:    'running',
+        items:     updatedItems,
+        groups:    [...fresh.groups, ...appendGroups],
+        ungrouped: newUngrouped,
+      },
+      appended: appendGroups.length,
+    };
   };
 
-  await saveOpRunState(connection, runId, newState);
+  let persisted: { merged: OpRunState; appended: number } | null = null;
+  for (let attempt = 0; attempt < 2 && !persisted; attempt++) {
+    const fresh = (await loadOpRunState(connection, runId)) ?? state;
+    const built = buildMergedState(fresh);
+    const saved = await saveOpRunStateWithRev(connection, runId, built.merged, Number(fresh.rev ?? 0));
+    if (saved) {
+      persisted = built;
+    } else {
+      console.warn(`[op-auto-group-run] Run ${runId}: state rev conflict while saving auto-group result (attempt ${attempt + 1}) — rebasing.`);
+    }
+  }
+  if (!persisted) {
+    const fresh = (await loadOpRunState(connection, runId)) ?? state;
+    const built = buildMergedState(fresh);
+    console.warn(`[op-auto-group-run] Run ${runId}: rev conflict persisted after retry — force-saving rebased state.`);
+    await saveOpRunState(connection, runId, { ...built.merged, rev: Number(fresh.rev ?? 0) + 1 });
+    persisted = built;
+  }
 
   return {
     // Every processed item now lands in a group (real or self-mapped singleton).
-    groups_created:     newGroups.length,
+    groups_created:     persisted.appended,
     items_committed:    itemsToProcess.length,
     lookup_matched:     matchedItems.length,
     llm_grouped:        unmatchedItems.length,
     llm_elapsed_ms:     llmElapsedMs,
     estimated_cost_usd: estimatedCost,
     chunk_count:        chunkCount,
-    ungrouped_literals: newUngrouped.map((u) => u.literal_value),
+    ungrouped_literals: persisted.merged.ungrouped.map((u) => u.literal_value),
   };
 }
