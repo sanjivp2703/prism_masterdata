@@ -10,9 +10,9 @@ Two surfaces:
 - **Snowflake database layer** — data storage and computation
 - **Next.js web UI** — human review and run management
 
-Two paid products sharing one codebase, controlled by `NEXT_PUBLIC_APP_MODE` env var:
-- **`basic`** — Ad hoc mode. User provides values, creates a run, reviews LLM groups, and exports manually (CSV/Excel/Sheets).
-- **`premium`** — Fully automated pipeline mode. A background poller watches live Snowflake tables via standard (delete-aware) streams; new values are queued, LLM-grouped, and exported automatically; deletes/updates drop rows from the export table. Supports Snowflake masking policy/UDF integration and export tables. See **Premium Pipeline Subsystems** below.
+Prism is a **single product**: the fully automated pipeline platform. A background poller watches live Snowflake tables via standard (delete-aware) streams; new values are queued, LLM-grouped, and exported automatically; deletes/updates drop rows from the export table. See **Pipeline Subsystems** below. The old basic/premium tier split is gone — there is no `NEXT_PUBLIC_APP_MODE`, no `feature-flags.ts`, and no mode guards.
+
+One additional feature (not a tier): the **one-time standardization flow** (`app/one-time/`) — "clean a list once", standardize a source table's columns to a standalone output table without ever touching the shared lookup. See **One-Time Standardization** below.
 
 ---
 
@@ -33,13 +33,12 @@ There is no test suite.
 
 ```bash
 snowsql -f 00_bootstrap.sql       # create DB + schemas
-snowsql -f 01_internal_tables.sql # tables + roles + grants (all-in-one)
-snowsql -f 02_public_api.sql
+snowsql -f 01_internal_tables.sql # tables + UDF + roles + grants (all-in-one)
 ```
 
-`01_internal_tables.sql` contains commented-out `ALTER TABLE` statements at the bottom for incremental migrations.
+That's the complete deploy — `02_public_api.sql` was dead code and has been deleted, and there are no deploy/setup shell scripts. `01_internal_tables.sql` contains commented-out `ALTER TABLE` statements at the bottom for incremental migrations.
 
-**Demo seed (currently disabled).** `01_internal_tables.sql` carries a demo seed for `TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS_SHORT` (two columns → "Mobile Carrier" / "Company Name" domains, one shared export table). As of 2026-06-14 the internal-state seeds — `DOMAINS`, the example `PIPELINES`, and the initial standardizations (`APPROVED_ALIAS_NAMES` + `LITERAL_ALIAS_MATCHES`) — are **temporarily disabled** with `TEMP:` markers (the DOMAINS insert is `--`-commented; the others are wrapped in `/* … */`). The raw source table + its sample rows are kept live. So a fresh `01` run = all tables created/empty + a populated source table (clean slate to test the from-scratch create flow). Re-enable the `TEMP:`-marked blocks to restore the demo (re-enable DOMAINS too, since the pipeline/standardization seeds resolve `domain_id` by name).
+**Demo seed (currently disabled).** `01_internal_tables.sql` carries a demo seed for `TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS_SHORT` (two columns → "Mobile Carrier" / "Company Name" domains, one shared export table). As of 2026-06-14 the internal-state seeds — `DOMAINS`, the example `PIPELINES`, and the initial standardizations (`APPROVED_ALIAS_NAMES` + `LITERAL_ALIAS_MATCHES`) — are **temporarily disabled** with `TEMP:` markers (the DOMAINS insert is `--`-commented; the others are wrapped in `/* … */`). The raw source table + its sample rows are kept live. So a fresh `01` run = all tables created/empty + a populated source table (clean slate to test the from-scratch create flow). Re-enable the `TEMP:`-marked blocks to restore the demo (re-enable DOMAINS too, since the pipeline/standardization seeds resolve `domain_id` by name). The **client-side half** of the demo — prefilled table/column values in the connect form — is gated behind the `NEXT_PUBLIC_PRISM_DEMO_DATA` env flag (off by default).
 
 ---
 
@@ -49,19 +48,22 @@ Copy `stand-ui/.env.local.example` to `stand-ui/.env.local`.
 
 | Variable | Purpose |
 |---|---|
-| `NEXT_PUBLIC_APP_MODE` | `basic` or `premium` |
-| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_WAREHOUSE` | Required for all modes |
+| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_WAREHOUSE` | Required (server-env fallback when no per-account credentials are saved in Settings) |
 | `SNOWFLAKE_PASSWORD` | Password auth (fallback) |
 | `SNOWFLAKE_PRIVATE_KEY` | Inline PEM private key (preferred); handle literal `\n` → real newline |
 | `SNOWFLAKE_PRIVATE_KEY_PATH` | File path to PEM private key (alternative to inline) |
 | `ANTHROPIC_API_KEY` | Required for LLM grouping and validation |
 | `SESSION_SECRET` | HMAC key for session cookies |
+| `PRISM_ENCRYPTION_KEY` | 64 hex chars (32 bytes) — AES-256-GCM app-level encryption key for stored secrets: `ACCOUNTS.sf_password`, `ACCOUNTS.sf_private_key`, and the Google `refresh_token` in `file_source_meta`. Ciphertext format `enc:v1:<iv>:<ciphertext>:<authTag>`. Generate with `openssl rand -hex 32`; store per-installation in a password manager (losing it orphans the encrypted secrets). |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Google OAuth (login + Sheets export) |
 | `ADMIN_EMAIL` | Bootstrap admin; all other users must be invited |
 | `REDIS_URL` | Optional — enables auto-export baseline tracking; degrades gracefully if absent |
 | `SMTP_*` + `APP_URL` | Email invitations |
-
-**All changes should target premium mode unless explicitly told otherwise.**
+| `SENTRY_DSN` / `NEXT_PUBLIC_SENTRY_DSN` | Optional — server/client error monitoring. Everything no-ops when unset. |
+| `PRISM_DEBUG_TOOLS` | `'true'` enables the `/debug` page and `/api/admin/table` inspector. Operator-only — never set in customer installs. |
+| `PRISM_DEBUG_ARTIFACTS` | Writes LLM breakdown / validation audit JSONs to the OS temp dir for debugging. |
+| `NEXT_PUBLIC_PRISM_DEMO_DATA` | Enables demo prefills in the connect form (off by default). |
+| `PRISM_CHUNK_MODEL` / `PRISM_MERGE_MODEL` | Optional model-ID overrides for the grouping chunk / merge LLM calls (default `claude-sonnet-4-6`). |
 
 ---
 
@@ -71,14 +73,16 @@ Copy `stand-ui/.env.local.example` to `stand-ui/.env.local`.
 
 The deterministic scoring pipeline has been replaced with a single LLM call per chunk. Key principles:
 
-- No metadata generation — no tokenization or importance scoring (the legacy deterministic pipeline). Note: a lightweight matching-only normalization (`PRISM_NORMALIZE`) IS applied to compare/dedup literals — see Premium Pipeline Subsystems; it does not generate stored metadata.
+- No metadata generation — no tokenization or importance scoring (the deleted legacy deterministic pipeline). Note: a lightweight matching-only normalization (`PRISM_NORMALIZE`) IS applied to compare/dedup literals — see Pipeline Subsystems; it does not generate stored metadata beyond the `normalized_value` column on `LITERAL_ALIAS_MATCHES`.
 - Hash lookup first — literal value match (normalized) against `LITERAL_ALIAS_MATCHES` before any LLM call
-- Single JSON blob per run — run state in `RUNS.state`, one read on page load, one write per sync
-- Async LLM validation — runs in background after export; does not block the export confirmation
+- Single JSON blob per run — run state in `RUNS.state`, one read on page load, one write per sync, optimistic-concurrency `rev` field
+- Write-first export — the user's decisions are written immediately; the async LLM validation is an amendment pass afterwards and never blocks or unwinds the write
 
-### Legacy System (Do Not Delete)
+### Legacy Code (Deleted)
 
-The original deterministic pipeline (tokenization, confidence scoring, admin validation) remains in the codebase but is not used for new runs. Legacy tables are read-only from the UI perspective.
+The original deterministic pipeline has been **deleted from the codebase**: `grouping-phase0.ts`–`grouping-phase4.ts`, `grouping-pipeline.ts`, `grouping-llm.ts`, `grouping-utils.ts`, `feature-payload.ts`, `llm-pairscore.ts`, `llm-confidence.ts`, `redis-cache.ts`, `clique-detection.ts`, and `pairscore.ts` are gone — the last two survive only as type definitions in `app/api/_lib/grouping-types.ts` (`RunItemForPairing`, `FinalGroup`, …), which the live LLM grouping flow still consumes. `masking-policy.ts` was also deleted: the masking feature was never wired into the product — **do not claim Prism supports masking policies** (the poller's `checkSourceHealth` still *detects* policies on watched columns purely to skip/pause safely).
+
+The 13 legacy tables (`CONCEPTS`, `ALIASES`, `ALIAS_SUMMARY`, `RAW_VALUES`, `TOKENS_SUMMARY`, `ALIAS_TOKEN_COUNT`, `GLOBAL_TOKEN_COUNT`, `RUN_GROUPS`, `RUN_ITEMS`, `RUN_APPLIED_TARGETS`, `AUDIT_LOG`, `CLASSIFICATION_METADATA_PROFILES`, `CONCEPT_COMPATIBILITY`) are unreferenced by any live code path and can be dropped from any existing database without consequence.
 
 ---
 
@@ -93,16 +97,13 @@ The original deterministic pipeline (tokenization, confidence scoring, admin val
 | Alias Name | The canonical correct name a group maps to (e.g. "AT&T", "Verizon"). Stored in `APPROVED_ALIAS_NAMES`. |
 | Lookup Match | A previously confirmed `literal_value → alias_id` mapping stored in `LITERAL_ALIAS_MATCHES`. |
 
-What was removed:
-- **Concepts** — replaced by Domains
-- **Admin Validation Stage** — replaced by async LLM validation post-export
-- **Org ID scoping** — single-tenant by definition
+Historical removals: **Concepts** → replaced by Domains; the blocking **Admin Validation Stage** → replaced by the post-export async LLM amendment pass; **Org ID scoping** → single-tenant by definition.
 
 ---
 
 ## Database Tables
 
-All tables live in `STAND_DB.STAND_INTERNAL`.
+All internal tables live in `STAND_DB.STAND_INTERNAL`.
 
 ### Active Tables
 
@@ -113,7 +114,9 @@ All tables live in `STAND_DB.STAND_INTERNAL`.
 - `source_column` VARCHAR
 - `domain_id` INT FK → DOMAINS (nullable — NULL = no domain)
 - `mode` VARCHAR — `'auto'` | `'manual'`
-- `run_status` VARCHAR — `'created'` | `'running'` | `'complete'` | `'failed'`
+- `run_type` VARCHAR — `'normal'` (writes to the shared lookup on export) | `'one_time'` (throwaway run that exports to a standalone table and never touches the lookup)
+- `created_by` INT — ACCOUNTS.account_id of the creator (scopes the one-time archive)
+- `run_status` VARCHAR — `'created'` | `'running'` | `'approved'` (wizard deferred export) | `'validating'` | `'completed'` | `'failed'`
 - `state` VARIANT — full JSON blob (see State Blob Structure below)
 - `stats_snapshot` VARIANT
 - `creation_nonce` VARCHAR
@@ -130,11 +133,11 @@ All tables live in `STAND_DB.STAND_INTERNAL`.
 **LITERAL_ALIAS_MATCHES**
 - `match_id` INT AUTOINCREMENT PK
 - `literal_value` VARCHAR
+- `normalized_value` VARCHAR — `PRISM_NORMALIZE(literal_value)` **materialized at write time** so lookup/export joins compare a plain stored column (hash-joinable, partition-prunable) instead of re-running the JS UDF over this only-growing table. Every code path that INSERTs/MERGEs here MUST set it. If `PRISM_NORMALIZE` logic ever changes, this column must be backfilled.
 - `alias_id` INT FK → APPROVED_ALIAS_NAMES (not alias_name directly)
-- `domain_id` INT FK (nullable)
+- `domain_id` INT FK (nullable, denormalized from alias)
 - `run_id` INT FK
 - `confirmed_at` TIMESTAMP
-- Unique on `(literal_value, domain_id)`
 
 **DOMAINS**
 - `domain_id` INT AUTOINCREMENT PK
@@ -149,48 +152,51 @@ All tables live in `STAND_DB.STAND_INTERNAL`.
 - `llm_decision` VARCHAR — `'user'` | `'original'`
 - `decided_at` TIMESTAMP
 
-**PIPELINES** (premium only)
+**PIPELINES**
 - `pipeline_id` INT AUTOINCREMENT PK
 - `table_fqn` VARCHAR — fully qualified source table (for file-based: synthetic key `SHEETS:<spreadsheet_id>:<tab>:<nonce>`)
 - `column_name` VARCHAR — first (or only) standardized column; authoritative for Snowflake pipelines
-- `domain_id` INT FK (nullable) — first column's domain for file-based multi-column pipelines
+- `domain_id` INT FK **NOT NULL** — every pipeline must belong to a domain (first column's domain for file-based multi-column pipelines)
 - `name` VARCHAR
 - `export_table_fqn` VARCHAR (nullable) — Snowflake export table (not used for file-based)
-- `source_type` VARCHAR — `'snowflake'` (default/NULL) | `'sheets'` | `'csv'` | `'excel'`
-- `file_source_meta` VARIANT — for file-based: `{ source_type, spreadsheet_url, spreadsheet_id, sheet_tab_name, columns: [{column_name, domain_id}], refresh_token? }`
+- `source_type` VARCHAR — `'snowflake'` (default) | `'sheets'` | `'csv'` | `'excel'`
+- `file_source_meta` VARIANT — for file-based: `{ source_type, spreadsheet_url, spreadsheet_id, sheet_tab_name, columns: [{column_name, domain_id}], refresh_token? }` (refresh_token stored **encrypted**, `enc:v1:` format)
 - `file_export_meta` VARIANT — for Sheets: `{ spreadsheet_id, spreadsheet_url, output_spreadsheet_id, output_spreadsheet_url, output_tab_name }`
 - `export_unmapped_rows` BOOLEAN — whether to include unmapped rows in export (default true)
 - `status` VARCHAR — `'initializing'` | `'pending_baseline'` | `'active'` | `'paused'`
 - `status_message` VARCHAR (nullable) — human-readable reason shown while paused/blocked (NULL = healthy); see Pipeline Health Guards & Alerts
 - `mode` VARCHAR — `'auto'` | `'manual'`
-- `total_source_values` INT
+- `created_by` INT — ACCOUNTS.account_id of creator (scopes alert notifications for non-admins)
+- `total_source_values` INT, `total_new_values` INT
 - `total_mapped` INT
 - `queue_size` INT
 - `last_polled_at`, `last_queue_empty_at`, `updated_at` TIMESTAMP
+- Unique on `(table_fqn, column_name, domain_id)`
 
 Each active **Snowflake** pipeline has a standard (delete-aware) Snowflake stream `PIPELINE_STREAM_<pipeline_id>` in `STAND_INTERNAL`. File-based pipelines have no stream.
 
-**PIPELINE_QUEUE** (premium only) — values detected by the stream poller not yet standardized. Deduped on the normalized form (`PRISM_NORMALIZE`); stores a representative original `literal_value`. Schema: `queue_id` PK, `pipeline_id` FK, `literal_value`, `source_frequency`, `detected_at`. Unique on `(pipeline_id, literal_value)`. Note: for file-based pipelines this table is NOT the primary source for standardization — `PIPELINE_FILE_ROWS` is used instead.
+**PIPELINE_QUEUE** — values detected by the stream poller not yet standardized. Deduped on the normalized form (`PRISM_NORMALIZE`); stores a representative original `literal_value`. Schema: `queue_id` PK, `pipeline_id` FK, `literal_value`, `source_frequency`, `detected_at`. Unique on `(pipeline_id, literal_value)`. Note: for file-based pipelines this table is NOT the primary source for standardization — `PIPELINE_FILE_ROWS` is used instead.
 
-**PIPELINE_FILE_ROWS** (premium, file-based pipelines only) — row-level snapshot of the uploaded file or Google Sheet. Schema: `pipeline_id` FK, `row_num` INT, `column_data` VARIANT (JSON object with all column values keyed by column name). Populated at pipeline creation from the uploaded file or Google Sheet. For Sheets pipelines: refreshed on every poller cycle by `refreshSheetsFileRows`. `readFileDistinctValues` reads from this table to get processable literals.
+**PIPELINE_FILE_ROWS** (file-based pipelines only) — row-level snapshot of the uploaded file or Google Sheet. Schema: `pipeline_id` FK, `row_num` INT, `column_data` VARIANT (JSON object with all column values keyed by column name). Populated at pipeline creation from the uploaded file or Google Sheet. For Sheets pipelines: refreshed on every poller cycle by `refreshSheetsFileRows`. `readFileDistinctValues` reads from this table to get processable literals.
+
+**ONE_TIME_STANDARDIZATIONS** — per-user archive of completed one-time sessions. One row per exported session: `ots_id` PK, `created_by`, `session_nonce` (ties together the session's working RUNS), `source_relation`, `columns` VARIANT, `export_target`, `export_mode` (`'create'` | `'overwrite'`), `convention` VARIANT, `mappings` VARIANT, `created_at`, `exported_at`. Fully decoupled from the domain lookup.
 
 **ACCOUNTS**
 - `account_id` INT AUTOINCREMENT PK
-- `google_id` VARCHAR
-- `email` VARCHAR
-- `name` VARCHAR
-- `picture_url` VARCHAR
+- `google_id` VARCHAR, `email` VARCHAR, `name` VARCHAR, `picture_url` VARCHAR
 - `role` VARCHAR — `'admin'` | `'user'`
+- `session_version` INT NOT NULL DEFAULT 1 — bumped to revoke all of the account's live sessions (cookies carry the version they were issued with; a mismatch rejects the session)
+- `sf_account` / `sf_user` / `sf_warehouse` / `sf_role` / `sf_password` / `sf_private_key` — per-account Snowflake configuration (nullable; falls back to env vars). `sf_password` and `sf_private_key` are stored **app-level encrypted** (AES-256-GCM via `PRISM_ENCRYPTION_KEY`, `enc:v1:` prefix).
 - `creation_nonce` VARCHAR
-- `created_at`, `updated_at` TIMESTAMP
+- `created_at`, `last_login_at` TIMESTAMP
 
 **INVITATIONS**
 - Status values: `'pending'` | `'accepted'` | `'revoked'`
 - Expire after 7 days
 
-### Legacy Tables (Read-Only — Do Not Modify from New Code)
+### Legacy Tables
 
-`CONCEPTS`, `ALIASES`, `ALIAS_SUMMARY`, `RAW_VALUES`, `TOKENS_SUMMARY`, `ALIAS_TOKEN_COUNT`, `GLOBAL_TOKEN_COUNT`, `RUN_GROUPS`, `RUN_ITEMS`, `RUN_APPLIED_TARGETS`, `AUDIT_LOG`, `CLASSIFICATION_METADATA_PROFILES`, `CONCEPT_COMPATIBILITY`
+The 13 legacy deterministic-pipeline tables (listed under **Legacy Code (Deleted)** above) may still exist in older databases but are unreferenced by any live code and can be dropped freely. Do not write new code against them.
 
 ---
 
@@ -200,6 +206,7 @@ The `RUNS.state` VARIANT column is the sole source of truth for a run. Schema:
 
 ```json
 {
+  "rev": 4,
   "status": "created | running | complete",
   "items": [
     { "literal_value": "VZW", "source_frequency": 14, "matched_from_lookup": false }
@@ -208,8 +215,9 @@ The `RUNS.state` VARIANT column is the sole source of truth for a run. Schema:
     {
       "group_id": 1,
       "alias_name": "Verizon",
-      "alias_name_source": "lookup_validated | llm_proposed | user_override",
+      "alias_name_source": "lookup_validated | llm_proposed | user_override | llm_failed",
       "confidence": "h | m | l",
+      "needs_review": false,
       "from_lookup_chunk": true,
       "items": [{ "literal_value": "VZW", "matched_from_lookup": true }]
     }
@@ -218,38 +226,47 @@ The `RUNS.state` VARIANT column is the sole source of truth for a run. Schema:
 }
 ```
 
+### Optimistic Concurrency (`rev`)
+
+The blob carries an integer `rev` field (missing = 0). `PUT /api/run/[run_id]/state` takes `{ state, expectedRev }`; the UPDATE only lands when the stored rev still equals `expectedRev`. Success → `200 { rev: expectedRev + 1 }`; conflict → `409 { error: 'conflict', currentRev }` so the client can refetch and rebase. Server-side writers (auto-group, the export route's state patch) re-load fresh state and bump `rev` themselves.
+
 ---
 
 ## Run Lifecycle
 
 ### 1. Run Creation
 1. Insert into `RUNS` with `run_status = 'created'`
-2. `SELECT DISTINCT {source_column}, COUNT(*) AS source_frequency FROM {source_relation} GROUP BY {source_column}`
+2. Distinct-value scan of the source column — **deduped on the normalized form**: `GROUP BY PRISM_NORMALIZE(...)` + `ANY_VALUE(...)` (a representative original), NOT a raw `SELECT DISTINCT`
 3. Write skeleton state blob to `RUNS.state` — items populated, groups = [], ungrouped = []
 
 ### 2. Auto Group (triggered by button click, not run creation)
 1. Read items from state blob — do NOT re-query source table
-2. Literal lookup — single hash lookup against `LITERAL_ALIAS_MATCHES` for all items at once
+2. Literal lookup — single hash lookup against `LITERAL_ALIAS_MATCHES` for all items at once (stored `normalized_value` vs `normalizeLiteral` of the item)
 3. Lookup chunk — group matched items by alias; `alias_name_source = 'lookup_validated'`, `confidence = 'h'`; skip LLM entirely
 4. LLM chunking — split unmatched items into chunks of 25; send all chunks in parallel
-5. Merge pass — merge all proposed groups + lookup groups; lookup names always win
-6. Write final state blob; update `run_status` to `'running'`
+5. Merge pass — merge all proposed groups + lookup groups; lookup names always win (matched on `normalizeLiteral(name)`)
+6. Write final state blob (bumping `rev`); update `run_status` to `'running'`
+- Chunks whose LLM call fails even after retries become **honest fallbacks**: self-mapped singletons with `alias_name_source = 'llm_failed'`, `confidence = 'l'`, `needs_review = true` — never silently marked high-confidence.
 
 ### 3. User Review
 - State maintained in memory on client
-- Debounced 30-second timer writes full blob on changes
-- `beforeunload` triggers immediate write
+- Autosave every 30 seconds while there are unsaved changes; `pagehide` flushes via `sendBeacon`; `beforeunload` warns when unsaved changes exist
+- On a 409 the client refetches the server blob and replaces its local copy
 
-### 4. Export
+### 4. Export — WRITE-FIRST, VALIDATE-SECOND
 1. Read final state blob
-2. Upsert every grouped item into `LITERAL_ALIAS_MATCHES` (via `alias_id` FK)
-3. Upsert alias names into `APPROVED_ALIAS_NAMES`, increment `usage_count`
-4. Update `run_status` to `'complete'`
-5. Async LLM validation pass (non-blocking)
+2. Detect Case A / Case B deviations (no DB writes yet)
+3. Mark the run `'validating'` (double-export guard — a run already `'validating'`/`'completed'`/`'failed'` does not re-trigger the write pass; repeat calls return the same counts)
+4. **Write everything immediately with the user's choices taken at face value** (`writeAllDecisions`): bulk-upsert grouped items into `LITERAL_ALIAS_MATCHES` (via `alias_id` FK, setting `normalized_value`), upsert alias names into `APPROVED_ALIAS_NAMES`, increment `usage_count`. The bulk MERGE dedups its source rows on `normalizeLiteral` first (Snowflake errors on duplicate MERGE source keys).
+5. On successful write → `run_status = 'completed'`. Only a failure of the write itself marks the run `'failed'` — which is retriable.
+6. The async LLM validation then runs as an **amendment pass** (may flip Case A/B rows afterwards). Its failure records `validation_status: 'failed'` in the state blob and **never blocks or unwinds the write**.
+7. `PIPELINE_QUEUE` cleanup after export is scoped to the run's normalized literals only (never a blanket pipeline-wide delete).
+
+Steps 4–6 normally run in the background after the HTTP response (fire-and-forget); the wizard's `wait: true` path awaits the write.
 
 ### 5. Async LLM Validation
 
-Fires after export. Reviews only:
+Fires after the write pass. Reviews only:
 - **Case A** — User moved a `matched_from_lookup = true` item to a different group
 - **Case B** — User renamed a `lookup_validated` alias name
 
@@ -258,15 +275,23 @@ Does NOT review:
 - New LLM-grouped items accepted as-is
 - Ungrouped items (not written to DB)
 
-All decisions logged to `VALIDATION_LOG`.
+The validation LLM's output is **structurally validated against exactly what was sent** (unknown literals/aliases are ignored) before any amendment is applied. All decisions logged to `VALIDATION_LOG`.
 
 ---
 
 ## LLM Integration
 
-**Model**: `claude-sonnet-4-6` for all classification and validation calls.
+**Model**: `claude-sonnet-4-6` for ALL calls — grouping chunks, merge pass, and validation. Chunk and merge model IDs are env-overridable via `PRISM_CHUNK_MODEL` / `PRISM_MERGE_MODEL` (for A/B testing).
 
-Legacy files (`llm-confidence.ts`, `llm-pairscore.ts`) use `claude-haiku-4-5-20251001` — these are part of the legacy pipeline and not called by new code.
+### Reliability
+- Chunk + merge calls retry **twice with backoff** on 429/5xx and **once** on a parse failure.
+- A chunk that still fails after retries degrades to honest `'llm_failed'` singleton fallbacks (confidence `'l'`, `needs_review: true`) — never a silent `'h'`.
+- Group confidence is the LLM's real `h`/`m`/`l` band; lookup groups are `'h'`.
+- Literal values are JSON-escaped when embedded in prompts; LLM-proposed names are validated (length cap, no newlines) before use.
+- The merge call uses `max_tokens: 8000`.
+
+### Prompt Caching
+The "EXISTING CANONICAL NAMES" block (top 200 domain aliases by `usage_count`) lives in the **system prompt** with `cache_control: { type: 'ephemeral' }`, so all parallel chunks share one cached prefix instead of paying for it per chunk.
 
 ### LLM Output Formats
 
@@ -295,14 +320,20 @@ No merges needed: `{"m":[]}`
 - `k = 'o'` — revert to original
 
 ### Merge Name Precedence
-- Lookup group + non-lookup group → always use lookup group's alias_name
+- Lookup group + non-lookup group → always use lookup group's alias_name. Lookup-vs-LLM group reconciliation matches names on `normalizeLiteral(name)` (so casing/whitespace variants of the same name collide correctly) — this documented invariant is now true in the live merge path.
 - Two lookup groups → use alias with higher `usage_count` in `APPROVED_ALIAS_NAMES`
 - Two non-lookup groups → LLM proposes merged name
 
 ### Group Naming
-- The group's alias name comes from the **LLM's `proposed_name`** (its real-world canonical name), threaded through `FinalGroup.proposed_name` (in `clique-detection.ts`) and carried through the merge pass (`applyMerges` uses the merge LLM's `merged_name`). `pickBestAliasName` (a deterministic pick from the input strings) is now only a **fallback** for safety-net singletons or unidentifiable entities — it is no longer the primary namer.
+- The group's alias name comes from the **LLM's `proposed_name`** (its real-world canonical name), threaded through `FinalGroup.proposed_name` (types in `grouping-types.ts`) and carried through the merge pass (`applyMerges` uses the merge LLM's `merged_name`). `pickBestAliasName` (a deterministic pick from the input strings) is only a **fallback** for safety-net singletons or unidentifiable entities.
 - The grouping + merge prompts (`llm-one-prompt-grouping.ts`) instruct the model to: identify the real entity and use its commonly-used canonical name (may differ from any input string); prefer the full common name over an acronym (use an acronym only when it genuinely IS the common name — IBM, AT&T); and **FIRST reuse an existing approved alias name verbatim** when a group matches one.
-- The domain's existing `APPROVED_ALIAS_NAMES` (top 200 by `usage_count`) are passed into both prompts as an "EXISTING CANONICAL NAMES" list so the model snaps new groups onto already-approved names instead of coining near-duplicates.
+- The domain's existing `APPROVED_ALIAS_NAMES` (top 200 by `usage_count`) are passed into both prompts as the cached "EXISTING CANONICAL NAMES" list so the model snaps new groups onto already-approved names instead of coining near-duplicates.
+
+---
+
+## One-Time Standardization (`app/one-time/`, `op-one-time.ts`)
+
+A throwaway, one-shot flow: standardize one or more columns of a source table and write the result to a standalone Snowflake table (`'create'` or `'overwrite'`). Unlike the domain pipeline path, it **never reads or writes the shared lookup** (`LITERAL_ALIAS_MATCHES` / `APPROVED_ALIAS_NAMES`) — every value is grouped purely by the LLM, optionally subject to a structured naming convention (`convention-rules.ts`, edited via `ConventionEditor`). Working state lives in `RUNS` with `run_type = 'one_time'` (tied together by a session nonce); the durable archive row is written to `ONE_TIME_STANDARDIZATIONS` on export. It reuses the grouping engine (`runOnePromptGrouping`) and the run state blob. Routes live under `/api/one-time/`; the review UI is `app/one-time/[session]/`.
 
 ---
 
@@ -336,7 +367,7 @@ Horizontal data (values across columns) is not supported. Show large file warnin
 
 ### Export Formats
 All formats must include: raw value, canonical value, confidence indicator, run ID.
-- **Snowflake export table** (default, premium only) — enables masking policy and UDF gateway
+- **Snowflake export table** (default) — the standardized output table embedded in the customer's warehouse
 - **CSV** — fallback for non-Snowflake stacks, dbt seed file workflows
 - **Excel/Google Sheets** — for less technical users
 
@@ -344,37 +375,40 @@ All formats must include: raw value, canonical value, confidence indicator, run 
 
 ## State Management (Client)
 
-- Do NOT write to Snowflake on every drag/rename
-- Maintain state in memory on the client
-- Write full state blob on debounced 30-second timer if unsaved changes exist
-- Write immediately on `beforeunload`
+Implemented in `RunReviewClient.tsx`:
+- Do NOT write to Snowflake on every drag/rename — state is maintained in memory on the client
+- A 30-second autosave timer writes the full blob (with `expectedRev`) whenever there are unsaved changes; suspended while an export is in flight
+- `pagehide` flushes via `navigator.sendBeacon` (which can't read the response — acceptable); `beforeunload` warns when unsaved changes exist; the two are debounced against double-firing
+- On a `409 conflict` the client refetches the server blob and replaces its local state
 - On page load: fetch blob by `run_id` — one query, no joins — hydrate UI directly
 
 ---
 
 ## Domain Management
 
-- Domain required before run creation; locked after run is created
+- Domain required before run creation; locked after run is created. Pipelines always require a domain (`PIPELINES.domain_id` NOT NULL); a lookup-less run can still have `domain_id = NULL`.
 - Default to last used domain
-- If user never creates a domain, runs use `domain_id = NULL`
-- Domain selection UI scales (`PILL_THRESHOLD = 10`, `RECENT_COUNT = 4`):
-  - ≤10 domains: pill selectors, recency-weighted (top 4 recent)
-  - >10 domains: dropdown with search, recently used at top
-- Reusable domain selectors:
-  - `app/components/DomainSelector.tsx` — the full pill/dropdown selector above (fetches its own domains).
-  - `app/components/CompactDomainPicker.tsx` — compact per-column picker (select existing, search, or create inline / via `CreateDomainModal`); domains are passed in from the parent so several pickers share one list (`onDomainCreated` propagates a new domain to all). Used by BOTH the new-pipeline setup (`AutoExportHome`) and the add-column modal (`PipelinesView`). It lives in `components/` (not `AutoExportHome`) specifically because `AutoExportHome` imports `PipelinesView` — defining it in either would create a circular import.
+- The domain picker is **`app/components/CompactDomainPicker.tsx`** (select existing, search, or create inline / via `CreateDomainModal`); domains are passed in from the parent so several pickers share one list (`onDomainCreated` propagates a new domain to all). Used by BOTH the new-pipeline setup (`AutoExportHome`) and the add-column modal (`PipelinesView`). It lives in `components/` (not `AutoExportHome`) specifically because `AutoExportHome` imports `PipelinesView` — defining it in either would create a circular import. The old full-page `DomainSelector.tsx` was **deleted**.
+- The shared `Domain` interface lives in `app/components/domain-types.ts`.
+- Domains can carry a structured naming convention (`convention-rules.ts` + `ConventionEditor`) enforced two ways: prompt instructions for the LLM + deterministic normalization of the model's output.
 
 ---
 
 ## Accounts & Auth
 
-- Google OAuth — default authentication (no passwords)
-- All users in a company share one account (no per-user data restriction at launch)
-- First user to authenticate becomes account owner (`admin` role)
-- Account owner can invite/remove users by email
+- Google OAuth — default authentication (no passwords). OAuth `returnTo` is sanitized to relative paths only (`sanitizeReturnTo`).
+- All users in a company share one installation (no per-user data restriction at launch)
+- First user to authenticate becomes account owner (`admin` role); `ADMIN_EMAIL` bootstraps the admin
 - Invitations expire after 7 days; statuses: `pending` | `accepted` | `revoked`
-- Removing a user invalidates active sessions immediately
 - Roles: `admin` | `user`
+
+### Sessions & Revocation
+- The HMAC-signed session cookie (`prism_session`) carries `v` (session version) and `exp` (7-day TTL; missing/expired ⇒ rejected). Cookies get `Secure` in production.
+- `ACCOUNTS.session_version` is the revocation switch: `_lib/account-security.ts` provides `requireAdminSession` / `requireValidSession` / `bumpSessionVersion`. The version check hits the DB with a **60-second in-memory cache** and **fails open on transient DB errors** (availability over strictness); a genuine mismatch or missing account fails closed.
+- Member management APIs: `GET /api/accounts/members`, `PATCH` / `DELETE /api/accounts/members/[account_id]` — with **last-admin** and **self-delete** guards. Removing a user or demoting an admin bumps their `session_version`, so their live sessions die within ~60 s.
+
+### Error Hygiene
+Snowflake error responses to clients are sanitized — no raw SQL or driver messages leak to the browser.
 
 ---
 
@@ -449,16 +483,18 @@ None. No box-shadows anywhere except the active toggle option (`0 1px 3px rgba(0
 ## Snowflake Connection
 
 - Two auth modes: key-pair/JWT (preferred) vs password+MFA (fallback)
+- Per-account credentials (`ACCOUNTS.sf_*`, saved via Settings → Snowflake connection, stored app-level encrypted) take precedence; the server env vars are the fallback when none are saved
 - `SNOWFLAKE_PRIVATE_KEY`: inline PEM — handle literal `\n` → real newline conversion before use
 - `SNOWFLAKE_PRIVATE_KEY_PATH`: file path alternative — read and parse at connection time
 - No connection pool — new connection per request, destroyed in `finally`
 - `destroy()` always resolves — swallows "Already disconnected" errors
 - MFA error 394508 → respond with "use key-pair auth" message
 - Use `import 'server-only'` compile-time guard in all Snowflake utility files
+- Error responses to clients are sanitized (no raw SQL/driver messages)
 
 ---
 
-## Pipeline Update Modes (Premium Only)
+## Pipeline Update Modes
 
 Configured at pipeline setup — available as the `mode` field in `PIPELINES`:
 - **`auto`** (default): new values detected by the stream poller are queued and standardized automatically (when queue exceeds 25 items or the hourly sweep fires). Only for Snowflake pipelines.
@@ -504,13 +540,13 @@ This means the GET `/api/pipelines` route **virtually expands** Sheets pipelines
     { "column_name": "Company Name", "domain_id": 1, "total_source_values": 5, "total_mapped": 3 },
     { "column_name": "Mobile Carrier", "domain_id": 2, "total_source_values": 7, "total_mapped": 5 }
   ],
-  "refresh_token": "1//..."
+  "refresh_token": "enc:v1:..."
 }
 ```
 
-The `refresh_token` is the user's Google OAuth refresh token, stored at pipeline creation so the background poller can re-read the sheet autonomously every 30 seconds. Required for automatic metrics updates. Stored in a STAND_ADMIN-only Snowflake VARIANT column (encrypted at rest).
+The `refresh_token` is the user's Google OAuth refresh token, stored at pipeline creation so the background poller can re-read the sheet autonomously every 30 seconds. Required for automatic metrics updates. It is stored **app-level encrypted** (AES-256-GCM via `PRISM_ENCRYPTION_KEY`, `enc:v1:` format) and decrypted only at the point of use.
 
-**Per-column metrics** (`total_source_values`, `total_mapped`) are written into each column entry by `refreshSheetsFileRows` and the poller's fallback path. The GET `/api/pipelines` virtual expansion reads these per-column values when present, so `buildPipelineGroups` sums correct per-column values instead of duplicating the row-level aggregate to every virtual entry (which caused double-counting). If per-column metrics are absent (legacy rows), the row-level aggregate is used as a fallback.
+**Per-column metrics** (`total_source_values`, `total_mapped`) are written into each column entry by `refreshSheetsFileRows` and the poller's fallback path. Meta write-backs **re-read fresh `file_source_meta` and merge only the computed per-column metrics** into it (never overwrite the whole object from a stale in-memory copy). The GET `/api/pipelines` virtual expansion reads these per-column values when present, so `buildPipelineGroups` sums correct per-column values instead of duplicating the row-level aggregate to every virtual entry (which caused double-counting). If per-column metrics are absent (legacy rows), the row-level aggregate is used as a fallback.
 
 ### Standardization Flow (Sheets)
 
@@ -518,14 +554,18 @@ The `refresh_token` is the user's Google OAuth refresh token, stored at pipeline
 2. Multi-column wizard → user reviews each column's run → "Accept Standardizations" (deferred export) for each → "Begin Pipeline" commits all
 3. `POST /api/pipelines/[id]/process-queue` (manual trigger) → reads `PIPELINE_FILE_ROWS` via `readFileDistinctValues` per column → `bulkProcessPipelineQueue` per column → `syncSheetsColumn` once at end to write output sheet
 
-### Google Sheets Export (`syncSheetsColumn`)
+### Google Sheets I/O (`op-file-pipeline.ts`)
 
-Rewrites the entire output tab: fetches ALL confirmed mappings from `LITERAL_ALIAS_MATCHES` for all standardized columns, reads full source sheet, applies mappings to each standardized column, and writes back. One call covers all columns regardless of which column's pipeline triggered it.
+- **Reads paginate**: `readAllSheetRows` fetches in 10 000-row pages until exhausted — no hardcoded `A1:ZZZ10000` cap; large sheets are read fully.
+- **Output writes are non-destructive**: `syncSheetsColumn` rewrites the output tab via chunked `values.update` calls; any trailing-row cleanup happens only AFTER the new data is successfully written (a mid-write failure never leaves the tab cleared).
+- **A1 tab names** are escaped by doubling single quotes (`a1Sheet`) so tabs with quotes/spaces address correctly.
+- **Output matching + CSV download use `normalizeLiteral`** on the compare key, consistent with the SQL `PRISM_NORMALIZE` joins.
+- `syncSheetsColumn` fetches ALL confirmed mappings from `LITERAL_ALIAS_MATCHES` for all standardized columns, reads the full source sheet, applies mappings to each standardized column, and writes back. One call covers all columns regardless of which column's pipeline triggered it.
 
 ### Background Polling for File Pipelines
 
 `pollOneFilePipeline` runs every 30 s for each active file pipeline:
-- **Sheets + refresh_token**: `refreshSheetsFileRows(pipelineId, meta)` — authenticates with stored `refresh_token`, reads full sheet via Sheets API, wraps `DELETE` + `INSERT` into `PIPELINE_FILE_ROWS` in an explicit `BEGIN`/`COMMIT` transaction, computes per-column metrics (`total_source_values` / `total_mapped`) via SQL joining `PIPELINE_FILE_ROWS` against `LITERAL_ALIAS_MATCHES` (PRISM_NORMALIZE on both sides), writes per-column metrics into `file_source_meta.columns`, and updates aggregate PIPELINES metrics
+- **Sheets + refresh_token**: `refreshSheetsFileRows(pipelineId, meta)` — authenticates with the decrypted `refresh_token`, reads the full sheet via the paginated Sheets API, wraps `DELETE` + `INSERT` into `PIPELINE_FILE_ROWS` in an explicit `BEGIN`/`COMMIT` transaction, computes per-column metrics via SQL joining `PIPELINE_FILE_ROWS` against `LITERAL_ALIAS_MATCHES` (normalized on both sides), writes per-column metrics into `file_source_meta.columns`, and updates aggregate PIPELINES metrics
 - **CSV/Excel (or Sheets without token)**: computes metrics from existing `PIPELINE_FILE_ROWS` only, writes per-column metrics into `file_source_meta.columns`, updates aggregate PIPELINES metrics. **Empty guard:** if `PIPELINE_FILE_ROWS` has zero rows (table not yet populated or data cleared), the UPDATE is skipped entirely to avoid resetting metrics to 0/0
 
 Emits `scanning_started` / `scanning_finished` SSE events (same as Snowflake) so the ring animates correctly. Does NOT LLM-standardize anything.
@@ -539,17 +579,16 @@ Emits `scanning_started` / `scanning_finished` SSE events (same as Snowflake) so
 
 ---
 
-## Premium Pipeline Subsystems
+## Pipeline Subsystems
 
-These cover the premium background pipeline path. All target premium mode.
+These cover the background pipeline path — the core of the product.
 
 ### Literal Normalization (`PRISM_NORMALIZE`)
-- `STAND_DB.STAND_INTERNAL.PRISM_NORMALIZE(VARCHAR)` — a JavaScript UDF in `01_internal_tables.sql`: Unicode NFC → strip control chars → collapse/trim whitespace → lowercase. Mirrored EXACTLY by `normalizeLiteral()` in `app/api/_lib/normalize.ts` (same JS engine) so in-memory matching agrees with SQL matching — **change both together**.
+- `STAND_DB.STAND_INTERNAL.PRISM_NORMALIZE(VARCHAR)` — a JavaScript UDF in `01_internal_tables.sql`: Unicode NFC → strip control chars → collapse/trim whitespace → lowercase. Mirrored EXACTLY by `normalizeLiteral()` in `app/api/_lib/normalize.ts` (same JS engine) so in-memory matching agrees with SQL matching — **change both together** (and backfill `LITERAL_ALIAS_MATCHES.normalized_value` if the logic changes).
 - Purpose: byte-variant spellings of the same value (`"AT&T "` vs `at&t`, NFC vs NFD, stray control chars) compare equal for lookups/dedup.
-- **Normalize-on-compare**: `PRISM_NORMALIZE()` wraps BOTH sides of every literal match/join (lookup queries in `op-auto-group*`, `op-export` upsert MERGEs, poller classify/merge, reconciliation, export join, `updatePipelineMappedCount`, setup mapped-count). The **original** literal is what's stored/displayed — case is folded only for the match key, so the LLM still sees real casing.
+- **Stored column on the lookup side**: `LITERAL_ALIAS_MATCHES.normalized_value` is materialized at write time (every INSERT/MERGE must set it), so lookup/export joins compare a plain stored column — hash-joinable, partition-prunable. Only the **source side** of a join runs the UDF (`PRISM_NORMALIZE()` on the source expression). The **original** literal is still what's stored/displayed — case is folded only for the match key, so the LLM sees real casing.
 - Source scans dedup with `GROUP BY PRISM_NORMALIZE(...)` + `ANY_VALUE(...)` (a representative original) instead of `SELECT DISTINCT`.
 - Service role needs `GRANT USAGE ON FUNCTION PRISM_NORMALIZE` (included in the ROLES AND GRANTS block of `01_internal_tables.sql`).
-- ⚠️ Perf caveat — see **Deferred / Open Items**.
 
 ### Delete-Aware Streams (NOT append-only)
 - Pipeline streams are STANDARD streams (no `APPEND_ONLY`) so the poller sees inserts, updates, AND deletes.
@@ -563,18 +602,26 @@ These cover the premium background pipeline path. All target premium mode.
 
 ### Export Table — Source-Order Preservation
 - `refreshExportTable` adds a `PRISM_ROW_ORDER` column and orders rows to mirror the source, resolved by `resolveSourceOrdering` in tiers: (1) source PRIMARY KEY, (2) source CLUSTERING KEY columns, (3) ingest order via `LITERAL_ALIAS_MATCHES.match_id`. Consumers should `ORDER BY PRISM_ROW_ORDER`. The full rebuild re-derives order each time, so a previously-missing row slots into its correct place once standardized.
+- Rebuilds use `CREATE OR REPLACE TABLE … COPY GRANTS AS SELECT`, so privileges granted to consumers on the export table survive each rebuild.
+
+### Poller Cost & Failure Backoff
+- **Standardization failure backoff** (`pipeline-hourly-processor.ts`): consecutive standardization failures per pipeline are tracked in memory; retries back off exponentially (`2^n` minutes, capped at 60), and after **5 consecutive failures the pipeline auto-pauses** with a `status_message` explaining why. A full success resets the counter.
+- **Retries reuse the pending RUNS row** — hourly/threshold standardization runs are created with a `creation_nonce` prefixed `hourly_<pipeline_id>_`; a retry looks up and reuses the pending run for that pipeline instead of inserting a new one each attempt.
+- **At most one export rebuild per table per cycle** — rebuild triggers are collected across all of a table's columns during the poll and executed once, not per column.
+- **`fetchActivePipelines` is cached for 10 s** (shared by the supervisor tick and every per-table loop; invalidated whenever the poller itself changes a pipeline's status).
+- **`checkSourceHealth` runs every 10th cycle per pipeline** (INFORMATION_SCHEMA + POLICY_REFERENCES queries are expensive), forced immediately after an error or while a `status_message` is set.
 
 ### Pipeline Health Guards & Alerts
-- Each poll runs `checkSourceHealth` before stream work:
+- When it runs (see cadence above), `checkSourceHealth` verifies before stream work:
   - source table dropped/renamed/access-revoked, watched column dropped/renamed, or column type no longer text → **pause** + `status_message`.
-  - masking / row-access policy on the watched column (via `POLICY_REFERENCES`) → **skip** standardization that cycle + message; auto-recovers when removed.
+  - masking / row-access policy detected on the watched column (via `POLICY_REFERENCES`) → **skip** standardization that cycle + message; auto-recovers when removed. (Detection only — Prism does not manage or integrate with masking policies.)
 - `classifyPollError`: global infra (expired key, disabled user, suspended/no-credit warehouse, read-only secondary) → account-level banner + auto-resume, **no** per-pipeline pause; per-table access (revoked/not-authorized/does-not-exist) → pause; transient → retry next cycle.
 - SWAP / CREATE OR REPLACE and admin-dropped streams are handled by the stale-stream recreate + reconcile path. Renames are indistinguishable from drops, so both → pause + message.
 - See `pipeline-alerts.ts` for the helpers and the SSE `alert` event.
 
 ### Review-First Pipeline Creation (`pending_baseline`)
 - "Create initial standardizations" inserts the pipeline as `status='pending_baseline'` (no auto-standardize) and builds a review run via `POST /api/pipelines/[id]/create-initial-run` (pre-creates the stream, then auto-groups) → opens `/run/{run_id}`.
-- Run page (premium → `isAutoExport`) → **Accept Standardizations** exports to the lookup, advances `pending_baseline → paused`, returns `pipeline_id`, redirects to `/home`.
+- Run page (pipeline runs → `isAutoExport`) → **Accept Standardizations** exports to the lookup, advances `pending_baseline → paused`, returns `pipeline_id`, redirects to `/home`.
 - `/home` activation card → **Begin Pipeline Standardization** → `paused → active` (poller takes over). Resuming (`PATCH status='active'`) clears `status_message`.
 - `pending_baseline` cards in `PipelinesView` have their own "Create initial standardizations" button (rebuilds the review run). The one-shot `/api/pipelines/setup` route still exists but is no longer the UI's create path.
 - **Card-visibility rule (don't hide a live pipeline):** `PipelinesView` hides a card while its export is still being set up for the first time — but only when the export has **no** live (active/paused) column. Compute `exportsWithLiveColumn` first; an export is hidden only if every one of its columns is `pending_baseline`. Adding a column to an already-live pipeline creates a `pending_baseline` row sharing that export, so a naive "hide if any column is pending_baseline" wrongly hides the live pipeline → a "blank pipeline page" while the new column's baseline run builds. Do not reintroduce that.
@@ -591,13 +638,15 @@ The pipeline lookup in the deferred export path matches by `table_fqn` only for 
 Single-column Sheets pipelines skip the wizard (`runIds.length === 1`) and use the standard non-deferred export path.
 
 ### Grants (`01_internal_tables.sql` — ROLES AND GRANTS block)
-- All roles and grants are consolidated in `01_internal_tables.sql` (bottom section). A single `snowsql -f 01_internal_tables.sql` is sufficient for a fresh install — no separate `03_grants.sql`.
+- All roles and grants are consolidated in `01_internal_tables.sql` (bottom section). A single `snowsql -f 01_internal_tables.sql` is sufficient for a fresh install — no separate grants file.
 - The same grant statements are executed programmatically via `app/api/_lib/grants.ts` (`buildGrantStatements` / `applyGrants`) in two places: (1) when a user saves Snowflake credentials via Settings, and (2) automatically when a new account is created (Google OAuth callback Cases 2 and 3).
 - `STAND_ADMIN` = the app **service** role (full write — it writes mappings during standardization).
 - `STAND_DATA_ADMIN` = a separate **human-only** role, the ONLY other role granted write on `LITERAL_ALIAS_MATCHES` / `APPROVED_ALIAS_NAMES` / `PIPELINES` (for manual SQL maintenance). Non-admin roles get no write on `STAND_INTERNAL`. Snowflake doesn't enforce CHECK/PK/FK/UNIQUE, so grants are the guardrail; read paths tolerate orphans and a rebuild self-heals.
 
-### Identifier Validation
+### Identifier & String Safety
 - `isSimpleIdent` (poller, hourly processor, and the `auto-export/source`, `runs`, `auto-export/poll` routes) is **permissive**: any non-empty name `quoteIdent` can safely wrap is allowed (spaces, hyphens, leading digits, Unicode letters), rejecting only control chars and `" ' \`. Every identifier is wrapped in `quoteIdent` before SQL interpolation.
+- `sqlStringLiteral()` in `normalize.ts` escapes backslashes + single quotes for column names interpolated into `column_data['...']` VARIANT paths (used at 4 sites: `export-table.ts`, `op-file-pipeline.ts` ×2 conceptually, `pipeline-poller.ts`). Use it for ANY string literal built into SQL text.
+- The lookup-export route parses and quotes user-supplied target FQNs part-by-part and **refuses `STAND_DB.STAND_INTERNAL` targets** (users cannot overwrite internal tables via export).
 
 ---
 
@@ -605,13 +654,14 @@ Single-column Sheets pipelines skip the wizard (`runIds.length === 1`) and use t
 
 - **`PARSE_JSON(?)` is invalid in `VALUES` clauses.** Snowflake does not allow function calls around bind parameters inside VALUES. Use the `SELECT column1, column2, PARSE_JSON(column3) FROM VALUES (?, ?, ?)` pattern instead. This applies to `insertFileRows` and `refreshSheetsFileRows` in `op-file-pipeline.ts`.
 - **Explicit transactions needed for multi-statement atomicity.** Snowflake auto-commits each statement by default. Wrap `DELETE` + `INSERT` (e.g. `refreshSheetsFileRows` replacing `PIPELINE_FILE_ROWS`) in explicit `BEGIN` / `COMMIT` / `ROLLBACK` to prevent a crash between statements from leaving the table empty.
+- **Duplicate MERGE source keys error.** Snowflake rejects a MERGE whose source has duplicate join keys — bulk upserts must dedup their source rows first (done on `normalizeLiteral` in `op-export.ts`).
 
 ---
 
 ## Deferred / Open Items
 
-- **Normalization performance (revisit at scale):** matching uses *normalize-on-compare* — `PRISM_NORMALIZE()` wraps both sides of lookup/export joins, so Snowflake cannot prune micro-partitions on `LITERAL_ALIAS_MATCHES` and runs the JS UDF per row. Fine at current scale; if the lookup table grows very large (hundreds of thousands+ distinct values), switch to a stored `normalized_value` column populated at write time (matching compares the stored column; only the source side runs the UDF). Free to adopt given the dev DB-reset workflow (no migration). Tradeoff: a stored column goes stale if `PRISM_NORMALIZE` logic changes; normalize-on-compare is always correct.
 - **`POLICY_REFERENCES` for space-containing table names:** `checkSourceHealth` builds the entity name as an unquoted string, so policy detection silently skips tables whose **name** contains spaces (degrades gracefully). Column-name spaces are unaffected. Quote the parts if needed.
+- **Legal pages:** `/terms` and `/privacy` carry placeholder legal text pending counsel review.
 
 ---
 
@@ -626,13 +676,14 @@ Single-column Sheets pipelines skip the wizard (`runIds.length === 1`) and use t
 
 ## Key Invariants
 
-- Lookup group alias names always win over LLM-proposed names in a merge
+- Lookup group alias names always win over LLM-proposed names in a merge (matched on `normalizeLiteral(name)`)
 - Domain is locked at run creation — cannot be changed after
 - Ungrouped items are never written to `LITERAL_ALIAS_MATCHES`
-- Async validation does not block the export confirmation to the user
-- State blob (`RUNS.state`) is the sole source of truth for a run's final state at export time
-- `LITERAL_ALIAS_MATCHES` stores `alias_id` FK (not `alias_name` directly)
-- Legacy tables are read-only from new code paths
+- Export is write-first: the async validation is an amendment pass and never blocks, delays, or unwinds the user's exported decisions
+- State blob (`RUNS.state`) is the sole source of truth for a run's final state at export time; concurrent writers are serialized by the blob's `rev`
+- `LITERAL_ALIAS_MATCHES` stores `alias_id` FK (not `alias_name` directly) and every write sets `normalized_value`
+- LLM failures degrade honestly — `'llm_failed'` / confidence `'l'` / `needs_review`, never a fabricated high-confidence group
+- One-time runs (`run_type='one_time'`) never touch the shared lookup
 
 ---
 
@@ -640,32 +691,41 @@ Single-column Sheets pipelines skip the wizard (`runIds.length === 1`) and use t
 
 | File | Responsibility |
 |---|---|
-| `snowflake.ts` | Connection factory (`withSnowflake`) + error helpers. Every API route uses this. |
-| `feature-flags.ts` | `getAppMode()`, `isPremiumMode()`, `premiumModeGuard()`. |
-| `session.ts` | HMAC-signed cookie encode/decode (`prism_session`). |
+| `snowflake.ts` | Connection factory (`withSnowflake`) + error helpers (sanitized client messages). Every API route uses this. |
+| `session.ts` | HMAC-signed cookie encode/decode (`prism_session`) — payload carries `v` (session version) + `exp` (7 days); `sanitizeReturnTo`; `Secure` in production. |
+| `account-security.ts` | Session revocation: `requireAdminSession` / `requireValidSession` / `bumpSessionVersion` — checks cookie `v` against `ACCOUNTS.session_version` (60 s cache, fails open on transient DB errors). |
+| `crypto.ts` | App-level AES-256-GCM secret encryption (`encryptSecret` / `decryptSecret`), key from `PRISM_ENCRYPTION_KEY`, `enc:v1:` format; plaintext passthrough for unmigrated values; malformed key throws. |
+| `report-error.ts` | Central error reporting: always `console.error`, forwards to Sentry when a DSN is configured, never throws. Deliberately importable from client AND server. |
+| `run-header.ts` | `getRunHeader` — direct server-side run-header query used by the run page server component (no self-HTTP fetch of its own API). |
 | `pipeline-broadcaster.ts` | In-process Node `EventEmitter` on `global` for SSE push to the UI. Survives hot-reloads. Event types include `alert` (banner/toast). |
 | `pipeline-coordination.ts` | Per-pipeline lock tracking — prevents concurrent standardization runs on same pipeline. |
 | `pipeline-alerts.ts` | Pause/resume + alert helpers: `pausePipelineWithMessage`, `clearPipelineStatusMessage`, `flagPipelineMessage`, `broadcastGlobalAlert`, `broadcastPipelineAlert`. Writes `PIPELINES.status_message` and emits SSE `alert` events. |
-| `normalize.ts` | `normalizeLiteral()` — pure TS mirror of the `PRISM_NORMALIZE` SQL UDF (NFC → strip control chars → collapse/trim whitespace → lowercase). Keep in sync with the UDF. (No `server-only` — pure.) |
-| `pipeline-poller.ts` | 30 s background loop for ALL active pipelines (Snowflake and file-based). Snowflake path: `checkSourceHealth`, stream classify (list A/B/deletes), queue list B, LLM if queue > 25 and `mode='auto'`, export rebuild for list A + deletes. File-based path: `pollOneFilePipeline` — Sheets re-reads the sheet via stored `refresh_token` and updates `PIPELINE_FILE_ROWS`; CSV/Excel reads existing file rows; both recompute metrics. `PipelineRef` carries `source_type` so the two paths never cross. |
-| `op-file-pipeline.ts` | File-based pipeline helpers. `syncSheetsColumn` — rewrites the full output Google Sheet tab with current confirmed mappings. `refreshSheetsFileRows` — re-reads source sheet, replaces `PIPELINE_FILE_ROWS`, returns computed metrics. `insertFileRows` / `readFileDistinctValues` — write/read `PIPELINE_FILE_ROWS`. `readFilePipelineRowsForDownload` — builds a downloadable CSV with standardized column appended. |
-| `pipeline-hourly-processor.ts` | Hourly sweep + on-demand `processPipelineQueue` (`mode='auto'` only). Also `reconcilePipelineQueue` / `runReconciliationSweep` (queue unmapped source values beyond the baseline cap) and per-pipeline safety export rebuild. Exports `bulkProcessPipelineQueue` for initial baseline imports. |
-| `op-auto-group.ts` | Legacy/unused orchestrator (`runOpAutoGroup` is dead code). Live auto-grouping is `op-auto-group-run.ts` → `llm-one-prompt-grouping.ts`. Still exports the state-blob types + load/save helpers. |
-| `op-auto-group-run.ts` | Live auto-grouping: normalized literal lookup → lookup groups → `runOnePromptGrouping` for unmatched → assemble state. Names groups from the LLM's `proposed_name`; passes the domain's existing alias names into the LLM. |
-| `llm-one-prompt-grouping.ts` | LLM grouping + merge calls (`claude-sonnet-4-6`). Carries `proposed_name` through groups/merge; prompts enforce real-world canonical naming + reuse of existing approved alias names. |
-| `op-export.ts` | Export pipeline: reads state blob, detects Case A / Case B deviations, calls validation LLM, bulk-upserts `LITERAL_ALIAS_MATCHES` + `APPROVED_ALIAS_NAMES` via atomic Snowflake MERGE (dedup on `PRISM_NORMALIZE`). |
-| `export-table.ts` | Rebuilds the pipeline's optional export Snowflake table (`CREATE OR REPLACE TABLE … AS SELECT`). Joins on `PRISM_NORMALIZE`, adds a `PRISM_ROW_ORDER` column ordered to mirror the source (PK → clustering key → ingest order). |
-| `masking-policy.ts` | Manages Snowflake Enterprise masking policies on watched columns (degrades gracefully on Standard Edition). |
+| `normalize.ts` | `normalizeLiteral()` — pure TS mirror of the `PRISM_NORMALIZE` SQL UDF (NFC → strip control chars → collapse/trim whitespace → lowercase); keep in sync with the UDF + stored `normalized_value` column. Also `sqlStringLiteral()` for safe string-literal interpolation. (No `server-only` — pure.) |
+| `pipeline-poller.ts` | 30 s background loop for ALL active pipelines (Snowflake and file-based). Snowflake path: throttled `checkSourceHealth`, stream classify (list A/B/deletes), queue list B, LLM if queue > 25 and `mode='auto'`, one export rebuild per table per cycle. File-based path: `pollOneFilePipeline`. `fetchActivePipelines` cached 10 s. `PipelineRef` carries `source_type` so the two paths never cross. |
+| `op-file-pipeline.ts` | File-based pipeline helpers. `readAllSheetRows` (paginated 10k-row reads), `a1Sheet` (A1 tab-name escaping), `syncSheetsColumn` (non-destructive full output-tab rewrite), `refreshSheetsFileRows`, `insertFileRows` / `readFileDistinctValues`, `readFilePipelineRowsForDownload`. |
+| `pipeline-hourly-processor.ts` | Hourly sweep + on-demand `processPipelineQueue` (`mode='auto'` only). Failure backoff + auto-pause after 5 consecutive failures; retries reuse the pending run (`hourly_<pid>_` nonce). Also `reconcilePipelineQueue` / `runReconciliationSweep` and per-pipeline safety export rebuild. Exports `bulkProcessPipelineQueue` for initial baseline imports. |
+| `op-auto-group.ts` | State-blob types (`OpRunState`, `OpGroup`, …) + load/save helpers (including the rev-checked save) — ~100 lines, nothing else. Live auto-grouping is `op-auto-group-run.ts` → `llm-one-prompt-grouping.ts`. |
+| `op-auto-group-run.ts` | Live auto-grouping: normalized literal lookup → lookup groups → `runOnePromptGrouping` for unmatched → assemble state (honest `'llm_failed'` fallbacks for failed chunks). Names groups from the LLM's `proposed_name`; passes the domain's existing alias names into the LLM. |
+| `llm-one-prompt-grouping.ts` | LLM grouping + merge calls (`claude-sonnet-4-6`, env-overridable). Retries (2× backoff on 429/5xx, 1× on parse failure), prompt caching (`cache_control` on the canonical-names system block), JSON-escaped literals, proposed-name validation, merge `max_tokens: 8000`. |
+| `grouping-types.ts` | Shared grouping types (`RunItemForPairing`, `FinalGroup`, …) — the only survivors of the deleted deterministic pipeline. |
+| `op-export.ts` | Write-first export: reads state blob, detects Case A/B, **writes all decisions immediately** (atomic Snowflake MERGE, deduped on `normalizeLiteral`, sets `normalized_value`), marks run `'completed'`, then runs the validation LLM as an amendment pass (structurally validated output; failure → `validation_status: 'failed'`, never unwinds). |
+| `op-one-time.ts` | One-time standardization engine: lookup-free LLM grouping, optional naming convention, export to a standalone table, archive to `ONE_TIME_STANDARDIZATIONS`. |
+| `convention-rules.ts` | Structured naming-convention rules for a domain — prompt instructions + deterministic normalization of LLM output. Pure module shared by UI and server. |
+| `namescore.ts` | NameScore — deterministic "most representative literal" scoring, used as the fallback group namer. |
+| `export-table.ts` | Rebuilds the pipeline's optional export Snowflake table (`CREATE OR REPLACE TABLE … COPY GRANTS AS SELECT`). Joins stored `normalized_value` vs `PRISM_NORMALIZE(source)`, adds a `PRISM_ROW_ORDER` column ordered to mirror the source (PK → clustering key → ingest order). |
+| `grants.ts` | `buildGrantStatements` / `applyGrants` — programmatic role grants (Settings save + OAuth account creation). |
+| `email.ts` | SMTP invitation emails. |
+| `timing.ts` | `appendTiming` — phase-timing instrumentation to console + log file (`PRISM_TIMING_LOG`, default `/tmp/prism-timing.log`). |
 | `redis.ts` | Optional ioredis singleton; returns `null` when `REDIS_URL` is unset. |
 | `auto-export-seen.ts` | Redis-backed baseline tracking — records which values existed at pipeline setup to avoid reprocessing. |
 
 ### Background Startup (`instrumentation.ts`)
 
-Next.js `register()` hook fires once on server start and calls:
+Next.js `register()` hook fires once on server start, initializes Sentry (server config), and calls:
 - `startPoller()` — starts per-table self-chaining poll loops (30 s cadence) via a `superviseTables` supervisor; see the Polling Ring Animation section for the loop model
 - `startHourlyProcessor()` — runs at the top of each clock hour
 
-Both are guarded with `global.__*Started` flags to prevent duplicate intervals on Next.js hot-reloads.
+Both are guarded with `global.__*Started` flags to prevent duplicate intervals on Next.js hot-reloads. Neither is gated behind any mode/tier flag.
 
 > ⚠️ **Poller/background code changes need a full dev-server restart.** Because `startPoller()` runs once (guarded by `global.__pipelinePollerStarted`) and its loops are already-scheduled closures, Next.js hot-reload does **not** replace the running poller — your edits to `pipeline-poller.ts` / `instrumentation.ts`-started code won't take effect until you stop and restart `npm run dev`. This has repeatedly masked otherwise-correct fixes; always remind the user to restart after such changes.
 
@@ -711,6 +771,7 @@ The Prism logo (`app/layout.tsx`) links to `/home?tab=connect`. `AutoExportHome.
 
 - `DomainInfoTooltip` in `AutoExportHome.tsx` — hover tooltip, `pointerEvents: 'none'`
 - "Update Standardizations" dropdown in `PipelinesView.tsx` — click dropdown using `stdTriggerRef` / `stdMenuRef` / `menuPos` state / `openStdMenu()` / click-outside handler via refs. Portaled with `position: 'fixed', top: menuPos.top, right: menuPos.right, zIndex: 9999, width: 220`
+- `Toast.tsx` in `app/components/` — shared portaled toast notifications.
 
 **Critical:** use `width: NNN` (exact), NOT `minWidth`. A portaled `position: fixed` element with only `minWidth` will stretch to the viewport width because the fixed-position stacking context has no `overflow: hidden` parent to constrain it.
 
@@ -730,7 +791,7 @@ Shared portaled modal (`createPortal` to `document.body`, z-index 60). Four form
 - **CSV** — client-side blob: fetches from `GET /api/global-standardizations?domain_id=N`, builds CSV string, triggers download
 - **Excel** — client-side blob: same fetch, dynamic `import('xlsx')`, triggers `.xlsx` download
 - **Google Sheets** — `POST /api/global-standardizations/export` with `{ format: 'sheets', domain_id, domain_name }`. Handles 401 → Google OAuth redirect. Opens the created sheet in a new tab.
-- **Snowflake** — `POST /api/global-standardizations/export` with `{ format: 'snowflake', domain_id, domain_name, snowflakeTableFqn? }`. Shows an optional target table name input; default is `STAND_DB.PUBLIC.<DOMAIN>_LOOKUP`.
+- **Snowflake** — `POST /api/global-standardizations/export` with `{ format: 'snowflake', domain_id, domain_name, snowflakeTableFqn? }`. Shows an optional target table name input; default is `STAND_DB.PUBLIC.<DOMAIN>_LOOKUP`. The route parses/quotes the user-supplied FQN part-by-part and refuses `STAND_DB.STAND_INTERNAL` targets.
 
 ### `POST /api/global-standardizations/export` Extensions
 
@@ -738,10 +799,38 @@ The export route accepts optional `domain_id` and `domain_name` in the request b
 
 ---
 
+## Settings, Debug & Top-Level Pages
+
+The old `/admin` page is gone, split into:
+
+- **`/settings`** (admin-role-gated via `requireAdminSession`; `UserMenu` shows the Settings item for admins only): three sections —
+  1. **Snowflake connection** — status, test connection, save credentials (+ applies grants; some grants require ACCOUNTADMIN and must be run manually)
+  2. **Team** — member list, role changes, remove member, invite link (last-admin/self-delete guards enforced by the members API)
+  3. **Pipeline health** — rollup of all pipelines' status/`status_message`
+- **`/debug`** (gated by `PRISM_DEBUG_TOOLS === 'true'`, otherwise `notFound()` → 404): table inspector for operators. `/api/admin/table/[tableName]` is gated identically. Never enabled in customer installs.
+- **`/terms`** and **`/privacy`** — placeholder legal text (pending counsel review), linked from the login page.
+- **`/`** redirects to `/home`.
+
+---
+
+## Observability
+
+Sentry is wired via `instrumentation.ts` (server), `instrumentation-client.ts` (client), and `app/global-error.tsx` (root error boundary) — all env-gated by `SENTRY_DSN` / `NEXT_PUBLIC_SENTRY_DSN` and fully no-op when unset. Use the `reportError(err, context)` helper (`_lib/report-error.ts`) instead of bare `console.error` in new code: it always console-logs, forwards to Sentry when configured, and never throws.
+
+---
+
+## Deployment Model
+
+- **One long-lived Node process per installation is REQUIRED.** The poller loops, per-pipeline locks, and the SSE broadcaster are all in-process — serverless/multi-instance deployments break them. Deploy as a single persistent `next start` (or equivalent) process.
+- **Single-tenant:** one deployment + one customer Snowflake account per company. There is no cross-tenant isolation inside the app.
+- **`xlsx` is installed from `cdn.sheetjs.com`** (pinned `0.20.3` tarball in `package.json`) — `npm install` may need network access to that host.
+
+---
+
 ## File/Folder Conventions
 
-- All Snowflake utility and server-only files must include `import 'server-only'` (applies to: `snowflake.ts`, `op-auto-group.ts`, `redis.ts`, `masking-policy.ts`, `pipeline-broadcaster.ts`, `pipeline-coordination.ts`, `pipeline-alerts.ts`, `export-table.ts`, `auto-export-seen.ts`, `email.ts`, `op-auto-group-run.ts`, `op-file-pipeline.ts`). Exception: `normalize.ts` is pure (no Snowflake/secrets) and intentionally omits `server-only`.
+- All Snowflake-touching and secret-touching `_lib` files include `import 'server-only'` (`snowflake.ts`, `crypto.ts`, `account-security.ts`, `op-auto-group.ts`, `op-auto-group-run.ts`, `op-export.ts`, `op-file-pipeline.ts`, `op-one-time.ts`, `export-table.ts`, `grants.ts`, `email.ts`, `redis.ts`, `auto-export-seen.ts`, `pipeline-broadcaster.ts`, `pipeline-coordination.ts`, `pipeline-alerts.ts`, `pipeline-hourly-processor.ts`, `run-header.ts`, `timing.ts`). Intentional exceptions: `normalize.ts`, `convention-rules.ts`, `grouping-types.ts`, `namescore.ts` (pure modules shared with the client) and `report-error.ts` (deliberately client-safe).
 - API routes for run operations: `/api/run/[run_id]/...`
-- Pipeline API routes: `/api/pipelines/...`
-- Legacy routes — do not delete, may still be referenced
+- Pipeline API routes: `/api/pipelines/...`; one-time routes: `/api/one-time/...`; member management: `/api/accounts/members...`
 - Snowflake field names come back uppercase; normalise with `r.FIELD_NAME ?? r.field_name` pattern everywhere
+- Shared UI components live in `app/components/` (`CompactDomainPicker`, `CreateDomainModal`, `ExportLookupModal`, `Toast`, `RoleBadge`, `ConventionEditor`, `DomainChangeWarning`, `UserMenu`, plus the `domain-types.ts` `Domain` interface)
