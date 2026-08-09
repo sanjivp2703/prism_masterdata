@@ -470,6 +470,45 @@ export async function assertCompanionColumnAvailable(
  * the activation path already do. Rethrows so existing callers keep whatever
  * behaviour they had — this only adds the missing user-visible signal.
  */
+/**
+ * Why an ALTER/UPDATE against a column-mode source failed, and therefore what
+ * remedy to offer.
+ *
+ * Every failure used to be reported as "adding a column requires ownership of
+ * the table", which is only sometimes true. Live testing (OUT-08) hit two cases
+ * where it was actively misleading: the object was a VIEW, and the table did
+ * not exist — in both the user was sent to fix a permission that was not the
+ * problem. The write still aborts safely either way, so this costs a support
+ * round trip rather than data, but the message IS the entire remedy a customer
+ * gets (ERR-DIAG-01).
+ */
+type ColumnModeFailure = 'missing' | 'not_a_table' | 'privilege';
+
+function classifyColumnModeFailure(err: unknown): ColumnModeFailure {
+  const msg = String((err as { message?: unknown } | null)?.message ?? err ?? '').toLowerCase();
+  // Order matters: Snowflake's "does not exist or not authorized" mentions
+  // authorization too, but a missing object is the more actionable reading —
+  // granting on something that isn't there cannot help.
+  if (/does not exist|invalid identifier|cannot be found|object .* not found/.test(msg)) return 'missing';
+  if (/is not a table|cannot alter view|not supported on view|is a view/.test(msg))      return 'not_a_table';
+  return 'privilege';
+}
+
+/** The remedy sentence for a column-mode failure, matched to its actual cause. */
+function columnModeRemedy(kind: ColumnModeFailure, source_fqn: string, column_name: string): string {
+  switch (kind) {
+    case 'missing':
+      return `Prism can no longer find ${source_fqn}. It may have been dropped, renamed, or had access ` +
+             `revoked. Point the pipeline at the current table, or restore it, then resume.`;
+    case 'not_a_table':
+      return `${source_fqn} is not a table, so a standardized column cannot be added to it. ` +
+             `Column output writes onto the source itself — for a view, use Table or View output instead.`;
+    default:
+      return `Prism can no longer maintain the standardized column for "${column_name}" on ${source_fqn} — ` +
+             `the required permissions are missing. Run this to restore it: ${columnModeSetupSql(source_fqn, column_name)}`;
+  }
+}
+
 async function withColumnModeFailureSurfaced<T>(
   pipelineId:  number | null | undefined,
   source_fqn:  string,
@@ -486,10 +525,12 @@ async function withColumnModeFailureSurfaced<T>(
       isWarehouseAccessError(err) ||
       isWarehouseAccessError((err as { cause?: unknown } | null)?.cause);
     if (pipelineId != null && isAccessFailure) {
+      // Diagnose before prescribing: the underlying error, not the curated
+      // rethrow, carries the real cause.
+      const cause = (err as { cause?: unknown } | null)?.cause ?? err;
       await pausePipelineWithMessage(
         pipelineId,
-        `Prism can no longer maintain the standardized column for "${column_name}" on ${source_fqn} — ` +
-        `the required permissions are missing. Run this to restore it: ${columnModeSetupSql(source_fqn, column_name)}`,
+        columnModeRemedy(classifyColumnModeFailure(cause), source_fqn, column_name),
         'error',
         'column_mode_access',
       ).catch(() => {});
@@ -760,11 +801,14 @@ async function refreshStandardizedColumnsSnowflake(
     try {
       await exec(conn, `ALTER TABLE ${sourceRef} ADD COLUMN ${quoteIdent(stdName)} VARCHAR`);
     } catch (err) {
+      const kind = classifyColumnModeFailure(err);
       throw new ColumnModeAccessError(
-        `Prism could not add the standardized column "${stdName}" to ${source_fqn} — ` +
-        `adding a column requires ownership of the table. Run in Snowflake as the table owner: ` +
-        `ALTER TABLE ${source_fqn} ADD COLUMN "${stdName}" VARCHAR; ` +
-        `GRANT UPDATE ON TABLE ${source_fqn} TO ROLE PRISM_SERVICE;`,
+        kind === 'privilege'
+          ? `Prism could not add the standardized column "${stdName}" to ${source_fqn} — ` +
+            `adding a column requires ownership of the table. Run in Snowflake as the table owner: ` +
+            `ALTER TABLE ${source_fqn} ADD COLUMN "${stdName}" VARCHAR; ` +
+            `GRANT UPDATE ON TABLE ${source_fqn} TO ROLE PRISM_SERVICE;`
+          : columnModeRemedy(kind, source_fqn, w.columnName),
         { cause: err },
       );
     }

@@ -664,6 +664,59 @@ console.log('\npipelines are warehouse-only:');
   check('GET /api/pipelines no longer virtually expands sheets rows',
         String(/source_type !== 'sheets'/.test(pipelinesRoute)), 'false');
 }
+// ── Column-mode failures are diagnosed, not guessed ──────────────────────────
+// Every column-mode failure used to be reported as "adding a column requires
+// ownership of the table". Live testing (OUT-08) hit two cases where that was
+// actively misleading — the object was a VIEW, and the table did not exist —
+// and in both the customer was sent to fix a permission that was not the
+// problem. The write aborts safely either way, so this costs a support round
+// trip rather than data; but the message IS the entire remedy they get
+// (ERR-DIAG-01).
+//
+// These strings are the REAL ones the warehouses produced during that live run.
+console.log('\ncolumn-mode failures are diagnosed by cause:');
+{
+  const src = fs.readFileSync(
+    path.join(repoRoot, 'stand-ui/app/api/_lib/export-table.ts'), 'utf8');
+  check('a failure classifier exists',
+        String(/function classifyColumnModeFailure/.test(src)), 'true');
+  check('the remedy is chosen from the classification',
+        String(/columnModeRemedy\(classifyColumnModeFailure\(/.test(src)), 'true');
+
+  // Re-implement the classifier's regexes here and pin them against captured
+  // strings. A guard assertion below proves the patterns were actually found,
+  // so a rename cannot turn this into a vacuous pass.
+  const missing = /does not exist|invalid identifier|cannot be found|object .* not found/;
+  const notTbl  = /is not a table|cannot alter view|not supported on view|is a view/;
+  check('classifier regexes still present in the source',
+        String(src.includes('does not exist|invalid identifier') &&
+               src.includes('is not a table|cannot alter view')), 'true');
+
+  const classify = (m: string) =>
+    missing.test(m.toLowerCase()) ? 'missing'
+    : notTbl.test(m.toLowerCase()) ? 'not_a_table'
+    : 'privilege';
+
+  const CASES: Array<[string, string]> = [
+    // Snowflake, captured live
+    ["SQL compilation error: Object 'TEST_DB.PUBLIC.OUT08E_GONE' does not exist or not authorized.", 'missing'],
+    ["SQL access control error: Insufficient privileges to operate on table 'OUT08E_SRC'", 'privilege'],
+    ["SQL access control error: Insufficient privileges to operate on account", 'privilege'],
+    ["SQL compilation error: invalid identifier 'CARRIER'", 'missing'],
+    // View target
+    ["SQL compilation error: OUT08E_VIEW is not a table", 'not_a_table'],
+    // SQL Server equivalents
+    ["Invalid object name 'dbo.OUT08E_SRC'.", 'privilege'],   // no phrase match -> safe default
+    ["ALTER TABLE permission was denied on object 'OUT08E_SRC'", 'privilege'],
+  ];
+  for (const [msg, want] of CASES) {
+    check(`classify: ${msg.slice(0, 52)}…`, classify(msg), want);
+  }
+  // The default must be 'privilege': it is the only branch that emits runnable
+  // GRANT SQL, so an unrecognised error still gives the admin something to do.
+  check('unknown errors default to the privilege remedy', classify('something unexpected'), 'privilege');
+}
+
 // ── Result ───────────────────────────────────────────────────────────────────
 if (failures > 0) {
   console.error(`\n${failures} parity check(s) FAILED`);

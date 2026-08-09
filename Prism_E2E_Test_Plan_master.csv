@@ -6737,7 +6737,7 @@ OPERATIONAL CAVEAT (raised by the verifier, worth carrying into onboarding): any
 saved sf_role is NOT PRISM_SERVICE will LOSE privileges the moment this ALTER runs — that is the
 intended tightening, but it will look like a broken install unless the saved role is corrected in
 the same maintenance window. This dev account was fine (CURRENT_ROLE = PRISM_SERVICE).",
-ERR-DIAG-01,Export outputs,,Column-mode failures are diagnosed accurately,,,The remedy offered matches the actual cause of the failure.,,,P2,Deferred,"Recorded deliberately, not fixed","FOUND LIVE 2026-08-09 (OUT-08) - NOT FIXED, recorded deliberately.
+ERR-DIAG-01,Export outputs,,Column-mode failures are diagnosed accurately,,,The remedy offered matches the actual cause of the failure.,,,P2,Pass,Classifier pinned against the real error strings captured live,"FOUND LIVE 2026-08-09 (OUT-08) - NOT FIXED, recorded deliberately.
 The catch around ALTER TABLE ADD COLUMN in export-table.ts is unconditional: ANY failure is
 reported as ""adding a column requires ownership of the table"". Live-proven wrong - the real cause
 in one variant was that the object was a VIEW, and the user was told to fix permissions. Likewise
@@ -6751,7 +6751,25 @@ Fix when convenient: branch on the error text before choosing the remedy sentenc
 DEFERRED BY DECISION, not by blocker. The misdiagnosis is real and live-proven, but it costs a
 support round trip rather than data: the write still aborts safely instead of proceeding. Fixing it
 means branching on error text before choosing the remedy sentence — worth doing, not worth doing
-in the same pass as P0 data-integrity fixes. Left visible rather than silently closed.",
+in the same pass as P0 data-integrity fixes. Left visible rather than silently closed.
+
+=== FIXED 2026-08-09 (was Deferred by decision; user asked for it now) ===
+The unconditional ""adding a column requires ownership of the table"" is replaced by
+classifyColumnModeFailure -> columnModeRemedy, so the remedy matches the cause:
+ - missing      -> ""Prism can no longer find <table>. It may have been dropped, renamed, or had
+                    access revoked."" (granting on an object that isn't there cannot help)
+ - not_a_table  -> ""<x> is not a table... Column output writes onto the source itself — for a
+                    view, use Table or View output instead."" (the live variant that was
+                    misdiagnosed as a permissions problem)
+ - privilege    -> the original message plus the exact runnable GRANT/ALTER SQL
+DEFAULT IS 'privilege' deliberately: it is the only branch that emits runnable SQL, so an
+unrecognised error still leaves the admin something to do rather than a dead end.
+Applied at BOTH sites — the ALTER's own throw and withColumnModeFailureSurfaced's pause message,
+the latter classifying on err.cause so a curated rethrow doesn't hide the real reason.
+12 parity checks pin the classifier against the ACTUAL strings captured during the OUT-08 live run
+(Snowflake ""does not exist or not authorized"", ""Insufficient privileges to operate on table"",
+""invalid identifier"", a view target, and two T-SQL forms), plus a guard that the regexes are still
+present so a rename cannot make it a vacuous pass.",
 POLL-RACE-01,Detection & poller,,Stream-reset recovery does not claim freshness while gap rows are outstanding,,,fully_synced_at is not advanced until gap reconciliation has finished queueing.,,,P2,Pass,Independent static verification of all call sites,"FOUND 2026-08-09 BY TWO INDEPENDENT LIVE RUNS (OPS-07A observed the stamp move during a
 stream-reset recovery cycle; DET-S12 independently described the same race) - FIXED.
 recoverAfterStreamReset fired reconcilePipelineQueue and the export refresh as two independent
