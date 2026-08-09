@@ -1,36 +1,55 @@
 /**
- * Standardized export-table builder for Premium pipelines.
+ * Standardized export-table/view builder for Premium pipelines.
  *
  * When a pipeline has an export_table_fqn set, Prism maintains a Snowflake
- * table that mirrors the source table but with the watched column replaced by
+ * object that mirrors the source table but with the watched column replaced by
  * the confirmed canonical alias name.  Only rows whose raw value has a
  * confirmed mapping in LITERAL_ALIAS_MATCHES are included — unmapped rows are
  * intentionally excluded.
  *
- * The table is rebuilt with CREATE OR REPLACE TABLE … AS SELECT … so it is
- * always a complete, consistent snapshot after each standardization pass.
+ * export_kind = 'table' (default): a materialized copy, rebuilt with
+ * CREATE OR REPLACE TABLE … AS SELECT … after each standardization pass so it
+ * is always a complete, consistent snapshot. Costs storage + rebuild compute
+ * on every pass, but reads are fast and it supports downstream streams.
+ *
+ * export_kind = 'view': a live Snowflake VIEW, created once with
+ * CREATE OR REPLACE VIEW … AS SELECT … . It always reflects the current
+ * source + lookup data with zero storage and zero rebuild compute — the join
+ * cost is paid at query time by whoever reads it instead. Callers should only
+ * invoke this for a view on initial creation/reactivation or from the
+ * refresh-export route (the user-facing repair path for a missing/dropped
+ * view), not on every poll cycle (see pipeline-poller.ts /
+ * pipeline-hourly-processor.ts). Activation failures are flagged on the card
+ * via flagPipelineMessage — a view has no periodic retry, so a silent failure
+ * there means the view simply never exists.
  *
  * Required Snowflake privileges for the service role:
  *   - SELECT on the source table
  *   - USAGE on the source database and schema (for INFORMATION_SCHEMA access)
- *   - CREATE TABLE on the export schema (or CREATE TABLE ON DATABASE if
- *     creating in a new schema)
+ *   - CREATE TABLE on the export schema (table kind) and/or CREATE VIEW on
+ *     the export schema (view kind)
+ *   - USAGE on PRISM_DB.INTERNAL.PRISM_NORMALIZE (the join calls it by its
+ *     fully qualified name — see the comment on the join clause below for why
+ *     it must never be written bare)
  */
 
 import 'server-only';
-import { withSnowflake } from './snowflake';
-import { sqlStringLiteral } from './normalize';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _s: any, rows: any[]) =>
-        err ? reject(err) : resolve(rows || []),
-    });
-  });
-}
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError } from './warehouse';
+// Defined in the neutral adapter-contract module so BOTH builders can throw it.
+import { ColumnModeAccessError } from './warehouse/types';
+export { ColumnModeAccessError };
+import {
+  refreshExportTableMssql, refreshStandardizedColumnsMssql, computeMappedCountsMssql, listSourceColumnsMssql,
+  hasTableModePermissions, grantTableModePermissions, tableModeSetupSql,
+  columnModeSetupSqlMssql,
+} from './warehouse/mssql/export';
+import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from './warehouse/mssql/dialect';
+import { getServiceLoginName } from './warehouse/mssql/connection';
+import { loadOpRunState } from './op-auto-group';
+import { getDb } from './sqlite';
+import { sqlStringLiteral, normalizeLiteral } from './normalize';
+import { type ExportKind, standardizedColumnName, assertCompanionColumnSafe } from './export-kind';
+import { pausePipelineWithMessage } from './pipeline-alerts';
 
 function quoteIdent(ident: string): string {
   return `"${String(ident).replace(/"/g, '""')}"`;
@@ -41,9 +60,6 @@ function parseFqn(fqn: string): { db: string; schema: string; table: string } {
   if (parts.length !== 3) throw new Error(`Expected DB.SCHEMA.TABLE, got: ${fqn}`);
   return { db: parts[0], schema: parts[1], table: parts[2] };
 }
-
-/** Name of the explicit ordering column added to every export table. */
-const ORDER_COLUMN_BASE = 'PRISM_ROW_ORDER';
 
 /**
  * Parse the column list out of a Snowflake CLUSTERING_KEY value, e.g.
@@ -65,34 +81,59 @@ function parseClusteringColumns(clusteringKey: string): string[] {
 }
 
 interface SourceOrdering {
-  tier:      'cluster' | 'ingest';
-  /** ORDER BY expression: references `src.<col>` (cluster) or a lam alias (ingest). */
+  tier:      'pk' | 'unique' | 'cluster';
+  /** ORDER BY expression referencing `src.<col>` columns. */
   orderExpr: string;
 }
 
+/** Key columns from a SHOW PRIMARY KEYS / SHOW UNIQUE KEYS result, in key
+ *  sequence. Multiple unique constraints → the first by constraint name
+ *  (deterministic). Returns [] when the table has none. */
+function keyColumnsFromShow(rows: any[]): string[] {
+  if (!rows.length) return [];
+  const constraint = (r: any) => String(r.CONSTRAINT_NAME ?? r.constraint_name ?? '');
+  const first = rows.map(constraint).sort()[0];
+  return rows
+    .filter(r => constraint(r) === first)
+    .sort((a, b) =>
+      Number(a.KEY_SEQUENCE ?? a.key_sequence ?? 0) - Number(b.KEY_SEQUENCE ?? b.key_sequence ?? 0))
+    .map(r => String(r.COLUMN_NAME ?? r.column_name ?? ''))
+    .filter(Boolean);
+}
+
 /**
- * Resolve how to order the export table:
- *   1. Source CLUSTERING KEY columns (the persistent "order by" a Snowflake table
- *      can carry), if they are plain columns.
- *   2. Else ingest order: the sequence in which each value was first confirmed
- *      (LITERAL_ALIAS_MATCHES.match_id, a monotonic autoincrement).  A clustering-
- *      keyless Snowflake table has no recoverable physical row order and Prism
- *      cannot add a column to the customer's source, so this value-ingest order is
- *      the fallback — rows cluster by when their value entered the system.
+ * Resolve how to order the export so it mirrors the source — ONLY when the
+ * source table declares an ordering basis of its own:
+ *   1. PRIMARY KEY columns
+ *   2. else UNIQUE KEY columns (first constraint by name when several exist)
+ *   3. else CLUSTERING KEY columns (the persistent "order by" a Snowflake
+ *      table can carry), if they are plain columns
  *
- * (Primary keys are intentionally NOT used: a natural/non-sequential PK would sort
- * the export by the key's value rather than any meaningful row order.)
- *
- * `firstLamAlias` is the join alias of the first watched column, used for the
- * ingest tier.
+ * Returns null when the table has none of these: the export is then built
+ * unordered, with NO synthetic ordering column (product decision 2026-07 —
+ * the old PRISM_ROW_ORDER column and its ingest-order fallback are gone).
+ * Because the key columns exist in the export itself, consumers who need
+ * source order can ORDER BY those columns directly.
  */
 async function resolveSourceOrdering(
-  conn:          any,
-  src:           { db: string; schema: string; table: string },
-  _sourceRef:    string,
-  firstLamAlias: string,
-): Promise<SourceOrdering> {
-  // ── Tier 1: clustering key ─────────────────────────────────────────────
+  conn:      any,
+  src:       { db: string; schema: string; table: string },
+  sourceRef: string,
+): Promise<SourceOrdering | null> {
+  // ── Tiers 1 + 2: primary key, then unique key (SHOW = metadata-layer) ──
+  for (const { tier, sql } of [
+    { tier: 'pk' as const,     sql: `SHOW PRIMARY KEYS IN TABLE ${sourceRef}` },
+    { tier: 'unique' as const, sql: `SHOW UNIQUE KEYS IN TABLE ${sourceRef}` },
+  ]) {
+    try {
+      const cols = keyColumnsFromShow(await exec(conn, sql));
+      if (cols.length > 0) {
+        return { tier, orderExpr: cols.map(c => `src.${quoteIdent(c)}`).join(', ') };
+      }
+    } catch { /* not permitted / unavailable — fall through */ }
+  }
+
+  // ── Tier 3: clustering key ─────────────────────────────────────────────
   try {
     const [ckRow] = await exec(
       conn,
@@ -108,8 +149,7 @@ async function resolveSourceOrdering(
     }
   } catch { /* no clustering key / not permitted — fall through */ }
 
-  // ── Tier 2: ingest order (value first-confirmed sequence) ──────────────
-  return { tier: 'ingest', orderExpr: `${firstLamAlias}.match_id` };
+  return null;
 }
 
 export interface ExportTableResult {
@@ -134,10 +174,59 @@ export async function refreshExportTable(
   export_fqn:   string,
   domain_id:    number | null,
   pipelineId?:  number,
+  exportKind:   ExportKind = 'table',
 ): Promise<ExportTableResult> {
-  return await withSnowflake(async (conn) => {
+  return await withWarehouse(async (conn) => {
+    if (getWarehouseAdapter().kind === 'mssql') {
+      if (exportKind === 'column') {
+        return await withColumnModeFailureSurfaced(
+          pipelineId, source_fqn, column_name,
+          () => refreshStandardizedColumnsMssql(conn, source_fqn, column_name, domain_id, pipelineId),
+        );
+      }
+      try {
+        return await refreshExportTableMssql(conn, source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind);
+      } catch (err) {
+        // Table-mode rebuilds need CREATE TABLE (database-scoped) + ALTER ON
+        // SCHEMA (destination schema) — permissions the mssql onboarding
+        // wizard doesn't grant up front (unlike Snowflake's Part D). Pause
+        // with a fixable reason so the UI can offer the auto-grant instead of
+        // just leaving a generic error banner on an otherwise-"active" card
+        // that will keep failing every cycle until someone notices.
+        if (pipelineId != null && isWarehouseAccessError(err)) {
+          await pausePipelineWithMessage(
+            pipelineId,
+            `Prism needs CREATE TABLE and ALTER ON SCHEMA permissions to build ${export_fqn} — see the card for a one-click fix or the exact SQL to run yourself.`,
+            'error',
+            'table_mode_access',
+          );
+        }
+        throw err;
+      }
+    }
+    if (exportKind === 'column') {
+      return await withColumnModeFailureSurfaced(
+        pipelineId, source_fqn, column_name,
+        () => refreshStandardizedColumnsSnowflake(conn, source_fqn, column_name, domain_id, pipelineId),
+      );
+    }
     const src = parseFqn(source_fqn);
     const exp = parseFqn(export_fqn);
+
+    // SAFETY: the table/view path must NEVER target the source table itself —
+    // CREATE OR REPLACE would destroy the customer's data. (Column-mode
+    // pipelines store export_table_fqn = table_fqn and are dispatched above;
+    // this guard turns any mis-parsed kind into a loud error instead.)
+    if (
+      src.db.toUpperCase() === exp.db.toUpperCase() &&
+      src.schema.toUpperCase() === exp.schema.toUpperCase() &&
+      src.table.toUpperCase() === exp.table.toUpperCase()
+    ) {
+      throw new Error(
+        `[ExportTable] Refusing to build an export over the source table itself (${source_fqn}). ` +
+        `If this pipeline should write standardized columns onto the source, its export_kind must be 'column'.`,
+      );
+    }
 
     const sourceRef = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
     const exportRef = `${quoteIdent(exp.db)}.${quoteIdent(exp.schema)}.${quoteIdent(exp.table)}`;
@@ -164,25 +253,27 @@ export async function refreshExportTable(
     // Multiple pipelines can write to the same destination — each one
     // standardizes a different source column. Union the caller in case its
     // PIPELINES row isn't visible yet (e.g. setup hasn't committed).
-    const siblingRows = await exec(conn,
-      `SELECT pipeline_id, column_name, domain_id, mode, export_unmapped_rows
-       FROM STAND_DB.STAND_INTERNAL.PIPELINES
-       WHERE table_fqn = ? AND export_table_fqn = ?`,
-      [source_fqn, export_fqn],
-    );
+    const siblingRows = getDb()
+      .prepare(
+        `SELECT pipeline_id, column_name, domain_id, export_unmapped_rows
+         FROM pipelines
+         WHERE table_fqn = ? AND export_table_fqn = ?`,
+      )
+      .all(source_fqn, export_fqn) as any[];
 
-    // Mode and export_unmapped_rows are consistent across a table's columns.
-    const isManual = siblingRows.some(r =>
-      String((r as any).MODE ?? (r as any).mode ?? '').toLowerCase() === 'manual');
-    // export_unmapped_rows (manual only): when TRUE every source row appears with
-    // unmapped values shown in raw form; when FALSE only mapped rows appear (same as auto).
+    // export_unmapped_rows is consistent across a table's columns (set at
+    // creation). When TRUE every source row appears, with unmapped values shown
+    // in raw form; when FALSE (the default) only rows whose values all have a
+    // confirmed mapping appear. Applies to EVERY update schedule — 24/7
+    // pipelines also hold unmapped values between ticks, during 5k-installment
+    // backlog drains, and while paused (the old schedule-type gate that forced
+    // mapped-only for 24/7 was removed 2026-07-22).
     const firstSibling = siblingRows[0] as any;
     const rawUnmapped = firstSibling
       ? (firstSibling.EXPORT_UNMAPPED_ROWS ?? firstSibling.export_unmapped_rows)
-      : true;
-    const exportUnmappedRowsSetting = rawUnmapped !== false && rawUnmapped !== 'false';
-    // Effective "include-unmapped" behaviour: only when manual AND the setting is on.
-    const includeUnmapped = isManual && exportUnmappedRowsSetting;
+      : false;
+    const includeUnmapped =
+      rawUnmapped === true || rawUnmapped === 1 || rawUnmapped === 'true';
 
     interface Watched { columnName: string; domainId: number | null }
     const watchedByCol = new Map<string, Watched>();
@@ -224,7 +315,7 @@ export async function refreshExportTable(
     //     pass through as NULL; mapped values export the canonical name.
     //   • TRUE  — every source row appears; unmapped non-null values COALESCE to
     //     the raw value, NULLs stay NULL, mapped values export the canonical name.
-    //   TRUE only applies to manual pipelines with export_unmapped_rows = true.
+    //   TRUE requires the pipeline's export_unmapped_rows setting (any schedule).
     const aliasFor = (i: number) => ({ lam: `lam_${i}`, aan: `aan_${i}` });
 
     const replaceMap = new Map<string, string>();
@@ -241,11 +332,19 @@ export async function refreshExportTable(
         ? `COALESCE(${aan}.alias_name, TO_VARCHAR(src.${quoteIdent(w.columnName)})) AS ${quoteIdent(w.columnName)}`
         : `${aan}.alias_name AS ${quoteIdent(w.columnName)}`;
       replaceMap.set(w.columnName.toUpperCase(), colSql);
+      // PRISM_NORMALIZE must be FULLY QUALIFIED here, not left to the session
+      // schema. This same SELECT body is used for `CREATE VIEW`, and Snowflake
+      // resolves unqualified names in a stored view body against the VIEW's own
+      // schema — not the schema the session had when the view was created. An
+      // unqualified call therefore worked for the table build (which runs in
+      // the session, schema = INTERNAL) but failed every view build whose
+      // destination lived outside PRISM_DB.INTERNAL — i.e. every realistic
+      // customer destination — with "Unknown function PRISM_NORMALIZE".
       joinClauses.push(
-        `LEFT JOIN STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES ${lam}
-        ON ${lam}.normalized_value = PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.columnName)}))
+        `LEFT JOIN PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES ${lam}
+        ON ${lam}.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.columnName)}))
         ${domainFilter}
-      LEFT JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES ${aan}
+      LEFT JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES ${aan}
         ON ${aan}.alias_id = ${lam}.alias_id`,
       );
       // Exclude rows where this column has a non-null unmapped value.
@@ -262,36 +361,35 @@ export async function refreshExportTable(
       return replacement ?? `src.${quoteIdent(col)}`;
     }).join(',\n    ');
 
-    // ── Resolve source ordering and add an explicit order column ───────────
-    // Export rows are ordered to mirror the source table.  Because the table is
-    // fully rebuilt each refresh, a row that was missing (not yet standardized)
-    // automatically slots into its correct position once its value is mapped.
-    // The explicit ORDER_COLUMN guarantees the order survives being queried
-    // (Snowflake does not return stored order without ORDER BY); the CTAS is
-    // also physically sorted so a plain SELECT * reads back in order.
-    const ordering = await resolveSourceOrdering(conn, src, sourceRef, aliasFor(0).lam);
+    // ── Resolve source ordering ────────────────────────────────────────────
+    // When the source declares its own ordering basis (PK / unique key /
+    // clustering key), the TABLE build is physically sorted by it so a plain
+    // SELECT * reads back mirroring the source, and consumers can ORDER BY the
+    // same key columns (they exist in the export) for a guaranteed order. A
+    // source with no such basis gets an unordered export — no synthetic
+    // ordering column is added (the old PRISM_ROW_ORDER is gone).
+    const ordering = await resolveSourceOrdering(conn, src, sourceRef);
 
-    // Avoid colliding with a source column of the same name.
-    const sourceColsUpper = new Set(
-      colRows.map((r: any) => String(r.COLUMN_NAME ?? r.column_name ?? '').toUpperCase()),
-    );
-    let orderColName = ORDER_COLUMN_BASE;
-    while (sourceColsUpper.has(orderColName.toUpperCase())) orderColName = `_${orderColName}`;
-
-    // ── Create / replace the export table ─────────────────────────────────
+    // ── Create / replace the export table or view ──────────────────────────
     // COPY GRANTS preserves consumers' privileges (e.g. SELECT granted to
     // downstream roles) across the rebuild — without it every CREATE OR REPLACE
-    // drops all grants on the export table.
-    await exec(conn, `
-      CREATE OR REPLACE TABLE ${exportRef} COPY GRANTS AS
-      SELECT
-        ${selectList},
-        ROW_NUMBER() OVER (ORDER BY ${ordering.orderExpr}) AS ${quoteIdent(orderColName)}
-      FROM ${sourceRef} src
-      ${joinClauses.join('\n      ')}
-      ${whereClause}
-      ORDER BY ${ordering.orderExpr}
-    `);
+    // drops all grants on the export object.
+    // The trailing physical ORDER BY only applies to the TABLE case: a VIEW is
+    // never materialized, so an ORDER BY there would force every consumer query
+    // to re-sort at read time for no benefit.
+    const selectBody =
+      `SELECT
+           ${selectList}
+         FROM ${sourceRef} src
+         ${joinClauses.join('\n      ')}
+         ${whereClause}`;
+    const createStmt = exportKind === 'view'
+      ? `CREATE OR REPLACE VIEW ${exportRef} COPY GRANTS AS
+         ${selectBody}`
+      : `CREATE OR REPLACE TABLE ${exportRef} COPY GRANTS AS
+         ${selectBody}
+         ${ordering ? `ORDER BY ${ordering.orderExpr}` : ''}`;
+    await exec(conn, createStmt);
 
     const countRows = await exec(conn, `SELECT COUNT(*) AS cnt FROM ${exportRef}`);
     const rows_written = Number(countRows[0]?.CNT ?? countRows[0]?.cnt ?? 0);
@@ -302,48 +400,434 @@ export async function refreshExportTable(
     // per-card aggregation, which sums across columns, double/garble the totals.)
     // The export table itself still reflects rows where ALL columns map (the
     // INNER JOINs above); only these per-pipeline counters are per-column.
-    for (const s of siblings) {
-      const colRef = quoteIdent(s.columnName);
-      const domainFilter = s.domainId != null
-        ? `AND lam.domain_id = ${Number(s.domainId)}`
-        : `AND lam.domain_id IS NULL`;
-      // Aggregate the source ONCE by normalized value, then count mapped via a
-      // semi-join (IN) against the DISTINCT lookup keys. This replaces the old
-      // per-row LEFT JOIN of the entire source against LITERAL_ALIAS_MATCHES:
-      //   • total_source is a plain frequency sum (no join at all),
-      //   • total_mapped joins only the deduped source values to a plain stored
-      //     column — so no per-row UDF on the lookup side and no row fan-out.
-      const [statsRow] = await exec(conn,
-        `WITH src_agg AS (
-           SELECT PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
-           FROM ${sourceRef} src
-           WHERE src.${colRef} IS NOT NULL
-           GROUP BY PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
-         )
-         SELECT
-           COALESCE(SUM(sa.freq), 0) AS total_source,
-           COALESCE(SUM(CASE WHEN sa.nv IN (
-             SELECT lam.normalized_value
-             FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-             WHERE 1=1 ${domainFilter}
-           ) THEN sa.freq ELSE 0 END), 0) AS total_mapped
-         FROM src_agg sa`);
-      const totalSource = Number((statsRow as any)?.TOTAL_SOURCE ?? (statsRow as any)?.total_source ?? 0);
-      const totalMapped = Number((statsRow as any)?.TOTAL_MAPPED  ?? (statsRow as any)?.total_mapped  ?? 0);
-      await exec(conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET total_mapped = ?, total_source_values = ?, updated_at = CURRENT_TIMESTAMP()
-         WHERE pipeline_id = ?`,
-        [totalMapped, totalSource, s.pipelineId]);
-    }
+    await refreshSnowflakeSiblingMetrics(conn, sourceRef, siblings);
 
     console.log(
-      `[ExportTable] Rebuilt ${export_fqn} ← ${source_fqn} ` +
-      `(columns: ${watched.map(w => w.columnName).join(', ')}; order: ${ordering.tier}) — ${rows_written} rows`,
+      `[ExportTable] Rebuilt ${export_fqn} (${exportKind}) ← ${source_fqn} ` +
+      `(columns: ${watched.map(w => w.columnName).join(', ')}; order: ${ordering?.tier ?? 'none'}) — ${rows_written} rows`,
     );
 
     return { rows_written };
   });
+}
+
+/** Thrown when a column-mode pipeline would target a companion-column name
+ *  that ALREADY exists on the source table. Prism cannot tell a column it
+ *  created apart from one the customer owns, so it refuses at creation time —
+ *  the only moment the distinction is knowable. */
+export class CompanionColumnConflictError extends Error {
+  constructor(table_fqn: string, companionName: string) {
+    super(
+      `A column named "${companionName}" already exists on ${table_fqn}. Prism only writes ` +
+      `to companion columns it creates itself, so it can't use the Column output for this ` +
+      `column. If a previous Prism pipeline created "${companionName}", drop it and reconnect; ` +
+      `otherwise rename the existing column or choose a different output mode.`,
+    );
+    this.name = 'CompanionColumnConflictError';
+  }
+}
+
+/**
+ * GUARDRAIL (creation-time) — refuse to create a column-mode pipeline whose
+ * `<col>_STANDARDIZED` companion already exists on the source table. After
+ * creation, an existing-but-missing-at-creation companion is by construction
+ * Prism's own. Uses metadata-layer listing on both warehouses.
+ */
+export async function assertCompanionColumnAvailable(
+  conn:        any,
+  table_fqn:   string,
+  column_name: string,
+): Promise<void> {
+  const companion = standardizedColumnName(column_name);
+  let cols: string[];
+  if (getWarehouseAdapter().kind === 'mssql') {
+    cols = await listSourceColumnsMssql(conn, table_fqn);
+  } else {
+    const src = parseFqn(table_fqn);
+    const ref = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
+    const rows = await exec(conn, `SHOW COLUMNS IN TABLE ${ref}`);
+    cols = rows.map((r: any) => String(r['column_name'] ?? r.COLUMN_NAME ?? ''));
+  }
+  if (cols.some(c => c.toUpperCase() === companion.toUpperCase())) {
+    throw new CompanionColumnConflictError(table_fqn, companion);
+  }
+}
+
+/**
+ * Runs a column-mode sync and SURFACES a permission failure on the pipeline
+ * instead of letting it die in a server log (KI-123 / KI-145).
+ *
+ * Column mode writes onto the CUSTOMER's source table, so it depends on grants
+ * that can disappear underneath it — the table gets recreated, or UPDATE/ALTER
+ * is revoked. Every recurring caller of refreshExportTable catches and
+ * console.logs; runOpExportDirect swallows it internally so it never reaches
+ * processPipelineQueue's recordStandardizationFailure either, meaning the
+ * 5-consecutive-failure auto-pause could not fire. Net effect, live-proven on
+ * both warehouses with a genuine REVOKE: the pipeline stayed 'active' with no
+ * status_message while silently no longer maintaining <col>_STANDARDIZED.
+ *
+ * Pausing with the exact fix SQL matches what the mssql table-mode branch and
+ * the activation path already do. Rethrows so existing callers keep whatever
+ * behaviour they had — this only adds the missing user-visible signal.
+ */
+async function withColumnModeFailureSurfaced<T>(
+  pipelineId:  number | null | undefined,
+  source_fqn:  string,
+  column_name: string,
+  run:         () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    // Classify on the TYPE and on the ORIGINAL error, not only on this error's
+    // own text — a curated rethrow otherwise slips past every pattern.
+    const isAccessFailure =
+      err instanceof ColumnModeAccessError ||
+      isWarehouseAccessError(err) ||
+      isWarehouseAccessError((err as { cause?: unknown } | null)?.cause);
+    if (pipelineId != null && isAccessFailure) {
+      await pausePipelineWithMessage(
+        pipelineId,
+        `Prism can no longer maintain the standardized column for "${column_name}" on ${source_fqn} — ` +
+        `the required permissions are missing. Run this to restore it: ${columnModeSetupSql(source_fqn, column_name)}`,
+        'error',
+        'column_mode_access',
+      ).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+/** The exact statements a customer admin runs to enable column mode for one
+ *  table+column — also what the consent-time provisioning below executes.
+ *  Onboarding deliberately grants NO write access on existing tables; this is
+ *  the case-by-case consent setup. */
+export function columnModeSetupSql(table_fqn: string, column_name: string): string {
+  const companion = standardizedColumnName(column_name);
+  if (getWarehouseAdapter().kind === 'mssql') {
+    // ONE generator, defined in warehouse/mssql/export.ts. It lives there rather
+    // than here only to keep the import direction sane (this file already
+    // imports from that one). Previously each side hand-rolled its own copy and
+    // they drifted: the copy inside the mssql builder emitted
+    // `GRANT UPDATE ON <fqn> TO the Prism service login's role;` — prose, not
+    // SQL — so an admin pasting the message from THAT surface got Msg 102 while
+    // the same failure produced correct SQL elsewhere (PIPE-09 / OUT-15).
+    return columnModeSetupSqlMssql(table_fqn, column_name);
+  }
+
+  // Same ordering rule as the mssql branch above — see that comment.
+  return (
+    `GRANT UPDATE ON TABLE ${table_fqn} TO ROLE PRISM_SERVICE; ` +
+    `ALTER TABLE ${table_fqn} ADD COLUMN IF NOT EXISTS "${companion}" VARCHAR;`
+  );
+}
+
+/**
+ * Case-by-case consent provisioning for the Column output mode, executed with
+ * the pipeline CREATOR'S personal warehouse credentials (same pattern as the
+ * change-tracking auto-fix — the service role deliberately cannot grant its
+ * way onto customer tables, and adding a column needs table ownership, which
+ * UPDATE does not confer). Two statements, scoped to ONE table:
+ *   1. create the `<col>_STANDARDIZED` companion column (IF NOT EXISTS)
+ *   2. GRANT UPDATE on that table to the service role
+ * Returns 'granted' on success, 'manual_required' when the creator has no
+ * saved personal credentials or either statement fails (caller surfaces
+ * columnModeSetupSql() for the admin to run). The companion-conflict guard
+ * (assertCompanionColumnAvailable) must have passed before this runs, so the
+ * ADD COLUMN can only ever create Prism's own column.
+ */
+export async function provisionColumnModeAccess(
+  table_fqn:        string,
+  column_name:      string,
+  creatorAccountId: number,
+): Promise<'granted' | 'manual_required'> {
+  if (!Number.isFinite(creatorAccountId) || !hasUserWarehouseConfig(creatorAccountId)) {
+    return 'manual_required';
+  }
+  const companion = standardizedColumnName(column_name);
+  assertCompanionColumnSafe(companion, [column_name]); // guardrail — creator-cred path too
+  try {
+    await withUserWarehouse(creatorAccountId, async (conn) => {
+      if (getWarehouseAdapter().kind === 'mssql') {
+        // TWO separate round trips, deliberately NOT columnModeSetupSql's
+        // single batch string. Sending them as one batch let the ALTER run
+        // even after the GRANT failed (T-SQL continues past a statement-level
+        // runtime error), which is what stranded an orphan companion column on
+        // the customer's table. As separate calls, a failed GRANT throws here
+        // and the ALTER is never reached — the guarantee we actually want, and
+        // it does not depend on transaction semantics at all.
+        const p = msParseFqn(table_fqn);
+        const obj = `${msQuoteIdent(p.schema)}.${msQuoteIdent(p.table)}`;
+        await exec(conn, `USE ${msQuoteIdent(p.db)}; GRANT UPDATE ON OBJECT::${obj} TO ${msQuoteIdent(getServiceLoginName())};`);
+        await exec(
+          conn,
+          `USE ${msQuoteIdent(p.db)}; IF COL_LENGTH('${p.schema}.${p.table}', '${companion.replace(/'/g, "''")}') IS NULL ` +
+          `ALTER TABLE ${obj} ADD ${msQuoteIdent(companion)} NVARCHAR(450) NULL;`,
+        );
+      } else {
+        const src = parseFqn(table_fqn);
+        const ref = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
+        // GRANT first — see columnModeSetupSql's ordering comment. A failed
+        // GRANT must not leave an orphan companion column behind that the
+        // creation-time conflict guard will later refuse to work with.
+        await exec(conn, `GRANT UPDATE ON TABLE ${ref} TO ROLE PRISM_SERVICE`);
+        await exec(conn, `ALTER TABLE ${ref} ADD COLUMN IF NOT EXISTS ${quoteIdent(companion)} VARCHAR`);
+      }
+    });
+    console.log(`[ColumnMode] Provisioned "${companion}" + UPDATE grant on ${table_fqn} via account ${creatorAccountId}'s credentials`);
+    return 'granted';
+  } catch (e) {
+    console.warn(`[ColumnMode] Consent provisioning failed for ${table_fqn}:`, (e as any)?.message ?? e);
+    return 'manual_required';
+  }
+}
+
+/**
+ * mssql only — table-mode export provisioning, executed with the pipeline
+ * CREATOR'S personal credentials (same "service role can't grant its own way
+ * onto customer schemas" reasoning as the Column-mode and Change-Tracking
+ * auto-fixes). Grants prism_svc CREATE TABLE (database-scoped) and ALTER ON
+ * SCHEMA (the destination schema) — required for the table-rebuild's
+ * SELECT INTO + DROP/sp_rename swap. No-op on Snowflake: its onboarding
+ * wizard's Part D already includes CREATE TABLE/CREATE VIEW for configured
+ * schemas, so this gap doesn't exist there.
+ * Returns 'granted' on success, 'manual_required' when the creator has no
+ * saved personal credentials or the grant fails (caller surfaces
+ * tableModeSetupSql() for the admin to run).
+ */
+export async function provisionTableModeAccess(
+  export_table_fqn: string,
+  creatorAccountId:  number,
+): Promise<'granted' | 'manual_required' | 'not_applicable'> {
+  if (getWarehouseAdapter().kind !== 'mssql') return 'not_applicable';
+  if (!Number.isFinite(creatorAccountId) || !hasUserWarehouseConfig(creatorAccountId)) {
+    return 'manual_required';
+  }
+  try {
+    await withUserWarehouse(creatorAccountId, async (conn) => {
+      await grantTableModePermissions(conn, export_table_fqn);
+    });
+    console.log(`[TableMode] Granted CREATE TABLE + ALTER ON SCHEMA for ${export_table_fqn} via account ${creatorAccountId}'s credentials`);
+    return 'granted' as const;
+  } catch (e) {
+    console.warn(`[TableMode] Provisioning failed for ${export_table_fqn}:`, (e as any)?.message ?? e);
+    return 'manual_required' as const;
+  }
+}
+
+/** Metadata-only pre-check (no elevated rights needed) — lets callers decide
+ *  whether to bother attempting provisioning at all. Always true on
+ *  Snowflake (no such gap there). */
+export async function checkTableModeAccess(export_table_fqn: string): Promise<boolean> {
+  if (getWarehouseAdapter().kind !== 'mssql') return true;
+  return await withWarehouse((conn) => hasTableModePermissions(conn, export_table_fqn));
+}
+
+export { tableModeSetupSql };
+
+interface SiblingMetric { pipelineId: number; columnName: string; domainId: number | null }
+
+/**
+ * Per-sibling metric refresh shared by the table/view rebuild and the
+ * standardized-column sync: recomputes total_source_values / total_mapped for
+ * each pipeline's OWN column and stamps export_updated_at (+ fully_synced_at
+ * when the queue is empty). fully_synced_at's FIRST-EVER stamp (still NULL
+ * going in) uses created_at instead of now(): that rebuild's data is the
+ * initial baseline scan's snapshot, taken back at pipeline creation, not
+ * "just now" — review can sit for a while before Accept/activate actually
+ * runs this. Every later rebuild still stamps the real current time.
+ * Aggregates the source ONCE by normalized value,
+ * then counts mapped via a semi-join (IN) against the DISTINCT lookup keys —
+ * no per-row UDF on the lookup side and no row fan-out.
+ */
+async function refreshSnowflakeSiblingMetrics(
+  conn:      any,
+  sourceRef: string,
+  siblings:  SiblingMetric[],
+): Promise<void> {
+  for (const s of siblings) {
+    const colRef = quoteIdent(s.columnName);
+    const domainFilter = s.domainId != null
+      ? `AND lam.domain_id = ${Number(s.domainId)}`
+      : `AND lam.domain_id IS NULL`;
+    const [statsRow] = await exec(conn,
+      `WITH src_agg AS (
+         SELECT PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
+         FROM ${sourceRef} src
+         WHERE src.${colRef} IS NOT NULL
+         GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+       )
+       SELECT
+         COALESCE(SUM(sa.freq), 0) AS total_source,
+         COALESCE(SUM(CASE WHEN sa.nv IN (
+           SELECT lam.normalized_value
+           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+           WHERE 1=1 ${domainFilter}
+         ) THEN sa.freq ELSE 0 END), 0) AS total_mapped
+       FROM src_agg sa`);
+    const totalSource = Number((statsRow as any)?.TOTAL_SOURCE ?? (statsRow as any)?.total_source ?? 0);
+    const totalMapped = Number((statsRow as any)?.TOTAL_MAPPED  ?? (statsRow as any)?.total_mapped  ?? 0);
+    getDb()
+      .prepare(
+        `UPDATE pipelines
+         SET total_mapped = ?, total_source_values = ?,
+             export_updated_at = CASE WHEN fully_synced_at IS NULL THEN created_at ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+             fully_synced_at   = CASE WHEN queue_size != 0 THEN fully_synced_at
+                                      WHEN fully_synced_at IS NULL THEN created_at
+                                      ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+             updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE pipeline_id = ?`,
+      )
+      .run(totalMapped, totalSource, s.pipelineId);
+  }
+}
+
+/**
+ * export_kind = 'column' — maintain a `<col>_STANDARDIZED` companion column on
+ * the SOURCE table itself: canonical name where the raw value has a confirmed
+ * mapping, NULL where it doesn't (or where the raw value is NULL).
+ *
+ * Never creates/drops/replaces any table. First run adds the missing companion
+ * column(s) via ALTER TABLE; every run then applies two guarded UPDATEs per
+ * watched column. Both UPDATEs only touch rows whose standardized value
+ * actually CHANGES — critical, because the pipeline's own stream watches this
+ * table: an unguarded rewrite would re-detect its own writes every cycle and
+ * churn forever, while the guarded version settles after one echo cycle (the
+ * echoed values are already in the lookup, so re-queuing them costs no LLM
+ * calls and the follow-up sync updates 0 rows).
+ *
+ * Required privileges beyond SELECT: UPDATE on the source table (every sync),
+ * and table ownership for the one-time ALTER TABLE ADD COLUMN. Failures throw
+ * with the exact SQL the customer's admin must run — callers surface it
+ * (poller pause status_message / refresh-export error).
+ */
+async function refreshStandardizedColumnsSnowflake(
+  conn:        any,
+  source_fqn:  string,
+  column_name: string,
+  domain_id:   number | null,
+  pipelineId?: number,
+): Promise<ExportTableResult> {
+  const src = parseFqn(source_fqn);
+  const sourceRef = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
+
+  // ── Gather all watched columns on this table (column-mode pipelines store
+  //    export_table_fqn = table_fqn, so siblings share both) ────────────────
+  const siblingRows = getDb()
+    .prepare(
+      `SELECT pipeline_id, column_name, domain_id
+       FROM pipelines
+       WHERE table_fqn = ? AND export_table_fqn = ? AND export_kind = 'column'`,
+    )
+    .all(source_fqn, source_fqn) as any[];
+
+  interface Watched { columnName: string; domainId: number | null }
+  const watchedByCol = new Map<string, Watched>();
+  const siblings: SiblingMetric[] = [];
+  for (const r of siblingRows) {
+    const col = String(r.COLUMN_NAME ?? r.column_name ?? '').trim();
+    if (!col) continue;
+    const domR = r.DOMAIN_ID ?? r.domain_id;
+    const dom  = domR == null ? null : Number(domR);
+    watchedByCol.set(col.toUpperCase(), { columnName: col, domainId: dom });
+    const pid = Number(r.PIPELINE_ID ?? r.pipeline_id);
+    if (Number.isFinite(pid)) siblings.push({ pipelineId: pid, columnName: col, domainId: dom });
+  }
+  if (!watchedByCol.has(column_name.toUpperCase())) {
+    watchedByCol.set(column_name.toUpperCase(), { columnName: column_name, domainId: domain_id });
+  }
+  if (pipelineId != null && !siblings.some(s => s.pipelineId === pipelineId)) {
+    siblings.push({ pipelineId, columnName: column_name, domainId: domain_id });
+  }
+  const watched = Array.from(watchedByCol.values());
+
+  // GUARDRAIL — every identifier this function will ALTER/UPDATE must be a
+  // companion of a watched column and must not be a watched raw column.
+  // Throws before ANY SQL runs; do not remove (see docs/PRELAUNCH_CHECKLIST.md).
+  const watchedRawNames = watched.map(w => w.columnName);
+  for (const w of watched) {
+    assertCompanionColumnSafe(standardizedColumnName(w.columnName), watchedRawNames);
+  }
+
+  // ── Ensure the companion columns exist (SHOW COLUMNS is metadata-layer) ──
+  const showRows = await exec(conn, `SHOW COLUMNS IN TABLE ${sourceRef}`);
+  const existingCols = new Set(
+    showRows.map((r: any) => String(r['column_name'] ?? r.COLUMN_NAME ?? '').toUpperCase()),
+  );
+  for (const w of watched) {
+    const stdName = standardizedColumnName(w.columnName);
+    if (existingCols.has(stdName.toUpperCase())) continue;
+    try {
+      await exec(conn, `ALTER TABLE ${sourceRef} ADD COLUMN ${quoteIdent(stdName)} VARCHAR`);
+    } catch (err) {
+      throw new ColumnModeAccessError(
+        `Prism could not add the standardized column "${stdName}" to ${source_fqn} — ` +
+        `adding a column requires ownership of the table. Run in Snowflake as the table owner: ` +
+        `ALTER TABLE ${source_fqn} ADD COLUMN "${stdName}" VARCHAR; ` +
+        `GRANT UPDATE ON TABLE ${source_fqn} TO ROLE PRISM_SERVICE;`,
+        { cause: err },
+      );
+    }
+  }
+
+  // ── Sync each companion column (guarded — steady state touches 0 rows) ───
+  for (const w of watched) {
+    const stdName = standardizedColumnName(w.columnName);
+    assertCompanionColumnSafe(stdName, watchedRawNames); // guardrail — write target only
+    const colRef = quoteIdent(w.columnName);
+    const stdRef = quoteIdent(stdName);
+    const domainFilter = w.domainId != null
+      ? `AND lam.domain_id = ${Number(w.domainId)}`
+      : `AND lam.domain_id IS NULL`;
+    try {
+      // Mapped values whose standardized value is missing or stale.
+      await exec(conn,
+        `UPDATE ${sourceRef}
+         SET ${stdRef} = m.prism_alias_name
+         FROM (
+           SELECT lam.normalized_value AS prism_nv, MAX(aan.alias_name) AS prism_alias_name
+           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES aan ON aan.alias_id = lam.alias_id
+           WHERE 1=1 ${domainFilter}
+           GROUP BY lam.normalized_value
+         ) m
+         WHERE PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${sourceRef}.${colRef})) = m.prism_nv
+           AND NOT EQUAL_NULL(${sourceRef}.${stdRef}, m.prism_alias_name)`);
+      // Rows no longer mapped (raw value changed/cleared, or mapping removed).
+      await exec(conn,
+        `UPDATE ${sourceRef}
+         SET ${stdRef} = NULL
+         WHERE ${stdRef} IS NOT NULL
+           AND (${colRef} IS NULL OR PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef})) NOT IN (
+             SELECT lam.normalized_value
+             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+             WHERE 1=1 ${domainFilter}
+           ))`);
+    } catch (err) {
+      if (isWarehouseAccessError(err)) {
+        throw new ColumnModeAccessError(
+          `Prism does not have update access on ${source_fqn}, which the standardized-column ` +
+          `output requires. Run in Snowflake: GRANT UPDATE ON TABLE ${source_fqn} TO ROLE PRISM_SERVICE;`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  // rows_written = source rows that currently carry a standardized value.
+  const anyStd = watched
+    .map(w => `${quoteIdent(standardizedColumnName(w.columnName))} IS NOT NULL`)
+    .join(' OR ');
+  const countRows = await exec(conn, `SELECT COUNT(*) AS cnt FROM ${sourceRef} WHERE ${anyStd}`);
+  const rows_written = Number(countRows[0]?.CNT ?? countRows[0]?.cnt ?? 0);
+
+  await refreshSnowflakeSiblingMetrics(conn, sourceRef, siblings);
+
+  console.log(
+    `[ExportTable] Synced standardized columns on ${source_fqn} ` +
+    `(columns: ${watched.map(w => w.columnName).join(', ')}) — ${rows_written} rows standardized`,
+  );
+  return { rows_written };
 }
 
 
@@ -360,12 +844,18 @@ export async function updatePipelineMappedCount(
   domain_id:   number | null,
   pipelineId:  number,
 ): Promise<void> {
-  // File pipelines store a synthetic FQN — route to the appropriate handler.
-  if (source_fqn.startsWith('FILE:') || source_fqn.startsWith('SHEETS:')) {
-    return updateFilePipelineMappedCount(source_fqn, column_name, domain_id, pipelineId);
-  }
-
-  return await withSnowflake(async (conn) => {
+  return await withWarehouse(async (conn) => {
+    if (getWarehouseAdapter().kind === 'mssql') {
+      const { totalSource, totalMapped } = await computeMappedCountsMssql(conn, source_fqn, column_name, domain_id);
+      getDb()
+        .prepare(
+          `UPDATE pipelines
+           SET total_mapped = ?, total_source_values = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE pipeline_id = ?`,
+        )
+        .run(totalMapped, totalSource, pipelineId);
+      return;
+    }
     const src = parseFqn(source_fqn);
     const tableRef = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
     const colRef   = quoteIdent(column_name);
@@ -379,16 +869,16 @@ export async function updatePipelineMappedCount(
     const [statsRow] = await exec(
       conn,
       `WITH src_agg AS (
-         SELECT PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
+         SELECT PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
          FROM ${tableRef} src
          WHERE src.${colRef} IS NOT NULL
-         GROUP BY PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+         GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
        )
        SELECT
          COALESCE(SUM(sa.freq), 0) AS total_source,
          COALESCE(SUM(CASE WHEN sa.nv IN (
            SELECT lam.normalized_value
-           FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
+           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
            WHERE 1=1 ${domainFilter}
          ) THEN sa.freq ELSE 0 END), 0) AS total_mapped
        FROM src_agg sa`,
@@ -396,92 +886,13 @@ export async function updatePipelineMappedCount(
     const mapped             = Number(statsRow?.TOTAL_MAPPED  ?? statsRow?.total_mapped  ?? 0);
     const totalSourceValues  = Number(statsRow?.TOTAL_SOURCE  ?? statsRow?.total_source  ?? 0);
 
-    await exec(
-      conn,
-      `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-       SET total_mapped = ?, total_source_values = ?, updated_at = CURRENT_TIMESTAMP()
-       WHERE pipeline_id = ?`,
-      [mapped, totalSourceValues, pipelineId],
-    );
+    getDb()
+      .prepare(
+        `UPDATE pipelines
+         SET total_mapped = ?, total_source_values = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE pipeline_id = ?`,
+      )
+      .run(mapped, totalSourceValues, pipelineId);
   });
 }
 
-/**
- * Variant of updatePipelineMappedCount for file-based pipelines (CSV, Excel, Sheets)
- * whose table_fqn is a synthetic key, not a real Snowflake table reference.
- *
- * - CSV/Excel (FILE: prefix): counts from PIPELINE_FILE_ROWS.
- * - Sheets (SHEETS: prefix): counts items from the most recent RUNS state blob.
- *
- * In both cases total_mapped is determined by a semi-join against LITERAL_ALIAS_MATCHES.
- */
-async function updateFilePipelineMappedCount(
-  source_fqn:  string,
-  column_name: string,
-  domain_id:   number | null,
-  pipelineId:  number,
-): Promise<void> {
-  return await withSnowflake(async (conn) => {
-    const domainFilter = domain_id != null
-      ? `AND lam.domain_id = ${Number(domain_id)}`
-      : `AND lam.domain_id IS NULL`;
-
-    let totalSource = 0;
-    let totalMapped = 0;
-
-    if (source_fqn.startsWith('FILE:')) {
-      // CSV/Excel: PIPELINE_FILE_ROWS holds all source rows for this pipeline.
-      const safeCol = sqlStringLiteral(column_name);
-      const [statsRow] = await exec(conn, `
-        WITH src AS (
-          SELECT PRISM_NORMALIZE(column_data['${safeCol}']::VARCHAR) AS nv,
-                 COUNT(*) AS freq
-          FROM STAND_DB.STAND_INTERNAL.PIPELINE_FILE_ROWS
-          WHERE pipeline_id = ?
-            AND column_data['${safeCol}']::VARCHAR IS NOT NULL
-          GROUP BY PRISM_NORMALIZE(column_data['${safeCol}']::VARCHAR)
-        )
-        SELECT
-          COALESCE(SUM(freq), 0) AS total_source,
-          COALESCE(SUM(CASE WHEN nv IN (
-            SELECT lam.normalized_value
-            FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-            WHERE 1=1 ${domainFilter}
-          ) THEN freq ELSE 0 END), 0) AS total_mapped
-        FROM src
-      `, [pipelineId]);
-      totalSource = Number(statsRow?.TOTAL_SOURCE ?? statsRow?.total_source ?? 0);
-      totalMapped = Number(statsRow?.TOTAL_MAPPED ?? statsRow?.total_mapped ?? 0);
-    } else {
-      // Sheets: the source values live in the most recent RUNS state blob.
-      // Each item in state.items is one distinct raw value (1 occurrence each).
-      const [statsRow] = await exec(conn, `
-        WITH latest_run AS (
-          SELECT state FROM STAND_DB.STAND_INTERNAL.RUNS
-          WHERE source_relation = ? AND source_column = ?
-          ORDER BY run_id DESC LIMIT 1
-        ),
-        run_items AS (
-          SELECT f.value:literal_value::VARCHAR AS lv
-          FROM latest_run r, LATERAL FLATTEN(r.state:items) f
-        )
-        SELECT
-          COUNT(*) AS total_source,
-          COUNT(CASE WHEN PRISM_NORMALIZE(lv) IN (
-            SELECT lam.normalized_value
-            FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-            WHERE 1=1 ${domainFilter}
-          ) THEN 1 END) AS total_mapped
-        FROM run_items
-      `, [source_fqn, column_name]);
-      totalSource = Number(statsRow?.TOTAL_SOURCE ?? statsRow?.total_source ?? 0);
-      totalMapped = Number(statsRow?.TOTAL_MAPPED ?? statsRow?.total_mapped ?? 0);
-    }
-
-    await exec(conn, `
-      UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-      SET total_mapped = ?, total_source_values = ?, updated_at = CURRENT_TIMESTAMP()
-      WHERE pipeline_id = ?
-    `, [totalMapped, totalSource, pipelineId]);
-  });
-}

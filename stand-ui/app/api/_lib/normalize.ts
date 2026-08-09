@@ -1,7 +1,7 @@
 /**
  * Canonical normalization for literal MATCHING only.
  *
- * Mirrors the STAND_DB.STAND_INTERNAL.PRISM_NORMALIZE Snowflake JavaScript UDF
+ * Mirrors the PRISM_DB.INTERNAL.PRISM_NORMALIZE Snowflake JavaScript UDF
  * EXACTLY (same JS engine semantics) so in-memory matching/dedup agrees with the
  * SQL match/join. If you change one, change the other (see 01_internal_tables.sql).
  *

@@ -2,68 +2,42 @@
  * Server-side session enforcement helpers.
  *
  * Lives apart from _lib/session.ts on purpose: session.ts is pure/edge-safe
- * (imported by proxy.ts), while these helpers hit Snowflake to validate the
- * session's version against ACCOUNTS.session_version — the revocation
- * mechanism used by member management (role change / removal).
+ * (imported by proxy.ts), while these helpers hit the local SQLite database to
+ * validate the session's version against accounts.session_version — the
+ * revocation mechanism used by member management (role change / removal).
+ *
+ * ACCOUNTS lives in SQLite, so the version check is a local read — cheap
+ * enough to run on every request with no cache and no fail-open compromise.
  */
 
 import 'server-only';
 import { cookies } from 'next/headers';
-import { withSnowflake } from './snowflake';
+import { getDb } from './sqlite';
 import { decodeSession, SESSION_COOKIE_NAME, type SessionPayload } from './session';
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
-
-// ── Session-version cache (60 s TTL) ─────────────────────────────────────────
-// Avoids a Snowflake round-trip on every version-checked request. Bumping a
-// version invalidates the entry immediately in this process.
-
-const VERSION_CACHE_TTL_MS = 60_000;
-const versionCache = new Map<number, { version: number; fetchedAt: number }>();
-
-async function fetchAccountSessionVersion(accountId: number): Promise<number | null> {
-  const rows = await withSnowflake(async (conn) =>
-    exec(
-      conn,
-      `SELECT session_version FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE account_id = ? LIMIT 1`,
-      [accountId],
-    ),
-  );
-  if (!rows.length) return null; // account deleted → no valid version
-  const r = rows[0] as any;
-  return Number(r.SESSION_VERSION ?? r.session_version ?? 1);
+function fetchAccountSessionVersion(accountId: number): number | null {
+  const row = getDb()
+    .prepare(`SELECT session_version FROM accounts WHERE account_id = ?`)
+    .get(accountId) as { session_version?: number } | undefined;
+  if (!row) return null; // account deleted → no valid version
+  return Number(row.session_version ?? 1);
 }
 
 /**
  * True when the session's `v` claim matches the account's current
  * session_version. False when the account no longer exists or the version was
- * bumped (role change / removal). Fails open on transient Snowflake errors so
- * an outage doesn't lock everyone out.
+ * bumped (role change / removal).
  */
 export async function validateSessionVersion(session: SessionPayload): Promise<boolean> {
   const accountId = Number(session.accountId);
   if (!Number.isFinite(accountId) || accountId <= 0) return false;
 
-  const cached = versionCache.get(accountId);
   let current: number | null;
-  if (cached && Date.now() - cached.fetchedAt < VERSION_CACHE_TTL_MS) {
-    current = cached.version;
-  } else {
-    try {
-      current = await fetchAccountSessionVersion(accountId);
-    } catch (err) {
-      console.error('[account-security] session_version lookup failed:', err);
-      return true; // transient DB error — don't lock the user out
-    }
-    if (current != null) versionCache.set(accountId, { version: current, fetchedAt: Date.now() });
-    else versionCache.delete(accountId);
+  try {
+    current = fetchAccountSessionVersion(accountId);
+  } catch (err) {
+    console.error('[account-security] session_version lookup failed:', err);
+    return true; // local DB error should be near-impossible — don't lock everyone out
   }
 
   if (current == null) return false;
@@ -71,20 +45,17 @@ export async function validateSessionVersion(session: SessionPayload): Promise<b
 }
 
 /**
- * Increment ACCOUNTS.session_version for an account, invalidating all of its
+ * Increment accounts.session_version for an account, invalidating all of its
  * outstanding session cookies (they carry the old `v`).
  */
 export async function bumpSessionVersion(accountId: number): Promise<void> {
-  await withSnowflake(async (conn) => {
-    await exec(
-      conn,
-      `UPDATE STAND_DB.STAND_INTERNAL.ACCOUNTS
+  getDb()
+    .prepare(
+      `UPDATE accounts
        SET session_version = COALESCE(session_version, 1) + 1
        WHERE account_id = ?`,
-      [accountId],
-    );
-  });
-  versionCache.delete(accountId);
+    )
+    .run(accountId);
 }
 
 // ── Route guards ──────────────────────────────────────────────────────────────

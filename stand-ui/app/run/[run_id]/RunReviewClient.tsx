@@ -2,8 +2,17 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { DomainScopeNotice, DomainChangeConfirmModal, UndoButton } from '@/app/components/DomainChangeWarning';
+import { SpecScopeNotice, SpecChangeConfirmModal, UndoButton } from '@/app/components/SpecChangeWarning';
 import ToastHost, { showToast } from '@/app/components/Toast';
+import { reportError } from '@/app/api/_lib/report-error';
+import {
+  applyConventionRules,
+  validateConventionViolations,
+  hasAnyRule,
+  describeConventionRules,
+  type ConventionRules,
+} from '@/app/api/_lib/convention-rules';
+import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
 
 const UNGROUPED_KEY = '__UNGROUPED__';
 
@@ -42,7 +51,6 @@ type Snapshot = {
   uiAliasMap: AliasMap;
   pendingMoves: Record<number, number | null>;
   pendingAliasNames: Record<number, string>;
-  checkedAliases: Set<string>;
   nextTempGroupId: number;
 };
 
@@ -164,20 +172,6 @@ function getStatusLabel(status: string | undefined): string {
   }
 }
 
-function CheckmarkIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-      <path
-        d="M2.5 7L5.5 10L11.5 4"
-        stroke="white"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
 function DragDots() {
   return (
     <div
@@ -228,10 +222,24 @@ function IncludeOriginalToggle({
 export default function RunReviewClient({
   runId,
   initialRunStatus,
+  sourceRelation,
+  sourceColumn,
+  convention,
+  standardizationRules,
+  domainName,
 }: {
   runId: string;
   initialRunStatus?: string;
+  sourceRelation?: string;
+  sourceColumn?: string;
+  /** The column's deterministic naming convention (regex and/or form rules) — renames must conform. */
+  convention?: { type: string | null; value: string; rules: ConventionRules | null } | null;
+  /** The column's free-text standardization rules — displayed so the reviewer sees the contract. */
+  standardizationRules?: string[];
+  /** The column name — titles the standardization-rules panel (was the domain name). */
+  domainName?: string;
 }) {
+  const warehouseLabel = useWarehouseLabel();
   const router = useRouter();
   const isAutoExport = true; // single-tier product — pipeline mode is the only mode
 
@@ -243,7 +251,6 @@ export default function RunReviewClient({
   // reload server truth after an autosave conflict).
   const [aliasMapReload, setAliasMapReload] = useState(0);
 
-  const [checkedAliases, setCheckedAliases] = useState<Set<string>>(new Set());
   const [nextTempGroupId, setNextTempGroupId] = useState(-1);
   const [pendingMoves, setPendingMoves] = useState<Record<number, number | null>>({});
   const [pendingAliasNames, setPendingAliasNames] = useState<Record<number, string>>({});
@@ -254,7 +261,6 @@ export default function RunReviewClient({
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportResult, setExportResult] = useState<any>(null);
-  const [copiedSql, setCopiedSql] = useState(false);
 
   // Set when advancing the multi-column wizard fails to BUILD the next column's
   // review run (server error / network) — distinct from a genuinely-empty column.
@@ -336,7 +342,8 @@ export default function RunReviewClient({
   const [includeOriginalCol, setIncludeOriginalCol] = useState(true);
   const [dragOverAliasName, setDragOverAliasName] = useState<string | null>(null);
   const [draggingGroupName, setDraggingGroupName] = useState<string | null>(null);
-  const [openMenuForAliasName, setOpenMenuForAliasName] = useState<string | null>(null);
+  const [hoveredDividerIdx, setHoveredDividerIdx] = useState<number | null>(null);
+  const [groupOrder, setGroupOrder] = useState<string[] | null>(null);
 
   const [undoStack, setUndoStack] = useState<Snapshot[]>([]);
   const [redoStack, setRedoStack] = useState<Snapshot[]>([]);
@@ -406,7 +413,6 @@ export default function RunReviewClient({
           setUiAliasMap(structuredClone(data));
           setPendingMoves({});
           setPendingAliasNames({});
-          setCheckedAliases(new Set());
           setEditingAliasKey(null);
           setUndoStack([]);
           setRedoStack([]);
@@ -436,6 +442,17 @@ export default function RunReviewClient({
   const revRef       = useRef(0);
   const dirtyRef     = useRef(false);
   const savingRef    = useRef(false);
+  // Autosave-failure signal. The ref is what autosave() reads (it runs on a
+  // timer outside React's render cycle); the state drives the banner.
+  const saveFailedRef = useRef(false);
+  const [saveFailed, setSaveFailed] = useState(false);
+  function markSaveFailed() {
+    if (saveFailedRef.current) return; // already warned — don't toast every tick
+    saveFailedRef.current = true;
+    setSaveFailed(true);
+  }
+  // One warning per outage, not one every 30s (see autosave / KI-84).
+  const loadFailureWarnedRef = useRef(false);
   const exportingRef = useRef(false);
 
   function markDirty() { dirtyRef.current = true; }
@@ -493,8 +510,34 @@ export default function RunReviewClient({
 
   async function autosave() {
     if (!dirtyRef.current || savingRef.current || exportingRef.current) return;
-    const blob = buildStateBlob();
-    if (!blob) return;
+    let blob = buildStateBlob();
+    // A null blob means baseStateRef never loaded — the mount-time GET failed
+    // (warehouse outage), and loadBaseState only re-runs on mount, after a 409,
+    // or after an export. So autosave silently no-op'd on EVERY 30s tick for
+    // the rest of the session while the page stayed fully editable: the user
+    // kept working and their edits existed only in browser memory.
+    //
+    // Retry the load here instead of bailing — this is the one place that knows
+    // the save is being prevented. If it still fails, TELL the user rather than
+    // returning quietly; they can then copy their work out or reload before
+    // losing more. See KI-84.
+    if (!blob) {
+      const recovered = await loadBaseStateRef.current();
+      blob = recovered ? buildStateBlob() : null;
+      if (!blob) {
+        if (!loadFailureWarnedRef.current) {
+          loadFailureWarnedRef.current = true;
+          showToast(
+            'Your changes are NOT being saved — Prism could not load this run from the warehouse. ' +
+            'Reload the page once the connection recovers; edits made now may be lost.',
+            'error',
+          );
+        }
+        return;
+      }
+      // Recovered — allow a future failure to warn again.
+      loadFailureWarnedRef.current = false;
+    }
     savingRef.current = true;
     try {
       const res = await fetch(`/api/run/${runId}/state`, {
@@ -506,6 +549,11 @@ export default function RunReviewClient({
         const body = await res.json().catch(() => ({}));
         revRef.current = typeof body?.rev === 'number' ? body.rev : revRef.current + 1;
         dirtyRef.current = false;
+        // Recovered from a previous failed save — clear the warning.
+        if (saveFailedRef.current) {
+          saveFailedRef.current = false;
+          setSaveFailed(false);
+        }
       } else if (res.status === 409) {
         // Someone else saved a newer state — take server truth (simplest safe
         // resolution), warn, and rehydrate the review UI from it.
@@ -515,9 +563,18 @@ export default function RunReviewClient({
         dirtyRef.current = false;
         showToast('This run was updated elsewhere — reloaded latest', 'info');
         setAliasMapReload((n) => n + 1);
+      } else {
+        // Any other failure (500 during a warehouse outage, gateway error).
+        // Edits stay in memory and retry on the next tick, so nothing is lost
+        // — but silence here meant a reviewer could work for an hour through
+        // an outage with no hint their changes were not being persisted, and
+        // then close the tab. Say so, once, until a save succeeds again.
+        markSaveFailed();
       }
-      // Other failures: stay dirty and retry on the next tick.
-    } catch { /* network error — retry on the next tick */ }
+    } catch {
+      // Network error — same reasoning as above; retry on the next tick.
+      markSaveFailed();
+    }
     finally { savingRef.current = false; }
   }
   const autosaveRef = useRef(autosave);
@@ -529,7 +586,19 @@ export default function RunReviewClient({
   }, []);
 
   // Flush unsaved changes when the page is being closed/hidden, and warn on
-  // accidental closes. sendBeacon can't read the response — acceptable.
+  // accidental closes.
+  //
+  // DO NOT switch this back to navigator.sendBeacon. sendBeacon can only issue
+  // POST, and /api/run/[run_id]/state exports GET and PUT only — so every
+  // beacon flush 405'd and silently persisted NOTHING. The bug survived a long
+  // time because sendBeacon returns `true` regardless of the response status,
+  // its response is unreadable by design, and the call sat in a bare try/catch:
+  // there was no signal anywhere that the save had failed. (The OTHER beacon in
+  // this file works only because /api/timing does export POST.)
+  //
+  // fetch(..., { keepalive: true }) survives page unload the same way, but uses
+  // the PUT the route actually implements AND lets us see the status, so a
+  // future method/route change surfaces instead of silently losing edits.
   useEffect(() => {
     let lastBeaconAt = 0;
     function flushBeacon() {
@@ -539,11 +608,20 @@ export default function RunReviewClient({
       if (!blob) return;
       try {
         lastBeaconAt = Date.now();
-        navigator.sendBeacon(
-          `/api/run/${runId}/state`,
-          new Blob([JSON.stringify({ state: blob, expectedRev: revRef.current })], { type: 'application/json' }),
-        );
-      } catch { /* best effort */ }
+        void fetch(`/api/run/${runId}/state`, {
+          method:      'PUT',
+          keepalive:   true,
+          headers:     { 'Content-Type': 'application/json' },
+          body:        JSON.stringify({ state: blob, expectedRev: revRef.current }),
+        })
+          .then((res) => {
+            // A 409 here means someone else advanced the blob; the closing tab
+            // has nowhere to show a toast, but we must not fail silently in the
+            // logs the way the old beacon did.
+            if (!res.ok) reportError(new Error(`unload flush failed: HTTP ${res.status}`), { runId });
+          })
+          .catch((err) => reportError(err, { runId, phase: 'unload-flush' }));
+      } catch (err) { reportError(err, { runId, phase: 'unload-flush-sync' }); }
     }
     function onBeforeUnload(e: BeforeUnloadEvent) {
       if (!dirtyRef.current || exportingRef.current) return;
@@ -568,7 +646,6 @@ export default function RunReviewClient({
       uiAliasMap: structuredClone(uiAliasMap),
       pendingMoves: { ...pendingMoves },
       pendingAliasNames: { ...pendingAliasNames },
-      checkedAliases: new Set(checkedAliases),
       nextTempGroupId,
     };
   }
@@ -577,12 +654,10 @@ export default function RunReviewClient({
     setUiAliasMap(snap.uiAliasMap);
     setPendingMoves(snap.pendingMoves);
     setPendingAliasNames(snap.pendingAliasNames);
-    setCheckedAliases(snap.checkedAliases);
     setNextTempGroupId(snap.nextTempGroupId);
     setEditingAliasKey(null);
     setEditingAliasValue('');
     setRenameError(null);
-    setOpenMenuForAliasName(null);
     setDragOverAliasName(null);
     setDraggingGroupName(null);
   }
@@ -644,23 +719,34 @@ export default function RunReviewClient({
 
   const entries = useMemo(() => {
     const e = Object.entries(uiAliasMap || {}) as Array<[string, AliasMap[string]]>;
-    e.sort((a, b) => {
-      // Groups that still need review float to the very top of the list.
-      const aReview = a[1]?.items?.some(i => i.needs_review) ? 1 : 0;
-      const bReview = b[1]?.items?.some(i => i.needs_review) ? 1 : 0;
-      if (aReview !== bReview) return bReview - aReview;
+    if (groupOrder) {
+      const orderMap = new Map(groupOrder.map((k, i) => [k, i]));
+      e.sort((a, b) => {
+        const ai = orderMap.get(a[0]);
+        const bi = orderMap.get(b[0]);
+        if (ai != null && bi != null) return ai - bi;
+        if (ai != null) return -1;
+        if (bi != null) return 1;
+        return 0;
+      });
+    } else {
+      e.sort((a, b) => {
+        const aReview = a[1]?.items?.some(i => i.needs_review) ? 1 : 0;
+        const bReview = b[1]?.items?.some(i => i.needs_review) ? 1 : 0;
+        if (aReview !== bReview) return bReview - aReview;
 
-      const ag = a[1]?.group_id;
-      const bg = b[1]?.group_id;
-      if (ag == null && bg == null) return 0;
-      if (ag == null) return 1;
-      if (bg == null) return -1;
-      if (ag < 0 && bg >= 0) return 1;
-      if (bg < 0 && ag >= 0) return -1;
-      return ag - bg;
-    });
+        const ag = a[1]?.group_id;
+        const bg = b[1]?.group_id;
+        if (ag == null && bg == null) return 0;
+        if (ag == null) return 1;
+        if (bg == null) return -1;
+        if (ag < 0 && bg >= 0) return 1;
+        if (bg < 0 && ag >= 0) return -1;
+        return ag - bg;
+      });
+    }
     return e;
-  }, [uiAliasMap]);
+  }, [uiAliasMap, groupOrder]);
 
   const groupEntries = useMemo(
     () => entries.filter(([aliasName]) => aliasName !== UNGROUPED_KEY),
@@ -679,27 +765,12 @@ export default function RunReviewClient({
   }, [aliasMap]);
 
   const totalGroups = groupEntries.length;
-  const uncheckedCount = totalGroups - checkedAliases.size;
   const reviewItems = useMemo(() =>
     Object.values(uiAliasMap ?? {}).flatMap(g => g.items).filter(i => i.needs_review),
   [uiAliasMap]);
   const reviewCount = reviewItems.length;
 
   // ── Group mutations ───────────────────────────────────────────────────────
-
-  function toggle(aliasName: string) {
-    if (aliasName === UNGROUPED_KEY) return;
-    setCheckedAliases((prev) => {
-      const next = new Set(prev);
-      if (next.has(aliasName)) next.delete(aliasName);
-      else next.add(aliasName);
-      return next;
-    });
-  }
-
-  function checkAll() {
-    setCheckedAliases(new Set(groupEntries.map(([aliasName]) => aliasName)));
-  }
 
   function makeUniqueGroupName(base: string, excludeKey?: string) {
     const map = uiAliasMap || {};
@@ -709,7 +780,7 @@ export default function RunReviewClient({
     return `${base} (${i})`;
   }
 
-  function addGroup() {
+  function addGroup(afterIdx?: number) {
     pushHistory();
     const name = makeUniqueGroupName('Unnamed Group');
     const gid = nextTempGroupId;
@@ -719,6 +790,20 @@ export default function RunReviewClient({
       next[name] = { group_id: gid, display_name: name, items: [] };
       return next;
     });
+    if (typeof afterIdx === 'number') {
+      setGroupOrder((prev) => {
+        const order = prev ?? groupEntries.map(([k]) => k);
+        const copy = [...order];
+        const insertPos = Math.min(afterIdx, copy.length);
+        copy.splice(insertPos, 0, name);
+        return copy;
+      });
+    } else {
+      setGroupOrder((prev) => {
+        const order = prev ?? groupEntries.map(([k]) => k);
+        return [...order, name];
+      });
+    }
     setRenameError(null);
     setEditingAliasKey(name);
     setEditingAliasValue('');
@@ -773,15 +858,8 @@ export default function RunReviewClient({
       });
     }
 
-    setCheckedAliases((prev) => {
-      const next = new Set(prev);
-      next.delete(fromAliasName);
-      return next;
-    });
-
     if (editingAliasKey === fromAliasName) cancelRename();
     if (dragOverAliasName === fromAliasName) setDragOverAliasName(null);
-    if (openMenuForAliasName === fromAliasName) setOpenMenuForAliasName(null);
     setDraggingGroupName(null);
   }
 
@@ -853,6 +931,48 @@ export default function RunReviewClient({
     let newAliasName = desired || 'Unnamed Group';
     const currentDisplayName = uiAliasMap?.[oldAliasName]?.display_name ?? oldAliasName;
     if (newAliasName === currentDisplayName) { cancelRename(); return; }
+
+    // Same 200-char cap the LLM's proposed names get (sanitizeProposedName) —
+    // also bounds the string any convention regex is tested against.
+    if (newAliasName.length > 200) {
+      setRenameError('Alias names are limited to 200 characters.');
+      return;
+    }
+
+    // Enforce the column's deterministic naming conventions. Mirror the server's
+    // treatment of LLM-proposed names: first auto-apply the mechanical form rules
+    // (case, separators, …), then reject the rename if the result still violates
+    // the regex pattern or a checkable rule (word count, length). The edit stays
+    // open so the user can fix or Escape out.
+    if (convention) {
+      if (hasAnyRule(convention.rules)) {
+        // `|| newAliasName` matters: a mechanical rule can reduce a name to the
+        // empty string (special_chars='alnum_only' on '---'), and without this
+        // fallback the empty result was committed as both the map key and the
+        // display name. OneTimeReviewClient already had this guard; this client
+        // did not, so the two review UIs disagreed. Keeping the pre-transform
+        // value here lets the validation below reject it with a useful reason
+        // instead of silently accepting an empty group name.
+        newAliasName = applyConventionRules(newAliasName, convention.rules) || newAliasName;
+        if (newAliasName === currentDisplayName) { cancelRename(); return; }
+      }
+      const problems = validateConventionViolations(newAliasName, convention.rules ?? null);
+      if (convention.type === 'regex' && convention.value.trim()) {
+        let re: RegExp | null = null;
+        try { re = new RegExp(`^(?:${convention.value.trim()})$`); } catch { re = null; }
+        if (re && !re.test(newAliasName)) {
+          problems.unshift(`must match the column's naming pattern: ${convention.value.trim()}`);
+        }
+      }
+      if (problems.length > 0) {
+        setRenameError(
+          `"${newAliasName}" doesn't meet this column's naming convention — ${problems.join('; ')}. ` +
+          `The group keeps its previous name until the new one conforms.`,
+        );
+        return;
+      }
+    }
+    setRenameError(null);
     pushHistory();
 
     setUiAliasMap((prev) => {
@@ -871,11 +991,7 @@ export default function RunReviewClient({
       if (typeof gid === 'number') {
         setPendingAliasNames((p) => ({ ...p, [gid]: newAliasName }));
       }
-      setCheckedAliases((p) => {
-        const s = new Set(p);
-        if (s.has(oldAliasName)) { s.delete(oldAliasName); s.add(newAliasName); }
-        return s;
-      });
+      setGroupOrder((prev) => prev?.map((k) => k === oldAliasName ? newAliasName : k) ?? null);
 
       cancelRename();
       return next;
@@ -892,57 +1008,12 @@ export default function RunReviewClient({
     if (dragOverAliasName === toAliasName) setDragOverAliasName(null);
   }
 
-  function deleteGroup(aliasName: string) {
-    if (aliasName === UNGROUPED_KEY) return;
-    const group = uiAliasMap?.[aliasName];
-    if (!group) return;
-    pushHistory();
-
-    const itemsToMove = (group.items || []).map((it) => ({
-      run_item_id: it.run_item_id,
-      literal_value: String(it.literal_value),
-      confidence_score: it.confidence_score ?? null,
-    }));
-
-    setUiAliasMap((prev) => {
-      if (!prev) return prev;
-      const next: AliasMap = structuredClone(prev);
-      delete next[aliasName];
-      // Create a singleton review group for each displaced item
-      for (const it of itemsToMove) {
-        const key = `__review_${it.run_item_id}__`;
-        next[key] = {
-          group_id:     null,
-          display_name: String(it.literal_value),
-          items: [{ ...it, needs_review: true }],
-        };
-      }
-      return next;
-    });
-
-    setPendingMoves((prev) => {
-      const next = { ...prev };
-      for (const it of itemsToMove) next[it.run_item_id] = null;
-      return next;
-    });
-
-    const gid = group.group_id;
-    if (typeof gid === 'number') {
-      setPendingAliasNames((prev) => { const next = { ...prev }; delete next[gid]; return next; });
-    }
-
-    setCheckedAliases((prev) => { const next = new Set(prev); next.delete(aliasName); return next; });
-    if (editingAliasKey === aliasName) cancelRename();
-    if (dragOverAliasName === aliasName) setDragOverAliasName(null);
-    if (openMenuForAliasName === aliasName) setOpenMenuForAliasName(null);
-  }
 
   async function doExport() {
     setExporting(true);
     exportingRef.current = true;
     setExportError(null);
     setExportResult(null);
-    setCopiedSql(false);
 
     try {
       const res = await fetch(`/api/run/${runId}/export`, {
@@ -977,9 +1048,9 @@ export default function RunReviewClient({
     }
   }
 
-  // Accepting writes to the domain-wide lookup. If the user edited the proposed
-  // standardizations (any undo history), confirm first that this affects every
-  // table with a pipeline in the domain; an unedited accept goes straight through.
+  // Accepting writes this column's confirmed mappings. If the user edited the
+  // proposed standardizations (any undo history), confirm first that this updates
+  // the mappings this column reuses; an unedited accept goes straight through.
   function requestAcceptStandardizations() {
     if (isAutoExport && undoStack.length > 0) {
       setConfirmAcceptOpen(true);
@@ -1169,41 +1240,18 @@ export default function RunReviewClient({
     }
   }
 
-  function onExportClick() {
-    setSfExportModalOpen(true);
-  }
-
   function proceedSfExport() {
-    if (uncheckedCount > 0) checkAll();
     setSfExportModalOpen(false);
     void doExport();
   }
 
-  const viewFqn = exportResult?.view_fqn ? String(exportResult.view_fqn) : '';
-  const viewSql = viewFqn ? `SELECT * FROM ${viewFqn};` : '';
-
-  async function copyViewSql() {
-    if (!viewSql) return;
-    try {
-      await navigator.clipboard.writeText(viewSql);
-      setCopiedSql(true);
-      window.setTimeout(() => setCopiedSql(false), 1200);
-    } catch {
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = viewSql;
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        setCopiedSql(true);
-        window.setTimeout(() => setCopiedSql(false), 1200);
-      } catch { /* ignore */ }
-    }
-  }
+  // The "View created" success banner was removed 2026-08-08 (UI-07): it was
+  // unreachable twice over. Its condition was `!isAutoExport && …`, but
+  // isAutoExport is a hardcoded `true` (single-tier product), so the first half
+  // was permanently false; and nothing in the codebase ever set
+  // exportResult.view_fqn, so the second half could not become true either.
+  // Views are created at activation now, not on export, and the card's
+  // "Recreate view now" button is the surface for that.
 
   // ── Download Mapping helpers ─────────────────────────────────────────────
 
@@ -1227,38 +1275,6 @@ export default function RunReviewClient({
       void loadBaseStateRef.current();
     } finally {
       exportingRef.current = false;
-    }
-  }
-
-  async function openDownloadModal() {
-    setDownloadModalOpen(true);
-    setDownloadRows(null);
-    setDownloadHeaders([]);
-    setDownloadTitle(null);
-    setDownloadSourceColumn('');
-    setDownloadLoading(true);
-    setDownloadError(null);
-    setGoogleSheetsLoading(false);
-    setGoogleSheetsError(null);
-    setGoogleSheetsUrl(null);
-    try {
-      // Write the mappings FIRST — export-mapping reads the lookup table, which
-      // has nothing for this run until the export commits.
-      await ensureExportWritten();
-
-      const res  = await fetch(`/api/run/${runId}/export-mapping`);
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error || 'Failed to load mapping');
-      setDownloadRows(body.rows         || []);
-      setDownloadHeaders(body.headers   || []);
-      setDownloadTitle(body.title       || null);
-      setDownloadSourceColumn(body.sourceColumn ?? '');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to load mapping';
-      setDownloadError(msg);
-      showToast(msg, 'error');
-    } finally {
-      setDownloadLoading(false);
     }
   }
 
@@ -1405,169 +1421,139 @@ export default function RunReviewClient({
   const statusLabel = getStatusLabel(initialRunStatus);
 
   return (
-    <div onClick={() => setOpenMenuForAliasName(null)}>
+    <div>
       <ToastHost />
-      {/* ── Column wizard stepper (multi-column pipeline creation) ──────── */}
-      {inWizard && (
+
+      {/* Autosave failure. Persistent (not a toast) because the condition
+          persists: the reviewer needs to see it for as long as saves are
+          failing, not for four seconds. Clears itself on the next good save. */}
+      {saveFailed && (
         <div
-          className="rounded-card border-[0.5px] px-6 py-4 mb-4 flex items-center justify-between"
-          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+          className="sticky top-0 z-40 text-xs font-medium"
+          style={{
+            backgroundColor: 'var(--accent-tint)',
+            borderBottom: '0.5px solid var(--confidence-low)',
+            color: 'var(--confidence-low)',
+            padding: '8px 24px',
+          }}
         >
-          <div className="flex items-center gap-2">
-            {wizard!.cols.map((_, i) => {
-              const done    = i < colIndex;
-              const current = i === colIndex;
-              return (
-                <div key={i} className="flex items-center gap-2">
-                  <span
-                    className="inline-flex items-center justify-center rounded-full text-xs font-medium transition-colors"
-                    style={{
-                      width: 24,
-                      height: 24,
-                      backgroundColor: current ? 'var(--accent)' : done ? 'var(--accent-tint)' : 'var(--page-bg)',
-                      color:           current ? 'white' : done ? 'var(--accent-strong)' : 'var(--text-hint)',
-                      border:          current ? 'none' : '0.5px solid var(--border)',
-                    }}
-                  >
-                    {i + 1}
-                  </span>
-                  {i < wizard!.cols.length - 1 && (
-                    <span style={{ width: 18, height: '0.5px', backgroundColor: 'var(--border)' }} />
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <div className="text-sm" style={{ color: 'var(--text-muted)' }}>
-            Column{' '}
-            <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>{colIndex + 1}</span>
-            {' '}of {wizard!.pids.length}
-            {wizard!.cols[colIndex] && (
-              <span style={{ color: 'var(--text-secondary)' }}> · {wizard!.cols[colIndex]}</span>
-            )}
-          </div>
+          Couldn’t save your changes — still retrying. Your edits are safe in this tab; keep it open until this clears.
         </div>
       )}
 
-      {/* ── White surface card ─────────────────────────────────────────── */}
-      <div
-        className="rounded-card border-[0.5px] p-6"
-        style={{
-          backgroundColor: 'var(--surface)',
-          borderColor: 'var(--border)',
-        }}
-      >
-        {/* Card header */}
-        <div className="flex items-center justify-between mb-6">
-          {/* Left: title + status pill */}
-          <div className="flex items-center gap-3">
-            <h2 className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>
-              Alias groups
-            </h2>
-            <span
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill text-xs font-medium"
-              style={{
-                backgroundColor: 'var(--accent-tint)',
-                color: 'var(--accent-strong)',
-              }}
-            >
-              <span
-                className="w-1.5 h-1.5 rounded-full flex-shrink-0"
-                style={{ backgroundColor: 'var(--accent)' }}
-              />
-              {statusLabel}
-            </span>
-          </div>
-
-          {/* Right: counter + apply button + export button */}
-          <div className="flex items-center gap-3">
-            <span className="text-sm" style={{ color: 'var(--text-muted)' }}>
-              Checked{' '}
-              <span className="font-medium" style={{ color: 'var(--accent)' }}>
-                {checkedAliases.size}
-              </span>
-              {' / '}
-              {totalGroups}
-            </span>
-
-            <UndoButton onUndo={() => historyHandlersRef.current.undo()} disabled={exporting || undoStack.length === 0} />
-
-            {isAutoExport ? (
-              <>
-                {inWizard && colIndex > 0 && (
-                  <button
-                    type="button"
-                    onClick={goToPreviousColumn}
-                    disabled={exporting}
-                    className="px-4 py-1.5 rounded-button text-sm font-medium border-[0.5px] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
-                  >
-                    Back
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={requestAcceptStandardizations}
-                  disabled={exporting || loadingAliasMap || !!aliasMapError}
-                  className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{ backgroundColor: 'var(--accent)' }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
-                >
-                  {exporting
-                    ? 'Saving…'
-                    : inWizard && !isLastCol
-                      ? 'Accept & continue'
-                      : 'Accept Standardizations'}
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void openDownloadModal()}
-                  disabled={loadingAliasMap || !!aliasMapError}
-                  className="px-3 py-1.5 rounded-button text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{ backgroundColor: '#4BAE4F', color: '#FFFFFF' }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#439A47';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#4BAE4F';
-                  }}
-                >
-                  Export to Spreadsheet
-                </button>
-
-                <button
-                  type="button"
-                  onClick={onExportClick}
-                  disabled={exporting || loadingAliasMap || !!aliasMapError}
-                  className="px-4 py-1.5 rounded-button text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{ backgroundColor: 'var(--accent)' }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
-                >
-                  {exporting ? 'Exporting…' : 'Export to Snowflake'}
-                </button>
-              </>
+      {/* ── Sticky top bar ───────────────────────────────────────────── */}
+      <div className="sticky top-0 z-30" style={{ backgroundColor: 'var(--surface)', borderBottom: '0.5px solid var(--border)' }}>
+        <div className="mx-auto flex items-center justify-between gap-4" style={{ maxWidth: 980, padding: '14px 24px' }}>
+          <div className="min-w-0">
+            <h1 className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>Standardization review</h1>
+            {sourceRelation && (
+              <p className="text-[11px] font-mono truncate" style={{ color: 'var(--text-muted)' }}>
+                {sourceRelation}{sourceColumn ? ` · ${sourceColumn}` : ''}
+              </p>
             )}
           </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              type="button"
+              onClick={() => router.push('/home')}
+              className="text-xs font-medium rounded-button px-3 py-2 border-[0.5px]"
+              style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
+            >
+              Cancel
+            </button>
+            {inWizard && colIndex > 0 && (
+              <button
+                type="button"
+                onClick={goToPreviousColumn}
+                disabled={exporting}
+                className="text-xs font-medium rounded-button px-3 py-2 border-[0.5px] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
+              >
+                Back
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={requestAcceptStandardizations}
+              disabled={exporting || loadingAliasMap || !!aliasMapError}
+              className="text-xs font-medium rounded-button px-4 py-2 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ backgroundColor: 'var(--accent)' }}
+            >
+              {exporting
+                ? 'Saving…'
+                : inWizard && !isLastCol
+                  ? 'Accept & continue'
+                  : 'Accept Standardizations'}
+            </button>
+          </div>
         </div>
+        {/* Column tabs (wizard mode) */}
+        {inWizard && (
+          <div className="mx-auto flex items-center gap-1.5 overflow-x-auto" style={{ maxWidth: 980, padding: '0 24px 12px' }}>
+            {wizard!.cols.map((colName, i) => {
+              const done    = i < colIndex;
+              const current = i === colIndex;
+              return (
+                <span
+                  key={i}
+                  className="flex items-center gap-1.5 text-xs font-medium rounded-button px-3 py-1.5 border-[0.5px] whitespace-nowrap"
+                  style={{
+                    borderColor:     current ? 'var(--accent)' : 'var(--border)',
+                    backgroundColor: current ? 'var(--accent-tint)' : 'var(--surface)',
+                    color:           current ? 'var(--accent-strong)' : 'var(--text-secondary)',
+                  }}
+                >
+                  <span className="font-mono">{colName}</span>
+                  {done
+                    ? <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M2.5 7L5.5 10L11.5 4" stroke="#15803D" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                    : <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: current ? 'var(--accent)' : 'var(--text-hint)' }} />}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-        {/* Domain-wide scope notice (premium: accepting writes to the shared lookup) */}
-        {isAutoExport && <DomainScopeNotice style={{ marginBottom: 20 }} />}
+      {/* ── Page content ─────────────────────────────────────────────── */}
+      <div className="mx-auto" style={{ maxWidth: 980, padding: '24px' }}>
+        <div
+          className="rounded-card border-[0.5px] p-6"
+          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+        >
+          {/* Card header */}
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-3">
+              <h2 className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>
+                Alias groups
+              </h2>
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill text-xs font-medium"
+                style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent-strong)' }}
+              >
+                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: 'var(--accent)' }} />
+                {inWizard ? wizard!.cols[colIndex] : (sourceColumn || statusLabel)}
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                <span className="font-medium" style={{ color: 'var(--accent)' }}>{totalGroups}</span>
+                {' '}group{totalGroups !== 1 ? 's' : ''}
+              </span>
+              <UndoButton onUndo={() => historyHandlersRef.current.undo()} disabled={exporting || undoStack.length === 0} />
+            </div>
+          </div>
 
-        <DomainChangeConfirmModal
-          open={confirmAcceptOpen}
-          busy={exporting}
-          confirmLabel="Accept for all tables"
-          body="You changed the proposed standardizations. Accepting writes them to the shared lookup for this domain, so every other table with a pipeline in this domain will standardize using these mappings too."
-          onCancel={() => setConfirmAcceptOpen(false)}
-          onConfirm={() => void doAcceptStandardizations()}
-        />
+          {/* Per-column scope notice */}
+          <SpecScopeNotice style={{ marginBottom: 20 }} />
+
+          <SpecChangeConfirmModal
+            open={confirmAcceptOpen}
+            busy={exporting}
+            confirmLabel="Accept standardizations"
+            body="You changed the proposed standardizations. Accepting writes them to this column's confirmed mappings, which it reuses the next time it standardizes."
+            onCancel={() => setConfirmAcceptOpen(false)}
+            onConfirm={() => void doAcceptStandardizations()}
+          />
 
         {/* Export error */}
         {exportError && (
@@ -1602,32 +1588,6 @@ export default function RunReviewClient({
           </div>
         )}
 
-        {/* Export success — not shown in auto_export mode (we redirect instead) */}
-        {!isAutoExport && exportResult?.view_fqn && (
-          <div
-            className="rounded-button border-[0.5px] px-4 py-3 mb-5 text-sm"
-            style={{ backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' }}
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <span style={{ color: 'var(--confidence-high)' }}>View created:</span>
-              <code
-                className="text-xs px-2 py-1 rounded-[6px]"
-                style={{ backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)', color: 'var(--text-secondary)' }}
-              >
-                {viewSql}
-              </code>
-              <button
-                type="button"
-                onClick={() => void copyViewSql()}
-                className="px-3 py-1 rounded-[6px] border-[0.5px] text-xs font-medium"
-                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-secondary)' }}
-              >
-                {copiedSql ? 'Copied' : 'Copy'}
-              </button>
-            </div>
-          </div>
-        )}
-
         {/* Rename error */}
         {renameError && (
           <div
@@ -1635,6 +1595,73 @@ export default function RunReviewClient({
             style={{ backgroundColor: '#FFFBEB', borderColor: '#FDE68A', color: '#92400E' }}
           >
             {renameError}
+          </div>
+        )}
+
+        {/* Column standardization rules — the contract the reviewer is working under */}
+        {(standardizationRules?.length ?? 0) > 0 && (
+          <div
+            className="rounded-card border-[0.5px] px-4 py-3.5 mb-5"
+            style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+          >
+            <div className="text-sm font-semibold mb-1.5" style={{ color: 'var(--text-primary)' }}>
+              {domainName ? `${domainName} — standardization rules` : 'Standardization rules'}
+            </div>
+            <ul className="space-y-1">
+              {standardizationRules!.map((rule, i) => (
+                <li key={i} className="flex items-start gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+                  <span aria-hidden="true" style={{ color: 'var(--text-hint)' }}>•</span>
+                  <span>{rule}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Naming convention — shown for EVERY type, including the ones Prism
+            cannot mechanically check. A reviewer working through hundreds of
+            groups otherwise had no reminder of the naming contract they set up,
+            and for `examples`/`natural` the review UI previously received
+            nothing at all (SPEC-04). Labelled honestly so nobody assumes the
+            non-enforceable types are being checked. */}
+        {convention && (convention.value?.trim() || hasAnyRule(convention.rules)) && (
+          <div
+            className="rounded-card border-[0.5px] px-4 py-3.5 mb-5"
+            style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+          >
+            <div className="flex items-baseline justify-between gap-3 mb-1.5">
+              <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                Naming convention
+              </div>
+              <span className="text-[11px]" style={{ color: 'var(--text-hint)' }}>
+                {convention.type === 'regex' || hasAnyRule(convention.rules)
+                  ? 'Enforced — renames are checked against this'
+                  : 'Guidance for the AI — not checked automatically'}
+              </span>
+            </div>
+            {convention.type === 'regex' && convention.value.trim() && (
+              <p className="text-sm font-mono break-all" style={{ color: 'var(--text-secondary)' }}>
+                {convention.value.trim()}
+              </p>
+            )}
+            {convention.type === 'examples' && convention.value.trim() && (
+              <ul className="space-y-1">
+                {convention.value.split('\n').map(s => s.trim()).filter(Boolean).map((ex, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+                    <span aria-hidden="true" style={{ color: 'var(--text-hint)' }}>•</span>
+                    <span>{ex}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {convention.type === 'natural' && convention.value.trim() && (
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{convention.value.trim()}</p>
+            )}
+            {hasAnyRule(convention.rules) && (
+              <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>
+                {describeConventionRules(convention.rules!).join(' · ')}
+              </p>
+            )}
           </div>
         )}
 
@@ -1685,11 +1712,10 @@ export default function RunReviewClient({
             <div
               className="grid items-center mb-1 pb-2 border-b-[0.5px]"
               style={{
-                gridTemplateColumns: '36px 36px 160px 1fr 32px',
+                gridTemplateColumns: '36px 160px 1fr',
                 borderColor: 'var(--border-subtle)',
               }}
             >
-              <div />
               <div />
               <div
                 className="px-3 text-[10px] font-medium uppercase tracking-wider"
@@ -1703,13 +1729,11 @@ export default function RunReviewClient({
               >
                 Matched values
               </div>
-              <div />
             </div>
 
             {/* ── Group rows ──────────────────────────────────────────── */}
             <div>
               {groupEntries.map(([aliasName, group], idx) => {
-                const isChecked = checkedAliases.has(aliasName);
                 const isGroupDragOver =
                   dragOverAliasName === aliasName &&
                   draggingGroupName !== null &&
@@ -1723,14 +1747,61 @@ export default function RunReviewClient({
                   <div key={aliasName}>
                     {idx > 0 && (
                       <div
-                        className="mx-3 border-t-[0.5px]"
-                        style={{ borderColor: 'var(--border-subtle)' }}
-                      />
+                        className="relative mx-3"
+                        style={{ height: 0 }}
+                        onMouseEnter={() => setHoveredDividerIdx(idx)}
+                        onMouseLeave={() => setHoveredDividerIdx((prev) => prev === idx ? null : prev)}
+                      >
+                        <div
+                          className="absolute left-0 right-0"
+                          style={{ top: -6, height: 12, zIndex: 1, cursor: 'default' }}
+                        />
+                        <div
+                          className="absolute left-0 right-0"
+                          style={{
+                            height: '0.5px',
+                            top: 0,
+                            backgroundColor: hoveredDividerIdx === idx ? 'var(--accent)' : 'var(--border-subtle)',
+                            transition: 'background-color 0.15s',
+                          }}
+                        />
+                        {hoveredDividerIdx === idx && (
+                          <button
+                            type="button"
+                            onClick={() => addGroup(idx)}
+                            className="absolute rounded-full"
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              width: 18,
+                              height: 18,
+                              left: -3,
+                              top: '50%',
+                              transform: 'translateY(-50%)',
+                              backgroundColor: 'var(--accent)',
+                              color: '#fff',
+                              fontSize: 13,
+                              lineHeight: '18px',
+                              textAlign: 'center',
+                              padding: 0,
+                              zIndex: 2,
+                              border: 'none',
+                              cursor: 'pointer',
+                            }}
+                            title="Add a group"
+                          >
+                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{ display: 'block' }}>
+                              <path d="M5 1v8M1 5h8" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
                     )}
                     <div
                       className="grid items-start py-[13px] rounded-row transition-colors"
                       style={{
-                        gridTemplateColumns: '36px 36px 160px 1fr 32px',
+                        gridTemplateColumns: '36px 160px 1fr',
                         opacity: isBeingDragged ? 0.4 : 1,
                         ...(isDragOver
                           ? {
@@ -1750,23 +1821,7 @@ export default function RunReviewClient({
                       onDrop={(e) => onDropOnAlias(e, aliasName)}
                       onDragLeave={(e) => onDragLeaveAlias(e, aliasName)}
                     >
-                      {/* Col 1: Checkbox */}
-                      <div className="flex justify-center pt-0.5">
-                        <button
-                          type="button"
-                          onClick={() => toggle(aliasName)}
-                          aria-label={isChecked ? 'Uncheck group' : 'Check group'}
-                          className="w-[26px] h-[26px] rounded-full flex items-center justify-center flex-shrink-0 transition-colors"
-                          style={isChecked
-                            ? { backgroundColor: 'var(--accent)', border: 'none' }
-                            : { backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)' }
-                          }
-                        >
-                          {isChecked && <CheckmarkIcon />}
-                        </button>
-                      </div>
-
-                      {/* Col 2: Drag handle */}
+                      {/* Col 1: Drag handle */}
                       <div className="flex justify-center pt-1.5">
                         {editingAliasKey !== aliasName && (
                           <span
@@ -1837,7 +1892,7 @@ export default function RunReviewClient({
 
                               return (
                                 <span
-                                  key={it.run_item_id}
+                                  key={it.literal_value}
                                   draggable
                                   onDragStart={(e) =>
                                     onDragStart(e, {
@@ -1875,100 +1930,14 @@ export default function RunReviewClient({
                         )}
                       </div>
 
-                      {/* Col 5: More menu */}
-                      <div className="relative flex justify-center pt-0.5">
-                        {editingAliasKey !== aliasName && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setOpenMenuForAliasName((prev) => prev === aliasName ? null : aliasName);
-                              }}
-                              className="w-7 h-7 rounded-[6px] border-[0.5px] flex items-center justify-center text-sm transition-colors"
-                              style={{
-                                borderColor: 'var(--border)',
-                                backgroundColor: 'var(--surface)',
-                                color: 'var(--text-hint)',
-                              }}
-                              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
-                              title="Group actions"
-                              aria-label="Group actions"
-                            >
-                              ···
-                            </button>
-
-                            {openMenuForAliasName === aliasName && (
-                              <div
-                                className="absolute right-0 top-8 w-32 rounded-button border-[0.5px] z-10 overflow-hidden"
-                                style={{
-                                  backgroundColor: 'var(--surface)',
-                                  borderColor: 'var(--border)',
-                                }}
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() => { startRename(aliasName); setOpenMenuForAliasName(null); }}
-                                  className="w-full text-left px-3 py-2 text-sm transition-colors"
-                                  style={{ color: 'var(--text-secondary)' }}
-                                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = ''; }}
-                                >
-                                  Rename
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => deleteGroup(aliasName)}
-                                  className="w-full text-left px-3 py-2 text-sm transition-colors"
-                                  style={{ color: 'var(--confidence-low)' }}
-                                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEF2F2'; }}
-                                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = ''; }}
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
                     </div>
                   </div>
                 );
               })}
             </div>
-
-            {/* ── Add group button ─────────────────────────────────────── */}
-            <div className="flex justify-center mt-4 mb-1">
-              <button
-                type="button"
-                onClick={addGroup}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-button border-[0.5px] border-dashed text-sm transition-colors group"
-                style={{
-                  borderColor: 'var(--border)',
-                  backgroundColor: 'var(--surface)',
-                  color: 'var(--text-hint)',
-                }}
-                onMouseEnter={(e) => {
-                  const btn = e.currentTarget as HTMLButtonElement;
-                  btn.style.backgroundColor = 'var(--accent-tint)';
-                  btn.style.borderColor = 'var(--accent)';
-                  btn.style.color = 'var(--accent)';
-                }}
-                onMouseLeave={(e) => {
-                  const btn = e.currentTarget as HTMLButtonElement;
-                  btn.style.backgroundColor = 'var(--surface)';
-                  btn.style.borderColor = 'var(--border)';
-                  btn.style.color = 'var(--text-hint)';
-                }}
-              >
-                <span className="text-base leading-none">+</span>
-                Add a group
-              </button>
-            </div>
           </>
         )}
+        </div>
       </div>
 
       {/* ── Confirmation modal ─────────────────────────────────────────── */}
@@ -1979,10 +1948,10 @@ export default function RunReviewClient({
             style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
           >
             <h3 className="text-base font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
-              Export to Snowflake
+              Export to {warehouseLabel}
             </h3>
             <p className="text-xs mb-5" style={{ color: 'var(--text-hint)' }}>
-              A view will be created in Snowflake with the standardized column appended.
+              A view will be created in {warehouseLabel} with the standardized column appended.
             </p>
 
             {/* Include original column toggle */}
@@ -1990,16 +1959,6 @@ export default function RunReviewClient({
               value={includeOriginalCol}
               onChange={setIncludeOriginalCol}
             />
-
-            {/* Unreviewed warning */}
-            {uncheckedCount > 0 && (
-              <div
-                className="mt-4 rounded-button border-[0.5px] px-3 py-2.5 text-sm"
-                style={{ backgroundColor: '#FEF9C3', borderColor: '#FDE68A', color: '#92400E' }}
-              >
-                {uncheckedCount} group{uncheckedCount !== 1 ? 's' : ''} haven&apos;t been reviewed yet.
-              </div>
-            )}
 
             <div className="flex items-center justify-end gap-3 mt-6">
               <button
@@ -2020,7 +1979,7 @@ export default function RunReviewClient({
                 onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
               >
-                {uncheckedCount > 0 ? 'Export anyway' : 'Export'}
+                Export
               </button>
             </div>
           </div>

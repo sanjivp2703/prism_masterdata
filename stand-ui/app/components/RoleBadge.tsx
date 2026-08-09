@@ -51,7 +51,11 @@ export default function RoleBadge({ role }: { role: 'admin' | 'user' }) {
           alignItems:      'center',
           height:          28,
           padding:         '0 10px',
-          borderRadius:    20,
+          // Status pill — the design system assigns these the pill token (2px,
+          // a slightly-rounded rectangle), and status pills are explicitly NOT in
+          // the small-caps/floating carve-outs. 20px made this the one fully
+          // rounded badge in the app (UI-01).
+          borderRadius:    'var(--radius-pill)',
           fontSize:        12,
           fontWeight:      600,
           letterSpacing:   '0.01em',
@@ -76,7 +80,7 @@ export default function RoleBadge({ role }: { role: 'admin' | 'user' }) {
             minWidth:        230,
             backgroundColor: '#FFFFFF',
             border:          '0.5px solid #E5E7EB',
-            borderRadius:    10,
+            borderRadius:    'var(--radius-card)',   // was a hardcoded 10px (UI-01)
             boxShadow:       '0 4px 20px rgba(0,0,0,0.10)',
             padding:         '14px 16px',
             zIndex:          9999,

@@ -6,14 +6,11 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({ sqlText, binds, complete: (e: any, _s: any, r: any[]) => (e ? reject(e) : resolve(r || [])) });
-  });
-}
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { loadOpRunStatesBatch } from '@/app/api/_lib/op-auto-group';
+import { getDb } from '@/app/api/_lib/sqlite';
+import { countOneTimeFileRows } from '@/app/api/_lib/op-one-time-file';
 
 function safeJson(s: unknown): any {
   if (s == null) return null;
@@ -22,26 +19,30 @@ function safeJson(s: unknown): any {
 }
 
 export async function GET(_request: Request, { params }: { params: Promise<{ session: string }> }) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { session: sessionNonce } = await params;
   if (!sessionNonce) return Response.json({ error: 'Invalid session' }, { status: 400 });
 
   try {
-    return await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `SELECT run_id, source_relation, source_column, run_status, stats_snapshot,
-                ARRAY_SIZE(state:groups) AS group_count
-         FROM STAND_DB.STAND_INTERNAL.RUNS
-         WHERE run_type = 'one_time' AND created_by = ?
-           AND stats_snapshot:one_time_session::string = ?
-         ORDER BY run_id`,
-        [Number(session.accountId), sessionNonce],
-      );
+    return await withWarehouse(async (conn) => {
+      const rows = getDb()
+        .prepare(
+          `SELECT run_id, source_relation, source_column, run_status, stats_snapshot
+           FROM runs
+           WHERE run_type = 'one_time' AND created_by = ?
+             AND json_extract(stats_snapshot, '$.one_time_session') = ?
+           ORDER BY run_id`,
+        )
+        .all(Number(session.accountId), sessionNonce) as any[];
       if (!rows.length) return Response.json({ error: 'Session not found' }, { status: 404 });
+
+      // The grouping state lives warehouse-side (INTERNAL.RUN_STATE — data
+      // residency); batch-load it on the open connection to derive "grouped".
+      const runIds = rows.map((r) => Number((r as any).RUN_ID ?? (r as any).run_id)).filter(Number.isFinite);
+      const states = await loadOpRunStatesBatch(runIds, conn);
 
       const source_relation = String((rows[0] as any).SOURCE_RELATION ?? (rows[0] as any).source_relation ?? '');
       let exported = false;
@@ -50,18 +51,26 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
         const meta = safeJson(a.STATS_SNAPSHOT ?? a.stats_snapshot) ?? {};
         const status = String(a.RUN_STATUS ?? a.run_status ?? '');
         if (status === 'complete') exported = true;
+        const runId = Number(a.RUN_ID ?? a.run_id);
         return {
-          run_id:        Number(a.RUN_ID ?? a.run_id),
+          run_id:        runId,
           column_name:   String(a.SOURCE_COLUMN ?? a.source_column ?? ''),
-          grouped:       Number(a.GROUP_COUNT ?? a.group_count ?? 0) > 0,
+          grouped:       (states.get(runId)?.groups?.length ?? 0) > 0,
           accepted:      meta.accepted === true,
           convention:    meta.convention ?? null,
         };
       });
 
-      return Response.json({ session: sessionNonce, source_relation, exported, columns });
+      // Whether the source was an uploaded file / pasted list rather than a
+      // warehouse table. Reported explicitly rather than inferred from
+      // source_relation, which is a DISPLAY label for file sessions ("sales.csv")
+      // and would be guesswork to pattern-match. The review UI keys its export
+      // options on this: a file session can be exported as CSV/Excel/Sheets/table,
+      // a warehouse session writes a table as it always has.
+      const isFileSession = (await countOneTimeFileRows(conn, sessionNonce)) > 0;
+      return Response.json({ session: sessionNonce, source_relation, exported, columns, is_file_session: isFileSession });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to load one-time session');
+    return warehouseErrorResponse(err, 'Failed to load one-time session');
   }
 }

@@ -15,11 +15,23 @@ export default function UserMenu({ name, email, pictureUrl }: Props) {
 
   // The layout only passes name/email/picture — fetch the session role
   // client-side so the Settings item can be admin-only.
+  //
+  // A 401 here means the session was REVOKED (member removed / role changed):
+  // the cookie's signature still verifies, so pages render, but the account's
+  // session_version no longer matches. Send them through logout — clears the
+  // stale cookie and lands on /login — instead of leaving a zombie UI whose
+  // API calls all fail.
   useEffect(() => {
     let cancelled = false;
     fetch('/api/auth/session', { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (!cancelled) setRole(d?.role ?? null); })
+      .then((r) => {
+        if (r.status === 401) {
+          window.location.href = '/api/auth/logout';
+          return null;
+        }
+        return r.ok ? r.json() : null;
+      })
+      .then((d) => { if (!cancelled && d) setRole(d.role ?? null); })
       .catch(() => { /* no role → no Settings item */ });
     return () => { cancelled = true; };
   }, []);
@@ -45,7 +57,10 @@ export default function UserMenu({ name, email, pictureUrl }: Props) {
           width: 36,
           height: 36,
           borderRadius: '50%',
-          border: '2px solid #E5E7EB',
+          // 0.5px per the design system — the two documented border exceptions
+          // (drag-over left edge, featured-card accent) do not apply to an avatar
+          // button, so 2px made this the heaviest border in the app (UI-01).
+          border: '0.5px solid #E5E7EB',
           overflow: 'hidden',
           cursor: 'pointer',
           padding: 0,
@@ -95,7 +110,7 @@ export default function UserMenu({ name, email, pictureUrl }: Props) {
             minWidth: 220,
             backgroundColor: '#FFFFFF',
             border: '0.5px solid #E5E7EB',
-            borderRadius: 12,
+            borderRadius: 'var(--radius-card)',   // was a hardcoded 12px — off-system (UI-01)
             boxShadow: '0 4px 20px rgba(0,0,0,0.10)',
             overflow: 'hidden',
             zIndex: 9999,

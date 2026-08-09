@@ -1,5 +1,29 @@
 // PLACEHOLDER LEGAL TEXT — have counsel review/replace before selling. Generated 2026-07-02.
 
+import { getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+
+/**
+ * The warehouse this installation is actually configured for.
+ *
+ * The page hardcoded "Snowflake" in four places — including the subprocessor
+ * list and the credential-security section — so a SQL Server customer read a
+ * privacy policy naming a vendor they have no relationship with, and listing a
+ * subprocessor that never touches their data. That is a worse failure on a
+ * legal page than on a settings screen (SEC-07). The sibling
+ * ExportTableDisclosure was parameterised the same way earlier today.
+ *
+ * Falls back to neutral wording rather than throwing: this page is PUBLIC
+ * (linked from login), so it has to render even if the workspace config cannot
+ * be read.
+ */
+function warehouseName(): string {
+  try {
+    return getWarehouseAdapter().kind === 'mssql' ? 'SQL Server' : 'Snowflake';
+  } catch {
+    return 'your data warehouse';
+  }
+}
+
 export const metadata = {
   title: 'Privacy policy — Prism',
 };
@@ -26,6 +50,7 @@ const listStyle: React.CSSProperties = {
 };
 
 export default function PrivacyPage() {
+  const warehouse = warehouseName();
   return (
     <div style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh', padding: '48px 24px' }}>
       <div style={{ maxWidth: 720, margin: '0 auto' }}>
@@ -60,7 +85,7 @@ export default function PrivacyPage() {
           <p style={bodyText}>
             This privacy policy explains what information Prism collects, how it is used, and the
             choices you have. Prism is a data standardization platform that connects to data
-            sources you designate — your Snowflake data warehouse and Google Sheets — and helps
+            sources you designate — your {warehouse} data warehouse and Google Sheets — and helps
             you map inconsistent text values to canonical names. It applies alongside our{' '}
             <a href="/terms" style={{ color: 'var(--accent)', textDecoration: 'none' }}>terms of service</a>.
           </p>
@@ -72,7 +97,7 @@ export default function PrivacyPage() {
               from Google sign-in, plus your workspace role and invitation history.
             </li>
             <li>
-              <strong>Connection credentials</strong> — Snowflake credentials (password or private
+              <strong>Connection credentials</strong> — {warehouse} credentials (password or private
               key) and Google OAuth tokens (including refresh tokens for connected Sheets
               pipelines) that you provide to connect your data sources.
             </li>
@@ -106,12 +131,13 @@ export default function PrivacyPage() {
           <h2 style={sectionTitle}>3. Subprocessors</h2>
           <ul style={listStyle}>
             <li>
-              <strong>Snowflake</strong> — mappings, run state, and pipeline configuration are
-              stored in your connected Snowflake account, under your agreement with Snowflake.
+              <strong>{warehouse}</strong> — mappings, run state, and pipeline configuration are
+              stored in your connected {warehouse} account, under your agreement with {warehouse}.
             </li>
             <li>
-              <strong>Anthropic</strong> — distinct data values (never your credentials) are sent
-              to Anthropic&rsquo;s API to propose groupings and canonical names.
+              <strong>AI provider (Anthropic by default; OpenAI or Google if your
+              workspace configures one)</strong> — distinct data values (never your credentials) are
+              sent to the configured provider&rsquo;s API to propose groupings and canonical names.
             </li>
             <li>
               <strong>Google</strong> — used for sign-in and, when you connect them, for reading
@@ -132,7 +158,7 @@ export default function PrivacyPage() {
           <h2 style={sectionTitle}>5. Security measures</h2>
           <ul style={listStyle}>
             <li>
-              Stored credentials — Snowflake passwords, private keys, and Google refresh tokens —
+              Stored credentials — {warehouse} passwords, private keys, and Google refresh tokens —
               are encrypted at rest at the application level using AES-256-GCM, in addition to the
               storage-layer encryption provided by the underlying platform.
             </li>

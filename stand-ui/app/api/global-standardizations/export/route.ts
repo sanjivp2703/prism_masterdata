@@ -1,8 +1,10 @@
+import { reportError, googleErrorMessage } from '@/app/api/_lib/report-error';
 import { NextRequest } from 'next/server';
 import { cookies } from 'next/headers';
 import { google } from 'googleapis';
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { parseFqn, quoteIdent, isSimpleIdent } from '@/app/api/_lib/op-one-time';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 /**
  * Validate and quote a user-supplied DB.SCHEMA.TABLE target so it can be
@@ -27,23 +29,27 @@ function buildSafeTargetFqn(rawFqn: string): { fqn: string } | { error: string }
   if (resolved.some((p) => !isSimpleIdent(p))) {
     return { error: 'Target table name contains unsupported characters.' };
   }
-  if (resolved[0] === 'STAND_DB' && resolved[1] === 'STAND_INTERNAL') {
-    return { error: 'Cannot export into the STAND_DB.STAND_INTERNAL schema.' };
+  // Compare case-INSENSITIVELY. Unquoted parts were uppercased above, but
+  // QUOTED parts are preserved verbatim, so `"prism_db"."internal".X` sailed
+  // past this guard. On Snowflake that was refused anyway — by accident of the
+  // platform, since quoted identifiers are case-sensitive and no lowercase
+  // `prism_db` exists — and it surfaced as a driver 500 rather than this clean
+  // 400. On SQL Server, where identifiers are case-insensitive by default, the
+  // same input would have resolved to the real internal schema. A guard that
+  // holds only because of one dialect's casing rules is not a guard.
+  //
+  // Deliberately over-strict: a genuinely distinct lowercase-quoted database is
+  // refused too. Nobody should be exporting a lookup into anything that reads
+  // as PRISM_DB.INTERNAL.
+  // .trim() as well as .toUpperCase(): parseFqn trims each part's OUTER
+  // whitespace, but a space INSIDE the quotes survives, so `"PRISM_DB "` was
+  // still slipping past. Harmless on Snowflake (resolves to nothing), but SQL
+  // Server ignores trailing blanks in identifiers, where it would have resolved
+  // to the real internal schema.
+  if (resolved[0].trim().toUpperCase() === 'PRISM_DB' && resolved[1].trim().toUpperCase() === 'INTERNAL') {
+    return { error: 'Cannot export into the PRISM_DB.INTERNAL schema.' };
   }
   return { fqn: resolved.map(quoteIdent).join('.') };
-}
-
-async function exec(connection: any, sqlText: string, binds?: any[]) {
-  return new Promise<any[]>((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      },
-    });
-  });
 }
 
 function getOAuth2Client() {
@@ -63,6 +69,8 @@ const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE
 // Changes should be saved via POST /api/global-standardizations first.
 
 export async function POST(request: NextRequest) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const body = await request.json().catch(() => ({}));
   const { format, snowflakeTableFqn, domain_id: rawDomainId, domain_name: rawDomainName } = body as {
     format?: string;
@@ -75,21 +83,31 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: 'Invalid format. Use "sheets" or "snowflake".' }, { status: 400 });
   }
 
-  const domainId   = rawDomainId != null ? Number(rawDomainId) : null;
+  // Validate rather than passing NaN straight through to a bind, which the
+  // warehouse rejected with a driver error surfaced as a 500 on what is plainly
+  // a bad request.
+  let domainId: number | null = null;
+  if (rawDomainId != null) {
+    const n = Number(rawDomainId);
+    if (!Number.isFinite(n)) {
+      return Response.json({ error: 'domain_id must be a number.' }, { status: 400 });
+    }
+    domainId = n;
+  }
   const domainName = rawDomainName ? String(rawDomainName) : null;
 
   // ── Load current mappings from Snowflake ────────────────────────────────────
   let rows: Array<{ canonical_name: string; raw_value: string }>;
 
   try {
-    const result = await withSnowflake(async (connection) => {
+    const result = await withWarehouse(async (connection) => {
       const domainFilter = domainId != null ? 'WHERE lam.domain_id = ?' : '';
       const binds        = domainId != null ? [domainId] : [];
       const sfRows = await exec(
         connection,
         `SELECT aan.alias_name AS canonical_name, lam.literal_value AS raw_value
-         FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
            ON lam.alias_id = aan.alias_id
          ${domainFilter}
          ORDER BY aan.alias_name, lam.literal_value`,
@@ -102,7 +120,7 @@ export async function POST(request: NextRequest) {
     });
     rows = result as Array<{ canonical_name: string; raw_value: string }>;
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to load global standardizations for export');
+    return warehouseErrorResponse(err, 'Failed to load global standardizations for export');
   }
 
   const headers     = ['canonical_name', 'raw_value'];
@@ -140,6 +158,15 @@ export async function POST(request: NextRequest) {
     try {
       const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
+      // The asymmetry here is deliberate, not an oversight (LKP-02): Google caps
+      // a SHEET (tab) title at 100 characters and rejects the create call above
+      // that, but imposes no comparable limit on the SPREADSHEET (file) title.
+      // So the slice belongs on the tab only. Do not "tidy" this by making the
+      // two match — capping both truncates the file name for no reason, and
+      // removing the slice turns a long spec name into a hard API error.
+      //
+      // Consequence worth knowing: for a name over 100 chars the file name and
+      // the tab name legitimately differ. That is cosmetic and accepted.
       const createResp = await sheets.spreadsheets.create({
         requestBody: {
           properties: { title: sheetTitle },
@@ -199,23 +226,36 @@ export async function POST(request: NextRequest) {
       if (statusCode === 401 || statusCode === 403) {
         return Response.json({ needsAuth: true }, { status: 401 });
       }
+      reportError(err, { route: 'app/api/global-standardizations/export/route.ts' });
       return Response.json(
-        { error: err?.message || 'Failed to create Google Sheet' },
+        { error: googleErrorMessage(err) },
         { status: 500 },
       );
     }
   }
 
-  // ── Snowflake table ──────────────────────────────────────────────────────────
+  // ── Warehouse table (Snowflake or SQL Server) ───────────────────────────────
   if (format === 'snowflake') {
+    const isMssql = getWarehouseAdapter().kind === 'mssql';
+    // SQL Server installs default lookup exports into EXPORTS ("PUBLIC"
+    // collides with the built-in database role there).
+    const defaultSchema = isMssql ? 'EXPORTS' : 'PUBLIC';
     const defaultFqn = domainName
-      ? `STAND_DB.PUBLIC.${domainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
-      : 'STAND_DB.STAND_INTERNAL.GLOBAL_CANONICAL_MAPPINGS';
+      ? `PRISM_DB.${defaultSchema}.${domainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+      : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`;
     const targetFqn = snowflakeTableFqn?.trim() || defaultFqn;
 
     // Never interpolate the raw string: parse, validate, and fully quote each
-    // part. The internal-schema block only applies to user-supplied targets —
-    // the legacy no-domain default deliberately lives in STAND_INTERNAL.
+    // part.
+    //
+    // The INTERNAL-schema refusal inside buildSafeTargetFqn is skipped on the
+    // else-branch because that branch handles a target Prism itself just built
+    // above (PRISM_DB.PUBLIC/EXPORTS.*), not anything the user typed — so
+    // there is nothing to validate. It is NOT skipped because the default
+    // "lives in INTERNAL", which is what this comment used to claim; that
+    // stopped being true when the default moved to PUBLIC/EXPORTS, and it read
+    // as a security exemption resting on a false premise. Both branches still
+    // fully quote every part.
     let safeFqn: string;
     if (snowflakeTableFqn?.trim()) {
       const built = buildSafeTargetFqn(targetFqn);
@@ -226,24 +266,47 @@ export async function POST(request: NextRequest) {
     }
 
     try {
-      await withSnowflake(async (connection) => {
-        await exec(
-          connection,
-          `CREATE OR REPLACE TABLE ${safeFqn} AS
-           SELECT
+      await withWarehouse(async (connection) => {
+        const selectBody =
+          `SELECT
              aan.alias_name    AS canonical_name,
              lam.literal_value AS raw_value,
-             lam.confirmed_at
-           FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-           JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+             lam.confirmed_at`;
+        // The spec filter MUST be repeated here. It is not enough that the
+        // `rows` array loaded above was filtered: that array only feeds the
+        // response's row COUNT, while the statement below re-queries the lookup
+        // independently. Without this WHERE the created table received EVERY
+        // spec's mappings in the install while being named after one column and
+        // reported as "N mappings" for that column — wrong contents, a false
+        // count, and a cross-column disclosure into a PUBLIC-schema table that
+        // other roles may read. Live-reproduced: a request scoped to one spec
+        // answered "5 mappings" and wrote 22 rows including another spec's
+        // values. CSV/Excel/Sheets were always scoped correctly; only this
+        // branch was not.
+        const exportFilter = domainId != null ? 'WHERE lam.domain_id = ?' : '';
+        const exportBinds  = domainId != null ? [domainId] : [];
+        const fromBody =
+          `FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
              ON lam.alias_id = aan.alias_id
-           ORDER BY canonical_name, raw_value`,
-        );
+           ${exportFilter}`;
+        if (isMssql) {
+          // T-SQL has no CREATE OR REPLACE — drop + SELECT INTO. (ORDER BY on
+          // a heap insert is not a durable order; consumers sort themselves.)
+          await exec(connection, `DROP TABLE IF EXISTS ${safeFqn}`);
+          await exec(connection, `${selectBody}\n           INTO ${safeFqn}\n           ${fromBody}`, exportBinds);
+        } else {
+          await exec(
+            connection,
+            `CREATE OR REPLACE TABLE ${safeFqn} AS\n           ${selectBody}\n           ${fromBody}\n           ORDER BY canonical_name, raw_value`,
+            exportBinds,
+          );
+        }
       });
 
       return Response.json({ success: true, table_fqn: targetFqn, rows: rows.length });
     } catch (err) {
-      return snowflakeErrorResponse(err, 'Failed to create Snowflake table');
+      return warehouseErrorResponse(err, 'Failed to create Snowflake table');
     }
   }
 

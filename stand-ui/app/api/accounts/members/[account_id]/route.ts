@@ -10,41 +10,25 @@
  */
 
 import 'server-only';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
+import { getDb } from '@/app/api/_lib/sqlite';
 import { requireAdminSession, bumpSessionVersion } from '@/app/api/_lib/account-security';
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
-
-function col(r: any, key: string) {
-  return r[key.toUpperCase()] ?? r[key.toLowerCase()];
-}
-
-async function loadTarget(conn: any, accountId: number) {
-  const rows = await exec(
-    conn,
-    `SELECT account_id, role FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE account_id = ? LIMIT 1`,
-    [accountId],
-  );
-  if (!rows.length) return null;
+function loadTarget(accountId: number): { account_id: number; role: 'admin' | 'user' } | null {
+  const row = getDb()
+    .prepare(`SELECT account_id, role FROM accounts WHERE account_id = ?`)
+    .get(accountId) as { account_id: number; role: string } | undefined;
+  if (!row) return null;
   return {
-    account_id: Number(col(rows[0], 'account_id')),
-    role: col(rows[0], 'role') === 'admin' ? ('admin' as const) : ('user' as const),
+    account_id: Number(row.account_id),
+    role: row.role === 'admin' ? 'admin' : 'user',
   };
 }
 
-async function countAdmins(conn: any): Promise<number> {
-  const rows = await exec(
-    conn,
-    `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE role = 'admin'`,
-  );
-  return Number(col(rows[0] ?? {}, 'cnt') ?? 0);
+function countAdmins(): number {
+  const row = getDb()
+    .prepare(`SELECT COUNT(*) AS cnt FROM accounts WHERE role = 'admin'`)
+    .get() as { cnt: number };
+  return Number(row?.cnt ?? 0);
 }
 
 export async function PATCH(
@@ -68,42 +52,33 @@ export async function PATCH(
   }
 
   try {
-    const result = await withSnowflake(async (conn) => {
-      const target = await loadTarget(conn, targetId);
-      if (!target) return Response.json({ error: 'Member not found.' }, { status: 404 });
+    const target = loadTarget(targetId);
+    if (!target) return Response.json({ error: 'Member not found.' }, { status: 404 });
 
-      if (target.role === role) {
-        return Response.json({ ok: true, account_id: targetId, role });
-      }
-
-      // Refuse demoting the last admin — the workspace must keep one.
-      if (target.role === 'admin' && role === 'user') {
-        const admins = await countAdmins(conn);
-        if (admins <= 1) {
-          return Response.json(
-            { error: 'Cannot demote the last admin. Promote another member first.' },
-            { status: 409 },
-          );
-        }
-      }
-
-      await exec(
-        conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.ACCOUNTS SET role = ? WHERE account_id = ?`,
-        [role, targetId],
-      );
+    if (target.role === role) {
       return Response.json({ ok: true, account_id: targetId, role });
-    });
+    }
+
+    // Refuse demoting the last admin — the workspace must keep one.
+    if (target.role === 'admin' && role === 'user') {
+      if (countAdmins() <= 1) {
+        return Response.json(
+          { error: 'Cannot demote the last admin. Promote another member first.' },
+          { status: 409 },
+        );
+      }
+    }
+
+    getDb().prepare(`UPDATE accounts SET role = ? WHERE account_id = ?`).run(role, targetId);
 
     // Invalidate the target's live sessions (their cookie carries the old role).
-    if (result.status === 200) {
-      await bumpSessionVersion(targetId).catch((err) =>
-        console.error('[members] failed to bump session_version:', err),
-      );
-    }
-    return result;
+    await bumpSessionVersion(targetId).catch((err) =>
+      console.error('[members] failed to bump session_version:', err),
+    );
+    return Response.json({ ok: true, account_id: targetId, role });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to update member role');
+    console.error('[members] role update failed:', err);
+    return Response.json({ error: 'Failed to update member role' }, { status: 500 });
   }
 }
 
@@ -125,36 +100,27 @@ export async function DELETE(
   }
 
   try {
-    const result = await withSnowflake(async (conn) => {
-      const target = await loadTarget(conn, targetId);
-      if (!target) return Response.json({ error: 'Member not found.' }, { status: 404 });
+    const target = loadTarget(targetId);
+    if (!target) return Response.json({ error: 'Member not found.' }, { status: 404 });
 
-      if (target.role === 'admin') {
-        const admins = await countAdmins(conn);
-        if (admins <= 1) {
-          return Response.json(
-            { error: 'Cannot remove the last admin. Promote another member first.' },
-            { status: 409 },
-          );
-        }
+    if (target.role === 'admin') {
+      if (countAdmins() <= 1) {
+        return Response.json(
+          { error: 'Cannot remove the last admin. Promote another member first.' },
+          { status: 409 },
+        );
       }
-
-      await exec(
-        conn,
-        `DELETE FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE account_id = ?`,
-        [targetId],
-      );
-      return Response.json({ ok: true, account_id: targetId });
-    });
-
-    // Kill the removed member's live sessions. Even though the ACCOUNTS row is
-    // gone (version lookup now fails), bumping keeps the cache coherent and is
-    // harmless if the row was somehow recreated.
-    if (result.status === 200) {
-      await bumpSessionVersion(targetId).catch(() => {});
     }
-    return result;
+
+    getDb().prepare(`DELETE FROM accounts WHERE account_id = ?`).run(targetId);
+
+    // Kill the removed member's live sessions. Even though the accounts row is
+    // gone (version lookup now fails), bumping is harmless if the row was
+    // somehow recreated.
+    await bumpSessionVersion(targetId).catch(() => {});
+    return Response.json({ ok: true, account_id: targetId });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to remove member');
+    console.error('[members] delete failed:', err);
+    return Response.json({ error: 'Failed to remove member' }, { status: 500 });
   }
 }

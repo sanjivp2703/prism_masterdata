@@ -1,0 +1,136 @@
+/**
+ * Phase 6/7 exit-criteria test — workspace-choice resolution, workspace-tier
+ * credentials, personal credentials, the one-time export writer, and file
+ * pipelines on SQL Server.
+ *
+ *   MSSQL_SA_PASSWORD='...' NODE_OPTIONS='--conditions=react-server' \
+ *     npx tsx scripts/live-mssql-setup-test.mts
+ *
+ * Isolated SQLite; the container from docs/DEV_MSSQL.md.
+ */
+
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
+
+// NOTE: no PRISM_WAREHOUSE_TYPE here — this test proves the WORKSPACE choice
+// (SQLite) drives the factory, with encrypted workspace credentials.
+process.env.PRISM_ENCRYPTION_KEY ??= 'a'.repeat(64);
+const tmpDb = path.join(os.tmpdir(), `prism-setup-test-${process.pid}.db`);
+process.env.PRISM_SQLITE_PATH = tmpDb;
+
+const SA_PASSWORD = process.env.MSSQL_SA_PASSWORD ?? '';
+
+const { getDb } = await import('../app/api/_lib/sqlite');
+const { encryptSecret } = await import('../app/api/_lib/crypto');
+const { getWarehouseAdapter, invalidateWarehouseTypeCache, withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery: exec } = await import('../app/api/_lib/warehouse');
+const { invalidateWorkspaceMsConfig, mssqlServiceConnectionSource } = await import('../app/api/_lib/warehouse/mssql/connection');
+const { exportOneTimeToSnowflake } = await import('../app/api/_lib/op-one-time');
+const { insertFileRows, readFileDistinctValues, mssqlFileColumnMetrics } = await import('../app/api/_lib/op-file-pipeline');
+
+let failures = 0;
+function check(name: string, ok: boolean, detail?: unknown): void {
+  if (ok) console.log(`  ok    ${name}`);
+  else { failures++; console.error(`  FAIL  ${name}${detail !== undefined ? ` — ${JSON.stringify(detail)}` : ''}`); }
+}
+
+// ── Workspace choice + workspace-tier credentials ────────────────────────────
+console.log('Workspace resolution:');
+check('fresh install resolves snowflake', getWarehouseAdapter().kind === 'snowflake');
+
+const db = getDb();
+db.prepare(`INSERT OR IGNORE INTO workspace_config (id, sf_account, sf_user, sf_warehouse) VALUES (1, '', '', '')`).run();
+db.prepare(
+  `UPDATE workspace_config
+   SET warehouse_type = 'mssql', ms_server = 'localhost', ms_port = 1433, ms_database = 'PRISM_DB',
+       ms_user = 'sa', ms_password = ?, ms_encrypt = 1, ms_trust_server_cert = 1
+   WHERE id = 1`,
+).run(encryptSecret(SA_PASSWORD));
+invalidateWarehouseTypeCache();
+invalidateWorkspaceMsConfig();
+
+check('workspace choice switches the factory to mssql', getWarehouseAdapter().kind === 'mssql');
+check('service connection source is workspace', mssqlServiceConnectionSource() === 'workspace');
+
+await withWarehouse(async (conn) => {
+  const rows = await exec(conn, `SELECT DB_NAME() AS d`);
+  check('workspace-tier credentials connect (encrypted round-trip)', rows[0]?.d === 'PRISM_DB', rows[0]);
+});
+
+// ── Personal credentials (one-time fallback) ─────────────────────────────────
+console.log('Personal credentials:');
+db.prepare(
+  `INSERT INTO accounts (google_id, email, name, role, ms_server, ms_port, ms_database, ms_user, ms_password)
+   VALUES ('setup-test', 'setup-test@example.com', 'Setup Test', 'user', 'localhost', 1433, 'PRISM_DB', 'sa', ?)`,
+).run(encryptSecret(SA_PASSWORD));
+const accountId = Number((db.prepare(`SELECT account_id FROM accounts WHERE google_id = 'setup-test'`).get() as any).account_id);
+check('hasUserConfig sees personal mssql creds', hasUserWarehouseConfig(accountId) === true);
+await withUserWarehouse(accountId, async (conn) => {
+  const rows = await exec(conn, `SELECT SUSER_SNAME() AS u`);
+  check('personal connection works', String(rows[0]?.u ?? '').length > 0);
+});
+
+// ── One-time export writer ────────────────────────────────────────────────────
+console.log('One-time export (create + overwrite):');
+await withWarehouse(async (conn) => {
+  await exec(conn, `DROP TABLE IF EXISTS TEST_DB.dbo.OT_TARGET`);
+  const args = {
+    source_relation: 'TEST_DB.dbo.RAW_MOBILE_CARRIERS_SHORT',
+    target_fqn: 'TEST_DB.dbo.OT_TARGET',
+    mode: 'create' as const,
+    nonce: 'p7test',
+    columns: [{
+      column_name: 'RAW_CARRIER_VALUE',
+      mappings: [
+        { raw: 'ATT', standardized: 'AT&T' },
+        { raw: 'TMobile', standardized: 'T-Mobile' },
+        { raw: 'VZW', standardized: 'Verizon' },
+      ],
+    }],
+  };
+  const created = await exportOneTimeToSnowflake(conn, args as any);
+  check('create-mode export writes all source rows', created.rows_written === 28, created);
+
+  const [std] = await exec(conn, `SELECT TOP (1) RAW_CARRIER_VALUE AS v FROM TEST_DB.dbo.OT_TARGET WHERE RAW_COMPANY_VALUE = N'Goldman Sachs & Co'`);
+  check('mapped value standardized (ATT → AT&T)', std?.v === 'AT&T', std?.v);
+  const [raw] = await exec(conn, `SELECT TOP (1) RAW_CARRIER_VALUE AS v FROM TEST_DB.dbo.OT_TARGET WHERE RAW_COMPANY_VALUE = N'McKinsey'`);
+  check('unmapped value falls through raw (Verizon row untouched by other maps)', raw?.v === 'Verizon', raw?.v);
+
+  // Overwrite path: existing target → DELETE + INSERT (permission-preserving).
+  const overwritten = await exportOneTimeToSnowflake(conn, { ...args, mode: 'overwrite' } as any);
+  check('overwrite-mode export succeeds on existing target', overwritten.rows_written === 28, overwritten);
+  await exec(conn, `DROP TABLE IF EXISTS TEST_DB.dbo.OT_TARGET`);
+});
+
+// ── File pipelines (JSON rows) ────────────────────────────────────────────────
+console.log('File pipelines:');
+db.prepare(
+  `INSERT INTO pipelines (pipeline_id, table_fqn, column_name, domain_id, name, status, update_schedule, source_type)
+   VALUES (9201, 'FILE:setup-test', 'Carrier', 1, 'file-test', 'active', '{"type":"manual"}', 'csv')`,
+).run();
+await withWarehouse(async (conn) => {
+  await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_FILE_ROWS WHERE pipeline_id = ?`, [9201]);
+  await insertFileRows(conn, 9201, [
+    { Carrier: 'ATT', Company: "O'Brien & Sons" },
+    { Carrier: 'AT&T', Company: 'Acme' },
+    { Carrier: 'T Mobile', Company: 'Beta LLC' },
+    { Carrier: 'att', Company: 'Gamma' },
+  ]);
+  const distinct = await readFileDistinctValues(conn, 9201, 'Carrier');
+  check('file rows insert + distinct read (normalized dedup: att≡ATT)', distinct.length === 3, distinct);
+
+  const metrics = await mssqlFileColumnMetrics(conn, 9201, 'Carrier', 1);
+  check('file metrics computed (nothing mapped yet)', metrics.total === 3 && metrics.mapped === 0, metrics);
+  await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_FILE_ROWS WHERE pipeline_id = ?`, [9201]);
+});
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+fs.rmSync(tmpDb, { force: true });
+fs.rmSync(`${tmpDb}-wal`, { force: true });
+fs.rmSync(`${tmpDb}-shm`, { force: true });
+
+if (failures > 0) {
+  console.error(`\n${failures} setup check(s) FAILED`);
+  process.exit(1);
+}
+console.log('\nAll Phase 6/7 setup checks passed.');

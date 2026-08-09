@@ -1,0 +1,23 @@
+{
+  // Typecheck for the maintained scripts in scripts/ — parity-tests.ts and the
+  // live-mssql suites. These are excluded from the main tsconfig so that a
+  // stray throwaway script can never fail `npm run build` (see the note there),
+  // but the ones we actually keep should still be checked.
+  //
+  // Run with:  npm run typecheck:scripts
+  //
+  // Deliberately NOT wired into `build`. The whole point is that the deploy
+  // path cannot be broken by anything in this directory; run this alongside
+  // `npx tsc --noEmit` when you change a script.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Scripts import .ts/.mts paths directly because tsx runs them unbundled;
+    // the app's bundler resolution doesn't apply here.
+    "allowImportingTsExtensions": true,
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  },
+  "include": ["scripts/**/*.ts", "scripts/**/*.mts"],
+  "exclude": ["node_modules"]
+}

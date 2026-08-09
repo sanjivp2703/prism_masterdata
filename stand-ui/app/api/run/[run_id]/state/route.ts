@@ -12,7 +12,8 @@
  *   Does not touch the run status column.
  */
 
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { warehouseErrorResponse, withWarehouse } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 import {
   loadOpRunState,
   saveOpRunStateWithRev,
@@ -23,6 +24,8 @@ export async function GET(
   _request: Request,
   { params }: { params: Promise<{ run_id: string }> },
 ) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { run_id } = await params;
   const runId = Number(run_id);
   if (!Number.isFinite(runId) || runId <= 0) {
@@ -30,8 +33,8 @@ export async function GET(
   }
 
   try {
-    return await withSnowflake(async (connection) => {
-      const state = await loadOpRunState(connection, runId);
+    return await withWarehouse(async (connection) => {
+      const state = await loadOpRunState(runId);
       if (!state) {
         return Response.json({ error: `No state found for run ${runId}` }, { status: 404 });
       }
@@ -40,7 +43,7 @@ export async function GET(
     });
   } catch (error) {
     console.error(`[state] GET error for run ${runId}:`, error);
-    return snowflakeErrorResponse(error, 'Failed to load run state');
+    return warehouseErrorResponse(error, 'Failed to load run state');
   }
 }
 
@@ -48,6 +51,8 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ run_id: string }> },
 ) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { run_id } = await params;
   const runId = Number(run_id);
   if (!Number.isFinite(runId) || runId <= 0) {
@@ -82,14 +87,14 @@ export async function PUT(
   if (!Number.isFinite(expectedRev) || expectedRev < 0) expectedRev = 0;
 
   try {
-    return await withSnowflake(async (connection) => {
-      const saved = await saveOpRunStateWithRev(connection, runId, state!, expectedRev);
+    return await withWarehouse(async (connection) => {
+      const saved = await saveOpRunStateWithRev(runId, state!, expectedRev);
       if (saved) {
         return Response.json({ data: { saved: true }, rev: expectedRev + 1 }, { status: 200 });
       }
 
       // 0 rows updated: either a rev conflict or the run doesn't exist.
-      const current = await loadOpRunState(connection, runId);
+      const current = await loadOpRunState(runId);
       if (!current) {
         return Response.json({ error: `Run ${runId} not found` }, { status: 404 });
       }
@@ -100,6 +105,6 @@ export async function PUT(
     });
   } catch (error) {
     console.error(`[state] PUT error for run ${runId}:`, error);
-    return snowflakeErrorResponse(error, 'Failed to save run state');
+    return warehouseErrorResponse(error, 'Failed to save run state');
   }
 }

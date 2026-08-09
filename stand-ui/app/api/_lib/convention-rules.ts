@@ -1,7 +1,7 @@
 /**
- * Structured naming-convention rules for a domain.
+ * Structured naming-convention rules for a per-column standardization spec.
  *
- * Pure module (no server-only deps) — imported by both the CreateDomainModal UI
+ * Pure module (no server-only deps) — imported by both the ColumnSpecEditor UI
  * and the LLM grouping enforcement so the two always agree on the rule schema,
  * the prompt instructions, and the deterministic normalization.
  *
@@ -176,8 +176,10 @@ const SUFFIX_NORMALIZE: [RegExp, string][] = [
 function applyCase(name: string, caseRule: string | undefined, acronymRule: string | undefined): string {
   if (!caseRule && acronymRule !== 'force_caps') return name;
   const forceCaps = acronymRule === 'force_caps';
-  return name.split(/(\s+)/).map(tok => {
-    if (!tok || /^\s+$/.test(tok)) return tok;
+  // Hyphens/underscores are word boundaries too — title-casing "t-mobile"
+  // must yield "T-Mobile", not "T-mobile".
+  return name.split(/([\s\-_]+)/).map(tok => {
+    if (!tok || /^[\s\-_]+$/.test(tok)) return tok;
     const isAcronym = tok.length >= 2 && /[A-Z]/.test(tok) && tok === tok.toUpperCase();
     if (forceCaps && isAcronym) return tok.toUpperCase();   // override case rule for acronyms
     switch (caseRule) {
@@ -236,8 +238,43 @@ export function applyConventionRules(name: string, rules: ConventionRules | null
  * (word count + length). An empty array means the name satisfies them.
  */
 export function validateConventionViolations(name: string, rules: ConventionRules | null | undefined): string[] {
-  if (!rules || !name) return [];
+  if (!rules) return [];
+  // An empty name must be reported as a violation, never treated as "nothing to
+  // check". Previously this short-circuited on `!name` too, so when a mechanical
+  // rule reduced a typed name to '' (e.g. special_chars='alnum_only' applied to
+  // '---') the caller got ZERO violations back and committed an empty group
+  // name. Note the word-count and length checks below cannot catch it either:
+  // an empty string trivially satisfies "at most N words", so a configured
+  // length:{min} rule was skipped along with everything else. Flag it here.
+  if (!name || !name.trim()) return ['must not be empty'];
   const out: string[] = [];
+
+  // The name must ALREADY satisfy the mechanical rules — not merely be
+  // fixable by them.
+  //
+  // Callers apply applyConventionRules first and fall back to the typed value
+  // when the transform yields '' (`applyConventionRules(x, rules) || x`). That
+  // fallback hands an UNTRANSFORMED name to this function, and the checks below
+  // only cover word count and length — so a name like '---' under an
+  // `alnum_only` convention produced zero violations and was committed as the
+  // group's display name, in visible breach of the very rule that had just
+  // emptied it (REV-11; reproduced with the real functions before fixing).
+  //
+  // Comparing against the transform catches EVERY mechanical rule rather than
+  // special-casing special_chars: if normalizing would change the name, the
+  // name does not currently conform. Cheap, and it cannot drift as rules are
+  // added — a new mechanical rule is covered the day it ships.
+  const normalized = applyConventionRules(name, rules);
+  if (!normalized || !normalized.trim()) {
+    // The rules strip the name to nothing — it contains NO conforming content
+    // at all (e.g. '---' under alnum_only). Guarding this with a truthiness
+    // check on `normalized` would skip exactly this case, which is the one that
+    // started the bug.
+    out.push('contains no characters allowed by this column\'s naming rules');
+  } else if (normalized !== name) {
+    out.push(`must be written as "${normalized}"`);
+  }
+
   const wordCount = name.trim().split(/\s+/).filter(Boolean).length;
 
   const wc = rules['word_count'];
@@ -252,4 +289,145 @@ export function validateConventionViolations(name: string, rules: ConventionRule
     out.push(`must be between ${len.min} and ${len.max} characters`);
 
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catastrophic-backtracking (ReDoS) screening for user-supplied regex
+// conventions.
+//
+// WHY A LENGTH CAP IS NOT ENOUGH: the spec route caps regex conventions at 500
+// characters and credits that with bounding ReDoS exposure. It does not. The
+// SIX-character pattern `(a+)+b` is accepted, and testing it took a measured
+// 246 ms / 698 ms / 11,311 ms against 23 / 27 / 31-character inputs — growth is
+// exponential in the INPUT length, not the pattern length, so ~40-50 characters
+// hangs effectively forever. That matters because violatesConvention() applies
+// the pattern to RAW SOURCE LITERALS, whose length the customer controls, and
+// Prism is a single Node process: one hanging match is a whole-installation
+// outage, not a slow request.
+//
+// This is a deliberately CONSERVATIVE static screen, not a proof of safety.
+// It rejects the classic exponential shapes — a quantified group whose body is
+// itself quantified, and a quantified group containing alternation plus a
+// quantifier. It can miss exotic constructions, so treat it as defence in
+// depth. The genuinely complete fix is a linear-time engine (RE2) or running
+// every match in a killable worker; both are larger changes than this screen.
+
+/** True when `src` compiles but has a shape known to backtrack exponentially. */
+export function isProbablyCatastrophicRegex(src: string): boolean {
+  // Walk the pattern tracking escapes, character classes and group nesting, so
+  // a quantifier inside `[...]` or after `\` is never mistaken for a real one.
+  interface Frame { bodyStart: number; hasQuantifier: boolean; hasAlternation: boolean }
+  const stack: Frame[] = [];
+  let inClass = false;
+
+  const isQuantAt = (i: number): boolean => {
+    const c = src[i];
+    if (c === '*' || c === '+') return true;
+    if (c === '{') {
+      // {n,} / {n,m} with an upper bound > 1 (or none) can backtrack; {n} cannot.
+      const close = src.indexOf('}', i);
+      if (close === -1) return false;
+      const body = src.slice(i + 1, close);
+      if (!/^\d+(,\d*)?$/.test(body)) return false;
+      const [, tail] = body.split(',');
+      return tail !== undefined && (tail === '' || Number(tail) > 1);
+    }
+    return false;
+  };
+
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === '\\') { i++; continue; }                 // escaped — skip the pair
+    if (inClass) { if (c === ']') inClass = false; continue; }
+    if (c === '[') { inClass = true; continue; }
+
+    if (c === '(') { stack.push({ bodyStart: i + 1, hasQuantifier: false, hasAlternation: false }); continue; }
+
+    if (c === ')') {
+      const frame = stack.pop();
+      if (!frame) continue;                            // unbalanced — compile check catches it
+      // Is this group itself quantified?
+      let j = i + 1;
+      if (j < src.length && isQuantAt(j)) {
+        // Quantified group whose body also quantifies, or offers overlapping
+        // alternatives — the two classic exponential shapes.
+        if (frame.hasQuantifier || frame.hasAlternation) return true;
+      }
+      // A nested group's properties propagate outward: (?:(a+))+ is still bad.
+      const parent = stack[stack.length - 1];
+      if (parent) {
+        if (frame.hasQuantifier) parent.hasQuantifier = true;
+        if (frame.hasAlternation) parent.hasAlternation = true;
+      }
+      continue;
+    }
+
+    const top = stack[stack.length - 1];
+    if (!top) continue;                                // top-level quantifiers are fine
+    if (c === '|') { top.hasAlternation = true; continue; }
+    if (isQuantAt(i)) top.hasQuantifier = true;
+  }
+
+  return false;
+}
+
+/**
+ * Longest string a convention regex is ever run against.
+ *
+ * NO LONGER a ReDoS mitigation — that job moved to RE2 (see safe-regex.ts),
+ * a linear-time engine that cannot backtrack, so match cost is bounded by
+ * construction rather than by capping the input. This cap now serves only its
+ * plain purpose: a name longer than 200 characters is not an acceptable alias
+ * anyway (it matches the cap both review UIs and sanitizeProposedName already
+ * enforce), so treating it as a violation routes it to the name-fix path.
+ *
+ * The history is kept because the reasoning was wrong once and should not be
+ * re-adopted: capping the input was believed to bound the hazard, and it did
+ * not.
+ *
+ * Backtracking cost grows with input length, so capping the input shrinks the
+ * exposure, but it does NOT eliminate it: a classic catastrophic pattern was
+ * measured against a 200-character input and had still not returned after 60
+ * seconds (SPEC-03, empirically verified). Catastrophic patterns hang on inputs
+ * of ~40 characters, so no cap that still admits real names can bound this.
+ *
+ * The genuinely complete fix is an execution-time bound at the match sites —
+ * a killable worker thread, or a linear-time engine such as RE2 — which is an
+ * open decision (new dependency vs. worker subsystem). Until then the layered
+ * mitigations are: the save-time static screen (isProbablyCatastrophicRegex,
+ * which its own docstring calls conservative and not a proof of safety), the
+ * 500-char pattern cap, and this input cap. A regex whose shape evades the
+ * screen can still hang the single Node process for the whole installation,
+ * and POST /api/column-specs is requireValidSession, not admin-only. The save-time `isProbablyCatastrophicRegex`
+ * screen is, by its own docstring, "a deliberately CONSERVATIVE static screen,
+ * not a proof of safety" that "can miss exotic constructions" — and the runtime
+ * `.test()` calls run synchronously on the single Node process, where a hang is
+ * a whole-installation outage, not one slow request. So the screen alone is not
+ * enough (SPEC-03).
+ *
+ * 200 matches the alias-name cap already enforced in both review UIs and
+ * `sanitizeProposedName`, so no legitimate name is affected: a name longer than
+ * this is already rejected elsewhere. The values being tested are raw source
+ * literals, which have no length cap of their own.
+ */
+export const MAX_CONVENTION_TEST_LEN = 200;
+
+/**
+ * Whole-string convention match with the input length-capped.
+ *
+ * Returns false for over-long input rather than testing it — the caller treats
+ * that as "violates the convention", which is both true (an over-long name is
+ * not acceptable anyway) and the safe direction: it routes the value to the
+ * name-fix path instead of running an unbounded match on it.
+ */
+export function conventionMatches(
+  // Structurally typed so this pure module (shared with the browser) works with
+  // BOTH engines: the server passes an RE2 matcher from safe-regex.ts, the
+  // client passes a plain RegExp for live form feedback.
+  re: { test(value: string): boolean } | null,
+  value: string,
+): boolean {
+  if (!re) return true;
+  if (!value || value.length > MAX_CONVENTION_TEST_LEN) return false;
+  return re.test(value);
 }

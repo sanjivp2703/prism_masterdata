@@ -30,5 +30,18 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules"]
+  // `scripts/` is deliberately OUT of the production typecheck.
+  //
+  // The include list above picks up **/*.mts anywhere in the project, so a
+  // half-finished throwaway script under scripts/ — a bad import path, an
+  // implicit any — failed `npm run build` even though nothing in it ships.
+  // That happened three separate times during the 2026-08 QA run, each time
+  // pointing the failure at a file with no relation to the app. A stray dev
+  // script must never be able to block a deploy.
+  //
+  // The real scripts (parity-tests.ts, the live-mssql suites) are still
+  // typechecked — just on purpose rather than incidentally: see
+  // tsconfig.scripts.json and `npm run typecheck:scripts`. `tsx` executes them
+  // regardless of either config, so `npm run test:parity` is unaffected.
+  "exclude": ["node_modules", "scripts"]
 }

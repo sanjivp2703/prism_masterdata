@@ -9,10 +9,13 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { getDb } from '@/app/api/_lib/sqlite';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { fetchPipelineById, fetchQueueLiterals } from '@/app/api/_lib/pipeline-hourly-processor';
-import { runOnePromptGrouping } from '@/app/api/_lib/llm-one-prompt-grouping';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
+import { fetchPipelineById, fetchQueueLiteralsWithFreq } from '@/app/api/_lib/pipeline-hourly-processor';
+import { runOnePromptGrouping, llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { normalizeLiteral } from '@/app/api/_lib/normalize';
 import { sanitizeConventionRules, hasAnyRule } from '@/app/api/_lib/convention-rules';
 import { pickBestAliasName } from '@/app/api/_lib/namescore';
@@ -23,22 +26,14 @@ function safeJsonParse(s: string): unknown {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
-
 export async function POST(
   _request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
   const cookieStore = await cookies();
-  const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
@@ -46,9 +41,9 @@ export async function POST(
     return Response.json({ error: 'Invalid pipeline_id' }, { status: 400 });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = getAnthropicApiKey();
   if (!apiKey) {
-    return Response.json({ error: 'ANTHROPIC_API_KEY is not configured.' }, { status: 500 });
+    return Response.json({ error: 'No Anthropic API key configured — add one on the setup page.' }, { status: 500 });
   }
 
   try {
@@ -57,8 +52,15 @@ export async function POST(
       return Response.json({ error: `Pipeline ${pid} not found` }, { status: 404 });
     }
 
-    const groups = await withSnowflake(async (conn) => {
-      const literals = await fetchQueueLiterals(conn, pid);
+    const groups = await withWarehouse(async (conn) => {
+      // Capped (5,000 FIFO installment), matching the tick and process-queue.
+      // This was the SECOND uncapped queue-drain surface (KI-165). Note a
+      // repo-wide grep finds no caller for this route outside its own file, so
+      // it looks dead — capping rather than deleting deliberately, since an
+      // external/manual caller can't be ruled out and removing a route is a
+      // product decision, not a bug fix.
+      const capped = await fetchQueueLiteralsWithFreq(conn, pid);
+      const literals = capped.map((r) => r.literal_value);
       if (literals.length === 0) return [];
 
       const domainId = pipeline.domain_id;
@@ -73,8 +75,8 @@ export async function POST(
           : `AND lam.domain_id IS NULL`;
         const lookupRows = await exec(conn, `
           SELECT lam.normalized_value AS norm_key, aan.alias_name
-          FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-          JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+          FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+          JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
             ON lam.alias_id = aan.alias_id
           WHERE lam.normalized_value IN (${ph})
             ${domainFilter}
@@ -106,8 +108,12 @@ export async function POST(
         const aliasFilter = domainId != null
           ? `WHERE domain_id = ${Number(domainId)}`
           : `WHERE domain_id IS NULL`;
-        const aliasRows = await exec(conn, `
-          SELECT alias_name FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+        const aliasRows = await exec(conn, getWarehouseAdapter().kind === 'mssql'
+          ? `SELECT TOP (200) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+             ${aliasFilter}
+             ORDER BY usage_count DESC, last_used_at DESC`
+          : `
+          SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
           ${aliasFilter}
           ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
           LIMIT 200
@@ -116,15 +122,20 @@ export async function POST(
           .map((r: any) => String(r.ALIAS_NAME ?? r.alias_name ?? '').trim())
           .filter(Boolean);
 
-        // Naming convention for this domain.
+        // Description + naming convention for this column, from its per-column
+        // spec (spec_id === the pipeline's `domain_id` scope slot).
         let namingConvention: NamingConvention | null = null;
+        let conceptDef = '';
         if (domainId != null) {
-          const convRows = await exec(conn,
-            `SELECT convention_type, convention_value, convention_rules
-             FROM STAND_DB.STAND_INTERNAL.DOMAINS WHERE domain_id = ?`,
-            [domainId],
-          );
+          const specRow = getDb()
+            .prepare(
+              `SELECT description, convention_type, convention_value, convention_rules
+               FROM column_specs WHERE spec_id = ?`,
+            )
+            .get(domainId);
+          const convRows = specRow ? [specRow] : [];
           if (convRows.length > 0) {
+            conceptDef = String((convRows[0] as any).DESCRIPTION ?? (convRows[0] as any).description ?? '').trim();
             const ct  = String((convRows[0] as any).CONVENTION_TYPE  ?? (convRows[0] as any).convention_type  ?? '').toLowerCase();
             const cv  = String((convRows[0] as any).CONVENTION_VALUE ?? (convRows[0] as any).convention_value ?? '');
             const crR = (convRows[0] as any).CONVENTION_RULES ?? (convRows[0] as any).convention_rules ?? null;
@@ -136,7 +147,7 @@ export async function POST(
           }
         }
 
-        const conceptName = pipeline.domain_name ?? '';
+        const conceptName = pipeline.column_name ?? '';
         const runItems: RunItemForPairing[] = unmatched.map((lv, i) => ({
           run_item_id:         i,
           literal_value:       lv,
@@ -148,7 +159,7 @@ export async function POST(
         const runItemsById = new Map(runItems.map(ri => [ri.run_item_id, ri]));
 
         const llmResult = await runOnePromptGrouping(
-          runItems, conceptName, '', existingAliasNames, namingConvention,
+          runItems, conceptName, conceptDef, existingAliasNames, namingConvention,
         );
 
         const orderedGroups = [
@@ -190,6 +201,13 @@ export async function POST(
 
     return Response.json({ groups });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to propose groupings');
+    // Classify AI-provider failures BEFORE the warehouse sanitizer, which is
+    // tuned for Snowflake/SQL Server shapes and would discard the provider's
+    // own actionable message (rate-limit retry hints, rejected-key detail).
+    // Returns null for anything not provider-shaped, so warehouse errors are
+    // handled exactly as before.
+    const llmResp = llmErrorResponse(err);
+    if (llmResp) return llmResp;
+    return warehouseErrorResponse(err, 'Failed to propose groupings');
   }
 }

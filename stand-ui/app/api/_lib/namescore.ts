@@ -232,6 +232,29 @@ export function applyAliasNameCasing(literal: string): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Derive the cleaned form + token arrays from a raw literal. Live callers no
+ * longer carry the deleted deterministic pipeline's precomputed fields (they
+ * pass null/[]), which silently reduced most of NameScore to constants — so
+ * the scorer now computes its own inputs when they're missing.
+ */
+function withDerivedFields(
+  m: NameScorable,
+  genericStopwords: ReadonlySet<string>,
+): NameScorable {
+  const hasTokens = m.std_tokens.length > 0 || m.norm_tokens.length > 0;
+  if (hasTokens && m.cleaned_value != null) return m;
+  const cleaned = m.cleaned_value ?? m.literal_value
+    .replace(/[^\p{L}\p{N}\s&-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const stdTokens  = m.std_tokens.length > 0 ? m.std_tokens : cleaned.split(' ').filter(Boolean);
+  const normTokens = m.norm_tokens.length > 0
+    ? m.norm_tokens
+    : stdTokens.filter((t) => !genericStopwords.has(t.toLowerCase()));
+  return { ...m, cleaned_value: cleaned, std_tokens: stdTokens, norm_tokens: normTokens };
+}
+
+/**
  * Given all members of a group, returns the best candidate alias name.
  *
  * Winner = highest NameScore; ties broken by shortest literal_value.
@@ -245,10 +268,11 @@ export function pickBestAliasName(
     return { run_item_id: -1, literal_value: '', name_score: 0 };
   }
 
-  const scored = members.map((m) => ({
+  const filled = members.map((m) => withDerivedFields(m, genericStopwords));
+  const scored = filled.map((m) => ({
     run_item_id:  m.run_item_id,
     raw_literal:  m.literal_value,
-    name_score:   computeNameScore(m, members, genericStopwords),
+    name_score:   computeNameScore(m, filled, genericStopwords),
   }));
 
   scored.sort((a, b) =>

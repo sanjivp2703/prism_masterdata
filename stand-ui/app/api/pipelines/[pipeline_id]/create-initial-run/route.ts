@@ -14,47 +14,86 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { diffScan, initDetection, enableCt, grantViewChangeTracking} from '@/app/api/_lib/warehouse/mssql/detection';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
+import { getDb } from '@/app/api/_lib/sqlite';
+import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import {
   fetchPipelineById,
   createRunFromQueue,
   type PipelineForProcessing,
 } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
-import { readFileDistinctValues } from '@/app/api/_lib/op-file-pipeline';
+import { isChangeTrackingPrivilegeError } from '@/app/api/_lib/pipeline-poller';
+import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 import { appendTiming } from '@/app/api/_lib/timing';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
 
 function quoteIdent(ident: string): string {
   return `"${String(ident).replace(/"/g, '""')}"`;
 }
 
+/**
+ * Distinct source values for the baseline run, WITH their real frequencies.
+ *
+ * Returns a representative original per normalized value plus how many source
+ * rows collapsed into it. Both halves used to be thrown away: Snowflake never
+ * computed a count at all, and the mssql branch called diffScan (which DOES
+ * compute correct per-value frequencies) and then mapped them off with
+ * `.map(v => v.literal_value)`. Everything fed into createRunFromQueue with no
+ * frequency map, so buildInitialQueueRunState's `frequencies?.get(lv) ?? 1`
+ * fallback stamped source_frequency = 1 on every item regardless of whether one
+ * row or eight thousand normalized into it (REV-01).
+ *
+ * Nothing read the field at the time, which is exactly why it was worth fixing
+ * rather than deleting: a silently-wrong number is a landmine for the first
+ * consumer that trusts it (prevalence sorting, an "N rows affected" count,
+ * frequency-weighted grouping). The tick path already supplied real counts from
+ * PIPELINE_QUEUE.source_frequency, so the baseline path was also the ONLY place
+ * the two disagreed.
+ */
 async function fetchSourceLiterals(
   conn: any,
   pipeline: PipelineForProcessing,
-): Promise<string[]> {
+): Promise<{ literals: string[]; frequencies: Map<string, number> }> {
   const parts = pipeline.table_fqn.split('.');
-  if (parts.length !== 3) return [];
+  if (parts.length !== 3) return { literals: [], frequencies: new Map() };
   const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
   const colRef   = quoteIdent(pipeline.column_name);
-  // Dedup by the normalized form; ANY_VALUE keeps a representative original.
+
+  // SQL Server: no SQL-side normalize — the detection engine's diff scan
+  // reads distincts and dedups on normalizeLiteral app-side. Same 5k cap.
+  if (getWarehouseAdapter().kind === 'mssql') {
+    const scan = await diffScan(conn, pipeline.table_fqn, pipeline.column_name);
+    const values = scan.values.slice(0, 5000);
+    const frequencies = new Map<string, number>();
+    for (const v of values) {
+      // diffScan already returns a real per-value count — keep it.
+      frequencies.set(v.literal_value, Number((v as { frequency?: number }).frequency ?? 1) || 1);
+    }
+    return { literals: values.map(v => v.literal_value), frequencies };
+  }
+
+  // Dedup by the normalized form; ANY_VALUE keeps a representative original,
+  // COUNT(*) is how many source rows collapsed into it.
   const rows = await exec(conn, `
-    SELECT ANY_VALUE(${colRef}) AS val
+    SELECT ANY_VALUE(${colRef}) AS val, COUNT(*) AS freq
     FROM ${tableRef}
     WHERE ${colRef} IS NOT NULL
-    GROUP BY PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+    GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
-  return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter(Boolean);
+  const literals: string[] = [];
+  const frequencies = new Map<string, number>();
+  for (const r of rows as any[]) {
+    const val = String(r.VAL ?? r.val ?? '');
+    if (!val) continue;
+    literals.push(val);
+    frequencies.set(val, Number(r.FREQ ?? r.freq ?? 1) || 1);
+  }
+  return { literals, frequencies };
 }
 
 export async function POST(
@@ -62,8 +101,9 @@ export async function POST(
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
   const cookieStore = await cookies();
-  const session     = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
@@ -71,9 +111,9 @@ export async function POST(
     return Response.json({ error: 'Invalid pipeline_id' }, { status: 400 });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = getAnthropicApiKey();
   if (!apiKey) {
-    return Response.json({ error: 'ANTHROPIC_API_KEY is not configured.' }, { status: 500 });
+    return Response.json({ error: 'No Anthropic API key configured — add one on the setup page.' }, { status: 500 });
   }
 
   try {
@@ -85,45 +125,153 @@ export async function POST(
     appendTiming(`[Timing] initial-run.fetch_pipeline: ${Date.now() - _t0}ms (pipeline ${pid})`);
 
     const _scanStart    = Date.now();
-    const isFilePipeline = pipeline.source_type && pipeline.source_type !== 'snowflake';
 
-    const literals = isFilePipeline
-      ? await withSnowflake(async (conn) => readFileDistinctValues(conn, pid, pipeline.column_name))
-      : await withSnowflake(async (conn) => {
-          // Pre-create the stream BEFORE scanning so there's no gap between what the
-          // review run sees and what the stream tracks once the pipeline is activated.
-          const parts = pipeline.table_fqn.split('.');
-          if (parts.length === 3) {
-            const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
-            const streamName = `STAND_DB.STAND_INTERNAL.PIPELINE_STREAM_${pid}`;
-            try {
-              await exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${tableRef}`);
-            } catch (streamErr: any) {
-              console.warn(`[InitialRun] Pipeline ${pid}: could not pre-create stream:`, streamErr?.message ?? streamErr);
+    // Pre-create the stream BEFORE scanning so there's no gap between what the
+    // review run sees and what the stream tracks once the pipeline is activated.
+    // Uses its own connections (sequential, never nested inside the scan
+    // connection): creating the FIRST stream on a table auto-enables change
+    // tracking, which needs MODIFY — the service role typically has only
+    // SELECT. When that fails, try enabling change tracking with the CREATOR'S
+    // saved personal Snowflake credentials (the same mechanism the one-time
+    // flow uses), then retry; only when that's impossible does the card get a
+    // heads-up message with the exact fix SQL. Setup itself can continue — the
+    // review run only needs SELECT.
+    if (getWarehouseAdapter().kind === 'mssql') {
+      // SQL Server: initialize change detection (Change Tracking when the
+      // table qualifies, tiered diff scan otherwise). ALTER DATABASE/ALTER
+      // TABLE are schema-modifying DDL, so — mirroring the Column output
+      // mode's consent gate — Prism only attempts the CT-enable ladder
+      // (service connection → the creator's saved personal credentials) when
+      // the creator explicitly consented via the connect-form disclosure.
+      // Without consent this is a pure status check: whatever's already
+      // enabled is used, nothing is altered, and diff-scan is the fallback —
+      // never blocks setup either way.
+      const consentRow = getDb()
+        .prepare(`SELECT change_tracking_consent FROM pipelines WHERE pipeline_id = ?`)
+        .get(pid) as any;
+      const ctConsent = consentRow?.change_tracking_consent === 1;
+      try {
+        let state = await withWarehouse(async (conn) =>
+          initDetection(conn, pipeline.table_fqn, { tryEnable: ctConsent }));
+        // 'ct_no_grant' escalates too, not just 'ct_disabled'. Splitting those
+        // two reasons (INS-M09) would otherwise have narrowed this condition by
+        // accident and silently stopped the personal-credential retry for the
+        // missing-permission case — which is precisely the case that retry can
+        // fix, since granting VIEW CHANGE TRACKING needs rights the service
+        // login lacks. enableCt is safe to call when CT is already on.
+        if (ctConsent && state.mode === 'diff'
+            && (state.diff_reason === 'ct_disabled' || state.diff_reason === 'ct_no_grant')
+            && hasUserWarehouseConfig(Number(session.accountId))) {
+          try {
+            await withUserWarehouse(Number(session.accountId), async (conn) => {
+              await enableCt(conn, pipeline.table_fqn);
+              await grantViewChangeTracking(conn, pipeline.table_fqn);
+            });
+            state = await withWarehouse(async (conn) =>
+              initDetection(conn, pipeline.table_fqn, { tryEnable: false }));
+            console.log(`[InitialRun] Pipeline ${pid}: enabled Change Tracking using the creator's saved credentials`);
+          } catch (fixErr: any) {
+            console.warn(`[InitialRun] Pipeline ${pid}: personal-credential Change Tracking enable failed:`, fixErr?.message ?? fixErr);
+          }
+        }
+        getDb()
+          .prepare(`UPDATE pipelines SET detection_mode = ?, detection_state = ? WHERE pipeline_id = ?`)
+          .run(state.mode, JSON.stringify(state), pid);
+        console.log(`[InitialRun] Pipeline ${pid}: detection initialized — mode=${state.mode}${state.diff_reason ? ` (${state.diff_reason})` : ''}`);
+      } catch (detErr: any) {
+        console.warn(`[InitialRun] Pipeline ${pid}: detection init failed (poller will retry):`, detErr?.message ?? detErr);
+      }
+    } else {
+      const parts = pipeline.table_fqn.split('.');
+      if (parts.length === 3) {
+        const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
+        const streamName = `PRISM_DB.INTERNAL.PIPELINE_STREAM_${pid}`;
+        const createStream = () => withWarehouse(async (conn) =>
+          exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${tableRef}`));
+        try {
+          await createStream();
+        } catch (streamErr: any) {
+          console.warn(`[InitialRun] Pipeline ${pid}: could not pre-create stream:`, streamErr?.message ?? streamErr);
+          if (isChangeTrackingPrivilegeError(streamErr)) {
+            let fixed = false;
+            if (hasUserWarehouseConfig(Number(session.accountId))) {
+              try {
+                await withUserWarehouse(Number(session.accountId), async (conn) => {
+                  await exec(conn, `ALTER TABLE ${tableRef} SET CHANGE_TRACKING = TRUE`);
+                });
+                await createStream();
+                fixed = true;
+                console.log(`[InitialRun] Pipeline ${pid}: enabled change tracking on ${pipeline.table_fqn} using the creator's saved credentials`);
+              } catch (fixErr: any) {
+                console.warn(`[InitialRun] Pipeline ${pid}: automatic change-tracking fix failed:`, fixErr?.message ?? fixErr);
+              }
+            }
+            if (!fixed) {
+              flagPipelineMessage(
+                pid,
+                `Heads up: Prism won't be able to watch ${pipeline.table_fqn} for new values yet — change tracking is not enabled on the table and the service role can't enable it. ` +
+                `Run in Snowflake as the table owner or an admin: ALTER TABLE ${pipeline.table_fqn} SET CHANGE_TRACKING = TRUE; ` +
+                `(or GRANT MODIFY ON TABLE ${pipeline.table_fqn} TO ROLE PRISM_SERVICE; or save your own Snowflake credentials in Setup so Prism can enable it for you.)`,
+              ).catch(() => {});
             }
           }
-          return fetchSourceLiterals(conn, pipeline);
-        });
+        }
+      }
+    }
+
+    // Warehouse pipelines supply real summed counts on both adapters (REV-01).
+    const scanned = await withWarehouse(async (conn) => fetchSourceLiterals(conn, pipeline));
+    const literals = scanned.literals;
     appendTiming(`[Timing] initial-run.source_scan: ${Date.now() - _scanStart}ms (${literals.length} distinct value(s))`);
 
     // Empty source table — advance directly to paused, no run needed.
     if (literals.length === 0) {
-      await withSnowflake(async (conn) => {
-        await exec(conn, `
-          UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-          SET status              = 'paused',
-              last_queue_empty_at = CURRENT_TIMESTAMP(),
-              updated_at          = CURRENT_TIMESTAMP()
-          WHERE pipeline_id = ? AND status = 'pending_baseline'
-        `, [pid]);
-      });
+      getDb().prepare(`
+        UPDATE pipelines
+        SET status              = 'paused',
+            last_queue_empty_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at          = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE pipeline_id = ? AND status = 'pending_baseline'
+      `).run(pid);
       return Response.json({ run_id: null, message: 'No values found in source table — pipeline is ready.' });
     }
 
+
+    // RESUME an already-reviewed run instead of silently replacing it.
+    //
+    // This route backs the "Continue" button on an Incomplete pipeline card. It
+    // used to unconditionally create a NEW run and re-run auto-group, and
+    // createRunFromQueue's reuse lookup deliberately excludes 'approved' and
+    // 'completed'. So a user who reviewed a column, accepted it (which marks the
+    // run 'approved' and writes nothing yet — the deferred-write design), then
+    // left and came back, got a brand-new run and a fresh LLM pass: their
+    // completed review was orphaned, silently, along with the LLM spend that
+    // produced it (PIPE-16b, live-reproduced).
+    //
+    // 'approved' means "reviewed, awaiting the commit at Begin". Handing that
+    // run back is the whole point of the wizard being resumable. Deliberately
+    // NOT reused: 'completed' (already written to the lookup — a new run is
+    // correct there) and 'failed' (createRunFromQueue's own stale-reuse handles
+    // it).
+    const existingApproved = getDb()
+      .prepare(
+        `SELECT run_id FROM runs
+         WHERE source_relation = ? AND source_column = ? AND run_status = 'approved'
+         ORDER BY run_id DESC LIMIT 1`,
+      )
+      .get(pipeline.table_fqn, pipeline.column_name) as { run_id?: number } | undefined;
+    if (existingApproved?.run_id) {
+      console.log(
+        `[InitialRun] Pipeline ${pid}: resuming already-approved run ${existingApproved.run_id} ` +
+        `for "${pipeline.column_name}" instead of creating a new one`,
+      );
+      return Response.json({ run_id: Number(existingApproved.run_id), resumed: true });
+    }
+
     // Create run and run auto-group for initial suggestions.
-    const runId = await withSnowflake(async (conn) => {
+    const runId = await withWarehouse(async (conn) => {
       const _runStart = Date.now();
-      const id = await createRunFromQueue(conn, pipeline, literals);
+      const id = await createRunFromQueue(conn, pipeline, literals, scanned.frequencies);
       appendTiming(`[Timing] initial-run.create_run: ${Date.now() - _runStart}ms (run ${id})`);
       const _agStart = Date.now();
       await runAutoGroupForRun(conn, id, apiKey, { writeBreakdown: false });
@@ -134,6 +282,13 @@ export async function POST(
 
     return Response.json({ run_id: runId });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to create initial mapping run');
+    // Classify AI-provider failures BEFORE the warehouse sanitizer, which is
+    // tuned for Snowflake/SQL Server shapes and would discard the provider's
+    // own actionable message (rate-limit retry hints, rejected-key detail).
+    // Returns null for anything not provider-shaped, so warehouse errors are
+    // handled exactly as before.
+    const llmResp = llmErrorResponse(err);
+    if (llmResp) return llmResp;
+    return warehouseErrorResponse(err, 'Failed to create initial mapping run');
   }
 }

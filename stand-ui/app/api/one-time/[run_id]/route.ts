@@ -6,31 +6,25 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
 import { loadOpRunState, saveOpRunState, type OpRunState, type OpGroup } from '@/app/api/_lib/op-auto-group';
 import { loadOneTimeMeta, saveOneTimeMeta } from '@/app/api/_lib/op-one-time';
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({ sqlText, binds, complete: (e: any, _s: any, r: any[]) => (e ? reject(e) : resolve(r || [])) });
-  });
-}
-
-async function loadRunMeta(conn: any, runId: number, accountId: number) {
-  const rows = await exec(
-    conn,
-    `SELECT source_relation, source_column, run_status
-     FROM STAND_DB.STAND_INTERNAL.RUNS
-     WHERE run_id = ? AND run_type = 'one_time' AND created_by = ?`,
-    [runId, accountId],
-  );
-  if (!rows.length) return null;
-  const r = rows[0] as any;
+function loadRunMeta(runId: number, accountId: number) {
+  const r = getDb()
+    .prepare(
+      `SELECT source_relation, source_column, run_status
+       FROM runs
+       WHERE run_id = ? AND run_type = 'one_time' AND created_by = ?`,
+    )
+    .get(runId, accountId) as any;
+  if (!r) return null;
   return {
-    source_relation: String(r.SOURCE_RELATION ?? r.source_relation ?? ''),
-    source_column:   String(r.SOURCE_COLUMN ?? r.source_column ?? ''),
-    run_status:      String(r.RUN_STATUS ?? r.run_status ?? ''),
+    source_relation: String(r.source_relation ?? ''),
+    source_column:   String(r.source_column ?? ''),
+    run_status:      String(r.run_status ?? ''),
   };
 }
 
@@ -45,19 +39,19 @@ function serializeGroups(state: OpRunState | null) {
 }
 
 export async function GET(_request: Request, { params }: { params: Promise<{ run_id: string }> }) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { run_id } = await params;
   const runId = Number.parseInt(String(run_id), 10);
   if (!Number.isFinite(runId)) return Response.json({ error: 'Invalid run_id' }, { status: 400 });
 
   try {
-    return await withSnowflake(async (conn) => {
-      const meta = await loadRunMeta(conn, runId, Number(session.accountId));
+    return await withWarehouse(async (conn) => {
+      const meta = loadRunMeta(runId, Number(session.accountId));
       if (!meta) return Response.json({ error: 'Not found' }, { status: 404 });
-      const state = await loadOpRunState(conn, runId);
+      const state = await loadOpRunState(runId);
       const otMeta = await loadOneTimeMeta(conn, runId);
       return Response.json({
         run_id:          runId,
@@ -70,14 +64,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ run
       });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to load one-time run');
+    return warehouseErrorResponse(err, 'Failed to load one-time run');
   }
 }
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ run_id: string }> }) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { run_id } = await params;
   const runId = Number.parseInt(String(run_id), 10);
@@ -87,11 +81,11 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ ru
   try { body = await request.json(); } catch { body = {}; }
 
   try {
-    return await withSnowflake(async (conn) => {
-      const meta = await loadRunMeta(conn, runId, Number(session.accountId));
+    return await withWarehouse(async (conn) => {
+      const meta = loadRunMeta(runId, Number(session.accountId));
       if (!meta) return Response.json({ error: 'Not found' }, { status: 404 });
 
-      const state = await loadOpRunState(conn, runId);
+      const state = await loadOpRunState(runId);
       if (!state) return Response.json({ error: 'Run state not found' }, { status: 404 });
 
       // Overwrite groups from the client's full edited set (raw → standardized).
@@ -118,15 +112,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ ru
           });
         }
         const newState: OpRunState = { status: state.status, items: state.items, groups, ungrouped: [] };
-        await saveOpRunState(conn, runId, newState);
+        await saveOpRunState(runId, newState);
       }
 
       if (typeof body?.accepted === 'boolean') {
-        const otMeta = (await loadOneTimeMeta(conn, runId)) ?? { one_time_session: '', convention: null, accepted: false };
+        const otMeta = (await loadOneTimeMeta(conn, runId)) ?? { one_time_session: '', convention: null, standardization_rules: null, accepted: false };
         await saveOneTimeMeta(conn, runId, { ...otMeta, accepted: body.accepted });
       }
 
-      const finalState = await loadOpRunState(conn, runId);
+      const finalState = await loadOpRunState(runId);
       const otMeta = await loadOneTimeMeta(conn, runId);
       return Response.json({
         run_id:   runId,
@@ -135,6 +129,6 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ ru
       });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to save one-time run');
+    return warehouseErrorResponse(err, 'Failed to save one-time run');
   }
 }

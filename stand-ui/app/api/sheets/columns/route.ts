@@ -1,5 +1,7 @@
 import { cookies } from 'next/headers';
+import { detectHeaderRow } from '@/app/api/_lib/table-shape';
 import { google } from 'googleapis';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -24,6 +26,8 @@ function extractSpreadsheetId(urlOrId: string): string | null {
  * Returns the header row and available tabs from a Google Sheet.
  */
 export async function GET(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { searchParams } = new URL(request.url);
   const input = searchParams.get('url') ?? '';
   const tab   = searchParams.get('tab') ?? '';
@@ -72,9 +76,24 @@ export async function GET(request: Request) {
 
     if (!targetTab) return Response.json({ error: 'No sheets found in this spreadsheet' }, { status: 404 });
 
-    const range  = `'${targetTab.name.replace(/'/g, "\\'")}'!1:1`;
+    // Read the first 20 rows, not just row 1.
+    //
+    // This used to request '<tab>'!1:1 — so it could not merely GUESS the header
+    // wrong, it was structurally incapable of seeing one anywhere else. On a
+    // real customer sheet whose header sat on row 5 (under a narrow summary row
+    // and three blank rows) it returned "Number Sent | 77 | Number Emailed | 54"
+    // — two bare numbers — and the columns the user actually wanted were never
+    // offered. See KI-219.
+    //
+    // headerRow is returned so the client can (a) show it in the preview with an
+    // override, and (b) read DATA from the row below it. Both matter: fixing
+    // detection without moving the data range would still ingest the blank rows
+    // and the header text as data.
+    const range  = `'${targetTab.name.replace(/'/g, "\\'")}'!1:20`;
     const valRes = await sheets.spreadsheets.values.get({ spreadsheetId, range });
-    const columns: string[] = (valRes.data.values?.[0] ?? []).map(String).filter(Boolean);
+    const grid: string[][] = (valRes.data.values ?? []).map((r) => (r ?? []).map((c) => String(c ?? '')));
+    const detection = detectHeaderRow(grid);
+    const columns: string[] = (grid[detection.headerRow] ?? []).map(String).filter(Boolean);
 
     const responseHeaders = new Headers({ 'Content-Type': 'application/json' });
     if (refreshedTokens?.access_token) {
@@ -84,7 +103,13 @@ export async function GET(request: Request) {
       responseHeaders.append('Set-Cookie', `google_token_expiry=${refreshedTokens.expiry_date}; ${COOKIE_OPTS}`);
     }
 
-    return new Response(JSON.stringify({ spreadsheetId, title, sheets: sheetList, activeSheet: targetTab.name, columns }), {
+    return new Response(JSON.stringify({
+      spreadsheetId, title, sheets: sheetList, activeSheet: targetTab.name, columns,
+      // 0-based. The client uses this for the preview AND to offset the data range.
+      headerRow:        detection.headerRow,
+      headerConfidence: detection.confidence,
+      previewRows:      grid.slice(detection.headerRow + 1).filter(r => r.some(c => c.trim() !== '')).slice(0, 3),
+    }), {
       headers: responseHeaders,
     });
   } catch (err: any) {

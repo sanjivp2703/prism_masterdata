@@ -1,4 +1,5 @@
 import { appendTiming } from '@/app/api/_lib/timing';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 /**
  * POST /api/timing — receives a client-measured phase timing (e.g. the wall-clock
@@ -7,6 +8,8 @@ import { appendTiming } from '@/app/api/_lib/timing';
  * Body: { label: string, ms: number }
  */
 export async function POST(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   let body: any;
   try { body = await request.json(); } catch { body = {}; }
   const label = String(body?.label ?? 'client').slice(0, 80);

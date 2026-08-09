@@ -1,263 +1,371 @@
 /**
- * GET  /api/pipelines  — list all pipelines with domain name joined
- * POST /api/pipelines  — create or upsert a pipeline
+ * GET  /api/pipelines  — list all pipelines
+ * POST /api/pipelines  — create or upsert a pipeline (+ its per-column spec)
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-import { refreshExportTable } from '@/app/api/_lib/export-table';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { getDb } from '@/app/api/_lib/sqlite';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import {
+  refreshExportTable, assertCompanionColumnAvailable, CompanionColumnConflictError, provisionColumnModeAccess, columnModeSetupSql,
+  provisionTableModeAccess, checkTableModeAccess, tableModeSetupSql,
+} from '@/app/api/_lib/export-table';
+import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
+import {
+  validateSpecBody, insertColumnSpec, updateColumnSpec,
+  seedSpecValuesOnConn, setColumnSpecPipeline, deleteColumnSpec,
+} from '@/app/api/_lib/column-specs';
+import {
+  asUpdateSchedule,
+  parseStoredSchedule,
+  serializeUpdateSchedule,
+  DEFAULT_UPDATE_SCHEDULE,
+} from '@/app/api/_lib/update-schedule';
+import { asExportKind } from '@/app/api/_lib/export-kind';
 
 function parseMeta(v: any): Record<string, any> {
   if (typeof v === 'object' && v !== null) return v as Record<string, any>;
   try { return JSON.parse(String(v)); } catch { return {}; }
 }
 
+/** parseMeta, but preserves a genuine absence as null instead of {} — callers
+ *  distinguish "no file meta" (a warehouse pipeline) from "empty meta". */
+function parseMetaOrNull(v: any): Record<string, any> | null {
+  if (v == null) return null;
+  if (typeof v === 'object') return v as Record<string, any>;
+  try { return JSON.parse(String(v)); } catch { return null; }
+}
+
 export function row2pipeline(r: any) {
-  const rawUnmapped = r.EXPORT_UNMAPPED_ROWS ?? r.export_unmapped_rows;
+  const rawUnmapped  = r.EXPORT_UNMAPPED_ROWS ?? r.export_unmapped_rows;
+  // Coalesce BEFORE the null check — `r.DOMAIN_ID != null ? … : null` silently
+  // nulled these for every SQLite row (lowercase keys), which blanked the
+  // domain everywhere in the UI after the storage migration.
+  const domainIdRaw  = r.DOMAIN_ID  ?? r.domain_id;
+  const createdByRaw = r.CREATED_BY ?? r.created_by;
   return {
     pipeline_id:          Number(r.PIPELINE_ID         ?? r.pipeline_id),
     name:                 r.NAME                ?? r.name                ?? null,
     table_fqn:            String(r.TABLE_FQN           ?? r.table_fqn           ?? ''),
     column_name:          String(r.COLUMN_NAME         ?? r.column_name         ?? ''),
     export_table_fqn:     r.EXPORT_TABLE_FQN    ?? r.export_table_fqn    ?? null,
-    domain_id:            r.DOMAIN_ID != null           ? Number(r.DOMAIN_ID    ?? r.domain_id) : null,
+    export_kind:          asExportKind(r.EXPORT_KIND ?? r.export_kind),
+    domain_id:            domainIdRaw != null ? Number(domainIdRaw) : null,
     domain_name:          r.DOMAIN_NAME         ?? r.domain_name         ?? null,
     status:               String(r.STATUS              ?? r.status              ?? 'active'),
     status_message:       r.STATUS_MESSAGE      ?? r.status_message      ?? null,
-    mode:                 String(r.MODE                ?? r.mode                ?? 'auto'),
-    export_unmapped_rows: rawUnmapped !== false && rawUnmapped !== 'false',
+    status_reason:        r.STATUS_REASON       ?? r.status_reason       ?? null,
+    update_schedule:      parseStoredSchedule(r.UPDATE_SCHEDULE ?? r.update_schedule),
+    export_unmapped_rows: rawUnmapped !== false && rawUnmapped !== 'false' && rawUnmapped !== 0,
     queue_size:           Number(r.QUEUE_SIZE          ?? r.queue_size          ?? 0),
     total_new_values:     Number(r.TOTAL_NEW_VALUES     ?? r.total_new_values    ?? 0),
     last_polled_at:       r.LAST_POLLED_AT      ?? r.last_polled_at      ?? null,
     last_queue_empty_at:  r.LAST_QUEUE_EMPTY_AT ?? r.last_queue_empty_at ?? null,
-    created_by:           r.CREATED_BY != null ? Number(r.CREATED_BY ?? r.created_by) : null,
+    fully_synced_at:      r.FULLY_SYNCED_AT     ?? r.fully_synced_at     ?? null,
+    created_by:           createdByRaw != null ? Number(createdByRaw) : null,
     created_at:           r.CREATED_AT          ?? r.created_at          ?? null,
     updated_at:           r.UPDATED_AT          ?? r.updated_at          ?? null,
     total_mapped:         Number(r.TOTAL_MAPPED         ?? r.total_mapped         ?? 0),
     total_source_values:  Number(r.TOTAL_SOURCE_VALUES  ?? r.total_source_values  ?? 0),
-    source_type:          String(r.SOURCE_TYPE         ?? r.source_type          ?? 'snowflake'),
-    file_source_meta:     r.FILE_SOURCE_META    ?? r.file_source_meta    ?? null,
-    file_export_meta:     r.FILE_EXPORT_META    ?? r.file_export_meta    ?? null,
+    // Change-detection mode (SQL Server port Phase 4): 'stream' (Snowflake),
+    // 'ct' (Change Tracking) or 'diff' (tiered scan). detection_reason carries
+    // the diff-mode cause for the UI upgrade nudge
+    // ('no_pk' | 'ct_disabled' | 'ct_no_grant' | 'ct_error').
+    detection_mode:       r.DETECTION_MODE      ?? r.detection_mode      ?? null,
+    detection_reason:     parseDetectionReason(r.DETECTION_STATE ?? r.detection_state),
   };
 }
 
-export const PIPELINE_SELECT = `
-  SELECT
-    p.pipeline_id,
-    p.name,
-    p.table_fqn,
-    p.column_name,
-    p.export_table_fqn,
-    p.domain_id,
-    d.name              AS domain_name,
-    p.status,
-    p.status_message,
-    p.mode,
-    p.export_unmapped_rows,
-    p.queue_size,
-    p.total_new_values,
-    p.total_mapped,
-    p.total_source_values,
-    p.last_polled_at,
-    p.last_queue_empty_at,
-    p.created_by,
-    p.created_at,
-    p.updated_at,
-    p.source_type,
-    p.file_source_meta,
-    p.file_export_meta
-  FROM STAND_DB.STAND_INTERNAL.PIPELINES p
-  LEFT JOIN STAND_DB.STAND_INTERNAL.DOMAINS d ON d.domain_id = p.domain_id`;
+function parseDetectionReason(stateJson: unknown): string | null {
+  if (!stateJson) return null;
+  try {
+    const s = JSON.parse(String(stateJson));
+    return s?.diff_reason ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Domains were removed 2026-07-15, so `pipelines` has no domain_name column and
+// a bare `SELECT p.*` left domain_name null for EVERY pipeline. Three consumers
+// still read it (PipelinesView -> ExportLookupModal -> the lookup-export route),
+// so every Sheets lookup export was titled with the null fallback "Global
+// Standardizations", and — worse — every Snowflake lookup export defaulted to
+// the SAME table, PRISM_DB.PUBLIC.GLOBAL_CANONICAL_MAPPINGS, so exporting a
+// second spec silently overwrote the first.
+//
+// The display name now lives on the column spec, so resolve it from there:
+// column_specs.spec_id is what the historically-named pipelines.domain_id slot
+// actually holds (see CLAUDE.md "THE NAMING TRAP").
+export const PIPELINE_SELECT = `SELECT p.*, cs.column_name AS domain_name
+  FROM pipelines p
+  LEFT JOIN column_specs cs ON cs.spec_id = p.domain_id`;
 
 /**
  * GET /api/pipelines
- * Returns all pipelines, joining domain name. No extra auth required.
+ * Returns all pipelines. The per-column spec metadata (description / rules /
+ * naming convention) is fetched separately by the client via /api/column-specs
+ * keyed on the pipeline's `domain_id` slot (= spec_id); no domain name exists.
  */
 export async function GET() {
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+
   try {
-    return await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `${PIPELINE_SELECT}
-         WHERE p.status != 'initializing'
-         ORDER BY
-           p.last_polled_at DESC NULLS LAST,
-           p.created_at     DESC`,
-      );
+    {
+      const rows = getDb()
+        .prepare(
+          `${PIPELINE_SELECT}
+           WHERE p.status != 'initializing'
+           ORDER BY
+             p.last_polled_at IS NULL,
+             p.last_polled_at DESC,
+             p.created_at     DESC`,
+        )
+        .all() as any[];
       const pipelines = rows.map(row2pipeline);
 
       // Expand multi-column Sheets pipelines into virtual per-column entries.
       // Each virtual entry shares the same pipeline_id but has a distinct
-      // column_name / domain_id / domain_name, so PipelinesView can render
-      // each column in one card while groupKeyFor maps them all to the same key.
-      const extraDomainIds = new Set<number>();
-      for (const p of pipelines) {
-        if (p.source_type !== 'sheets') continue;
-        const meta = parseMeta(p.file_source_meta);
-        const cols: { column_name: string; domain_id: number | null }[] =
-          Array.isArray(meta?.columns) ? meta.columns : [];
-        if (cols.length <= 1) continue;
-        for (const c of cols) {
-          const did = c.domain_id != null ? Number(c.domain_id) : null;
-          if (did != null && did !== p.domain_id) extraDomainIds.add(did);
-        }
-      }
+      // column_name / domain_id (= spec_id), so PipelinesView can render each
+      // column in one card while groupKeyFor maps them all to the same key.
 
-      const domainNames: Record<number, string> = {};
-      if (extraDomainIds.size > 0) {
-        const ids = [...extraDomainIds];
-        const ph  = ids.map(() => '?').join(',');
-        const dRows = await exec(conn, `SELECT domain_id, name FROM STAND_DB.STAND_INTERNAL.DOMAINS WHERE domain_id IN (${ph})`, ids);
-        for (const r of dRows) {
-          domainNames[Number(r.DOMAIN_ID ?? r.domain_id)] = String(r.NAME ?? r.name ?? '');
-        }
-      }
-
-      const expanded: ReturnType<typeof row2pipeline>[] = [];
-      for (const p of pipelines) {
-        if (p.source_type !== 'sheets') { expanded.push(p); continue; }
-        const meta = parseMeta(p.file_source_meta);
-        const cols: { column_name: string; domain_id: number | null }[] =
-          Array.isArray(meta?.columns) && meta.columns.length > 1 ? meta.columns : [];
-        if (cols.length === 0) { expanded.push(p); continue; }
-        for (const c of cols) {
-          const did = c.domain_id != null ? Number(c.domain_id) : null;
-          const dname: string | null = did == null ? null
-            : (did === p.domain_id ? (p.domain_name ?? null) : (domainNames[did] ?? null));
-          // Use per-column metrics from file_source_meta when available (written by
-          // refreshSheetsFileRows) to avoid double-counting when buildPipelineGroups
-          // sums across virtual entries.
-          const colTSV = (c as any).total_source_values != null ? Number((c as any).total_source_values) : undefined;
-          const colTM  = (c as any).total_mapped != null ? Number((c as any).total_mapped) : undefined;
-          expanded.push({
-            ...p,
-            column_name: String(c.column_name ?? ''),
-            domain_id: did,
-            domain_name: dname,
-            ...(colTSV != null ? {
-              total_source_values: colTSV,
-              total_mapped:        colTM ?? 0,
-              queue_size:          Math.max(0, colTSV - (colTM ?? 0)),
-            } : {}),
-          });
-        }
-      }
+      // No virtual expansion any more: one pipeline row is one column. The
+      // expansion existed because a Sheets pipeline packed every standardized
+      // column of a tab into ONE row (file_source_meta.columns) and the UI had
+      // to fan it back out. Warehouse pipelines have always been one row per
+      // column.
+      const expanded = pipelines;
 
       return Response.json({ pipelines: expanded });
-    });
+    }
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to fetch pipelines');
+    console.error('[pipelines] list failed:', err);
+    return Response.json({ error: 'Failed to fetch pipelines' }, { status: 500 });
   }
 }
 
 /**
  * POST /api/pipelines
- * Body: { table_fqn, column_name, domain_id?, name?, status?, mode?, export_table_fqn? }
+ * Body: { table_fqn, column_name, domain_id?, name?, status?, update_schedule?, export_table_fqn?, export_kind? }
  *
  * Upserts on the unique key (table_fqn, column_name, domain_id).
  * Returns the pipeline row (created or existing, with updated status).
  */
 export async function POST(request: Request) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   let body: any;
   try { body = await request.json(); } catch { body = {}; }
 
   const table_fqn           = String(body?.table_fqn        ?? '').trim();
   const column_name         = String(body?.column_name       ?? '').trim();
-  const export_table_fqn    = body?.export_table_fqn ? String(body.export_table_fqn).trim() : null;
-  const domain_id           = body?.domain_id != null ? Number(body.domain_id) : null;
+  // Only meaningful when export_table_fqn is set — 'table' (materialized copy,
+  // rebuilt each pass), 'view' (live, created once), or 'column' (standardized
+  // companion column maintained on the source table itself).
+  const export_kind         = asExportKind(body?.export_kind);
+  // Column mode's destination IS the source table — set server-side so all
+  // rebuild triggers (keyed on export_table_fqn) fire for it, regardless of
+  // what the client sent.
+  const export_table_fqn    = export_kind === 'column'
+    ? table_fqn
+    : (body?.export_table_fqn ? String(body.export_table_fqn).trim() : null);
   const name                = body?.name ? String(body.name).trim() : null;
-  const mode                = ['auto', 'manual'].includes(body?.mode) ? String(body.mode) : 'auto';
-  const export_unmapped_rows = body?.export_unmapped_rows === false ? false : true;
+  // Update time window — when Prism may auto-standardize. Defaults to
+  // business hours (Mon–Fri, 9 AM–5 PM) when the client doesn't send one.
+  const update_schedule     = asUpdateSchedule(body?.update_schedule) ?? DEFAULT_UPDATE_SCHEDULE;
+  // Default OFF — only rows with a confirmed standardization appear in the
+  // export unless the creator explicitly opts in to raw passthrough.
+  const export_unmapped_rows = body?.export_unmapped_rows === true;
   const status              = ['active', 'paused', 'pending_baseline'].includes(body?.status)
     ? String(body.status)
     : 'active';
+  // SQL Server only — explicit consent before Prism attempts to enable Change
+  // Tracking automatically (ALTER DATABASE/ALTER TABLE), set only after the
+  // client shows the disclosure. Default false: no consent, no DDL attempt.
+  const change_tracking_consent = body?.change_tracking_consent === true;
+  // SQL Server only — same principle for table-mode export access (CREATE
+  // TABLE + ALTER ON SCHEMA): only attempted with explicit consent from the
+  // preflight popup, never silently.
+  const table_mode_consent      = body?.table_mode_consent === true;
 
   if (!table_fqn)   return Response.json({ error: 'table_fqn is required' }, { status: 400 });
   if (!column_name) return Response.json({ error: 'column_name is required' }, { status: 400 });
-  // Domain is mandatory — every pipeline must be scoped to a domain.
-  if (domain_id == null || !Number.isFinite(domain_id)) {
-    return Response.json({ error: 'domain_id is required — a pipeline must belong to a domain.' }, { status: 400 });
-  }
+
+  // Per-column spec — the mandatory description + optional standardization rules
+  // and naming convention. Its spec_id becomes the pipeline's lookup scope
+  // (stored in the historical `domain_id` slot). Fields may arrive under
+  // `body.spec` or at the top level of the body.
+  const validated = validateSpecBody(body?.spec ?? body);
+  if (!validated.ok) return Response.json({ error: validated.error }, { status: 400 });
 
   try {
-    return await withSnowflake(async (conn) => {
-      // Unqualified form for single-table queries against PIPELINES alone
-      const domainFilter = domain_id != null
-        ? `AND domain_id = ${Number(domain_id)}`
-        : `AND domain_id IS NULL`;
+    return await withWarehouse(async (conn) => {
+      const db = getDb();
+      // One spec (and one pipeline) per (table_fqn, column_name): per-column
+      // isolation means the scope id no longer participates in the dedup key.
+      const existingRow = db
+        .prepare(
+          `SELECT pipeline_id, status, domain_id, export_kind FROM pipelines
+           WHERE table_fqn = ? COLLATE NOCASE AND column_name = ? COLLATE NOCASE
+           LIMIT 1`,
+        )
+        .get(table_fqn, column_name) as any;
 
-      // Qualified form for queries that use PIPELINE_SELECT (which joins PIPELINES p with DOMAINS d)
-      // — without the alias Snowflake raises "Ambiguous column name 'DOMAIN_ID'"
-      const pDomainFilter = domain_id != null
-        ? `AND p.domain_id = ${Number(domain_id)}`
-        : `AND p.domain_id IS NULL`;
-
-      const existing = await exec(
-        conn,
-        `SELECT pipeline_id FROM STAND_DB.STAND_INTERNAL.PIPELINES
-         WHERE table_fqn = ? AND column_name = ? ${domainFilter}
-         LIMIT 1`,
-        [table_fqn, column_name],
-      );
-
-      if (existing.length > 0) {
-        const pid = Number((existing[0] as any).PIPELINE_ID ?? (existing[0] as any).pipeline_id);
-        const setClauses = [`status = ?`, `mode = ?`, `export_unmapped_rows = ?`, `updated_at = CURRENT_TIMESTAMP()`];
-        const binds: any[] = [status, mode, export_unmapped_rows];
-        if (name)             { setClauses.push('name = ?');             binds.push(name); }
-        if (export_table_fqn) { setClauses.push('export_table_fqn = ?'); binds.push(export_table_fqn); }
-        binds.push(pid);
-        await exec(conn, `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES SET ${setClauses.join(', ')} WHERE pipeline_id = ?`, binds);
-      } else {
-        const cols   = ['table_fqn', 'column_name', 'name', 'status', 'mode', 'export_unmapped_rows', 'created_by'];
-        const vals   = [table_fqn, column_name, name, status, mode, String(export_unmapped_rows), String(session.accountId)];
-        if (domain_id != null)  { cols.push('domain_id');        vals.push(String(domain_id)); }
-        if (export_table_fqn)   { cols.push('export_table_fqn'); vals.push(export_table_fqn); }
-
-        const placeholders = vals.map((v, i) => {
-          // domain_id and created_by are inlined as number literals; others use ?
-          if (cols[i] === 'domain_id')  return String(Number(domain_id));
-          if (cols[i] === 'created_by') return String(Number(session.accountId));
-          return '?';
-        });
-        const bindVals = vals.filter((_, i) => cols[i] !== 'domain_id' && cols[i] !== 'created_by');
-
-        await exec(
-          conn,
-          `INSERT INTO STAND_DB.STAND_INTERNAL.PIPELINES (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`,
-          bindVals,
-        );
+      // Column mode writes onto the customer's table — three gates before
+      // anything is created:
+      //   1. CONSENT — the client must send column_write_consent: true, set
+      //      only after showing the source-table disclaimer. Write access is
+      //      case-by-case: onboarding grants none; consent covers THIS table.
+      //   2. GUARDRAIL — refuse if a `<col>_STANDARDIZED` column already
+      //      exists on the source: Prism can't tell it apart from customer
+      //      data, and column mode must never write into a column Prism
+      //      didn't create.
+      //   3. GRANT — attempt the per-table `GRANT UPDATE` with the creator's
+      //      personal credentials (change-tracking-fix pattern); when that
+      //      isn't possible the pipeline is flagged with the exact SQL.
+      // Gates 1–2 are skipped only when this exact pipeline is already live
+      // in column mode (consent was given and its companion column is
+      // Prism's own by construction).
+      const alreadyLiveColumnPipeline =
+        export_kind === 'column' &&
+        existingRow &&
+        String(existingRow.status ?? '') !== 'pending_baseline' &&
+        String(existingRow.export_kind ?? '') === 'column';
+      if (export_kind === 'column' && !alreadyLiveColumnPipeline) {
+        if (body?.column_write_consent !== true) {
+          return Response.json(
+            { error: 'The Column output edits the source table and requires explicit consent (column_write_consent).' },
+            { status: 400 },
+          );
+        }
+        try {
+          await assertCompanionColumnAvailable(conn, table_fqn, column_name);
+        } catch (e) {
+          if (e instanceof CompanionColumnConflictError) {
+            return Response.json({ error: e.message }, { status: 400 });
+          }
+          throw e;
+        }
       }
 
-      const rows = await exec(
-        conn,
-        `${PIPELINE_SELECT}
-         WHERE p.table_fqn = ? AND p.column_name = ? ${pDomainFilter}
-         LIMIT 1`,
-        [table_fqn, column_name],
-      );
+      if (existingRow && String(existingRow.status ?? '') !== 'pending_baseline') {
+        // Active/paused re-save: update the existing spec's content and the
+        // pipeline's settings in place (keep the same spec_id / lookup scope).
+        const pid = Number(existingRow.pipeline_id);
+        let specId = existingRow.domain_id != null ? Number(existingRow.domain_id) : null;
+        if (specId != null) {
+          updateColumnSpec(specId, validated.spec);
+        } else {
+          const created = insertColumnSpec(validated.spec, { pipeline_id: pid, table_fqn, column_name });
+          specId = created.spec_id;
+          db.prepare(`UPDATE pipelines SET domain_id = ? WHERE pipeline_id = ?`).run(specId, pid);
+        }
+        await seedSpecValuesOnConn(conn, specId, validated.spec.valuesToSeed);
 
-      if (!rows.length) {
+        const setClauses = [`status = ?`, `update_schedule = ?`, `export_unmapped_rows = ?`, `updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`];
+        const binds: any[] = [status, serializeUpdateSchedule(update_schedule), export_unmapped_rows ? 1 : 0];
+        if (name)             { setClauses.push('name = ?');             binds.push(name); }
+        if (export_table_fqn) {
+          setClauses.push('export_table_fqn = ?'); binds.push(export_table_fqn);
+          setClauses.push('export_kind = ?');      binds.push(export_kind);
+        }
+        binds.push(pid);
+        db.prepare(`UPDATE pipelines SET ${setClauses.join(', ')} WHERE pipeline_id = ?`).run(...binds);
+      } else {
+        // No live pipeline for this column (or an abandoned pending_baseline
+        // setup attempt). Clean up the stale attempt — including its queue and
+        // orphaned spec — so the fresh create starts clean; otherwise the
+        // previously-accepted lookup matches make every value look "already
+        // standardized" and the review comes up empty.
+        if (existingRow) {
+          const pid = Number(existingRow.pipeline_id);
+          const oldSpecId = existingRow.domain_id != null ? Number(existingRow.domain_id) : null;
+          await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pid]);
+          db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
+          if (oldSpecId != null) deleteColumnSpec(oldSpecId);
+        }
+
+        // Create the spec FIRST — its spec_id fills the pipeline's domain_id slot.
+        const created = insertColumnSpec(validated.spec, { table_fqn, column_name });
+        const specId = created.spec_id;
+        await seedSpecValuesOnConn(conn, specId, validated.spec.valuesToSeed);
+
+        const cols: string[] = ['table_fqn', 'column_name', 'name', 'status', 'update_schedule', 'export_unmapped_rows', 'created_by', 'domain_id', 'change_tracking_consent'];
+        const vals: any[]    = [table_fqn, column_name, name, status, serializeUpdateSchedule(update_schedule), export_unmapped_rows ? 1 : 0, Number(session.accountId), specId, change_tracking_consent ? 1 : 0];
+        if (export_table_fqn)   {
+          cols.push('export_table_fqn'); vals.push(export_table_fqn);
+          cols.push('export_kind');      vals.push(export_kind);
+        }
+        const insRes = db.prepare(
+          `INSERT INTO pipelines (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+        ).run(...vals);
+        setColumnSpecPipeline(specId, Number(insRes.lastInsertRowid), table_fqn);
+      }
+
+      const row = db
+        .prepare(
+          `${PIPELINE_SELECT}
+           WHERE p.table_fqn = ? COLLATE NOCASE AND p.column_name = ? COLLATE NOCASE
+           LIMIT 1`,
+        )
+        .get(table_fqn, column_name) as any;
+
+      if (!row) {
         return Response.json({ error: 'Pipeline was saved but could not be retrieved.' }, { status: 500 });
       }
 
-      const pipeline = row2pipeline(rows[0]);
+      const pipeline = row2pipeline(row);
 
-      // If the pipeline was created as active and has an export table, build it.
+      // Gate 3 — consent-time provisioning: create the companion column and
+      // grant UPDATE on this ONE table via the creator's personal credentials
+      // (ALTER needs table ownership, which the service role never has).
+      // Idempotent, so re-running for a sibling column on the same table is
+      // harmless. On 'manual_required' the pipeline is created but flagged
+      // with the exact SQL; the sync will also pause with the same fix if it
+      // runs without access.
+      let column_write_access: 'granted' | 'manual_required' | null = null;
+      if (export_kind === 'column' && !alreadyLiveColumnPipeline) {
+        column_write_access = await provisionColumnModeAccess(table_fqn, column_name, Number(session.accountId));
+        if (column_write_access === 'manual_required') {
+          flagPipelineMessage(
+            pipeline.pipeline_id,
+            `Prism needs its standardized column and update access set up on ${table_fqn} ` +
+            `(it will not modify any other column). Ask an admin to run: ${columnModeSetupSql(table_fqn, column_name)}`,
+            'warning',
+          ).catch(() => {});
+        }
+      }
+
+      // mssql only — table-mode exports need CREATE TABLE + ALTER ON SCHEMA on
+      // the destination schema, a permission gap the mssql onboarding wizard
+      // doesn't close up front (unlike Snowflake's Part D). Check first (cheap,
+      // no elevated connection). Only ATTEMPT the grant with explicit consent
+      // from the preflight popup (table_mode_consent) — same "never grant
+      // without approval" principle as Change Tracking; without consent this
+      // is a pure status check, so the pipeline still gets flagged with the
+      // exact fix SQL, but nothing is altered on the customer's behalf.
+      if (export_kind === 'table' && pipeline.export_table_fqn && getWarehouseAdapter().kind === 'mssql') {
+        const alreadyOk = await checkTableModeAccess(pipeline.export_table_fqn).catch(() => false);
+        if (!alreadyOk) {
+          const granted = table_mode_consent
+            ? await provisionTableModeAccess(pipeline.export_table_fqn, Number(session.accountId))
+            : 'manual_required' as const;
+          if (granted === 'manual_required') {
+            flagPipelineMessage(
+              pipeline.pipeline_id,
+              `Prism needs CREATE TABLE and ALTER ON SCHEMA permissions to build ${pipeline.export_table_fqn}. Ask an admin to run: ${tableModeSetupSql(pipeline.export_table_fqn)}`,
+              'warning',
+            ).catch(() => {});
+          }
+        }
+      }
+
+      // If the pipeline was created as active and has an export table/view, build it
+      // (a view is only created here, once — it never needs rebuilding after this).
       if (status === 'active' && pipeline.export_table_fqn) {
         refreshExportTable(
           pipeline.table_fqn,
@@ -265,14 +373,15 @@ export async function POST(request: Request) {
           pipeline.export_table_fqn,
           pipeline.domain_id,
           pipeline.pipeline_id,
+          pipeline.export_kind,
         ).catch(err => {
           console.error(`[ExportTable] Background refresh failed for pipeline ${pipeline.pipeline_id}:`, err);
         });
       }
 
-      return Response.json({ pipeline }, { status: 201 });
+      return Response.json({ pipeline, column_write_access }, { status: 201 });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to save pipeline');
+    return warehouseErrorResponse(err, 'Failed to save pipeline');
   }
 }

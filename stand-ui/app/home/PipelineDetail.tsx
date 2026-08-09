@@ -1,11 +1,18 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import type { Pipeline, PipelineGroup } from './PipelinesView';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { SpecInfoIcon, type Pipeline, type PipelineGroup } from './PipelinesView';
+import UpdateScheduleEditor from '@/app/components/UpdateScheduleEditor';
+import ExportLookupModal from '@/app/components/ExportLookupModal';
+import { showToast } from '@/app/components/Toast';
+import { isScheduleActiveNow, scheduleLabel, type UpdateSchedule } from '@/app/api/_lib/update-schedule';
+import type { ColumnSpec } from '@/app/components/spec-types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Mapping {
+  match_id:      number;
+  alias_id:      number;
   literal_value: string;
   alias_name:    string;
   run_id:        number;
@@ -45,6 +52,20 @@ function relativeTime(iso: string | null): string {
   return `${days}d ago`;
 }
 
+// The standardization tick fires on every wall-clock 10-minute mark
+// (:00, :10, :20, …) — matches startQueueProcessor in
+// pipeline-hourly-processor.ts. Returns null when there's no automatic tick
+// to promise a time for: manual-only schedules, or a window schedule that's
+// currently closed (the note falls back to explaining why instead).
+function nextTickLabel(schedule: UpdateSchedule): string | null {
+  if (schedule.type === 'manual') return null;
+  const now = new Date();
+  if (schedule.type === 'window' && !isScheduleActiveNow(schedule, now)) return null;
+  const TICK_MS = 10 * 60_000;
+  const next = new Date((Math.floor(now.getTime() / TICK_MS) + 1) * TICK_MS);
+  return next.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
 function fmtDate(iso: string | null): string {
   if (!iso) return '—';
   const d = parseUtc(iso);
@@ -75,86 +96,40 @@ function PulseDot({ color = '#16a34a' }: { color?: string }) {
   );
 }
 
-/** Circular progress ring — fills clockwise from 12 o'clock as pct goes 0→100.
- *  There is NO reset animation: when pct DROPS (cycle end / wrap, or switching to a
- *  held state) the transition is suppressed so the ring snaps instantly instead of
- *  animating a retract. The cycle end is masked by the scanning state taking over.
- *  mode: 'normal' = blue counting, 'scanning' = teal held at 0%, 'standardizing' = amber held at 100%. */
-function RefreshRing({ pct, mode = 'normal' }: { pct: number; mode?: 'normal' | 'scanning' | 'standardizing' }) {
-  const r = 15;
-  const cx = 20, cy = 20;
-  const circumference = 2 * Math.PI * r;
-  const offset = circumference * (1 - Math.max(0, Math.min(1, pct / 100)));
-  const arcColor = mode === 'standardizing' ? '#D97706' : mode === 'scanning' ? '#0891B2' : 'var(--accent)';
-
-  // Only animate while the ring is FILLING (pct rising). Any drop — the 100→0 wrap,
-  // or normal→scanning/standardizing — snaps with no transition, so the reset
-  // retract the user asked to remove never plays. (State, not a ref, so we never
-  // read a ref during render; the extra render is harmless for a tiny SVG.)
-  const [prevPct, setPrevPct] = useState(pct);
-  const filling = pct >= prevPct;
-  useEffect(() => { setPrevPct(pct); }, [pct]);
-
-  return (
-    <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
-      <circle cx={cx} cy={cy} r={r} stroke="var(--border)" strokeWidth="2.5" />
-      <circle
-        cx={cx} cy={cy} r={r}
-        stroke={arcColor}
-        strokeWidth="2.5"
-        strokeLinecap="round"
-        strokeDasharray={circumference}
-        strokeDashoffset={offset}
-        transform={`rotate(-90 ${cx} ${cy})`}
-        style={{ transition: (mode === 'normal' && filling) ? 'stroke-dashoffset 1s linear' : 'none' }}
-      />
-    </svg>
-  );
-}
-
 // Inline SVG icons for the timeline (replaces emojis)
-function IcoCreated()     { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="2" y="3" width="10" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2"/><path d="M5 2v2M9 2v2M2 6h10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
-function IcoPolled()      { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.2"/><path d="M7 4.5V7l2 1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
-function IcoStandardized(){ return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.2"/><path d="M4.5 7l2 2 3-3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
-function IcoFound()       { return <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4" stroke="currentColor" strokeWidth="1.2"/><path d="M9.5 9.5l2.5 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>; }
 
 // ── Tab: Activity ─────────────────────────────────────────────────────────────
 
-function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp = false, cycleResetMs = 0 }: { group: PipelineGroup; isStandardizing?: boolean; isScanning?: boolean; cycleResetMs?: number }) {
+function ActivityTab({ group, isStandardizing = false, specsById }: { group: PipelineGroup; isStandardizing?: boolean; specsById: Map<number, ColumnSpec> }) {
   const isLive = group.status === 'active';
 
-  // Client-side 1 s ticker for the countdown ring
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!isLive) return;
-    const t = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(t);
-  }, [isLive]);
+  // Detection-mode hint (SQL Server warehouses only — Snowflake 'stream' and
+  // file pipelines show nothing). 'diff' carries the upgrade nudge.
+  const detectionHint = (() => {
+    const first = group.columns[0] as (typeof group.columns)[number] & { detection_mode?: string | null; detection_reason?: string | null };
+    if (first?.detection_mode === 'ct') {
+      return { label: 'Change Tracking', tooltip: 'New values are detected through SQL Server Change Tracking — the fastest detection.' };
+    }
+    if (first?.detection_mode === 'diff') {
+      const reason = first.detection_reason;
+      // Each cause needs its OWN fix. 'ct_no_grant' used to be reported as
+      // 'ct_disabled', so this tooltip told the customer to enable Change
+      // Tracking that was ALREADY enabled, and never named the one statement
+      // that would actually fix it — making the misconfiguration effectively
+      // undiscoverable (INS-M09).
+      const tooltip =
+        reason === 'no_pk'
+          ? 'New values are found by periodically scanning the column — the table has no primary key, which Change Tracking requires. Adding one enables the fastest detection.'
+        : reason === 'ct_no_grant'
+          ? 'Change Tracking is already enabled on this table, but Prism has not been given permission to read it. Ask your database admin to run: GRANT VIEW CHANGE TRACKING ON <schema>.<table> TO <the Prism login>; — then this switches to the fastest detection automatically.'
+        : reason === 'ct_error'
+          ? 'New values are found by periodically scanning the column — Change Tracking could not be read on this table. Ask your database admin to check it is enabled and that Prism can read it.'
+          : 'New values are found by periodically scanning the column. Ask your database admin to enable Change Tracking on the database and this table for the fastest detection.';
+      return { label: 'Scheduled scan', tooltip };
+    }
+    return null;
+  })();
 
-  // Countdown anchor — wraps 0→100 every 30 s.
-  // We count from the LATER of last_polled_at (server timestamp, refreshed via the
-  // metrics_updated refetch) and cycleResetMs (a client-clock timestamp set the
-  // instant scanning/standardizing FINISHES). The reset event arrives before the
-  // async refetch lands, so without this the ring would briefly show the stale
-  // pre-cycle position (e.g. ~16% for a 5 s scan) and snap back to 0 — the
-  // "continue a little, reset, continue" jank. Anchoring to the reset kills it.
-  const lastPollMs       = group.last_polled_at ? new Date(group.last_polled_at).getTime() : null;
-  const anchorMs         = Math.max(lastPollMs ?? 0, cycleResetMs) || null;
-  const secondsSince     = anchorMs != null ? Math.max(0, Math.floor((now - anchorMs) / 1_000)) : null;
-  const secondsUntilNext = secondsSince != null ? Math.max(0, 30 - secondsSince) : null;
-  const ringPct          = secondsSince != null ? (secondsSince % 30) / 30 * 100 : 0;
-
-  // Scanning is event-driven: the poller emits scanning_started/finished around the
-  // classification of new stream data, and PipelinesView turns that into this prop.
-  // The ring holds at the START of the cycle (0%) for the whole check — it never
-  // advances-then-snaps-back. Standardization (amber) takes precedence.
-  const isScanning = scanningProp && !isStandardizing;
-
-  const milestones: { Icon: () => React.JSX.Element; label: string; value: string; highlight?: boolean }[] = [
-    { Icon: IcoCreated,      label: 'Created',           value: fmtDate(group.created_at) },
-    { Icon: IcoPolled,       label: 'Last updated',      value: group.last_polled_at ? fmtDate(group.last_polled_at) : 'Never' },
-    { Icon: IcoStandardized, label: 'Last standardized', value: group.last_queue_empty_at ? fmtDate(group.last_queue_empty_at) : (group.created_at ? fmtDate(group.created_at) : '—'), highlight: true },
-  ];
 
   function StatCard({
     value, label, tooltip,
@@ -198,51 +173,66 @@ function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp 
   const unstdVal    = hasMetrics ? unstdCount.toLocaleString() : '—';
   const hasUnstd    = hasMetrics && unstdCount > 0;
 
+  // Explains the pending count instead of just showing a number — when the
+  // next automatic tick will pick these up, or why there isn't one right now.
+  const standardizeNote = !hasUnstd ? null
+    : !isLive ? 'Paused — resume this pipeline or run Update Standardizations to process these values.'
+    : (() => {
+        const label = nextTickLabel(group.update_schedule);
+        if (label) return `Will be standardized automatically at ${label}.`;
+        if (group.update_schedule.type === 'manual') return 'Will be standardized the next time you run Update Standardizations.';
+        return `Outside the update window (${scheduleLabel(group.update_schedule)}) — will be standardized once it reopens, or run Update Standardizations now.`;
+      })();
+
   return (
     <div>
-      {/* ── Live update status (active cards only) ────────────────────── */}
-      {isLive && (
-        <div className="mb-4 pb-4" style={{ borderBottom: '0.5px solid var(--border)' }}>
-          <div className="flex items-center gap-3">
-            <RefreshRing
-              pct={isStandardizing ? 100 : isScanning ? 0 : ringPct}
-              mode={isStandardizing ? 'standardizing' : isScanning ? 'scanning' : 'normal'}
-            />
-            <div className="flex-1 min-w-0">
-              {isStandardizing ? (
-                <>
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <PulseDot color="#D97706" />
-                    <span className="text-xs font-medium" style={{ color: '#92400E' }}>Standardizing data</span>
-                  </div>
-                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Polling paused — resumes when complete</p>
-                </>
-              ) : isScanning ? (
-                <>
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <PulseDot color="#0891B2" />
-                    <span className="text-xs font-medium" style={{ color: '#0E7490' }}>Checking for new values</span>
-                  </div>
-                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Identifying new values — cycle resumes when done</p>
-                </>
-              ) : (
-                <>
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <PulseDot color="#16a34a" />
-                    <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Live</span>
-                    <span className="text-xs" style={{ color: 'var(--text-muted)' }}>· refreshes every 30s</span>
-                  </div>
-                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                    {secondsUntilNext === null
-                      ? 'Waiting for first update…'
-                      : `Next refresh in ${secondsUntilNext}s`}
-                  </p>
-                </>
+      {/* ── Top row: live status + last updated ───────────────────────── */}
+      {/* "Last updated" is THE freshness timestamp: the last time the
+          standardized table was verified fully up to date — the source was
+          checked and everything found was already standardized and exported
+          (advances on empty-check polls, 10-minute ticks, and manual "Update
+          Standardizations" passes; freezes while values wait in the queue). */}
+      <div className="mb-4 pb-4 flex items-center justify-between gap-4" style={{ borderBottom: '0.5px solid var(--border)' }}>
+        <div className="min-w-0">
+          {/* Standardizing is shown for a PAUSED pipeline too.
+              The gate used to be `isLive` alone, so the amber "Standardizing
+              data" block never rendered while paused — even though the UI
+              actively routes users there: the "Update Standardizations"
+              dropdown is offered for any non-pending_baseline status, paused
+              included, and that trigger really does run a pass. So the one
+              moment a paused pipeline IS doing work was the one moment the card
+              showed nothing (TICK-11). `isLive` still gates the steady-state
+              "Live · watching" line, which genuinely only applies when active. */}
+          {(isLive || isStandardizing) && (isStandardizing ? (
+            <>
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <PulseDot color="#D97706" />
+                <span className="text-xs font-medium" style={{ color: '#92400E' }}>Standardizing data</span>
+              </div>
+              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>New values are being standardized and exported</p>
+            </>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <PulseDot color="#16a34a" />
+              <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Live</span>
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>· watching for new values</span>
+              {detectionHint && (
+                <span className="text-xs" style={{ color: 'var(--text-hint)' }} title={detectionHint.tooltip}>· {detectionHint.label}</span>
               )}
             </div>
-          </div>
+          ))}
         </div>
-      )}
+        <div className="text-right flex-shrink-0">
+          <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Standardized table last updated</p>
+          <p
+            className="text-xs font-mono"
+            style={{ color: 'var(--accent)', fontWeight: 500 }}
+            title="The last time the standardized table was verified fully up to date — the source was checked and every value was standardized and in the export"
+          >
+            {group.fully_synced_at ? fmtDate(group.fully_synced_at) : 'Not yet'}
+          </p>
+        </div>
+      </div>
 
       {/* ── 3 stat cards — aggregated across columns ──────────────────── */}
       <div className="mb-5 pb-5" style={{ borderBottom: '0.5px solid var(--border)' }}>
@@ -268,20 +258,24 @@ function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp 
             valueColor={hasUnstd ? '#92400E' : 'var(--text-muted)'}
           />
         </div>
+        {standardizeNote && (
+          <p className="text-[11px] mt-2" style={{ color: '#92400E' }}>{standardizeNote}</p>
+        )}
       </div>
 
-      {/* ── Per-column breakdown (multi-column only) ──────────────────── */}
-      {group.columns.length > 1 && <div className="mb-5 pb-5" style={{ borderBottom: '0.5px solid var(--border)' }}>
+      {/* ── Per-column breakdown — every card, incl. single-column. The ⓘ next
+             to the domain shows its standardization rules + naming convention
+             on hover or click. ───────────────────────────────────────────── */}
+      <div className="mb-5 pb-5" style={{ borderBottom: '0.5px solid var(--border)' }}>
         <p className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-muted)' }}>Columns</p>
         <div className="rounded-button border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}>
           {/* Header row */}
           <div
             className="grid text-[10px] font-semibold uppercase tracking-wide px-3 py-2"
-            style={{ gridTemplateColumns: '1fr 90px 56px 130px', gap: 8, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--accent-border)', backgroundColor: 'var(--surface)' }}
+            style={{ gridTemplateColumns: '1fr 150px 130px', gap: 8, color: 'var(--text-muted)', borderBottom: '0.5px solid var(--accent-border)', backgroundColor: 'var(--surface)' }}
           >
             <span>Column</span>
-            <span>Domain</span>
-            <span>Mode</span>
+            <span>Spec</span>
             <span className="text-right">Standardized</span>
           </div>
           {group.columns.map((c, i) => {
@@ -290,15 +284,22 @@ function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp 
               <div
                 key={`${c.pipeline_id}_${c.column_name}`}
                 className="grid items-center px-3 py-2.5"
-                style={{ gridTemplateColumns: '1fr 90px 56px 130px', gap: 8, borderTop: i > 0 ? '0.5px solid var(--accent-border)' : undefined }}
+                style={{ gridTemplateColumns: '1fr 150px 130px', gap: 8, borderTop: i > 0 ? '0.5px solid var(--accent-border)' : undefined }}
               >
                 <span className="text-xs font-medium font-mono truncate" style={{ color: 'var(--text-primary)' }}>{c.column_name}</span>
-                <span className="text-[10px] truncate" style={{ color: 'var(--accent)' }}>{c.domain_name ?? '—'}</span>
-                <span
-                  className="text-[9px] font-medium uppercase tracking-wide px-1.5 py-0.5 rounded self-start whitespace-nowrap"
-                  style={{ backgroundColor: c.mode === 'auto' ? '#F5F3FF' : 'var(--surface)', color: c.mode === 'auto' ? '#7C3AED' : 'var(--text-muted)', border: `0.5px solid ${c.mode === 'auto' ? '#DDD6FE' : 'var(--border)'}` }}
-                >
-                  {c.mode}
+                <span className="inline-flex items-center gap-1.5 min-w-0">
+                  {(() => {
+                    const spec = c.domain_id != null ? (specsById.get(c.domain_id) ?? null) : null;
+                    if (!spec) return <span className="text-[10px]" style={{ color: 'var(--text-hint)' }}>—</span>;
+                    return (
+                      <>
+                        <span className="text-[10px] truncate" style={{ color: 'var(--accent)' }} title={spec.description}>
+                          {spec.description || 'Details'}
+                        </span>
+                        <SpecInfoIcon spec={spec} />
+                      </>
+                    );
+                  })()}
                 </span>
                 <span className="text-[11px] tabular-nums text-right" style={{ color: 'var(--text-muted)' }}>
                   <span style={{ color: '#15803D', fontWeight: 500 }}>{(c.total_mapped || 0).toLocaleString()}</span>
@@ -309,20 +310,8 @@ function ActivityTab({ group, isStandardizing = false, isScanning: scanningProp 
             );
           })}
         </div>
-      </div>}
-
-      {/* ── Milestones ────────────────────────────────────────────────── */}
-      <div className="flex flex-col" style={{ gap: 1 }}>
-        {milestones.map(({ Icon, label, value, highlight }) => (
-          <div key={label} className="flex items-center justify-between py-2.5 px-1" style={{ borderBottom: '0.5px solid var(--border)' }}>
-            <div className="flex items-center gap-2.5">
-              <span style={{ color: highlight ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0, display: 'flex' }}><Icon /></span>
-              <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>{label}</span>
-            </div>
-            <span className="text-xs font-mono" style={{ color: highlight ? 'var(--accent)' : 'var(--text-primary)', fontWeight: highlight ? 500 : 400 }}>{value}</span>
-          </div>
-        ))}
       </div>
+
     </div>
   );
 }
@@ -337,30 +326,44 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
   const [loading,    setLoading]    = useState(true);
   const [error,      setError]      = useState<string | null>(null);
   const [search,     setSearch]     = useState('');
+  const [showExport, setShowExport] = useState(false);
+
+  // ── Inline editing ──────────────────────────────────────────────────────
+  const [editingMatchId, setEditingMatchId] = useState<number | null>(null);
+  const [editText,       setEditText]       = useState('');
+  const [savingMatchId,  setSavingMatchId]  = useState<number | null>(null);
+  // Set only when the edited alias is shared by other literals too — the
+  // choice between reassigning just this value vs renaming everywhere is
+  // only meaningful (and only shown) in that case.
+  const [pendingChoice, setPendingChoice] = useState<{ matchId: number; newName: string; sharedCount: number } | null>(null);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [mRes, qRes] = await Promise.all([
+        fetch(`/api/pipelines/${pipeline.pipeline_id}/mappings?limit=500`),
+        fetch(`/api/pipelines/${pipeline.pipeline_id}/queue`),
+      ]);
+      const [mBody, qBody] = await Promise.all([mRes.json().catch(() => ({})), qRes.json().catch(() => ({}))]);
+      if (!mRes.ok) throw new Error(mBody?.error ?? `HTTP ${mRes.status}`);
+      setMappings(mBody.mappings ?? []);
+      setTotal(mBody.total ?? 0);
+      setQueueItems(qBody.items ?? []);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load mappings');
+    } finally {
+      setLoading(false);
+    }
+  }, [pipeline.pipeline_id]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      setLoading(true);
-      try {
-        const [mRes, qRes] = await Promise.all([
-          fetch(`/api/pipelines/${pipeline.pipeline_id}/mappings?limit=500`),
-          fetch(`/api/pipelines/${pipeline.pipeline_id}/queue`),
-        ]);
-        const [mBody, qBody] = await Promise.all([mRes.json().catch(() => ({})), qRes.json().catch(() => ({}))]);
-        if (!mRes.ok) throw new Error(mBody?.error ?? `HTTP ${mRes.status}`);
-        if (cancelled) return;
-        setMappings(mBody.mappings ?? []);
-        setTotal(mBody.total ?? 0);
-        setQueueItems(qBody.items ?? []);
-        setError(null);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load mappings');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+      if (!cancelled) await fetchAll();
     })();
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pipeline.pipeline_id]);
 
   const q = search.trim().toLowerCase();
@@ -371,33 +374,66 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
     ? queueItems.filter(i => i.literal_value.toLowerCase().includes(q))
     : queueItems;
 
-  function exportCsv() {
-    const rows = [
-      ['raw_value', 'canonical_name', 'confirmed_at'],
-      ...mappings.map(m => [
-        `"${m.literal_value.replace(/"/g, '""')}"`,
-        `"${m.alias_name.replace(/"/g, '""')}"`,
-        m.confirmed_at ?? '',
-      ]),
-    ];
-    const blob = new Blob([rows.map(r => r.join(',')).join('\n')], { type: 'text/csv' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-    a.download = `${tableShort(pipeline.table_fqn)}_${pipeline.column_name}_mappings.csv`; a.click();
+  function startEdit(m: Mapping) {
+    if (savingMatchId != null) return;
+    setEditingMatchId(m.match_id);
+    setEditText(m.alias_name);
   }
 
-  const csvButton = mappings.length > 0 ? (
+  function cancelEdit() {
+    setEditingMatchId(null);
+    setEditText('');
+  }
+
+  async function submitEdit(matchId: number, newName: string, scope: 'this_value' | 'all_shared') {
+    setPendingChoice(null);
+    setEditingMatchId(null);
+    setSavingMatchId(matchId);
+    showToast('Saving — rebuilding the standardized export…', 'info');
+    try {
+      const res  = await fetch(`/api/pipelines/${pipeline.pipeline_id}/mappings`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ match_id: matchId, new_alias_name: newName, scope }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      await fetchAll();
+      showToast(body.rebuilt ? 'Mapping updated — export rebuilt.' : 'Mapping updated.', 'info');
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Couldn't update the mapping — check your connection.", 'error');
+    } finally {
+      setSavingMatchId(null);
+    }
+  }
+
+  function attemptSubmitEdit(m: Mapping) {
+    // Guards against a stale re-fire: submitting on Enter clears editingMatchId,
+    // which unmounts the input and can trigger a second call via its blur event.
+    if (editingMatchId !== m.match_id) return;
+    const newName = editText.trim();
+    if (!newName || newName === m.alias_name) { cancelEdit(); return; }
+    const sharedCount = mappings.filter(x => x.alias_id === m.alias_id).length;
+    if (sharedCount > 1) {
+      setPendingChoice({ matchId: m.match_id, newName, sharedCount });
+    } else {
+      submitEdit(m.match_id, newName, 'this_value');
+    }
+  }
+
+  const exportButton = pipeline.domain_id != null ? (
     <button
-      onClick={exportCsv}
+      onClick={() => setShowExport(true)}
       className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors flex items-center gap-1 shrink-0"
       style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent' }}
       onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }}
       onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-secondary)'; }}
-      title="Export this column's mappings as CSV"
+      title="Export this column's lookup table"
     >
       <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
         <path d="M6 1v7M3 5.5L6 9l3-3.5M2 10h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
-      Export CSV
+      Export lookup table
     </button>
   ) : null;
 
@@ -420,20 +456,19 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
 
   return (
     <div>
-      {/* Header row: column name + count on left, search + CSV on right */}
+      {/* Header row: column name + count on left, search + export on right */}
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-baseline gap-2 min-w-0 flex-1">
           {showHeading && (
             <>
               <span className="text-xs font-semibold font-mono truncate" style={{ color: 'var(--text-primary)' }}>{pipeline.column_name}</span>
-              {pipeline.domain_name && <span className="text-[10px]" style={{ color: 'var(--accent)' }}>{pipeline.domain_name}</span>}
               <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{total.toLocaleString()} confirmed · {queueItems.length} pending</span>
             </>
           )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {searchBox}
-          {csvButton}
+          {exportButton}
         </div>
       </div>
 
@@ -465,14 +500,98 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
                 <span className="text-[11px] font-medium px-1.5 py-0.5 rounded-pill whitespace-nowrap" style={{ backgroundColor: '#FEF9C3', color: '#A16207' }}>In queue</span>
               </div>
             ))}
-            {filteredMappings.map((m, i) => (
-              <div key={`m-${m.literal_value}`} className="grid px-3 py-2 text-xs items-center"
-                style={{ gridTemplateColumns: '1fr 1fr auto', borderTop: (i > 0 || filteredQueue.length > 0) ? '0.5px solid var(--border)' : undefined, backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent', gap: 8 }}>
-                <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }} title={m.literal_value}>{m.literal_value}</span>
-                <span className="truncate font-medium" style={{ color: 'var(--accent)' }} title={m.alias_name}>{m.alias_name}</span>
-                <span className="text-[11px] whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{relativeTime(m.confirmed_at)}</span>
-              </div>
-            ))}
+            {filteredMappings.map((m, i) => {
+              const isEditing = editingMatchId === m.match_id;
+              const isSaving  = savingMatchId === m.match_id;
+              return (
+                <div key={`m-${m.match_id}`} className="grid px-3 py-2 text-xs items-center"
+                  style={{ gridTemplateColumns: '1fr 1fr auto', borderTop: (i > 0 || filteredQueue.length > 0) ? '0.5px solid var(--border)' : undefined, backgroundColor: i % 2 === 0 ? 'var(--surface)' : 'transparent', gap: 8 }}>
+                  <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }} title={m.literal_value}>{m.literal_value}</span>
+                  {isEditing ? (
+                    <input
+                      autoFocus
+                      type="text"
+                      value={editText}
+                      onChange={e => setEditText(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') attemptSubmitEdit(m);
+                        if (e.key === 'Escape') cancelEdit();
+                      }}
+                      onBlur={() => attemptSubmitEdit(m)}
+                      maxLength={200}
+                      className="text-xs rounded-button border-[0.5px] outline-none px-2 py-1 w-full font-medium"
+                      style={{ borderColor: 'var(--accent)', backgroundColor: 'var(--surface)', color: 'var(--accent)' }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => startEdit(m)}
+                      disabled={isSaving}
+                      className="truncate font-medium text-left disabled:opacity-50"
+                      style={{ color: 'var(--accent)', background: 'none', border: 'none', padding: 0, cursor: isSaving ? 'wait' : 'text' }}
+                      title={`${m.alias_name} — click to edit`}
+                    >
+                      {isSaving ? <Spinner className="w-3 h-3" /> : m.alias_name}
+                    </button>
+                  )}
+                  <span className="text-[11px] whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{relativeTime(m.confirmed_at)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {showExport && (
+        <ExportLookupModal
+          domainId={pipeline.domain_id ?? undefined}
+          domainName={pipeline.column_name}
+          onClose={() => setShowExport(false)}
+        />
+      )}
+
+      {pendingChoice && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center" style={{ backgroundColor: 'rgba(26,26,46,0.35)' }} onClick={() => setPendingChoice(null)}>
+          <div
+            className="rounded-card border-[0.5px] w-full max-w-sm mx-4 p-5"
+            style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>Update shared canonical name</h3>
+            <p className="text-xs mb-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+              {pendingChoice.sharedCount} values currently map to this same canonical name. Choose whether to change
+              just this one value or rename it for all {pendingChoice.sharedCount}.
+            </p>
+            <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => submitEdit(pendingChoice.matchId, pendingChoice.newName, 'this_value')}
+                className="text-xs font-medium px-3 py-2 rounded-button border-[0.5px] text-left transition-colors"
+                style={{ borderColor: 'var(--border)', color: 'var(--text-primary)', backgroundColor: 'transparent' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; }}
+              >
+                Just this value — move it to &ldquo;{pendingChoice.newName}&rdquo;, leave the other {pendingChoice.sharedCount - 1} unchanged
+              </button>
+              <button
+                type="button"
+                onClick={() => submitEdit(pendingChoice.matchId, pendingChoice.newName, 'all_shared')}
+                className="text-xs font-medium px-3 py-2 rounded-button border-[0.5px] text-left transition-colors"
+                style={{ borderColor: 'var(--border)', color: 'var(--text-primary)', backgroundColor: 'transparent' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--accent)'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; }}
+              >
+                Rename for all {pendingChoice.sharedCount} values sharing it
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPendingChoice(null)}
+              className="text-[11px] font-medium mt-3"
+              style={{ color: 'var(--text-muted)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}
@@ -481,18 +600,17 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
 }
 
 function MappingsTab({ group }: { group: PipelineGroup }) {
-  // Group columns by domain (domain_id + domain_name).
-  type DomainGroup = { domainId: number | null; domainName: string | null; columns: Pipeline[] };
-  const domainGroups: DomainGroup[] = [];
-  for (const col of group.columns) {
-    const existing = domainGroups.find(d => d.domainId === col.domain_id);
-    if (existing) existing.columns.push(col);
-    else domainGroups.push({ domainId: col.domain_id, domainName: col.domain_name, columns: [col] });
-  }
+  // One section per column (specs are per-column now — no domain grouping).
+  type ColGroup = { key: string; columnName: string; columns: Pipeline[] };
+  const colGroups: ColGroup[] = group.columns.map(col => ({
+    key:        `${col.pipeline_id}:${col.column_name}`,
+    columnName: col.column_name,
+    columns:    [col],
+  }));
 
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 
-  function toggleDomain(key: string) {
+  function toggleSpec(key: string) {
     setExpanded(prev => {
       const next = new Set(prev);
       next.has(key) ? next.delete(key) : next.add(key);
@@ -504,18 +622,18 @@ function MappingsTab({ group }: { group: PipelineGroup }) {
     <div>
 
       <div className="rounded-card border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)' }}>
-        {domainGroups.map((dg, idx) => {
-          const key = String(dg.domainId ?? '__none__');
+        {colGroups.map((dg, idx) => {
+          const key = dg.key;
           const isOpen = expanded.has(key);
           const totalMapped = dg.columns.reduce((s, c) => s + c.total_mapped, 0);
           const totalQueue  = dg.columns.reduce((s, c) => s + c.queue_size, 0);
           return (
             <div key={key} style={{ borderTop: idx > 0 ? '0.5px solid var(--border)' : undefined }}>
-              {/* Domain header row */}
+              {/* Column header row */}
               <button
                 className="w-full flex items-center gap-3 px-4 py-3 text-left transition-colors"
                 style={{ backgroundColor: isOpen ? 'var(--page-bg)' : 'var(--surface)' }}
-                onClick={() => toggleDomain(key)}
+                onClick={() => toggleSpec(key)}
                 onMouseEnter={e => { if (!isOpen) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
                 onMouseLeave={e => { if (!isOpen) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
               >
@@ -526,8 +644,8 @@ function MappingsTab({ group }: { group: PipelineGroup }) {
                   <path d="M4 2.5l4 3.5-4 3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
 
-                <span className="text-sm font-semibold flex-1 text-left truncate" style={{ color: 'var(--text-primary)' }}>
-                  {dg.domainName ?? 'No domain'}
+                <span className="text-sm font-semibold font-mono flex-1 text-left truncate" style={{ color: 'var(--text-primary)' }}>
+                  {dg.columnName}
                 </span>
 
                 <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
@@ -636,30 +754,55 @@ function QueueTab({ group }: { group: PipelineGroup }) {
 interface SettingsTabProps {
   group:          PipelineGroup;
   onUpdateMember: (p: Pipeline, patch: Partial<Pipeline>) => void;
-  onDeleteMember: (p: Pipeline) => void;
+  onDeleteMember: (p: Pipeline) => void | Promise<void>;
   onDeleteGroup:  () => void;
 }
 
 function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: SettingsTabProps) {
   const [name,           setName]           = useState(group.name ?? '');
-  const [mode,           setMode]           = useState<'auto' | 'manual'>(group.mode === 'manual' ? 'manual' : 'auto');
+  const [updateSchedule, setUpdateSchedule] = useState<UpdateSchedule>(group.update_schedule);
   const [exportTableFqn, setExportTableFqn] = useState(group.export_table_fqn ?? '');
   const [saving,         setSaving]         = useState(false);
   const [saved,          setSaved]          = useState(false);
   const [refreshing,     setRefreshing]     = useState(false);
   const [refreshResult,  setRefreshResult]  = useState<{ ok: boolean; rows?: number; error?: string } | null>(null);
+  const [deletingColKey, setDeletingColKey] = useState<string | null>(null);
+
+  // Column-mode pipelines write onto the source table itself — there is no
+  // separate destination to edit, and the PATCH must not touch export_table_fqn
+  // (it is pinned to the source table).
+  const isColumnKind = group.export_kind === 'column';
+  // "Export unstandardized values" only shapes a table/view export's row set —
+  // column mode has no row filtering (unmapped rows just carry a NULL
+  // companion) and lookup-only has no export object at all.
+  const hasUnmappedSetting = !isColumnKind && !!group.export_table_fqn;
+  const [exportUnmapped, setExportUnmapped] = useState(group.export_unmapped_rows !== false);
 
   async function handleSave() {
     setSaving(true);
     try {
       const exportVal = exportTableFqn.trim() || null;
+      const unmappedChanged = hasUnmappedSetting && exportUnmapped !== (group.export_unmapped_rows !== false);
+      const patch = {
+        name: name || null,
+        update_schedule: updateSchedule,
+        ...(isColumnKind ? {} : { export_table_fqn: exportVal }),
+        ...(hasUnmappedSetting ? { export_unmapped_rows: exportUnmapped } : {}),
+      };
       // Config applies to every column in the card.
       await Promise.all(group.columns.map(c =>
         fetch(`/api/pipelines/${c.pipeline_id}`, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name || null, mode, export_table_fqn: exportVal }),
+          body: JSON.stringify(patch),
         }).catch(() => {})));
-      for (const c of group.columns) onUpdateMember(c, { name: name || null, mode, export_table_fqn: exportVal });
+      for (const c of group.columns) onUpdateMember(c, patch);
+      // The stored setting only shapes the next build — rebuild the shared
+      // export once now (recreates the view for view pipelines) so the change
+      // is live immediately. Fire-and-forget: a large table rebuild can take a
+      // while and must not pin the Save button; SSE metrics refresh will land.
+      if (unmappedChanged) {
+        fetch(`/api/pipelines/${group.columns[0].pipeline_id}/refresh-export`, { method: 'POST' }).catch(() => {});
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } finally {
@@ -693,9 +836,14 @@ function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: S
             <span style={{ color: 'var(--text-muted)' }}>Table</span>
             <span className="font-mono" style={{ color: 'var(--text-primary)' }}>{tableShort(group.table_fqn)}</span>
           </div>
-          {group.export_table_fqn && (
+          {group.export_kind === 'column' ? (
             <div className="flex justify-between text-xs gap-4">
-              <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>Export table</span>
+              <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>Output</span>
+              <span style={{ color: 'var(--text-primary)' }}>Standardized column(s) on the source table</span>
+            </div>
+          ) : group.export_table_fqn && (
+            <div className="flex justify-between text-xs gap-4">
+              <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{group.export_kind === 'view' ? 'Export view' : 'Export table'}</span>
               <span className="font-mono truncate text-right" style={{ color: 'var(--text-primary)' }} title={group.export_table_fqn}>{group.export_table_fqn}</span>
             </div>
           )}
@@ -708,17 +856,27 @@ function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: S
             <div key={`${c.pipeline_id}_${c.column_name}`} className="flex items-center justify-between text-xs rounded-button px-2 py-1.5" style={{ backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)' }}>
               <div className="flex items-center gap-2 min-w-0">
                 <span className="font-mono truncate" style={{ color: 'var(--text-primary)' }}>{c.column_name}</span>
-                {c.domain_name && <span className="text-[10px]" style={{ color: 'var(--accent)' }}>{c.domain_name}</span>}
               </div>
               <button
-                onClick={() => { if (confirm(`Stop standardizing column "${c.column_name}"? This removes it from the pipeline.`)) onDeleteMember(c); }}
-                className="w-5 h-5 flex items-center justify-center rounded transition-colors flex-shrink-0"
+                disabled={deletingColKey != null}
+                onClick={async () => {
+                  if (!confirm(`Stop standardizing column "${c.column_name}"? This removes it from the pipeline.`)) return;
+                  const key = `${c.pipeline_id}_${c.column_name}`;
+                  setDeletingColKey(key);
+                  try { await Promise.resolve(onDeleteMember(c)); }
+                  finally { setDeletingColKey(null); }
+                }}
+                className="w-5 h-5 flex items-center justify-center rounded transition-colors flex-shrink-0 disabled:opacity-50"
                 style={{ color: 'var(--text-muted)', backgroundColor: 'transparent', border: 'none' }}
                 onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
                 onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
                 title="Remove this column"
               >
-                <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+                {deletingColKey === `${c.pipeline_id}_${c.column_name}` ? (
+                  <Spinner className="w-3 h-3" />
+                ) : (
+                  <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+                )}
               </button>
             </div>
           ))}
@@ -742,31 +900,58 @@ function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: S
             <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>Card label — applies to the whole table pipeline.</p>
           </div>
           <div>
-            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Mode</label>
-            <div className="flex gap-2">
-              {(['auto', 'manual'] as const).map(m => (
-                <button key={m} onClick={() => setMode(m)}
-                  className="flex-1 py-1.5 text-xs font-medium rounded-button border-[0.5px] transition-colors"
-                  style={{ borderColor: mode === m ? 'var(--accent)' : 'var(--border)', backgroundColor: mode === m ? 'var(--accent-tint)' : 'transparent', color: mode === m ? 'var(--accent)' : 'var(--text-muted)' }}>
-                  {m === 'auto' ? 'Auto' : 'Manual'}
-                </button>
-              ))}
-            </div>
-            <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>
-              {mode === 'auto' ? 'New values are standardized and exported automatically.' : 'New values queue up for manual review before export.'}
-            </p>
+            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Update window</label>
+            <UpdateScheduleEditor value={updateSchedule} onChange={setUpdateSchedule} disabled={saving} />
           </div>
 
+          {hasUnmappedSetting && (
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="text-xs font-medium block" style={{ color: 'var(--text-primary)' }}>
+                  Export unstandardized values
+                </label>
+                <p className="text-[11px] mt-0.5 leading-relaxed" style={{ color: 'var(--text-hint)' }}>
+                  {exportUnmapped
+                    ? `Every source row appears in the export ${group.export_kind === 'view' ? 'view' : 'table'}; values without a confirmed standardization show their raw value until standardized.`
+                    : `Only rows whose values have a confirmed standardization appear in the export ${group.export_kind === 'view' ? 'view' : 'table'}. Rows appear once their values are standardized.`}
+                  {' '}Saving rebuilds the {group.export_kind === 'view' ? 'view' : 'export table'} with the new behavior.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={exportUnmapped}
+                onClick={() => setExportUnmapped(v => !v)}
+                disabled={saving}
+                className="flex-shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50"
+                style={{ backgroundColor: exportUnmapped ? 'var(--accent)' : '#D1D5DB' }}
+              >
+                <span
+                  className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
+                  style={{ transform: exportUnmapped ? 'translateX(18px)' : 'translateX(3px)' }}
+                />
+              </button>
+            </div>
+          )}
+
           <div>
-            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>Export table</label>
-            <input
-              type="text" value={exportTableFqn} onChange={e => setExportTableFqn(e.target.value)}
-              placeholder="DB.SCHEMA.TABLE_STANDARDIZED"
-              className="w-full text-xs px-3 py-2 rounded-button border-[0.5px] outline-none font-mono"
-              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
-            />
+            <label className="text-xs font-medium block mb-1" style={{ color: 'var(--text-primary)' }}>
+              {isColumnKind ? 'Standardized columns' : group.export_kind === 'view' ? 'Export view' : 'Export table'}
+            </label>
+            {!isColumnKind && (
+              <input
+                type="text" value={exportTableFqn} onChange={e => setExportTableFqn(e.target.value)}
+                placeholder="DB.SCHEMA.TABLE_STANDARDIZED"
+                className="w-full text-xs px-3 py-2 rounded-button border-[0.5px] outline-none font-mono"
+                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+              />
+            )}
             <p className="text-[11px] mt-1 leading-relaxed" style={{ color: 'var(--text-hint)' }}>
-              Shared destination table for every column in this pipeline. Rebuilt on every standardization pass.
+              {isColumnKind
+                ? `Standardized values are written to a companion column on the source table (e.g. ${group.columns[0]?.column_name ?? 'COLUMN'}_STANDARDIZED) — empty until the raw value is standardized. There is no separate destination to configure.`
+                : group.export_kind === 'view'
+                ? 'Shared destination view for every column in this pipeline. Created once — always reflects the live data, never rebuilt.'
+                : 'Shared destination table for every column in this pipeline. Rebuilt on every standardization pass.'}
             </p>
 
             {(group.export_table_fqn || exportTableFqn.trim()) && (
@@ -782,16 +967,28 @@ function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: S
                         <path d="M10 6A4 4 0 112.5 3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
                         <path d="M2.5 1v2.5H5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                       </svg>
-                      Rebuild export table now
+                      {isColumnKind ? 'Sync standardized columns now'
+                        : group.export_kind === 'view' ? 'Recreate view now'
+                        : 'Rebuild export table now'}
                     </>
                   )}
                 </button>
                 {refreshResult && (
                   <p className="text-[11px] mt-1.5" style={{ color: refreshResult.ok ? '#15803D' : 'var(--confidence-low)' }}>
-                    {refreshResult.ok ? `✓ Done — ${refreshResult.rows?.toLocaleString() ?? 0} row(s) written` : `✗ ${refreshResult.error}`}
+                    {refreshResult.ok
+                      ? group.export_kind === 'view'
+                        ? `✓ View recreated — ${refreshResult.rows?.toLocaleString() ?? 0} row(s) visible`
+                        : `✓ Done — ${refreshResult.rows?.toLocaleString() ?? 0} row(s) ${isColumnKind ? 'standardized' : 'written'}`
+                      : `✗ ${refreshResult.error}`}
                   </p>
                 )}
               </div>
+            )}
+            {group.export_kind === 'view' && group.export_table_fqn && (
+              <p className="text-[11px] mt-2" style={{ color: 'var(--text-hint)' }}>
+                A view always reflects the current data live — day to day there is nothing to rebuild.
+                Use the button above only if the view is missing or was dropped (it recreates it in place).
+              </p>
             )}
           </div>
         </div>
@@ -815,9 +1012,14 @@ function SettingsTab({ group, onUpdateMember, onDeleteMember, onDeleteGroup }: S
           Delete pipeline{group.columns.length > 1 ? ` (${group.columns.length} columns)` : ''}
         </button>
         <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-muted)' }}>
-          Removes the pipeline configuration. Historical mappings are preserved in the domain.
+          Removes the pipeline configuration. Historical mappings are preserved for this column.
         </p>
       </div>
+
+      {/* Creation date — moved here from the Activity tab */}
+      <p className="text-[11px]" style={{ color: 'var(--text-hint)' }}>
+        Pipeline created {fmtDate(group.created_at)}
+      </p>
     </div>
   );
 }
@@ -830,14 +1032,14 @@ interface Props {
   group:            PipelineGroup;
   initialTab?:      DetailTab;
   isStandardizing?: boolean;
-  isScanning?:      boolean;
-  cycleResetMs?:    number;
+  /** Full column-spec records (from /api/column-specs, keyed by spec_id) for the spec ⓘ tooltip. */
+  specsById?:       Map<number, ColumnSpec>;
   onUpdateMember:   (p: Pipeline, patch: Partial<Pipeline>) => void;
-  onDeleteMember:   (p: Pipeline) => void;
+  onDeleteMember:   (p: Pipeline) => void | Promise<void>;
   onDeleteGroup:    () => void;
 }
 
-export default function PipelineDetail({ group, initialTab = 'activity', isStandardizing = false, isScanning = false, cycleResetMs = 0, onUpdateMember, onDeleteMember, onDeleteGroup }: Props) {
+export default function PipelineDetail({ group, initialTab = 'activity', isStandardizing = false, specsById = new Map(), onUpdateMember, onDeleteMember, onDeleteGroup }: Props) {
   const [tab, setTab] = useState<DetailTab>(initialTab);
 
   // Sync when the parent changes the tab (e.g. clicking "Mapping" button on the row)
@@ -869,7 +1071,7 @@ export default function PipelineDetail({ group, initialTab = 'activity', isStand
 
         {/* Tab content */}
         <div style={{ padding: '16px 0 20px' }}>
-          {tab === 'activity' && <ActivityTab group={group} isStandardizing={isStandardizing} isScanning={isScanning} cycleResetMs={cycleResetMs} />}
+          {tab === 'activity' && <ActivityTab group={group} isStandardizing={isStandardizing} specsById={specsById} />}
           {tab === 'mappings' && <MappingsTab group={group} />}
           {tab === 'queue'    && <QueueTab    group={group} />}
           {tab === 'settings' && <SettingsTab group={group} onUpdateMember={onUpdateMember} onDeleteMember={onDeleteMember} onDeleteGroup={onDeleteGroup} />}

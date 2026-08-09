@@ -1,14 +1,20 @@
 /**
- * One-Prompt Export Pipeline — WRITE-FIRST, VALIDATE-SECOND.
+ * One-Prompt Export Pipeline — USER-FIRST, FAIL-OPEN.
  *
  * Called after the user confirms and exports a run.
  *
  *   Step 1 — Read state blob            (sole source of truth)
- *   Step 2 — Detect validation cases    (Case A: item moved; Case B: group renamed)
- *   Step 3 — WRITE all mappings FIRST   (user's choices at face value; run →
- *                                         'completed' on success)
- *   Step 4 — LLM validation amendment   (async; may flip Case A/B decisions and
- *                                         update rows + VALIDATION_LOG afterwards)
+ *   Step 2 — Detect validation cases    (Case A: lookup-confirmed item moved;
+ *                                         Case B: validated group renamed;
+ *                                         Case C: item moved out of a
+ *                                         high-confidence initial LLM group)
+ *   Step 3 — Validation referee         (only when cases exist; domain-context
+ *                                         system prompt; retries; reverts a user
+ *                                         change ONLY when extremely confident
+ *                                         it's a mistake; on total failure →
+ *                                         decisions = null, i.e. user wins)
+ *   Step 4 — WRITE everything in one    (verdicts baked in; batched idempotent
+ *             pass                        MERGEs; run → 'completed' on success)
  *
  * Steps 3–4 run in the background after the HTTP response is sent.
  * The run is atomically marked 'validating' to prevent double-export.
@@ -25,11 +31,17 @@ import fs   from 'node:fs';
 import os   from 'node:os';
 import path from 'node:path';
 
-import { withSnowflake } from './snowflake';
+import { withWarehouse, executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { upsertApprovedAliasMssql, bulkUpsertApprovedAliasesMssql, bulkUpsertLiteralMatchesMssql } from './warehouse/mssql/mappings';
+import { getDb } from './sqlite';
 import { normalizeLiteral } from './normalize';
-import { loadOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
+import { reportError } from './report-error';
+import { loadOpRunState, saveOpRunState, type OpRunState, type OpGroup, type OpGroupItem, type OpStateItem } from './op-auto-group';
+import { callAnthropicWithRetry, JSON_ONLY_REMINDER } from './llm-one-prompt-grouping';
+import { sanitizeConventionRules, describeConventionRules, hasAnyRule } from './convention-rules';
 import { initBaseline, hasBaseline } from './auto-export-seen';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
+import { asExportKind } from './export-kind';
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { appendTiming } from './timing';
 
@@ -39,6 +51,14 @@ import { appendTiming } from './timing';
 
 const VALIDATION_MODEL      = 'claude-sonnet-4-6';
 const VALIDATION_MAX_TOKENS = 4_096;
+
+// Max rows per bulk MERGE statement. Snowflake caps bind variables at ~65k per
+// statement (3 binds/literal ⇒ hard failure above ~21.8k literals in a single
+// MERGE); 5 000 keeps each statement comfortably inside that with headroom.
+// Batching trades single-statement atomicity for scale — safe because the
+// MERGEs are idempotent upserts and the 'validating' status guard makes a
+// partial-failure retry re-run the same batches.
+const EXPORT_MERGE_BATCH = 5_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,6 +70,10 @@ export interface ExportResult {
   /** true when another request already claimed/finished this run's export —
    *  the counts are returned but no write pass was started. */
   already_in_progress?: boolean;
+  /** true when the mappings were written but rebuilding the customer-visible
+   *  export object FAILED. Callers must not then claim the standardized output
+   *  is up to date (see KI-146). */
+  export_refresh_failed?: boolean;
 }
 
 interface CaseAItem {
@@ -71,26 +95,21 @@ interface CaseBGroup {
   total_known_literals:   number;
 }
 
+/** Case C: user moved an item away from a high-confidence initial LLM grouping
+ *  (the initial standardization is trusted, like the lookup is for Case A). */
+interface CaseCItem {
+  literal_value:       string;
+  original_alias_name: string;
+  user_moved_to:       string;
+}
+
 interface ValidationDecisionA { lv: string; k: 'u' | 'o'; }
 interface ValidationDecisionB { original_alias: string; new_alias: string; k: 'u' | 'o'; apply_to_all: boolean; }
-interface ValidationResponse   { case_a?: ValidationDecisionA[]; case_b?: ValidationDecisionB[]; }
+interface ValidationResponse   { case_a?: ValidationDecisionA[]; case_b?: ValidationDecisionB[]; case_c?: ValidationDecisionA[]; }
 
 // ---------------------------------------------------------------------------
 // Snowflake exec helper
 // ---------------------------------------------------------------------------
-
-async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else     resolve(rows ?? []);
-      },
-    });
-  });
-}
 
 // ---------------------------------------------------------------------------
 // JSON helpers
@@ -131,16 +150,24 @@ function tryParseJson<T>(text: string): T | null {
 // DB write helpers
 // ---------------------------------------------------------------------------
 
+/** RUNS lives in SQLite — status transitions are local writes. */
+function setRunStatus(runId: number, status: string): void {
+  getDb()
+    .prepare(`UPDATE runs SET run_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE run_id = ?`)
+    .run(status, runId);
+}
+
 /**
  * Upsert an alias name and return its alias_id.
  * MERGE matches on (alias_name, domain_id) — the unique key — so the same name
  * in two different domains produces two separate rows with separate alias_ids.
  */
-async function upsertApprovedAlias(
+export async function upsertApprovedAlias(
   connection: any,
   aliasName:  string,
   domainId:   number | null,
 ): Promise<number> {
+  if (getWarehouseAdapter().kind === 'mssql') return upsertApprovedAliasMssql(connection, aliasName, domainId);
   // domainFilter for MERGE uses alias 't'; selectFilter for plain SELECT uses no alias
   const domainFilter  = domainId != null
     ? `AND t.domain_id = ${Number(domainId)}`
@@ -152,7 +179,7 @@ async function upsertApprovedAlias(
 
   await exec(
     connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES AS t
+    `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES AS t
      USING (SELECT ? AS alias_name, ${domainLiteral} AS domain_id) AS s
        ON t.alias_name = s.alias_name ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
@@ -167,7 +194,7 @@ async function upsertApprovedAlias(
   const rows = await exec(
     connection,
     `SELECT alias_id
-     FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+     FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
      WHERE alias_name = ? ${selectFilter}`,
     [aliasName],
   );
@@ -191,6 +218,7 @@ async function bulkUpsertApprovedAliases(
   aliasNames: string[],
   domainId:   number | null,
 ): Promise<Map<string, number>> {
+  if (getWarehouseAdapter().kind === 'mssql') return bulkUpsertApprovedAliasesMssql(connection, aliasNames, domainId);
   const result = new Map<string, number>();
   const names  = Array.from(new Set(aliasNames)).filter((n) => n != null && n !== '');
   if (names.length === 0) return result;
@@ -199,35 +227,41 @@ async function bulkUpsertApprovedAliases(
   const selectFilter  = domainId != null ? `AND domain_id = ${Number(domainId)}`   : `AND domain_id IS NULL`;
   const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
 
-  // Upsert every distinct name at once. The source is deduped (Set) so no
-  // "multiple source rows matched" error on the MERGE.
-  const valuePlaceholders = names.map(() => '(?)').join(', ');
-  await exec(
-    connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES AS t
-     USING (SELECT column1 AS alias_name FROM VALUES ${valuePlaceholders}) AS s
-       ON t.alias_name = s.alias_name ${domainFilter}
-     WHEN MATCHED THEN UPDATE SET
-       t.usage_count  = t.usage_count + 1,
-       t.last_used_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (alias_name, domain_id, usage_count, last_used_at)
-       VALUES (s.alias_name, ${domainLiteral}, 1, CURRENT_TIMESTAMP())`,
-    names,
-  );
+  // Upsert every distinct name, batched to stay under the bind ceiling. The
+  // source is deduped (Set) so no "multiple source rows matched" on the MERGE.
+  for (let i = 0; i < names.length; i += EXPORT_MERGE_BATCH) {
+    const batch = names.slice(i, i + EXPORT_MERGE_BATCH);
+    const valuePlaceholders = batch.map(() => '(?)').join(', ');
+    await exec(
+      connection,
+      `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES AS t
+       USING (SELECT column1 AS alias_name FROM VALUES ${valuePlaceholders}) AS s
+         ON t.alias_name = s.alias_name ${domainFilter}
+       WHEN MATCHED THEN UPDATE SET
+         t.usage_count  = t.usage_count + 1,
+         t.last_used_at = CURRENT_TIMESTAMP()
+       WHEN NOT MATCHED THEN INSERT (alias_name, domain_id, usage_count, last_used_at)
+         VALUES (s.alias_name, ${domainLiteral}, 1, CURRENT_TIMESTAMP())`,
+      batch,
+    );
+  }
 
-  // Fetch every alias_id in one round-trip.
-  const inPlaceholders = names.map(() => '?').join(', ');
-  const rows = await exec(
-    connection,
-    `SELECT alias_name, alias_id
-     FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
-     WHERE alias_name IN (${inPlaceholders}) ${selectFilter}`,
-    names,
-  );
-  for (const r of rows) {
-    const name = String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '');
-    const id   = Number((r as any).ALIAS_ID   ?? (r as any).alias_id   ?? 0);
-    if (name && id) result.set(name, id);
+  // Fetch every alias_id, batched the same way.
+  for (let i = 0; i < names.length; i += EXPORT_MERGE_BATCH) {
+    const batch = names.slice(i, i + EXPORT_MERGE_BATCH);
+    const inPlaceholders = batch.map(() => '?').join(', ');
+    const rows = await exec(
+      connection,
+      `SELECT alias_name, alias_id
+       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+       WHERE alias_name IN (${inPlaceholders}) ${selectFilter}`,
+      batch,
+    );
+    for (const r of rows) {
+      const name = String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '');
+      const id   = Number((r as any).ALIAS_ID   ?? (r as any).alias_id   ?? 0);
+      if (name && id) result.set(name, id);
+    }
   }
 
   // Safety net: anything the bulk SELECT somehow missed falls back to the
@@ -246,8 +280,10 @@ async function bulkUpsertApprovedAliases(
  * and run_id, so the ON condition is uniform across the batch.
  *
  * Snowflake's VALUES subquery exposes implicit column names column1, column2, …
- * and supports up to ~65 k bind variables — well above the 5 000-literal cap
- * used when fetching source values, so no chunking is needed.
+ * and caps bind variables at ~65 k per statement (3 binds/literal). Entries are
+ * batched at EXPORT_MERGE_BATCH so a bulk-load-sized run (20 k+ literals) can't
+ * blow the ceiling; each batch MERGE is an idempotent upsert, so a retry after
+ * a partial failure re-runs safely.
  */
 async function bulkUpsertLiteralMatches(
   connection: any,
@@ -257,34 +293,77 @@ async function bulkUpsertLiteralMatches(
 ): Promise<void> {
   if (entries.length === 0) return;
 
+  // Dedup on the NORMALIZED form before anything else — above the adapter
+  // branch so both warehouses get it.
+  //
+  // The MERGE below joins ON t.normalized_value = PRISM_NORMALIZE(s.literal_value),
+  // so two entries whose literals normalize to the same key (e.g. 'Verizon' and
+  // 'verizon', or NFC vs NFD accents) are DUPLICATE JOIN KEYS in one source.
+  // Snowflake rejects that outright ("duplicate MERGE source keys"); the mssql
+  // path can land two rows and break the documented one-row-per
+  // (normalized_value, spec) invariant that every lookup/export join relies on.
+  //
+  // CLAUDE.md has always documented this dedup as existing here. It did not —
+  // normalizeLiteral was imported and never called. The Google Sheets connect
+  // flow makes it reachable with ordinary customer data, because that path
+  // dedups client-side with a raw case-sensitive Set (KI-107).
+  //
+  // Keep the FIRST mapping for a given normalized key so the result is
+  // deterministic, and warn when a conflicting one is dropped — a literal
+  // resolving to two different aliases means the run state disagrees with
+  // itself, which is worth surfacing rather than silently picking a winner.
+  const byNormalized = new Map<string, { literalValue: string; aliasId: number }>();
+  for (const e of entries) {
+    const key = normalizeLiteral(e.literalValue);
+    const existing = byNormalized.get(key);
+    if (!existing) { byNormalized.set(key, e); continue; }
+    if (existing.aliasId !== e.aliasId) {
+      console.warn(
+        `[op-export] run ${runId}: literals "${existing.literalValue}" and "${e.literalValue}" ` +
+        `normalize to the same key but map to different aliases (${existing.aliasId} vs ${e.aliasId}); ` +
+        `keeping the first. The run state maps one value to two groups.`,
+      );
+    }
+  }
+  const deduped = Array.from(byNormalized.values());
+  if (deduped.length !== entries.length) {
+    console.log(`[op-export] run ${runId}: deduped ${entries.length} → ${deduped.length} literal(s) on the normalized form.`);
+  }
+  entries = deduped;
+
+  if (getWarehouseAdapter().kind === 'mssql') return bulkUpsertLiteralMatchesMssql(connection, entries, domainId, runId);
+
   const domainFilter  = domainId != null
     ? `AND t.domain_id = ${Number(domainId)}`
     : `AND t.domain_id IS NULL`;
   const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
 
-  // Build (?, ?, ?) placeholders and a flat binds array.
-  // column1 = literal_value, column2 = alias_id, column3 = run_id
-  const placeholders = entries.map(() => '(?, ?, ?)').join(', ');
-  const binds: any[] = entries.flatMap(e => [e.literalValue, e.aliasId, runId]);
+  for (let i = 0; i < entries.length; i += EXPORT_MERGE_BATCH) {
+    const batch = entries.slice(i, i + EXPORT_MERGE_BATCH);
+    // Build (?, ?, ?) placeholders and a flat binds array.
+    // column1 = literal_value, column2 = alias_id, column3 = run_id
+    const placeholders = batch.map(() => '(?, ?, ?)').join(', ');
+    const binds: any[] = batch.flatMap(e => [e.literalValue, e.aliasId, runId]);
 
-  await exec(
-    connection,
-    `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES AS t
-     USING (
-       SELECT column1 AS literal_value,
-              column2 AS alias_id,
-              column3 AS run_id
-       FROM VALUES ${placeholders}
-     ) AS s
-       ON t.normalized_value = PRISM_NORMALIZE(s.literal_value) ${domainFilter}
-     WHEN MATCHED THEN UPDATE SET
-       t.alias_id     = s.alias_id,
-       t.run_id       = s.run_id,
-       t.confirmed_at = CURRENT_TIMESTAMP()
-     WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
-       VALUES (s.literal_value, PRISM_NORMALIZE(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
-    binds,
-  );
+    await exec(
+      connection,
+      `MERGE INTO PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES AS t
+       USING (
+         SELECT column1 AS literal_value,
+                column2 AS alias_id,
+                column3 AS run_id
+         FROM VALUES ${placeholders}
+       ) AS s
+         ON t.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value) ${domainFilter}
+       WHEN MATCHED THEN UPDATE SET
+         t.alias_id     = s.alias_id,
+         t.run_id       = s.run_id,
+         t.confirmed_at = CURRENT_TIMESTAMP()
+       WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
+         VALUES (s.literal_value, PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
+      binds,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +373,7 @@ async function bulkUpsertLiteralMatches(
 interface DetectResult {
   caseAItems:  CaseAItem[];
   caseBGroups: Omit<CaseBGroup, 'alias_exact_literal' | 'prior_lookup_literal' | 'current_new_literal' | 'prior_other_literal' | 'total_known_literals'>[];
+  caseCItems:  CaseCItem[];
 }
 
 function detectCases(state: OpRunState): DetectResult {
@@ -363,7 +443,37 @@ function detectCases(state: OpRunState): DetectResult {
     });
   }
 
-  return { caseAItems, caseBGroups };
+  // ── Detect Case C ────────────────────────────────────────────────────────
+  // The initial standardization is trusted: an item stamped with a
+  // high-confidence initial LLM group that now sits in a DIFFERENT group was
+  // moved by the user — referee it like Case A. Lookup-matched items are
+  // excluded (Case A covers them); 'm'/'l' initial groups are not trusted
+  // enough to second-guess the user over.
+  const caseCItems: CaseCItem[] = [];
+  for (const si of state.items) {
+    if (si.matched_from_lookup) continue;
+    if (!si.initial_alias_name || si.initial_confidence !== 'h') continue;
+    if (typeof si.initial_group_id !== 'number') continue;
+
+    const currentGroupId = groupIdByLiteral.get(si.literal_value);
+    if (currentGroupId === undefined || currentGroupId === si.initial_group_id) continue;
+    const currentGroup = groupByLiteral.get(currentGroupId);
+    if (!currentGroup) continue;
+
+    // Revert target: the initial group's CURRENT alias when it still exists
+    // (the user may have legitimately renamed it), else the stamped name.
+    const initialGroup  = groupByLiteral.get(si.initial_group_id);
+    const originalAlias = initialGroup?.alias_name ?? si.initial_alias_name;
+    if (currentGroup.alias_name === originalAlias) continue;
+
+    caseCItems.push({
+      literal_value:       si.literal_value,
+      original_alias_name: originalAlias,
+      user_moved_to:       currentGroup.alias_name,
+    });
+  }
+
+  return { caseAItems, caseBGroups, caseCItems };
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +498,14 @@ async function fetchCaseBContext(
   for (const raw of rawCaseBGroups) {
     const groupItemLiterals = new Set(raw.group_items.map((gi) => gi.literal_value));
 
+    const limitOne = getWarehouseAdapter().kind === 'mssql' ? 'SELECT TOP (1)' : 'SELECT';
+    const limitTail = getWarehouseAdapter().kind === 'mssql' ? '' : 'LIMIT 1';
     const exactRows = await exec(
       connection,
-      `SELECT lam.literal_value
-       FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-       JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
-       WHERE aan.alias_name = ? AND lam.literal_value = ? ${domainFilter} LIMIT 1`,
+      `${limitOne} lam.literal_value
+       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+       JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       WHERE aan.alias_name = ? AND lam.literal_value = ? ${domainFilter} ${limitTail}`,
       [raw.original_alias_name, raw.original_alias_name],
     );
     const alias_exact_literal =
@@ -416,8 +528,8 @@ async function fetchCaseBContext(
     const allKnownRows = await exec(
       connection,
       `SELECT lam.literal_value, COUNT(*) AS total
-       FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-       JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+       JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
        WHERE aan.alias_name = ? ${domainFilter}
        GROUP BY lam.literal_value`,
       [raw.original_alias_name],
@@ -452,12 +564,20 @@ async function fetchCaseBContext(
 
 const VALIDATION_SYSTEM_PROMPT = `\
 You are validating changes a user made to entity groupings after an automated classification run.
-Decide whether each user change should be persisted or reverted.
+The user is a domain expert reviewing their own data — their changes are presumed
+correct and the default verdict is to keep them ("u"). Revert to the original ("o")
+ONLY when you are extremely confident the change is a mistake: an unambiguous error
+a well-informed person would immediately recognize, such as mapping a literal to a
+clearly unrelated entity or what looks like an accidental drag/typo. If there is ANY
+plausible reading under which the change is intentional and correct — a granularity
+choice, an in-house naming preference, domain knowledge you may lack — keep it.
+When torn, keep the user's change.
 Respond only with valid JSON. No text outside the JSON.
 
 {
   "case_a": [{"lv":"literal_value","k":"u"|"o"},...],
-  "case_b": [{"original_alias":"string","new_alias":"string","k":"u"|"o","apply_to_all":true|false},...]
+  "case_b": [{"original_alias":"string","new_alias":"string","k":"u"|"o","apply_to_all":true|false},...],
+  "case_c": [{"lv":"literal_value","k":"u"|"o"},...]
 }
 
 Where:
@@ -465,9 +585,94 @@ Where:
   k = "o" means revert to the original
   apply_to_all (case b only) = true means rename the alias for all known literal values mapped to it, not just this run`;
 
+/** Spec context handed to the validation referee (5a): the same concept /
+ *  rules / convention information the grouping prompts get, so keep-vs-revert
+ *  verdicts are judged with knowledge of what the column actually is. */
+interface ValidationSpecContext {
+  conceptName:            string;
+  conceptDef:             string;
+  stdRules:               string[];
+  conventionRequirements: string[];
+}
+
+function loadValidationSpecContext(runId: number): ValidationSpecContext {
+  const ctx: ValidationSpecContext = { conceptName: '', conceptDef: '', stdRules: [], conventionRequirements: [] };
+  try {
+    // `runs.domain_id` now holds the per-column spec_id (the lookup scope). The
+    // validation referee's CONCEPT is the column name; its DEFINITION is the
+    // spec description.
+    const row = getDb()
+      .prepare(
+        `SELECT r.concept_key, r.source_column, cs.description, cs.standardization_rules,
+                cs.convention_type, cs.convention_value, cs.convention_rules
+         FROM runs r
+         LEFT JOIN column_specs cs ON cs.spec_id = r.domain_id
+         WHERE r.run_id = ?`,
+      )
+      .get(runId) as any;
+    if (!row) return ctx;
+
+    ctx.conceptName = String(row.source_column ?? row.concept_key ?? '').trim();
+    ctx.conceptDef  = String(row.description ?? '').trim();
+
+    if (row.standardization_rules) {
+      try {
+        const parsed = JSON.parse(String(row.standardization_rules));
+        if (Array.isArray(parsed)) ctx.stdRules = parsed.map(String).filter(Boolean);
+      } catch { /* malformed rules JSON → no rules context */ }
+    }
+
+    const ct = String(row.convention_type ?? '').toLowerCase();
+    const cv = String(row.convention_value ?? '').trim();
+    if (ct === 'regex' && cv) {
+      ctx.conventionRequirements.push(`fully match this regular expression (anchored start-to-end): ${cv}`);
+    } else if (ct === 'examples' && cv) {
+      const examples = cv.split('\n').map((s) => s.trim()).filter(Boolean).join(' | ');
+      if (examples) ctx.conventionRequirements.push(`follow the form of these examples: ${examples}`);
+    } else if (ct === 'natural' && cv) {
+      ctx.conventionRequirements.push(cv);
+    }
+    if (row.convention_rules) {
+      try {
+        const rules = sanitizeConventionRules(JSON.parse(String(row.convention_rules)));
+        if (hasAnyRule(rules)) ctx.conventionRequirements.push(...describeConventionRules(rules));
+      } catch { /* malformed convention rules → skip */ }
+    }
+  } catch (e) {
+    console.warn('[op-export] Could not load spec context for validation:', e);
+  }
+  return ctx;
+}
+
+function buildValidationSystemPrompt(ctx: ValidationSpecContext): string {
+  let out = VALIDATION_SYSTEM_PROMPT;
+  const parts: string[] = [];
+  if (ctx.conceptName) parts.push(`CONCEPT: ${ctx.conceptName}`);
+  if (ctx.conceptDef)  parts.push(`DEFINITION: ${ctx.conceptDef}`);
+  if (ctx.stdRules.length > 0) {
+    parts.push(
+      `STANDARDIZATION RULES — mandatory rules for this column. A user change that clearly\n` +
+      `violates one of these is evidence of a mistake (the extremely-confident bar\n` +
+      `above still applies):\n` +
+      ctx.stdRules.map((r) => `  - ${r}`).join('\n'),
+    );
+  }
+  if (ctx.conventionRequirements.length > 0) {
+    parts.push(
+      `NAMING CONVENTION — canonical names for this column must:\n` +
+      ctx.conventionRequirements.map((r) => `  - ${r}`).join('\n'),
+    );
+  }
+  if (parts.length > 0) {
+    out += `\n\nDOMAIN CONTEXT — use this to judge the user's changes:\n\n` + parts.join('\n\n');
+  }
+  return out;
+}
+
 function buildValidationUserTurn(
   caseAItems:  CaseAItem[],
   caseBGroups: CaseBGroup[],
+  caseCItems:  CaseCItem[] = [],
 ): string {
   const sections: string[] = [];
 
@@ -482,7 +687,7 @@ function buildValidationUserTurn(
     sections.push(
       `CASE A ITEMS:\n\n` +
       `For each Case A item, the user moved a literal value that had a confirmed prior mapping to a different group.\n` +
-      `Decide if the user's new mapping is correct or if the original should be kept.\n\n` +
+      `Keep the user's new mapping ("u") unless it is unambiguously a mistake ("o").\n\n` +
       blocks,
     );
   }
@@ -503,8 +708,28 @@ function buildValidationUserTurn(
     sections.push(
       `CASE B GROUPS:\n\n` +
       `For each Case B group, the user renamed a validated alias name to something new.\n` +
-      `Decide if the new name is a valid correction. If yes, decide if it should apply to all known\n` +
-      `literals mapped to the original alias or only to the items in this run.\n\n` +
+      `Keep the new name ("u") unless it is unambiguously a mistake ("o"). When keeping, decide\n` +
+      `if it should apply to all known literals mapped to the original alias or only to the\n` +
+      `items in this run.\n\n` +
+      blocks,
+    );
+  }
+
+  if (caseCItems.length > 0) {
+    const blocks = caseCItems.map((item, i) =>
+      `ITEM ${i + 1}:\n` +
+      `  literal_value: "${item.literal_value}"\n` +
+      `  original_alias_name: "${item.original_alias_name}"\n` +
+      `  user_moved_to: "${item.user_moved_to}"`,
+    ).join('\n\n');
+
+    sections.push(
+      `CASE C ITEMS:\n\n` +
+      `For each Case C item, the automated standardization placed the value in a group with\n` +
+      `high confidence, and the user moved it to a different group.\n` +
+      `Keep the user's new mapping ("u") unless it is unambiguously a mistake ("o") — e.g. the\n` +
+      `value clearly refers to the original group's entity and not the destination's (a likely\n` +
+      `accidental drag).\n\n` +
       blocks,
     );
   }
@@ -512,30 +737,14 @@ function buildValidationUserTurn(
   return sections.join('\n\n---\n\n');
 }
 
-async function callValidationLLM(apiKey: string, userTurn: string): Promise<string> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method:  'POST',
-    signal:  AbortSignal.timeout(120_000),
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':          apiKey,
-      'anthropic-version':  '2023-06-01',
-    },
-    body: JSON.stringify({
-      model:       VALIDATION_MODEL,
-      max_tokens:  VALIDATION_MAX_TOKENS,
-      temperature: 0,
-      system:      VALIDATION_SYSTEM_PROMPT,
-      messages:    [{ role: 'user', content: userTurn }],
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text().catch(() => '');
-    throw new Error(`[op-export] Validation LLM error ${res.status}: ${err.slice(0, 400)}`);
-  }
-
-  const body = await res.json() as { content?: Array<{ type: string; text?: string }> };
+async function callValidationLLM(apiKey: string, systemPrompt: string, userTurn: string): Promise<string> {
+  const body = await callAnthropicWithRetry(apiKey, {
+    model:       VALIDATION_MODEL,
+    max_tokens:  VALIDATION_MAX_TOKENS,
+    temperature: 0,
+    system:      systemPrompt,
+    messages:    [{ role: 'user', content: userTurn }],
+  }, 'export validation');
   return (body.content ?? [])
     .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text)
@@ -558,6 +767,7 @@ async function writeAllDecisions(
   caseBGroups: CaseBGroup[],
   decisions:   ValidationResponse | null,
   domainId:    number | null = null,
+  caseCItems:  CaseCItem[] = [],
 ): Promise<{ items_written: number; aliases_updated: number }> {
   // Build a map: literal_value → final alias, starting from user's current grouping.
   const finalAlias = new Map<string, string>();
@@ -574,6 +784,17 @@ async function writeAllDecisions(
   }
   for (const item of caseAItems) {
     const k = caseADecisions.get(item.literal_value) ?? 'u';
+    finalAlias.set(item.literal_value, k === 'o' ? item.original_alias_name : item.user_moved_to);
+  }
+
+  // Override Case C items per LLM decision (same semantics as Case A; the
+  // revert target is the item's initial high-confidence LLM group).
+  const caseCDecisions = new Map<string, 'u' | 'o'>();
+  for (const d of decisions?.case_c ?? []) {
+    caseCDecisions.set(d.lv, d.k);
+  }
+  for (const item of caseCItems) {
+    const k = caseCDecisions.get(item.literal_value) ?? 'u';
     finalAlias.set(item.literal_value, k === 'o' ? item.original_alias_name : item.user_moved_to);
   }
 
@@ -623,7 +844,7 @@ async function writeAllDecisions(
     const fromRows = await exec(
       connection,
       `SELECT alias_id, usage_count
-       FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
        WHERE alias_name = ? ${domainFilter}`,
       [rename.from],
     );
@@ -635,7 +856,7 @@ async function writeAllDecisions(
     const toRows = await exec(
       connection,
       `SELECT alias_id
-       FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
        WHERE alias_name = ? ${domainFilter}`,
       [rename.to],
     );
@@ -646,21 +867,27 @@ async function writeAllDecisions(
       const toId = Number((toRows[0] as any).ALIAS_ID ?? (toRows[0] as any).alias_id);
       await exec(
         connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
-         SET alias_id = ?, confirmed_at = CURRENT_TIMESTAMP()
+        // Paren-LESS CURRENT_TIMESTAMP: this block has no mssql delegation, so
+        // the same SQL runs on both warehouses. The `CURRENT_TIMESTAMP()` form
+        // is Snowflake-only and fails on SQL Server with "Incorrect syntax near
+        // ')'" (msg 102) — verified live on both. The paren-less form is valid
+        // on Snowflake AND T-SQL, which is why the sibling UPDATE just below
+        // already used it. See KI-105.
+        `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+         SET alias_id = ?, confirmed_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [toId, fromId],
       );
       await exec(
         connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
-         SET usage_count = usage_count + ?, last_used_at = CURRENT_TIMESTAMP()
+        `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+         SET usage_count = usage_count + ?, last_used_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [fromCount, toId],
       );
       await exec(
         connection,
-        `DELETE FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`,
+        `DELETE FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`,
         [fromId],
       );
     } else {
@@ -668,26 +895,41 @@ async function writeAllDecisions(
       // references alias_id, so this single UPDATE is the entire migration.
       await exec(
         connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
-         SET alias_name = ?, last_used_at = CURRENT_TIMESTAMP()
+        // Paren-less for the same dual-dialect reason as above (KI-105).
+        `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+         SET alias_name = ?, last_used_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [rename.to, fromId],
       );
     }
   }
 
-  // ── Log Case A/B decisions ────────────────────────────────────────────────
+  // ── Log Case A/B decisions (append-only audit trail, warehouse-side) ──────
+  // VALIDATION_LOG contains literal source values, so it lives in the
+  // customer's warehouse (data residency), written on the already-open export
+  // connection. Failures are logged but never fail the export.
+  const vlogTable = getWarehouseAdapter().kind === 'mssql'
+    ? 'INTERNAL.VALIDATION_LOG'
+    : 'PRISM_DB.INTERNAL.VALIDATION_LOG';
+  const insertValidationLog = async (
+    literalValue: string, originalAlias: string, changedTo: string, k: string,
+  ) => {
+    try {
+      await exec(
+        connection,
+        `INSERT INTO ${vlogTable}
+           (literal_value, run_id, original_alias_name, user_changed_to, llm_decision)
+         VALUES (?, ?, ?, ?, ?)`,
+        [literalValue.slice(0, 800), runId, originalAlias, changedTo, k === 'u' ? 'user' : 'original'],
+      );
+    } catch (err) {
+      console.error('[op-export] validation_log insert failed (non-fatal):', err);
+    }
+  };
   for (const d of decisions?.case_a ?? []) {
     const item = caseAItems.find((a) => a.literal_value === d.lv);
     if (!item) continue;
-    await exec(
-      connection,
-      `INSERT INTO STAND_DB.STAND_INTERNAL.VALIDATION_LOG
-         (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
-       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
-      [item.literal_value, runId, item.original_alias_name, item.user_moved_to,
-       d.k === 'u' ? 'user' : 'original'],
-    );
+    await insertValidationLog(item.literal_value, item.original_alias_name, item.user_moved_to, d.k);
   }
   for (const d of decisions?.case_b ?? []) {
     const group = caseBGroups.find(
@@ -695,23 +937,17 @@ async function writeAllDecisions(
     );
     if (!group) continue;
     for (const gi of group.group_items) {
-      await exec(
-        connection,
-        `INSERT INTO STAND_DB.STAND_INTERNAL.VALIDATION_LOG
-           (literal_value, run_id, original_alias_name, user_changed_to, llm_decision, decided_at)
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
-        [gi.literal_value, runId, group.original_alias_name, group.user_changed_to,
-         d.k === 'u' ? 'user' : 'original'],
-      );
+      await insertValidationLog(gi.literal_value, group.original_alias_name, group.user_changed_to, d.k);
     }
+  }
+  for (const d of decisions?.case_c ?? []) {
+    const item = caseCItems.find((c) => c.literal_value === d.lv);
+    if (!item) continue;
+    await insertValidationLog(item.literal_value, item.original_alias_name, item.user_moved_to, d.k);
   }
 
   // ── Mark run complete ─────────────────────────────────────────────────────
-  await exec(
-    connection,
-    `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-    [runId],
-  );
+  setRunStatus(runId, 'completed');
 
   return { items_written, aliases_updated: finalAliasNames.size };
 }
@@ -729,7 +965,7 @@ function writeValidationAudit(
   rawResponse: string,
   decisions:  ValidationResponse | null,
   appliedDecisions: Array<{
-    type:              'case_a' | 'case_b';
+    type:              'case_a' | 'case_b' | 'case_c';
     literal_value?:    string;
     original_alias:    string;
     user_changed_to:   string;
@@ -738,6 +974,12 @@ function writeValidationAudit(
   }>,
   error: string | null,
 ): void {
+  // GATE FIRST — this artifact contains the customer's literal values, their
+  // alias names, the full validation prompt and the raw LLM response. It was
+  // previously written UNCONDITIONALLY, on every export with a Case A/B/C
+  // deviation, in every install including customer deployments. Matches the
+  // gating writeOnePromptBreakdown already had.
+  if (process.env.PRISM_DEBUG_ARTIFACTS !== 'true') return;
   try {
     const audit = {
       meta: {
@@ -780,8 +1022,10 @@ function writeValidationAudit(
       applied_decisions: appliedDecisions,
     };
 
-    const projectRoot = path.resolve(process.cwd(), '..');
-    const outPath = path.join(projectRoot, `validation_audit_run_${runId}.json`);
+    // os.tmpdir(), never the project tree. This used to resolve to the PARENT of
+    // the app working directory — i.e. the repo root — so customer values were
+    // written into the checkout itself.
+    const outPath = path.join(os.tmpdir(), `validation_audit_run_${runId}.json`);
     fs.promises.writeFile(outPath, JSON.stringify(audit, null, 2), 'utf8')
       .then(() => console.log(`[op-export] Validation audit written → ${outPath}`))
       .catch((writeErr) => console.warn('[op-export] Could not write validation audit JSON:', writeErr));
@@ -800,54 +1044,71 @@ async function runWriteAndValidatePass(
   caseAItems:     CaseAItem[],
   rawCaseBGroups: Omit<CaseBGroup, 'alias_exact_literal' | 'prior_lookup_literal' | 'current_new_literal' | 'prior_other_literal' | 'total_known_literals'>[],
   apiKey:         string,
+  caseCItems:     CaseCItem[] = [],
 ): Promise<void> {
-  await withSnowflake(async (connection) => {
+  await withWarehouse(async (connection) => {
     try {
       // Fetch domain_id first — needed for both the Case B context lookup and writeAllDecisions.
-      const domainRows = await exec(
-        connection,
-        `SELECT domain_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
-        [runId],
-      );
-      const exportDomainId: number | null =
-        domainRows.length > 0
-          ? (Number((domainRows[0] as any).DOMAIN_ID ?? (domainRows[0] as any).domain_id) || null)
-          : null;
+      const domainRow = getDb().prepare(`SELECT domain_id FROM runs WHERE run_id = ?`).get(runId) as any;
+      const exportDomainId: number | null = domainRow ? (Number(domainRow.domain_id) || null) : null;
 
       let decisions:  ValidationResponse | null = null;
       let rawText   = '';
       let userTurn  = '';
       let caseBGroups: CaseBGroup[] = [];
+      let validationError: string | null = null;
 
-      if (caseAItems.length > 0 || rawCaseBGroups.length > 0) {
+      const systemPrompt = buildValidationSystemPrompt(loadValidationSpecContext(runId));
+
+      if (caseAItems.length > 0 || rawCaseBGroups.length > 0 || caseCItems.length > 0) {
         const _valStart = Date.now();
         caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups, exportDomainId);
-        userTurn    = buildValidationUserTurn(caseAItems, caseBGroups);
-        rawText     = await callValidationLLM(apiKey, userTurn);
-        decisions   = tryParseJson<ValidationResponse>(rawText);
-        appendTiming(`[Timing] accept.validation_llm: ${Date.now() - _valStart}ms (${caseAItems.length} caseA, ${rawCaseBGroups.length} caseB)`);
+        userTurn    = buildValidationUserTurn(caseAItems, caseBGroups, caseCItems);
+        try {
+          rawText   = await callValidationLLM(apiKey, systemPrompt, userTurn);
+          decisions = tryParseJson<ValidationResponse>(rawText);
+          if (!decisions) {
+            // One retry with an explicit JSON-only reminder (parity with the
+            // grouping calls).
+            rawText   = await callValidationLLM(apiKey, systemPrompt, userTurn + JSON_ONLY_REMINDER);
+            decisions = tryParseJson<ValidationResponse>(rawText);
+          }
+        } catch (err) {
+          validationError = err instanceof Error ? err.message : String(err);
+        }
+        appendTiming(`[Timing] accept.validation_llm: ${Date.now() - _valStart}ms (${caseAItems.length} caseA, ${rawCaseBGroups.length} caseB, ${caseCItems.length} caseC)`);
 
+        // FAIL-OPEN: a validation failure never blocks the write. The user's
+        // decisions are written at face value (decisions = null → every case
+        // defaults to keeping the user's change) and validation_status:
+        // 'failed' is recorded in the state blob after the write.
         if (!decisions) {
-          console.error(`[op-export] Run ${runId}: failed to parse validation LLM response.\nRaw: ${rawText.slice(0, 800)}`);
+          validationError ??= 'Failed to parse LLM response as JSON';
+          console.error(`[op-export] Run ${runId}: validation LLM failed — proceeding with the user's decisions unvalidated. ${validationError}\nRaw: ${rawText.slice(0, 800)}`);
           writeValidationAudit(
             runId, caseAItems, caseBGroups,
-            VALIDATION_SYSTEM_PROMPT, userTurn, rawText,
+            systemPrompt, userTurn, rawText,
             null, [],
-            'Failed to parse LLM response as JSON',
+            validationError,
           );
-          await exec(
-            connection,
-            `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-            [runId],
-          );
-          return;
         }
       }
 
-      // Step 4: write everything (normal items + Case A/B decisions) in one pass.
+      // Step 4: write everything (normal items + Case A/B/C decisions) in one pass.
       const _writeStart = Date.now();
-      await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions, exportDomainId);
+      await writeAllDecisions(connection, runId, state, caseAItems, caseBGroups, decisions, exportDomainId, caseCItems);
       appendTiming(`[Timing] accept.write_decisions: ${Date.now() - _writeStart}ms (lookup + alias upserts)`);
+
+      // Record the validation outcome in the state blob (the run itself stays
+      // 'completed' — the write landed; only validation was skipped).
+      if (validationError !== null) {
+        try {
+          const st = await loadOpRunState(runId);
+          if (st) await saveOpRunState(runId, { ...st, validation_status: 'failed', rev: Number(st.rev ?? 0) + 1 });
+        } catch (e) {
+          console.warn(`[op-export] Run ${runId}: could not record validation_status in state blob:`, e);
+        }
+      }
       const _rebuildStart = Date.now();
 
       // ── Premium mode: rebuild all domain pipelines + clean queue ─────────
@@ -866,15 +1127,13 @@ async function runWriteAndValidatePass(
           const standardizedLiterals = state.groups.flatMap((g) => g.items.map((gi) => gi.literal_value));
 
           // Seed Redis auto-export baseline from the run's source table (once only).
-          const runSourceRows = await exec(
-            connection,
-            `SELECT source_relation, source_column FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ? LIMIT 1`,
-            [runId],
-          );
-          if (runSourceRows.length > 0) {
-            const r          = runSourceRows[0] as any;
-            const tableFqn   = String(r.SOURCE_RELATION ?? r.source_relation ?? '');
-            const columnName = String(r.SOURCE_COLUMN   ?? r.source_column   ?? '');
+          const runSourceRow = getDb()
+            .prepare(`SELECT source_relation, source_column FROM runs WHERE run_id = ?`)
+            .get(runId) as any;
+          if (runSourceRow) {
+            const r          = runSourceRow;
+            const tableFqn   = String(r.source_relation ?? '');
+            const columnName = String(r.source_column   ?? '');
             if (tableFqn && columnName) {
               const alreadySet = await hasBaseline(tableFqn, columnName);
               if (!alreadySet) {
@@ -893,19 +1152,21 @@ async function runWriteAndValidatePass(
           const domainCond = exportDomainId != null
             ? `p.domain_id = ${Number(exportDomainId)}`
             : `p.domain_id IS NULL`;
-          const domainPipelines = await exec(
-            connection,
-            `SELECT p.pipeline_id, p.table_fqn, p.column_name, p.export_table_fqn, p.status
-             FROM STAND_DB.STAND_INTERNAL.PIPELINES p
-             WHERE p.status IN ('active', 'paused', 'pending_baseline') AND ${domainCond}
-             ORDER BY p.pipeline_id`,
-          );
+          const domainPipelines = getDb()
+            .prepare(
+              `SELECT p.pipeline_id, p.table_fqn, p.column_name, p.export_table_fqn, p.export_kind, p.status
+               FROM pipelines p
+               WHERE p.status IN ('active', 'paused', 'pending_baseline') AND ${domainCond}
+               ORDER BY p.pipeline_id`,
+            )
+            .all() as any[];
 
           for (const pRow of domainPipelines) {
-            const pipelineId     = Number((pRow as any).PIPELINE_ID      ?? (pRow as any).pipeline_id);
-            const tableFqn       = String((pRow as any).TABLE_FQN         ?? (pRow as any).table_fqn       ?? '');
-            const colName        = String((pRow as any).COLUMN_NAME       ?? (pRow as any).column_name     ?? '');
-            const exportTableFqn = ((pRow as any).EXPORT_TABLE_FQN ?? (pRow as any).export_table_fqn) as string | null;
+            const pipelineId     = Number(pRow.pipeline_id);
+            const tableFqn       = String(pRow.table_fqn       ?? '');
+            const colName        = String(pRow.column_name     ?? '');
+            const exportTableFqn = pRow.export_table_fqn as string | null;
+            const exportKind     = asExportKind(pRow.export_kind);
             const pStatus        = String((pRow as any).STATUS ?? (pRow as any).status ?? '');
 
             if (!tableFqn || !colName) continue;
@@ -917,8 +1178,11 @@ async function runWriteAndValidatePass(
               // activation card ("Begin Pipeline Standardization") — which flips it to
               // 'active' and builds the export then. Until then we only refresh metrics
               // (total_mapped / total_source_values) so the activation card is accurate.
-              if (exportTableFqn && pStatus === 'active') {
-                await refreshExportTable(tableFqn, colName, exportTableFqn, exportDomainId, pipelineId);
+              // A view is live already — it only needs creating once, at activation
+              // (handled by the pipeline status route), so every pass after that only
+              // recomputes metrics, same as a pipeline with no export object at all.
+              if (exportTableFqn && pStatus === 'active' && exportKind !== 'view') {
+                await refreshExportTable(tableFqn, colName, exportTableFqn, exportDomainId, pipelineId, exportKind);
               } else {
                 await updatePipelineMappedCount(tableFqn, colName, exportDomainId, pipelineId);
               }
@@ -930,40 +1194,62 @@ async function runWriteAndValidatePass(
             // and update queue_size / last_queue_empty_at atomically.
             if (standardizedLiterals.length > 0) {
               try {
+                // Match the queue on the NORMALIZED form, not the raw literal.
+                //
+                // Every writer into PIPELINE_QUEUE dedups on the normalized
+                // value and stores an ARBITRARY representative original, so the
+                // queue may hold 'at&t' while the reviewed run wrote 'AT&T'.
+                // A raw `literal_value IN (...)` comparison misses those rows,
+                // leaving already-standardized values queued forever: they get
+                // re-standardized every tick, keep queue_size non-zero, and so
+                // hold fully_synced_at back — the card says "not up to date"
+                // about work that is finished. Live-reproduced on both
+                // warehouses (EXP-01).
+                //
+                // Done app-side rather than with PRISM_NORMALIZE so the one
+                // normalization implementation (normalizeLiteral) decides, and
+                // so this path behaves identically on SQL Server, which has no
+                // SQL-side normalize at all. Scoped to this pipeline's queue,
+                // which is bounded by its distinct source values.
+                const wantNormalized = new Set(standardizedLiterals.map((lv) => normalizeLiteral(lv)));
                 const queueHitRows = await exec(
                   connection,
-                  `SELECT literal_value FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
-                   WHERE pipeline_id = ?
-                     AND literal_value IN (${standardizedLiterals.map(() => '?').join(', ')})`,
-                  [pipelineId, ...standardizedLiterals],
+                  `SELECT literal_value FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+                   WHERE pipeline_id = ?`,
+                  [pipelineId],
                 );
-                const toRemove = queueHitRows.map((r: any) => String(r.LITERAL_VALUE ?? r.literal_value ?? '')).filter(Boolean);
+                const toRemove = queueHitRows
+                  .map((r: any) => String(r.LITERAL_VALUE ?? r.literal_value ?? ''))
+                  .filter((lv: string) => lv && wantNormalized.has(normalizeLiteral(lv)));
 
-                if (toRemove.length > 0) {
+                // Batched under the adapter's bind budget, same as the tick's
+                // removeExportedFromQueue: a large drain would otherwise blow
+                // SQL Server's ~2.1k-parameter ceiling in a single statement.
+                const DEL_BATCH = Math.max(100, getWarehouseAdapter().bindLimit - 100);
+                for (let i = 0; i < toRemove.length; i += DEL_BATCH) {
+                  const batch = toRemove.slice(i, i + DEL_BATCH);
                   await exec(
                     connection,
-                    `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
-                     WHERE pipeline_id = ? AND literal_value IN (${toRemove.map(() => '?').join(', ')})`,
-                    [pipelineId, ...toRemove],
+                    `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+                     WHERE pipeline_id = ? AND literal_value IN (${batch.map(() => '?').join(', ')})`,
+                    [pipelineId, ...batch],
                   );
                 }
 
                 // Update queue_size (and last_queue_empty_at if now empty) regardless.
                 const [qRow] = await exec(
                   connection,
-                  `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+                  `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
                   [pipelineId],
                 );
                 const remaining = Number((qRow as any)?.CNT ?? (qRow as any)?.cnt ?? 0);
-                const setClauses = ['queue_size = ?', 'updated_at = CURRENT_TIMESTAMP()'];
+                const setClauses = [`queue_size = ?`, `updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`];
                 const updateBinds: any[] = [remaining];
-                if (remaining === 0) setClauses.push('last_queue_empty_at = CURRENT_TIMESTAMP()');
+                if (remaining === 0) setClauses.push(`last_queue_empty_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
                 updateBinds.push(pipelineId);
-                await exec(
-                  connection,
-                  `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES SET ${setClauses.join(', ')} WHERE pipeline_id = ?`,
-                  updateBinds,
-                );
+                getDb()
+                  .prepare(`UPDATE pipelines SET ${setClauses.join(', ')} WHERE pipeline_id = ?`)
+                  .run(...updateBinds);
 
                 if (toRemove.length > 0) {
                   console.log(
@@ -977,7 +1263,7 @@ async function runWriteAndValidatePass(
             }
           }
 
-          appendTiming(`[Timing] accept.export_rebuild+metrics: ${Date.now() - _rebuildStart}ms (${domainPipelines.length} domain pipeline(s))`);
+          appendTiming(`[Timing] accept.export_rebuild+metrics: ${Date.now() - _rebuildStart}ms (${domainPipelines.length} spec-scoped pipeline(s))`);
 
           // The write+export+metric refresh above runs in this background pass —
           // AFTER the export route already returned 200 to the client. Tell the UI
@@ -1016,23 +1302,33 @@ async function runWriteAndValidatePass(
           apply_to_all:    d.apply_to_all,
         });
       }
+      for (const d of decisions?.case_c ?? []) {
+        const item = caseCItems.find((c) => c.literal_value === d.lv);
+        if (!item) continue;
+        appliedDecisions.push({
+          type:            'case_c',
+          literal_value:   item.literal_value,
+          original_alias:  item.original_alias_name,
+          user_changed_to: item.user_moved_to,
+          llm_decision:    d.k === 'u' ? 'user' : 'original',
+        });
+      }
 
-      writeValidationAudit(
-        runId, caseAItems, caseBGroups,
-        VALIDATION_SYSTEM_PROMPT, userTurn, rawText,
-        decisions, appliedDecisions,
-        null,
-      );
+      if (decisions !== null) {
+        writeValidationAudit(
+          runId, caseAItems, caseBGroups,
+          systemPrompt, userTurn, rawText,
+          decisions, appliedDecisions,
+          null,
+        );
+      }
 
       const aCount = appliedDecisions.filter((d) => d.type === 'case_a').length;
       const bCount = appliedDecisions.filter((d) => d.type === 'case_b').length;
-      console.log(`[op-export] Run ${runId}: write+validate complete — ${aCount} Case A, ${bCount} Case B decisions applied.`);
+      const cCount = appliedDecisions.filter((d) => d.type === 'case_c').length;
+      console.log(`[op-export] Run ${runId}: write+validate complete — ${aCount} Case A, ${bCount} Case B, ${cCount} Case C decisions applied.`);
     } catch (err) {
-      await exec(
-        connection,
-        `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-        [runId],
-      ).catch(() => {});
+      try { setRunStatus(runId, 'failed'); } catch { /* best-effort */ }
       throw err;
     }
   });
@@ -1049,9 +1345,21 @@ async function runWriteAndValidatePass(
  * round-trip.  Export always succeeds and returns the run's grouping counts.
  *
  * Backend table writes (LITERAL_ALIAS_MATCHES, APPROVED_ALIAS_NAMES,
- * VALIDATION_LOG) are triggered only on the FIRST export — i.e. when
- * currentStatus is not already 'validating', 'completed', or 'failed'.
- * Subsequent exports return the same counts without re-triggering the write pass.
+ * VALIDATION_LOG) are triggered only when the run has not already been claimed
+ * or finished — i.e. when currentStatus is not 'validating' or 'completed'.
+ *
+ * 'failed' is DELIBERATELY retriable and must stay out of that exclusion list.
+ * It used to be excluded, which turned an idempotency guard into a data-loss
+ * path: once a mid-write failure marked a run 'failed', re-POSTing the export
+ * skipped writeAllDecisions entirely and returned a SUCCESS-shaped result
+ * computed from the state blob, while the caller went on to clear
+ * PIPELINE_QUEUE and advance the pipeline — so the user saw a successful
+ * export, the queue emptied, and no mappings were ever written. Nothing else in
+ * the codebase resets a user-driven run to 'created', so there was no recovery
+ * path at all.
+ *
+ * Callers MUST branch on `already_in_progress` before treating an export as
+ * committed: when it is true no write pass ran on this call.
  */
 export async function runOpExport(
   connection:    any,
@@ -1061,27 +1369,25 @@ export async function runOpExport(
   opts?:         { awaitWrite?: boolean },
 ): Promise<ExportResult> {
   // Step 1 — read state blob.
-  const state = await loadOpRunState(connection, runId);
+  const state = await loadOpRunState(runId);
   if (!state) throw new Error(`[op-export] No state found for run_id=${runId}`);
 
   // Compute return counts from state (always returned regardless of status).
   const items_written   = state.groups.reduce((n, g) => n + g.items.length, 0);
   const aliases_updated = new Set(state.groups.map((g) => g.alias_name)).size;
 
+  // NOTE: 'failed' is intentionally absent — see the doc comment above. Only a
+  // run that is mid-write ('validating') or already committed ('completed') may
+  // skip the write pass.
   const isFirstExport = currentStatus !== 'validating'
-                     && currentStatus !== 'completed'
-                     && currentStatus !== 'failed';
+                     && currentStatus !== 'completed';
 
   if (isFirstExport) {
-    // Step 2 — detect Case A/B from state (no DB writes).
-    const { caseAItems, caseBGroups: rawCaseBGroups } = detectCases(state);
+    // Step 2 — detect Case A/B/C from state (no DB writes).
+    const { caseAItems, caseBGroups: rawCaseBGroups, caseCItems } = detectCases(state);
 
     // Mark run as 'validating' so concurrent first-export calls are recognised.
-    await exec(
-      connection,
-      `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-      [runId],
-    );
+    setRunStatus(runId, 'validating');
 
     // Steps 3–4 — opens its own Snowflake connection.
     // Normally fire-and-forget so the user gets a fast export confirmation, with
@@ -1092,13 +1398,32 @@ export async function runOpExport(
     // current. For a brand-new pipeline there are no lookup matches yet, so there
     // is no Case A/B validation LLM call — the await is just the DB writes +
     // export rebuild (a few seconds), not an LLM round-trip.
-    const writePass = runWriteAndValidatePass(runId, state, caseAItems, rawCaseBGroups, apiKey).catch((err) => {
-      console.error(`[op-export] ${opts?.awaitWrite ? 'Awaited' : 'Background'} write+validate failed for run ${runId}:`, err);
-    });
-    if (opts?.awaitWrite) await writePass;
+    const writePass = runWriteAndValidatePass(runId, state, caseAItems, rawCaseBGroups, apiKey, caseCItems);
+
+    if (opts?.awaitWrite) {
+      // PROPAGATE when the caller is waiting. runWriteAndValidatePass already
+      // marks the run 'failed' and rethrows; swallowing that into console.error
+      // meant even the AWAITED path resolved normally and returned
+      // blob-derived counts, so the pipeline-creation wizard and
+      // commit-standardizations reported a successful export ({items_written:3,
+      // aliases_updated:2}) for a write that had failed outright. The caller
+      // asked to wait precisely so it could act on the outcome — give it one.
+      await writePass;
+    } else {
+      // Fire-and-forget: the HTTP response has already been sent, so there is
+      // nobody to reject to. Log AND report, so a background failure reaches
+      // Sentry instead of dying in a server log nobody reads. The run is left
+      // marked 'failed' by runWriteAndValidatePass, which (since KI-202) is a
+      // retriable state.
+      void writePass.catch((err) => {
+        reportError(err, { runId, phase: 'background-write-validate' });
+      });
+    }
   }
 
-  return { items_written, aliases_updated };
+  // Tell the caller whether a write pass actually ran on THIS call, so it can
+  // avoid treating a no-op as a committed export (see KI-202).
+  return { items_written, aliases_updated, already_in_progress: !isFirstExport };
 }
 
 /**
@@ -1110,44 +1435,57 @@ export async function runOpExport(
 export async function runOpExportDirect(
   runId: number,
 ): Promise<ExportResult> {
-  return await withSnowflake(async (connection) => {
-    const state = await loadOpRunState(connection, runId);
+  return await withWarehouse(async (connection) => {
+    const state = await loadOpRunState(runId);
     if (!state) throw new Error(`[op-export] No state found for run_id=${runId}`);
 
     // Fetch run metadata + matching pipeline in one query so we can rebuild
     // the export table / update total_mapped after writes commit.
-    const runMetaRows = await exec(
-      connection,
-      `SELECT r.domain_id,
-              p.pipeline_id,
-              p.table_fqn    AS pipeline_table_fqn,
-              p.column_name  AS pipeline_column_name,
-              p.export_table_fqn
-       FROM STAND_DB.STAND_INTERNAL.RUNS r
-       LEFT JOIN STAND_DB.STAND_INTERNAL.PIPELINES p
-         ON  p.table_fqn   = r.source_relation
-         AND p.column_name = r.source_column
-         AND (
-           (p.domain_id IS NULL AND r.domain_id IS NULL) OR
-           p.domain_id = r.domain_id
-         )
-       WHERE r.run_id = ?
-       LIMIT 1`,
-      [runId],
-    );
-
-    const metaRow  = runMetaRows.length > 0 ? (runMetaRows[0] as any) : null;
+    const metaRow = getDb()
+      .prepare(
+        `SELECT r.domain_id,
+                p.pipeline_id,
+                p.table_fqn    AS pipeline_table_fqn,
+                p.column_name  AS pipeline_column_name,
+                p.export_table_fqn,
+                p.export_kind
+         FROM runs r
+         LEFT JOIN pipelines p
+           ON  p.table_fqn   = r.source_relation
+           AND p.column_name = r.source_column
+           AND (
+             (p.domain_id IS NULL AND r.domain_id IS NULL) OR
+             p.domain_id = r.domain_id
+           )
+         WHERE r.run_id = ?`,
+      )
+      .get(runId) as any ?? null;
     const domainId: number | null = metaRow
-      ? (Number(metaRow.DOMAIN_ID ?? metaRow.domain_id) || null)
+      ? (Number(metaRow.domain_id) || null)
       : null;
 
-    await exec(
-      connection,
-      `UPDATE STAND_DB.STAND_INTERNAL.RUNS SET run_status = 'validating', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-      [runId],
-    );
+    setRunStatus(runId, 'validating');
 
-    const result = await writeAllDecisions(connection, runId, state, [], [], null, domainId);
+    // Mark the run 'failed' if the write dies mid-flight, then rethrow.
+    //
+    // Without this, a mid-write failure left the run stranded at 'validating'
+    // forever: createRunFromQueue's retry-reuse lookup only matches
+    // 'created'/'running', so every subsequent tick INSERTed a fresh RUNS row
+    // instead of reusing the pending one — the exact pileup the reuse lookup
+    // exists to prevent — and each orphan kept its own RUN_STATE blob holding
+    // customer values. runWriteAndValidatePass (the user-facing export) has
+    // always done this; runOpExportDirect (the automated tick path) never did.
+    //
+    // 'failed' rather than resetting to 'created': it is honest about what
+    // happened, and since KI-202 'failed' is a retriable state that
+    // runOpExport will re-attempt, so nothing is stuck.
+    let result: ExportResult;
+    try {
+      result = await writeAllDecisions(connection, runId, state, [], [], null, domainId);
+    } catch (writeErr) {
+      try { setRunStatus(runId, 'failed'); } catch { /* best-effort */ }
+      throw writeErr;
+    }
 
     // ── Rebuild export table + update metrics once writes have committed ───────
     // Awaited (not fire-and-forget) so that PIPELINES.total_mapped /
@@ -1155,21 +1493,31 @@ export async function runOpExportDirect(
     // caller removes items from PIPELINE_QUEUE.
     if (metaRow) {
       const exportTableFqn = (metaRow.EXPORT_TABLE_FQN ?? metaRow.export_table_fqn) as string | null;
+      const exportKind     = asExportKind(metaRow.EXPORT_KIND ?? metaRow.export_kind);
       const tableFqn       = String(metaRow.PIPELINE_TABLE_FQN   ?? metaRow.pipeline_table_fqn   ?? '');
       const colName        = String(metaRow.PIPELINE_COLUMN_NAME  ?? metaRow.pipeline_column_name  ?? '');
       const pipelineId     = (metaRow.PIPELINE_ID ?? metaRow.pipeline_id) != null
         ? Number(metaRow.PIPELINE_ID ?? metaRow.pipeline_id) : null;
 
       try {
-        if (exportTableFqn && pipelineId != null) {
-          await refreshExportTable(tableFqn, colName, exportTableFqn, domainId, pipelineId);
+        // A view is always live — never needs rebuilding, only metrics recomputed
+        // (same as the no-export-object case).
+        if (exportTableFqn && exportKind !== 'view' && pipelineId != null) {
+          await refreshExportTable(tableFqn, colName, exportTableFqn, domainId, pipelineId, exportKind);
         } else if (pipelineId != null && tableFqn && colName) {
           await updatePipelineMappedCount(tableFqn, colName, domainId, pipelineId);
         }
         broadcastPipelineEvent({ type: 'metrics_updated' });
       } catch (err) {
-        // Non-fatal — metrics can be corrected on the next poll / refresh.
-        console.error(`[op-export] Metric update failed for run ${runId}:`, err);
+        // Non-fatal to the MAPPINGS — those are already committed above, and
+        // metrics can be corrected on the next poll / refresh. But the caller
+        // must be told, because the customer-visible export object was NOT
+        // rebuilt: draining the queue and stamping "standardized table last
+        // updated just now" on the back of a failed rebuild is exactly the
+        // false-freshness bug (KI-146).
+        console.error(`[op-export] Export/metric refresh failed for run ${runId}:`, err);
+        reportError(err, { runId, phase: 'export-refresh' });
+        result.export_refresh_failed = true;
       }
     }
 

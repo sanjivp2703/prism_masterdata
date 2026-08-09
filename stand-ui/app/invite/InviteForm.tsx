@@ -208,6 +208,13 @@ export default function InviteForm() {
                     </div>
                   ))}
                 </div>
+                {/* Expiry stated BEFORE sending, not only on the confirmation
+                    screen. The security doc credits "7-day expiry" as part of
+                    what the admin is told at invite time, but it only rendered
+                    after the invite had already gone out (SEC-07). */}
+                <p className="text-[11px] mt-2" style={{ color: 'var(--text-hint)' }}>
+                  The invitation link expires in 7 days.
+                </p>
               </div>
             </div>
 

@@ -1,15 +1,18 @@
 'use client';
 
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { createPortal } from 'react-dom';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import type { Domain } from '@/app/components/domain-types';
-import CompactDomainPicker from '@/app/components/CompactDomainPicker';
+import {
+  emptyColumnSpecDraft, columnSpecDraftValid, columnSpecDraftToApiSpec,
+  type ColumnSpecDraft,
+} from '@/app/components/ColumnSpecEditor';
+import ColumnSpecField from '@/app/components/ColumnSpecField';
 import PipelinesView, { type Pipeline } from './PipelinesView';
-import StandardizationsView from './StandardizationsView';
+import OneTimeArchiveView from './OneTimeArchiveView';
 import OneTimeStandardizationCard from './OneTimeStandardizationCard';
-import FilePipelineConnectForm, { type FileSourceType } from './FilePipelineConnectForm';
+import UpdateScheduleEditor from '@/app/components/UpdateScheduleEditor';
+import { DEFAULT_UPDATE_SCHEDULE, type UpdateSchedule } from '@/app/api/_lib/update-schedule';
 
 // ── Layout ──────────────────────────────────────────────────────────────────────
 const SIDEBAR_WIDTH = 228;
@@ -17,17 +20,17 @@ const SIDEBAR_WIDTH = 228;
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ColumnEntry {
-  id:                string;
-  columnName:        string;
-  selectedDomain:    Domain | null;
+  id:         string;
+  columnName: string;
+  spec:       ColumnSpecDraft;
 }
 
 let _entryCounter = 0;
 function mkEntry(overrides: Partial<ColumnEntry> = {}): ColumnEntry {
   return {
-    id:             `e${++_entryCounter}`,
-    columnName:     '',
-    selectedDomain: null,
+    id:         `e${++_entryCounter}`,
+    columnName: '',
+    spec:       emptyColumnSpecDraft(),
     ...overrides,
   };
 }
@@ -38,22 +41,18 @@ function suggestExport(tableFqn: string): string {
   return `${t}_STANDARDIZED`;
 }
 
+function tableShortName(fqn: string): string {
+  if (fqn.startsWith('SHEETS:')) {
+    const parts = fqn.split(':');
+    return parts[2] || 'Google Sheet';
+  }
+  const parts = fqn.split('.');
+  return parts[parts.length - 1] || fqn;
+}
+
 // Demo-data mode: prefills the connect form with the seeded TEST_DB demo table.
 // Off by default so real customers see a clean empty form.
 const DEMO_DATA = process.env.NEXT_PUBLIC_PRISM_DEMO_DATA === 'true';
-
-// Default domain (by name) for known demo columns (demo mode only). The matching
-// Domain object is resolved once /api/domains has loaded (domain IDs are autoincrement).
-const DEFAULT_COLUMN_DOMAINS: Record<string, string> = {
-  RAW_CARRIER_VALUE: 'Mobile Carrier',
-  RAW_COMPANY_VALUE: 'Company Name',
-};
-function defaultDomainForColumn(columnName: string, domainsList: Domain[]): Domain | null {
-  if (!DEMO_DATA) return null;
-  const target = DEFAULT_COLUMN_DOMAINS[columnName.trim().toUpperCase()];
-  if (!target) return null;
-  return domainsList.find(d => d.name === target) ?? null;
-}
 
 // ── Prism mark ────────────────────────────────────────────────────────────────
 // ── Sidebar / step icons ────────────────────────────────────────────────────────
@@ -94,147 +93,6 @@ function IconGuide() {
   );
 }
 
-// ── Domain info modal ─────────────────────────────────────────────────────────
-function DomainInfoTooltip() {
-  const [open, setOpen] = useState(false);
-
-  const modal = open && typeof document !== 'undefined' ? createPortal(
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center"
-      style={{ backgroundColor: 'rgba(26,26,46,0.35)' }}
-      onClick={() => setOpen(false)}
-    >
-      <div
-        className="rounded-card border-[0.5px] w-full mx-4 overflow-y-auto"
-        style={{
-          backgroundColor: 'var(--surface)', borderColor: 'var(--border)',
-          padding: '20px 22px', maxHeight: '88vh', maxWidth: 400,
-        }}
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between mb-3">
-          <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>What is a domain?</p>
-          <button
-            type="button"
-            onClick={() => setOpen(false)}
-            aria-label="Close"
-            style={{
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              width: 22, height: 22, borderRadius: '50%', border: '0.5px solid var(--border)',
-              backgroundColor: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', flexShrink: 0,
-            }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-              <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-            </svg>
-          </button>
-        </div>
-
-        <p className="text-[12px] leading-relaxed mb-4" style={{ color: 'var(--text-secondary)' }}>
-          A domain groups columns that standardize the same kind of value.
-        </p>
-
-        <ul className="flex flex-col gap-2.5 mb-4" style={{ paddingLeft: 0, listStyle: 'none', margin: 0 }}>
-          {[
-            'Naming conventions are configured per domain and applied to values in every column linked to that domain.',
-            'Columns in the same domain share one lookup table — a confirmed mapping in one pipeline is reused by all others.',
-          ].map((point, i) => (
-            <li key={i} className="flex items-start gap-2">
-              <span style={{ color: 'var(--accent)', flexShrink: 0, marginTop: 2 }}>
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-                  <path d="M2 5l2.5 2.5L8 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-              </span>
-              <span className="text-[12px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{point}</span>
-            </li>
-          ))}
-        </ul>
-
-        {/* Examples of Domains */}
-        <div style={{ borderTop: '0.5px solid var(--border)', paddingTop: 12 }}>
-          <p className="text-[10px] font-semibold uppercase tracking-wide mb-2.5" style={{ color: 'var(--text-hint)' }}>Examples of Domains</p>
-          <div className="flex flex-col gap-2">
-            {([
-              {
-                domain: 'Company Name',
-                columns: [
-                  { col: 'VENDOR_NAME',      table: 'sales.ORDERS' },
-                  { col: 'SUPPLIER_COMPANY', table: 'procurement.CONTRACTS' },
-                ],
-              },
-              {
-                domain: 'Drug Name',
-                columns: [
-                  { col: 'MEDICATION', table: 'patient.PRESCRIPTIONS' },
-                  { col: 'DRUG',       table: 'safety.ADVERSE_EVENTS' },
-                ],
-              },
-            ] as const).map(ex => (
-              <div
-                key={ex.domain}
-                className="rounded-button border-[0.5px] px-3 py-2.5"
-                style={{ borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}
-              >
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <span className="text-[11px] font-semibold" style={{ color: 'var(--accent)' }}>{ex.domain}</span>
-                  <span className="text-[10px]" style={{ color: 'var(--text-hint)' }}>domain</span>
-                </div>
-                <div className="flex flex-col gap-1">
-                  {ex.columns.map(c => (
-                    <div key={c.col} className="flex items-center gap-1.5">
-                      <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
-                        <path d="M3 1L6 4L3 7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" style={{ color: 'var(--accent)' }}/>
-                      </svg>
-                      <span className="text-[11px] font-mono font-medium" style={{ color: 'var(--text-primary)' }}>{c.col}</span>
-                      <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>in {c.table}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setOpen(false)}
-          className="w-full mt-4 py-2 text-xs font-medium rounded-button border-[0.5px] transition-colors"
-          style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
-          onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
-        >
-          Close
-        </button>
-      </div>
-    </div>,
-    document.body,
-  ) : null;
-
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center' }}>
-      <button
-        type="button"
-        onClick={e => { e.stopPropagation(); setOpen(true); }}
-        aria-label="What is a domain?"
-        style={{
-          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          width: 16, height: 16, borderRadius: '50%',
-          backgroundColor: 'var(--accent)', border: 'none',
-          color: '#fff', cursor: 'pointer', flexShrink: 0,
-          padding: 0,
-        }}
-      >
-        <svg width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-          <path d="M5 4.5v3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-          <circle cx="5" cy="3" r="0.75" fill="currentColor"/>
-        </svg>
-      </button>
-      {modal}
-    </span>
-  );
-}
-
 // ── Spinner ───────────────────────────────────────────────────────────────────
 function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
   return (
@@ -253,9 +111,8 @@ interface TableColumn { name: string; type: string; isText: boolean }
 
 function ColumnPicker({
   columns, loading, error, hasTable,
-  entries, existingColNames,
-  domains, domainsLoading, busy,
-  onToggle, onSetDomain, onDomainCreated,
+  entries, existingColNames, busy,
+  onToggle, onSetSpec,
 }: {
   columns:          TableColumn[];
   loading:          boolean;
@@ -263,16 +120,13 @@ function ColumnPicker({
   hasTable:         boolean;
   entries:          ColumnEntry[];
   existingColNames: Set<string>;
-  domains:          Domain[];
-  domainsLoading:   boolean;
   busy:             boolean;
   onToggle:         (name: string) => void;
-  onSetDomain:      (name: string, d: Domain | null) => void;
-  onDomainCreated:  (d: Domain) => void;
+  onSetSpec:        (name: string, spec: ColumnSpecDraft) => void;
 }) {
   const [filter, setFilter] = useState('');
-  const selectedDomainOf = (name: string) =>
-    entries.find(e => e.columnName.toUpperCase() === name.toUpperCase())?.selectedDomain ?? null;
+  const specOf = (name: string) =>
+    entries.find(e => e.columnName.toUpperCase() === name.toUpperCase())?.spec ?? emptyColumnSpecDraft();
   const isSelected = (name: string) =>
     entries.some(e => e.columnName.toUpperCase() === name.toUpperCase());
 
@@ -329,29 +183,34 @@ function ColumnPicker({
           const disabled = blocked || busy;
           return (
             <div key={col.name} style={{ borderTop: i > 0 ? '0.5px solid var(--border)' : undefined }}>
-              <button
-                type="button"
-                disabled={disabled}
-                onClick={() => onToggle(col.name)}
-                className="w-full flex items-center gap-3 px-3 py-2.5 text-left transition-colors disabled:cursor-not-allowed"
+              <div
+                className="w-full flex items-center gap-3 px-3 py-2.5 transition-colors"
                 style={{ backgroundColor: selected ? 'var(--accent-tint)' : 'transparent', opacity: blocked ? 0.55 : 1 }}
-                onMouseEnter={e => { if (!disabled && !selected) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                onMouseLeave={e => { if (!selected) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
+                onMouseEnter={e => { if (!disabled && !selected) (e.currentTarget as HTMLDivElement).style.backgroundColor = 'var(--surface-hover)'; }}
+                onMouseLeave={e => { if (!selected) (e.currentTarget as HTMLDivElement).style.backgroundColor = 'transparent'; }}
               >
-                <span
-                  className="flex items-center justify-center flex-shrink-0"
-                  style={{ width: 18, height: 18, borderRadius: 5, border: `0.5px solid ${selected ? 'var(--accent)' : 'var(--border)'}`, backgroundColor: selected ? 'var(--accent)' : 'var(--surface)' }}
+                <button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => onToggle(col.name)}
+                  className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:cursor-not-allowed"
+                  style={{ background: 'none', border: 'none', padding: 0 }}
                 >
-                  {selected && (
-                    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-                      <path d="M2.5 7L5.5 10L11.5 4" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  )}
-                </span>
-                <span className="font-mono text-sm truncate" style={{ color: 'var(--text-primary)' }}>{col.name}</span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide flex-shrink-0" style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-muted)', border: '0.5px solid var(--border)' }}>
-                  {col.type.toLowerCase()}
-                </span>
+                  <span
+                    className="flex items-center justify-center flex-shrink-0"
+                    style={{ width: 18, height: 18, borderRadius: 5, border: `0.5px solid ${selected ? 'var(--accent)' : 'var(--border)'}`, backgroundColor: selected ? 'var(--accent)' : 'var(--surface)' }}
+                  >
+                    {selected && (
+                      <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                        <path d="M2.5 7L5.5 10L11.5 4" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    )}
+                  </span>
+                  <span className="font-mono text-sm truncate" style={{ color: 'var(--text-primary)' }}>{col.name}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-pill uppercase tracking-wide flex-shrink-0" style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-muted)', border: '0.5px solid var(--border)' }}>
+                    {col.type.toLowerCase()}
+                  </span>
+                </button>
                 {already && (
                   <span className="ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-pill flex-shrink-0 whitespace-nowrap" style={{ backgroundColor: '#DCFCE7', color: '#15803D' }}>
                     Already standardized
@@ -362,30 +221,16 @@ function ColumnPicker({
                     non-text
                   </span>
                 )}
-              </button>
-              {selected && (
-                <div className="px-3 pb-2.5 pt-0.5 flex flex-col gap-1.5" style={{ backgroundColor: 'var(--accent-tint)' }}>
-                  <div className="flex items-center gap-2">
-                    <span className="flex items-center gap-1 flex-shrink-0">
-                      <span className="text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>Domain</span>
-                      <DomainInfoTooltip />
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <CompactDomainPicker
-                        domains={domains}
-                        isLoading={domainsLoading}
-                        value={selectedDomainOf(col.name)}
-                        onChange={d => onSetDomain(col.name, d)}
-                        onDomainCreated={onDomainCreated}
-                        disabled={busy}
-                      />
-                    </div>
-                  </div>
-                  <p className="text-[10px] leading-tight" style={{ color: 'var(--text-muted)' }}>
-                    Domains establishes what the data in the column represents – e.g. Mobile Carriers, Drug Names, Company Names
-                  </p>
-                </div>
-              )}
+                {selected && (
+                  <ColumnSpecField
+                    variant="inline"
+                    value={specOf(col.name)}
+                    onChange={s => onSetSpec(col.name, s)}
+                    disabled={busy}
+                    columnName={col.name}
+                  />
+                )}
+              </div>
             </div>
           );
         })}
@@ -398,9 +243,17 @@ function ColumnPicker({
 }
 
 // ── Export table disclosure ───────────────────────────────────────────────────
-function ExportTableDisclosure({ exportTableFqn }: { exportTableFqn: string }) {
+// warehouseLabel is a PROP, not hardcoded: this panel is the privilege
+// disclosure an admin reads before activating a pipeline, and it said
+// "Snowflake changes" / "Required Snowflake privileges" verbatim on a SQL
+// Server install — naming a warehouse the customer does not have, in the one
+// place they are being asked to grant access (SEC-07). The surrounding
+// component already computed the right label and used it nearby.
+function ExportTableDisclosure({ exportTableFqn, exportKind = 'table', warehouseLabel = 'Snowflake' }: { exportTableFqn: string; exportKind?: 'table' | 'view' | 'column'; warehouseLabel?: string }) {
   const [open, setOpen] = useState(false);
-  const exportTable = exportTableFqn.trim() || 'DB.SCHEMA.TABLE_STANDARDIZED';
+  const isView   = exportKind === 'view';
+  const isColumn = exportKind === 'column';
+  const exportTable = exportTableFqn.trim() || (isView ? 'DB.SCHEMA.TABLE_STANDARDIZED_VIEW' : 'DB.SCHEMA.TABLE_STANDARDIZED');
 
   return (
     <div
@@ -424,10 +277,15 @@ function ExportTableDisclosure({ exportTableFqn }: { exportTableFqn: string }) {
           </svg>
         </span>
         <span className="flex-1 text-xs" style={{ color: '#475569' }}>
-          <span className="font-semibold" style={{ color: '#1E40AF' }}>Snowflake changes: </span>
-          Prism will create and maintain{' '}
-          <span className="font-mono" style={{ wordBreak: 'break-all' }}>{exportTable}</span>{' '}
-          as a standardized copy of your source table.
+          <span className="font-semibold" style={{ color: '#1E40AF' }}>{warehouseLabel} changes: </span>
+          {isColumn ? (<>
+            Prism will add and maintain a standardized column next to each connected column on{' '}
+            <span className="font-mono" style={{ wordBreak: 'break-all' }}>{exportTable}</span>.
+          </>) : (<>
+            Prism will create{isView ? '' : ' and maintain'}{' '}
+            <span className="font-mono" style={{ wordBreak: 'break-all' }}>{exportTable}</span>{' '}
+            as a standardized {isView ? 'view' : 'copy'} of your source table.
+          </>)}
         </span>
         <svg
           width="12" height="12" viewBox="0 0 12 12" fill="none"
@@ -441,17 +299,28 @@ function ExportTableDisclosure({ exportTableFqn }: { exportTableFqn: string }) {
       {open && (
         <div className="px-3.5 pb-3.5 flex flex-col gap-2.5" style={{ borderTop: '0.5px solid #E2E8F0' }}>
           <p className="text-[11px] mt-3" style={{ color: '#64748B' }}>
-            After each standardization pass, Prism rebuilds the export table with all confirmed mappings:
+            {isColumn
+              ? 'After each standardization pass, Prism refreshes the standardized column(s) on your source table:'
+              : isView
+              ? 'The view is created once and always reflects the current data live — nothing to rebuild:'
+              : 'After each standardization pass, Prism rebuilds the export table with all confirmed mappings:'}
           </p>
           <ol className="flex flex-col gap-2 mt-0.5">
             <li className="flex gap-2.5 items-start">
               <span className="text-[10px] font-semibold rounded-full flex-shrink-0 flex items-center justify-center"
                 style={{ width: 16, height: 16, backgroundColor: '#DBEAFE', color: '#2563EB', marginTop: 1 }}>1</span>
               <div>
-                <p className="text-[11px] font-semibold" style={{ color: '#1E293B' }}>Export table created / replaced</p>
+                <p className="text-[11px] font-semibold" style={{ color: '#1E293B' }}>
+                  {isColumn ? 'Standardized column added' : isView ? 'Export view created' : 'Export table created / replaced'}
+                </p>
                 <p className="text-[11px] mt-0.5 leading-relaxed" style={{ color: '#64748B' }}>
-                  <span className="font-mono">{exportTable}</span> — same schema as the source table but with the watched column replaced by the canonical standardized name.
-                  Only rows with a confirmed mapping are included.
+                  {isColumn ? (<>
+                    Each connected column gets a companion column named after it (e.g. CARRIER → CARRIER_STANDARDIZED) on{' '}
+                    <span className="font-mono">{exportTable}</span>. It holds the canonical standardized name, and stays empty for rows whose value has no confirmed standardization yet.
+                  </>) : (<>
+                    <span className="font-mono">{exportTable}</span> — same schema as the source table but with the watched column replaced by the canonical standardized name.
+                    Only rows with a confirmed mapping are included.
+                  </>)}
                 </p>
               </div>
             </li>
@@ -459,19 +328,25 @@ function ExportTableDisclosure({ exportTableFqn }: { exportTableFqn: string }) {
               <span className="text-[10px] font-semibold rounded-full flex-shrink-0 flex items-center justify-center"
                 style={{ width: 16, height: 16, backgroundColor: '#DBEAFE', color: '#2563EB', marginTop: 1 }}>2</span>
               <div>
-                <p className="text-[11px] font-semibold" style={{ color: '#1E293B' }}>Rebuilt on every pass</p>
+                <p className="text-[11px] font-semibold" style={{ color: '#1E293B' }}>
+                  {isColumn ? 'Kept in sync on every pass' : isView ? 'Always live — no storage, no rebuilds' : 'Rebuilt on every pass'}
+                </p>
                 <p className="text-[11px] mt-0.5 leading-relaxed" style={{ color: '#64748B' }}>
-                  Every time new values are standardized the table is fully refreshed — always a complete, consistent snapshot.
+                  {isColumn
+                    ? 'Every time new values are standardized, only the rows whose standardized value changed are updated — your source data columns are never modified. This requires Prism to have update access on the source table.'
+                    : isView
+                    ? 'Every query against the view re-reads the current source and lookup data directly — there is nothing for Prism to keep in sync, but each read does the join work, so it costs more the more it is queried.'
+                    : 'Every time new values are standardized the table is fully refreshed — always a complete, consistent snapshot.'}
                 </p>
               </div>
             </li>
           </ol>
           <div className="rounded-[8px] px-3 py-2 mt-1" style={{ backgroundColor: '#FFF7ED', border: '0.5px solid #FED7AA' }}>
             <p className="text-[11px]" style={{ color: '#92400E' }}>
-              <strong>Required Snowflake privileges</strong> for the service role:{' '}
+              <strong>Required {warehouseLabel} privileges</strong> for the service role:{' '}
               <span className="font-mono">SELECT</span> on the source table,{' '}
               <span className="font-mono">USAGE</span> on the source database and schema,
-              and <span className="font-mono">CREATE TABLE</span> on the export schema.
+              and <span className="font-mono">{isView ? 'CREATE VIEW' : 'CREATE TABLE'}</span> on the export schema.
             </p>
           </div>
         </div>
@@ -493,18 +368,18 @@ export default function AutoExportHome() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  type Tab = 'connect' | 'pipelines' | 'standardizations' | 'how-it-works';
+  type Tab = 'connect' | 'pipelines' | 'history' | 'how-it-works';
   const [activeTab, setActiveTab] = useState<Tab>('connect');
 
   // Switch to the tab specified in the URL (e.g. ?tab=connect from the logo link).
-  const [openDomainId, setOpenDomainId] = useState<number | null>(null);
   useEffect(() => {
-    const tab = searchParams.get('tab') as Tab | null;
-    if (tab && ['connect', 'pipelines', 'standardizations', 'how-it-works'].includes(tab)) {
+    const raw = searchParams.get('tab');
+    // The old domain-library tab was 'standardizations' — map any stale link to
+    // the one-time history tab that replaced it.
+    const tab = (raw === 'standardizations' ? 'history' : raw) as Tab | null;
+    if (tab && ['connect', 'pipelines', 'history', 'how-it-works'].includes(tab)) {
       setActiveTab(tab);
     }
-    const od = searchParams.get('open_domain_id');
-    setOpenDomainId(od ? Number(od) : null);
   }, [searchParams]);
 
   // ── Auth ──────────────────────────────────────────────────────────────────
@@ -517,17 +392,64 @@ export default function AutoExportHome() {
       .catch(() => setIsAdmin(false));
   }, []);
 
+  // ── Warehouse platform — drives copy that must name the right platform
+  // ("Snowflake" vs "SQL Server") instead of assuming Snowflake. Defaults to
+  // 'snowflake' (this app's historical default) until the fetch resolves.
+  const [warehouseKind, setWarehouseKind] = useState<'snowflake' | 'mssql'>('snowflake');
+  useEffect(() => {
+    fetch('/api/accounts/warehouse-kind')
+      .then(r => r.json())
+      .then(d => { if (d?.kind === 'mssql' || d?.kind === 'snowflake') setWarehouseKind(d.kind); })
+      .catch(() => {});
+  }, []);
+  const warehouseLabel = warehouseKind === 'mssql' ? 'SQL Server' : 'Snowflake';
+
+  // Copy for the Connect tab's "Output types" explainer grid.
+  //
+  // Kept in step with the ACTUAL picker below, which already drops View on
+  // mssql (a view can't reference the per-rebuild staging tables mssql exports
+  // use). The explainer did not: an mssql install advertised "one of four
+  // outputs" including a "Snowflake view", then offered three — describing a
+  // product they don't run and a feature they can't pick (SEC-07 follow-up).
+  const outputExplainers = ([
+    {
+      badge: 'Table',
+      cost:  '',
+      desc:  'Prism rebuilds a full copy of the source table, with standardized values in place of the raw ones.',
+    },
+    {
+      badge: 'Column',
+      cost:  '',
+      desc:  'Prism adds a standardized column next to each connected column on your source table — filled in as values are standardized, empty until then.',
+    },
+    {
+      badge: 'View',
+      cost:  '',
+      desc:  `Prism creates a ${warehouseLabel} view and every query against it automatically shows the applied standardized values.`,
+    },
+    {
+      badge: 'Lookup table',
+      cost:  '',
+      desc:  "Prism won't create any additional tables. Along with the other output types, it will maintain a lookup table denoting all standardizations.",
+    },
+  ]).filter(o => o.badge !== 'View' || warehouseKind !== 'mssql');
+
   // ── Pipeline alert badge ──────────────────────────────────────────────────
   // Snapshot of paused pipelines at page load. Admins see every paused pipeline;
   // standard users only see ones they created. The badge clears once the user
   // opens the Pipelines tab and stays cleared for this page session (it returns
   // on the next fresh load if pipelines are still paused).
   const [pausedPipelines, setPausedPipelines] = useState<Pipeline[]>([]);
+  const [pendingBaselinePipelines, setPendingBaselinePipelines] = useState<Pipeline[]>([]);
   const [alertBadgeSeen,  setAlertBadgeSeen]  = useState(false);
   useEffect(() => {
     fetch('/api/pipelines')
       .then(r => r.json())
-      .then(b => setPausedPipelines((b.pipelines ?? []).filter((p: Pipeline) => p.status === 'paused')))
+      .then(b => {
+        const all = b.pipelines ?? [];
+        setPausedPipelines(all.filter((p: Pipeline) => p.status === 'paused'));
+        setPendingBaselinePipelines(all.filter((p: Pipeline) => p.status === 'pending_baseline'));
+      })
       .catch(() => {});
   }, []);
 
@@ -535,28 +457,6 @@ export default function AutoExportHome() {
     if (isAdmin === null) return 0; // identity not resolved yet — don't flash a badge
     return pausedPipelines.filter(p => isAdmin || p.created_by === accountId).length;
   }, [pausedPipelines, isAdmin, accountId]);
-
-  // ── Domains (fetched once, shared across all entries) ─────────────────────
-  const [domains,        setDomains]        = useState<Domain[]>([]);
-  const [domainsLoading, setDomainsLoading] = useState(true);
-  useEffect(() => {
-    fetch('/api/domains')
-      .then(r => r.json())
-      .then(b => {
-        const list = (b.domains ?? []) as Domain[];
-        setDomains(list);
-        // Pre-fill the default domain for any selected column that has a known
-        // mapping but no domain yet (e.g. the demo RAW_CARRIER_VALUE / RAW_COMPANY_VALUE).
-        setColumnEntries(prev => prev.map(e =>
-          e.selectedDomain ? e : { ...e, selectedDomain: defaultDomainForColumn(e.columnName, list) }));
-      })
-      .catch(() => {})
-      .finally(() => setDomainsLoading(false));
-  }, []);
-
-  function handleDomainCreated(d: Domain) {
-    setDomains(prev => [d, ...prev]);
-  }
 
   // ── Pipeline DB state ─────────────────────────────────────────────────────
   const [activePipelineId, setActivePipelineId] = useState<number | null>(null);
@@ -567,11 +467,18 @@ export default function AutoExportHome() {
   // Progress while "Begin Pipeline Standardization" commits the deferred lookup
   // writes (one step per column) and then activates the pipeline.
   const [beginProgress, setBeginProgress] = useState<{ current: number; total: number; phase: 'writing' | 'starting'; pct: number; etaSec: number | null } | null>(null);
+  const [cancellingPipeline, setCancellingPipeline] = useState(false);
+  // `continue:<table_fqn>` or `delete:<table_fqn>` while an incomplete-card action is in flight.
+  const [incompleteBusyKey, setIncompleteBusyKey] = useState<string | null>(null);
   const beginTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [beginError,    setBeginError]    = useState<string | null>(null);
 
   // ── Pipeline source type ──────────────────────────────────────────────────
-  const [pipelineSourceType, setPipelineSourceType] = useState<'snowflake' | FileSourceType>('snowflake');
+  // Retained as a constant rather than deleted outright: several guards below
+  // still read it (notably the export-kind 'view' rule), and hard-coding the
+  // only remaining value keeps those reading naturally instead of inverting
+  // every condition.
+  const pipelineSourceType = 'snowflake' as const;
 
   // ── Connection form ───────────────────────────────────────────────────────
   // Demo mode prefills the seeded demo table; otherwise start clean.
@@ -589,12 +496,55 @@ export default function AutoExportHome() {
   const [loadingStep,    setLoadingStep]    = useState<'idle' | 'validating' | 'processing'>('idle');
   const [setupProgress,  setSetupProgress]  = useState<{ current: number; total: number } | null>(null);
   const [formError,      setFormError]      = useState<string | null>(null);
-  // Update mode for the whole table (all columns share it).
-  const [updateMode,        setUpdateMode]        = useState<'auto' | 'manual'>('auto');
-  // export_unmapped_rows: manual-only toggle. When false, unmapped rows are excluded
-  // from the export table (only rows with a confirmed mapping appear).
+  // Update time window for the whole table (all columns share it). Defaults to
+  // business hours (Mon–Fri, 9 AM–5 PM); the browser timezone is stamped after
+  // mount (not in the initializer) to avoid an SSR hydration mismatch.
+  const [updateSchedule,    setUpdateSchedule]    = useState<UpdateSchedule>(DEFAULT_UPDATE_SCHEDULE);
+  useEffect(() => {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz) setUpdateSchedule(s => (s.type === 'window' && !s.timezone) ? { ...s, timezone: tz } : s);
+    } catch { /* no timezone available — server time applies */ }
+  }, []);
+  // export_unmapped_rows: when true, source rows whose values have no confirmed
+  // standardization yet appear in the export with their raw value; when false
+  // (default), only rows with a confirmed mapping appear. Applies to every
+  // update schedule — even 24/7 pipelines hold unmapped values between ticks,
+  // during large-backlog installment drains, or while paused.
   const [exportUnmappedRows, setExportUnmappedRows] = useState(false);
-  const loading = loadingStep !== 'idle';
+  // copyMode: whether Prism maintains a rebuilt table copy, a standardized
+  // companion column on the source table itself, a live view, or only the
+  // raw-value -> standardized-value lookup with no export object at all.
+  const [copyMode, setCopyMode] = useState<'table' | 'column' | 'view' | 'lookup_only'>('table');
+  // View exports are refused at the mssql write layer (a view can't reference
+  // the per-rebuild staging tables mssql exports use — warehouse/mssql/export.ts).
+  // warehouseKind resolves asynchronously after 'view' may already be selected
+  // (it defaults to 'snowflake' until the fetch above completes), so force the
+  // mode back off view the moment mssql is confirmed, not just at selection time.
+  useEffect(() => {
+    if (warehouseKind === 'mssql' && copyMode === 'view') setCopyMode('table');
+  }, [warehouseKind, copyMode]);
+  // Only the table and view modes need a separate destination object; column
+  // mode writes onto the source table and lookup-only creates nothing.
+  const needsExportObject = copyMode === 'table' || copyMode === 'view';
+  // Column mode edits the source table — explicit per-table consent, required
+  // by the server (column_write_consent). Reset whenever the mode changes.
+  const [columnConsent, setColumnConsent] = useState(false);
+  useEffect(() => { setColumnConsent(false); }, [copyMode, tableFqn]);
+
+  // Preflight — checked once at submit time (never as-you-type): whatever
+  // warehouse permissions are missing for the table/export about to be
+  // created (SQL Server only; see /api/pipelines/preflight). Non-empty items
+  // pop an approve/cancel modal instead of silently fixing or silently
+  // failing later. preflightExport carries the export target the popup
+  // should proceed with once approved.
+  interface PreflightItem { key: string; label: string; detail: string; }
+  const [preflightItems, setPreflightItems] = useState<PreflightItem[] | null>(null);
+  const [preflightExport, setPreflightExport] = useState('');
+  const [preflightChecking, setPreflightChecking] = useState(false);
+  const [preflightSubmitting, setPreflightSubmitting] = useState(false);
+
+  const loading = loadingStep !== 'idle' || preflightChecking;
 
   // Snapshot of existing pipelines — used to detect duplicate table+column pairs
   // and to default/steer the export file for a table that already has a pipeline.
@@ -607,9 +557,11 @@ export default function AutoExportHome() {
   }, []);
 
   // The export file already configured for a table (if any pipeline exists on it).
+  // Column-mode pipelines are skipped — their export_table_fqn is the source
+  // table itself, which must never be offered as a table/view destination.
   function existingExportForTable(table: string): string | null {
     const t = table.trim();
-    const m = existingPipelines.find(p => p.table_fqn === t && p.export_table_fqn);
+    const m = existingPipelines.find(p => p.table_fqn === t && p.export_table_fqn && p.export_kind !== 'column');
     return m?.export_table_fqn ?? null;
   }
 
@@ -627,7 +579,7 @@ export default function AutoExportHome() {
   }
 
   // Once the existing-pipelines snapshot loads, re-default the export file for the
-  // current table if the user hasn't edited it (covers the initial default table).
+  // current table if the user hasn't edited it and the table already has a pipeline.
   useEffect(() => {
     if (exportTableEdited) return;
     const existing = existingExportForTable(tableFqn);
@@ -645,26 +597,52 @@ export default function AutoExportHome() {
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [columnsError,   setColumnsError]   = useState<string | null>(null);
   const [manualColumns,  setManualColumns]  = useState(false);
+  // SQL Server only — 'ct_status' is present in the /api/columns response only
+  // when the workspace is on the mssql adapter (absent for Snowflake). Drives
+  // the "no primary key" info note below; actual consent now happens in the
+  // submit-time preflight popup, not here.
+  const [ctStatus, setCtStatus] = useState<'enabled' | 'available' | 'no_pk' | null>(null);
 
   useEffect(() => {
     const t = tableFqn.trim();
     if (t.split('.').filter(Boolean).length !== 3) {
-      setTableColumns([]); setColumnsError(null); setColumnsLoading(false);
+      setTableColumns([]); setColumnsError(null); setColumnsLoading(false); setCtStatus(null);
       return;
     }
     let cancelled = false;
     setColumnsLoading(true); setColumnsError(null);
     const timer = setTimeout(async () => {
       try {
-        const res  = await fetch(`/api/columns?table_fqn=${encodeURIComponent(t)}`);
+        // `for=pipeline` so an access failure gets the remedy that applies HERE
+        // (an admin grant to the service connection), not the one-time flow's
+        // "connect your own credentials" — which cannot help a pipeline (PIPE-01).
+        const res  = await fetch(`/api/columns?table_fqn=${encodeURIComponent(t)}&for=pipeline`);
         const body = await res.json().catch(() => ({}));
         if (cancelled) return;
         if (!res.ok) {
           setColumnsError(body?.error ?? 'Could not read this table — check the name and that the service role has access.');
           setTableColumns([]);
+          setCtStatus(null);
+        } else if ((body?.fields?.length ?? 0) === 0 && body?.error) {
+          // A 200 that still carries an error. /api/columns answers 200 with
+          // `fields: []` + an explanatory `error` when the service role cannot
+          // see the table (INFORMATION_SCHEMA returns zero rows for an ungranted
+          // table rather than failing), so checking only `!res.ok` threw that
+          // explanation away and the picker fell through to a bare "No columns
+          // found for this table" — which reads as "wrong name" when the real
+          // cause is missing access. The sibling one-time card already handled
+          // this correctly; the connect form did not (PIPE-01).
+          //
+          // Deliberately NOT linking to /setup here: pipelines always run on the
+          // SERVICE connection, so personal credentials would not help. The fix
+          // is an admin grant (setup step 2, Part D).
+          setColumnsError(body.error);
+          setTableColumns([]);
+          setCtStatus(null);
         } else {
           const fields = (body.fields ?? []) as TableColumn[];
           setTableColumns(fields);
+          setCtStatus(body?.ct_status ?? null);
           // Drop any selected columns that aren't in this table (e.g. after a table change).
           const names = new Set(fields.map(f => f.name.toUpperCase()));
           setColumnEntries(prev => {
@@ -673,7 +651,7 @@ export default function AutoExportHome() {
           });
         }
       } catch {
-        if (!cancelled) { setColumnsError('Could not read this table — check the name and access.'); setTableColumns([]); }
+        if (!cancelled) { setColumnsError('Could not read this table — check the name and access.'); setTableColumns([]); setCtStatus(null); }
       } finally {
         if (!cancelled) setColumnsLoading(false);
       }
@@ -681,10 +659,18 @@ export default function AutoExportHome() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [tableFqn]);
 
-  // Columns of the current table that already have a pipeline (uppercased).
+  // Columns of the current table that already have a live pipeline (uppercased).
+  // pending_baseline pipelines are incomplete setups and should not block.
   const existingColNames = useMemo(() => {
     const t = tableFqn.trim();
-    return new Set(existingPipelines.filter(p => p.table_fqn === t).map(p => p.column_name.toUpperCase()));
+    // Case-INSENSITIVE table match: both warehouses resolve identifiers
+    // case-insensitively, so `db.s.T` and `DB.S.T` are the same physical table.
+    // Comparing them exactly let the same column be connected twice under a
+    // different casing, silently bypassing the already-connected guard
+    // (PIPE-01). The server-side dedup now uses COLLATE NOCASE for the same
+    // reason.
+    const tKey = t.toUpperCase();
+    return new Set(existingPipelines.filter(p => (p.table_fqn ?? '').toUpperCase() === tKey && p.status !== 'pending_baseline').map(p => p.column_name.toUpperCase()));
   }, [existingPipelines, tableFqn]);
 
   // Toggle a column's selection (add/remove a column entry by name).
@@ -692,14 +678,13 @@ export default function AutoExportHome() {
     setColumnEntries(prev => {
       const existing = prev.find(e => e.columnName.toUpperCase() === name.toUpperCase());
       if (existing) return prev.filter(e => e !== existing);
-      // Pre-select a default domain for known demo columns (Mobile Carrier / Company Name).
-      return [...prev, mkEntry({ columnName: name, selectedDomain: defaultDomainForColumn(name, domains) })];
+      return [...prev, mkEntry({ columnName: name })];
     });
   }
 
-  function setColumnDomainByName(name: string, domain: Domain | null) {
+  function setColumnSpecByName(name: string, spec: ColumnSpecDraft) {
     setColumnEntries(prev => prev.map(e =>
-      e.columnName.toUpperCase() === name.toUpperCase() ? { ...e, selectedDomain: domain } : e));
+      e.columnName.toUpperCase() === name.toUpperCase() ? { ...e, spec } : e));
   }
 
   function updateEntryColumn(id: string, columnName: string) {
@@ -708,9 +693,9 @@ export default function AutoExportHome() {
     ));
   }
 
-  function updateEntryDomain(id: string, domain: Domain | null) {
+  function updateEntrySpec(id: string, spec: ColumnSpecDraft) {
     setColumnEntries(prev => prev.map(e =>
-      e.id !== id ? e : { ...e, selectedDomain: domain }
+      e.id !== id ? e : { ...e, spec }
     ));
   }
 
@@ -744,9 +729,10 @@ export default function AutoExportHome() {
         setTableFqnRaw(pl.table_fqn);
         setExportTableFqnRaw(pl.export_table_fqn ?? '');
         setExportTableEdited(!!pl.export_table_fqn);
+        // Specs aren't re-edited on the activation card; start each column with a
+        // blank spec draft (the real spec already lives in column_specs).
         setColumnEntries((siblings.length > 0 ? siblings : [pl]).map(p => mkEntry({
-          columnName:     p.column_name,
-          selectedDomain: p.domain_id ? { domain_id: p.domain_id, name: p.domain_name ?? '', description: null, standardization_rules: null, convention_type: null, convention_value: null, convention_rules: null, usage_count: 0, last_used_at: null, created_at: null } : null,
+          columnName: p.column_name,
         })));
         setPendingSiblings(siblings);
         setPendingActivation(pl);
@@ -783,15 +769,12 @@ export default function AutoExportHome() {
     if (!raw) return;
     localStorage.removeItem('prism_ae_pending_connect');
     try {
-      const { table_fqn, column_name, domain_id, domain_name } = JSON.parse(raw);
+      const { table_fqn, column_name } = JSON.parse(raw);
       if (!table_fqn || !column_name) return;
       setTableFqnRaw(table_fqn);
       setExportTableFqnRaw(suggestExport(table_fqn));
       setExportTableEdited(false);
-      setColumnEntries([mkEntry({
-        columnName:     column_name,
-        selectedDomain: domain_id ? { domain_id, name: domain_name ?? '', description: null, standardization_rules: null, convention_type: null, convention_value: null, convention_rules: null, usage_count: 0, last_used_at: null, created_at: null } : null,
-      })]);
+      setColumnEntries([mkEntry({ columnName: column_name })]);
     } catch { /* malformed — ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -803,8 +786,12 @@ export default function AutoExportHome() {
     const exportTable = exportTableFqn.trim();
     if (!table || loading) return;
 
-    if (!exportTable) {
-      setFormError('Export table is required.');
+    if (needsExportObject && !exportTable) {
+      setFormError(copyMode === 'view' ? 'Export view is required.' : 'Export table is required.');
+      return;
+    }
+    if (copyMode === 'column' && !columnConsent) {
+      setFormError('The Column output edits the source table — please check the consent box in the warning above to continue.');
       return;
     }
     if (columnEntries.length === 0) {
@@ -817,19 +804,23 @@ export default function AutoExportHome() {
         setFormError(`Column ${i + 1}: column name is required.`);
         return;
       }
-      // Domain is mandatory for every column.
-      if (!entry.selectedDomain) {
+      // A description is mandatory for every column's spec.
+      if (!columnSpecDraftValid(entry.spec)) {
         const label = entry.columnName.trim() || `Column ${i + 1}`;
-        setFormError(`Choose a domain for ${label}.`);
+        setFormError(`Add a description for ${label} (and check its naming convention).`);
         return;
       }
     }
 
-    // Block table+column pairs that already have a pipeline.
+    // Block table+column pairs that already have a live pipeline.
+    // pending_baseline pipelines are incomplete setups and should not block.
     const shortTable = table.split('.').pop() ?? table;
     const dupes = columnEntries.filter(en =>
       existingPipelines.some(p =>
-        p.table_fqn === table && p.column_name.toLowerCase() === en.columnName.trim().toLowerCase()));
+        // Case-insensitive on BOTH parts — see existingColNames above (PIPE-01).
+        (p.table_fqn ?? '').toUpperCase() === table.toUpperCase()
+        && p.status !== 'pending_baseline'
+        && p.column_name.toLowerCase() === en.columnName.trim().toLowerCase()));
     if (dupes.length > 0) {
       const list = dupes.map(d => `${shortTable}.${d.columnName.trim()}`).join(', ');
       setFormError(`${list} already has a pipeline created.`);
@@ -840,20 +831,60 @@ export default function AutoExportHome() {
 
     // Export-file conflict: this table already exports to a different file. Ask
     // whether to reuse that export table or deliberately create a separate one.
-    const existingExport = existingExportForTable(table);
-    if (existingExport && existingExport !== exportTable) {
-      setExportConflict({ existingExport });
-      return;
+    // Only applies in table/view mode — column and lookup-only pipelines have
+    // no separate export object.
+    if (needsExportObject) {
+      const existingExport = existingExportForTable(table);
+      if (existingExport && existingExport !== exportTable) {
+        setExportConflict({ existingExport });
+        return;
+      }
     }
 
-    void proceedCreate(exportTable);
+    void runPreflightThenCreate(exportTable);
   }
 
-  async function proceedCreate(finalExport: string) {
+  // Checked once at the moment of submission — if anything's missing, opens
+  // the approve/cancel popup and STOPS here; proceedCreate only runs once the
+  // user explicitly approves (or immediately, unimpeded, when nothing's
+  // missing — the common case on Snowflake and on a fully-provisioned mssql
+  // install). A failed check (e.g. a network hiccup) never blocks creation —
+  // it just falls through, same as any other best-effort probe in this app.
+  async function runPreflightThenCreate(finalExport: string) {
     const table  = tableFqn.trim();
-    const exportTable = finalExport.trim();
+    const exportTable = needsExportObject ? finalExport.trim() : '';
+    const exportKindParam = copyMode === 'view' ? 'view' : copyMode === 'column' ? 'column' : 'table';
+    setPreflightChecking(true);
+    try {
+      const params = new URLSearchParams({
+        table_fqn:   table,
+        column_name: columnEntries[0]?.columnName.trim() ?? '',
+        export_kind: exportKindParam,
+      });
+      if (exportTable) params.set('export_table_fqn', exportTable);
+      const res  = await fetch(`/api/pipelines/preflight?${params.toString()}`);
+      const body = await res.json().catch(() => ({}));
+      const items: PreflightItem[] = Array.isArray(body?.items) ? body.items : [];
+      if (items.length > 0) {
+        setPreflightItems(items);
+        setPreflightExport(finalExport);
+        return;
+      }
+    } catch { /* check failed — don't block creation on it */ }
+    finally {
+      setPreflightChecking(false);
+    }
+    void proceedCreate(finalExport, {});
+  }
+
+  async function proceedCreate(finalExport: string, consents: { ct?: boolean; tableMode?: boolean }) {
+    const table  = tableFqn.trim();
+    // Only table/view modes carry a destination — column mode's destination is
+    // the source table itself (the server stamps export_table_fqn = table_fqn).
+    const exportTable = needsExportObject ? finalExport.trim() : '';
     if (!table || loading) return;
     setExportConflict(null);
+    setPreflightItems(null);
     setFormError(null);
 
     // Declared outside the try so the catch can roll back partially-created
@@ -881,10 +912,14 @@ export default function AutoExportHome() {
           body:    JSON.stringify({
             table_fqn:            table,
             column_name:          entry.columnName.trim(),
-            domain_id:            entry.selectedDomain?.domain_id ?? null,
-            export_table_fqn:     exportTable,
-            mode:                 updateMode,
-            export_unmapped_rows: updateMode === 'manual' ? exportUnmappedRows : true,
+            spec:                 columnSpecDraftToApiSpec(entry.spec),
+            export_table_fqn:     exportTable || null,
+            export_kind:          copyMode === 'view' ? 'view' : copyMode === 'column' ? 'column' : 'table',
+            ...(copyMode === 'column' ? { column_write_consent: true } : {}),
+            ...(consents.ct ? { change_tracking_consent: true } : {}),
+            ...(consents.tableMode ? { table_mode_consent: true } : {}),
+            update_schedule:      updateSchedule,
+            export_unmapped_rows: exportUnmappedRows,
             status:               'pending_baseline',
           }),
         });
@@ -972,6 +1007,9 @@ export default function AutoExportHome() {
   async function handleBeginStandardization() {
     if (!pendingActivation || beginProgress) return;
     const pl = pendingActivation;
+    // Claim the button BEFORE the first await — the sibling fetch below takes
+    // long enough that a double-click could start two commit passes.
+    setBeginProgress({ current: 0, total: 1, phase: 'writing', pct: 0, etaSec: null });
 
     // All columns of this table (sharing the export file) commit + activate together.
     let members: Pipeline[] = pendingSiblings.length > 0 ? pendingSiblings : [pl];
@@ -1047,20 +1085,25 @@ export default function AutoExportHome() {
   }
 
   async function handleCancelPipeline() {
-    if (!pendingActivation) return;
+    if (!pendingActivation || cancellingPipeline) return;
     const pl = pendingActivation;
-    // Cancel every column of this table together (mirrors begin/activation).
-    const members = pendingSiblings.length > 0 ? pendingSiblings : [pl];
-    await Promise.all(members.map(m =>
-      m.pipeline_id ? fetch(`/api/pipelines/${m.pipeline_id}`, { method: 'DELETE' }).catch(() => {}) : Promise.resolve()));
-    for (const m of members) {
-      fetch(`/api/auto-export/source?table_fqn=${encodeURIComponent(m.table_fqn)}&column_name=${encodeURIComponent(m.column_name)}`, { method: 'DELETE' }).catch(() => {});
+    setCancellingPipeline(true);
+    try {
+      // Cancel every column of this table together (mirrors begin/activation).
+      const members = pendingSiblings.length > 0 ? pendingSiblings : [pl];
+      await Promise.all(members.map(m =>
+        m.pipeline_id ? fetch(`/api/pipelines/${m.pipeline_id}`, { method: 'DELETE' }).catch(() => {}) : Promise.resolve()));
+      for (const m of members) {
+        fetch(`/api/auto-export/source?table_fqn=${encodeURIComponent(m.table_fqn)}&column_name=${encodeURIComponent(m.column_name)}`, { method: 'DELETE' }).catch(() => {});
+      }
+      setPendingActivation(null);
+      setPendingSiblings([]);
+      setActivePipelineId(null);
+      setFormError(null);
+      setLoadingStep('idle');
+    } finally {
+      setCancellingPipeline(false);
     }
-    setPendingActivation(null);
-    setPendingSiblings([]);
-    setActivePipelineId(null);
-    setFormError(null);
-    setLoadingStep('idle');
   }
 
   async function handleActivatePipeline(p: Pipeline) {
@@ -1080,9 +1123,15 @@ export default function AutoExportHome() {
     }
   }
 
-  const canSubmit = !loading && !!tableFqn.trim() && !!exportTableFqn.trim() &&
+  // Structural gate only — a missing/incomplete standardization spec does NOT
+  // disable the button silently. The click is allowed through to handleConnect,
+  // which blocks and points the user at the exact column that needs a spec
+  // (so "submit does nothing" never happens without an explanation).
+  const canSubmit = !loading && !!tableFqn.trim() &&
+    (!needsExportObject || !!exportTableFqn.trim()) &&
     columnEntries.length > 0 &&
-    columnEntries.every(e => e.columnName.trim() && e.selectedDomain);
+    columnEntries.every(e => e.columnName.trim());
+  const specsIncomplete = columnEntries.some(e => !columnSpecDraftValid(e.spec));
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -1101,10 +1150,10 @@ export default function AutoExportHome() {
         >
           <nav style={{ padding: '0 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
             {([
-              { id: 'connect',          label: 'Connect',          Icon: IconConnect },
-              { id: 'pipelines',        label: 'Pipelines',        Icon: IconClassify },
-              { id: 'standardizations', label: 'Standardizations', Icon: IconAutoExport },
-              { id: 'how-it-works',     label: 'How it works',     Icon: IconGuide },
+              { id: 'connect',      label: 'Connect',          Icon: IconConnect },
+              { id: 'pipelines',    label: 'Pipelines',        Icon: IconClassify },
+              { id: 'history',      label: 'One-time history', Icon: IconAutoExport },
+              { id: 'how-it-works', label: 'How it works',     Icon: IconGuide },
             ] as const).map(({ id, label, Icon }) => {
               const active = activeTab === id;
               return (
@@ -1160,7 +1209,7 @@ export default function AutoExportHome() {
             CONNECT TAB
         ════════════════════════════════════════════════════════════════ */}
         {activeTab === 'connect' && (
-          <div style={{ padding: '32px 40px' }}>
+          <div style={{ padding: '32px 40px', backgroundColor: 'var(--page-bg)' }}>
             <div className="mx-auto" style={{ maxWidth: 1100 }}>
 
               {/* Step summary — minimal graphics + brief copy */}
@@ -1169,7 +1218,7 @@ export default function AutoExportHome() {
                   {([
                     {
                       title: 'Connect source',
-                      desc:  'Point Prism at a Snowflake table and column, choose a domain, and set the export table.',
+                      desc:  `Point Prism at a ${warehouseLabel} table and column, define each column's standardization spec, and set the export table.`,
                       graphic: (
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                           <rect x="2.5" y="3" width="15" height="14" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
@@ -1179,7 +1228,7 @@ export default function AutoExportHome() {
                     },
                     {
                       title: 'Review groups',
-                      desc:  'Prism groups the raw values of the table and recommends a single standardized name for each group – check the groupings/standardized names and accept.',
+                      desc:  'Prism groups the raw values of the table and recommends a single standardized name for each group. Check the groupings/standardized names and accept.',
                       graphic: (
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                           <path d="M4 6h6.5M4 10h6.5M4 14h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
@@ -1241,48 +1290,12 @@ export default function AutoExportHome() {
                       Prism will build the initial mapping, then standardize new values
                     </p>
 
-                    {/* Source type selector */}
-                    <div className="mb-5">
-                      <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>Source type</label>
-                      <div
-                        className="inline-flex rounded-button overflow-hidden border-[0.5px] w-full"
-                        style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}
-                      >
-                        {([
-                          { id: 'snowflake', label: 'Snowflake' },
-                          { id: 'csv',       label: 'CSV' },
-                          { id: 'excel',     label: 'Excel' },
-                          { id: 'sheets',    label: 'Google Sheets' },
-                        ] as const).map(({ id, label }, i, arr) => (
-                          <button
-                            key={id}
-                            type="button"
-                            onClick={() => setPipelineSourceType(id)}
-                            className="flex-1 py-2 text-xs font-medium transition-colors"
-                            style={{
-                              backgroundColor: pipelineSourceType === id ? 'var(--accent)' : 'transparent',
-                              color:           pipelineSourceType === id ? 'white' : 'var(--text-muted)',
-                              borderRight:     i < arr.length - 1 ? '0.5px solid var(--border)' : undefined,
-                            }}
-                          >
-                            {label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* File-based pipeline form */}
-                    {pipelineSourceType !== 'snowflake' && (
-                      <FilePipelineConnectForm
-                        sourceType={pipelineSourceType}
-                        domains={domains}
-                        domainsLoading={domainsLoading}
-                        onDomainCreated={handleDomainCreated}
-                      />
-                    )}
-
-                    {/* Snowflake form */}
-                    {pipelineSourceType === 'snowflake' && (
+                    {/* A pipeline's source is ALWAYS the workspace's warehouse.
+                        Files and Google Sheets moved to the one-time flow: a
+                        pipeline exists to keep a LIVE source standardized on a
+                        schedule, and a spreadsheet had to be polled every 60
+                        seconds to pretend it was one. A file is a one-shot list,
+                        which is exactly what one-time standardization is for. */}
                     <><form onSubmit={handleConnect}>
                       {/* Source table — shared across all column entries */}
                       <div className="mb-4">
@@ -1303,15 +1316,113 @@ export default function AutoExportHome() {
                         <p className="mt-1 text-xs" style={{ color: 'var(--text-hint)' }}>Full path to the source table whose column values you want to standardize</p>
                       </div>
 
-                      {/* Export table — single shared destination for all columns */}
+                      {/* Output mode — table copy vs. standardized column on the source vs.
+                          live view vs. lookup table only. */}
+                      <div className="mb-5">
+                        <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>
+                          Output
+                        </label>
+                        <div
+                          className="inline-flex rounded-button overflow-hidden border-[0.5px] w-full"
+                          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}
+                        >
+                          {(() => {
+                            // View is refused on mssql (a view can't reference the
+                            // per-rebuild staging tables mssql exports use) and only
+                            // makes sense for a live warehouse table, not a file source
+                            // — rather than show it disabled, drop it from the list.
+                            const viewAllowed = pipelineSourceType === 'snowflake' && warehouseKind !== 'mssql';
+                            const outputOptions = ([
+                              { id: 'table',       label: 'Table' },
+                              { id: 'column',      label: 'Column' },
+                              { id: 'view',        label: 'View' },
+                              { id: 'lookup_only', label: 'Lookup table' },
+                            ] as const).filter(o => o.id !== 'view' || viewAllowed);
+                            return outputOptions.map(({ id, label }, i) => (
+                            <button
+                              key={id}
+                              type="button"
+                              onClick={() => setCopyMode(id)}
+                              disabled={loading}
+                              className="flex-1 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+                              style={{
+                                backgroundColor: copyMode === id ? 'var(--accent)' : 'transparent',
+                                color:           copyMode === id ? 'white' : 'var(--text-muted)',
+                                borderRight:     i < outputOptions.length - 1 ? '0.5px solid var(--border)' : undefined,
+                              }}
+                            >
+                              {label}
+                            </button>
+                            ));
+                          })()}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--text-hint)' }}>
+                          {copyMode === 'table' && 'Table — Prism creates and rebuilds a full copy of the source table after each pass, with the standardized column(s) in place of the raw values. Most expensive: storage plus rebuild compute on every pass, but reads are fast.'}
+                          {copyMode === 'column' && 'Column — Prism adds a new column next to each standardized column on your source table (e.g. CARRIER_STANDARDIZED) holding the standardized value, empty until the raw value is standardized. No separate table or view is created. Requires giving Prism update access on the source table.'}
+                          {copyMode === 'view' && "View — Prism creates a view once; it always reflects the current data live, with no storage and no rebuild compute. Cheaper than a table, but each read re-runs the join, so it costs more the more it’s queried."}
+                          {copyMode === 'lookup_only' && 'Lookup table — Prism maintains just the raw-value-to-standardized-value mappings. No copy, view, or column is created; you join the lookup table to your source table yourself. Least expensive: no derived object at all.'}
+                        </p>
+
+                        {/* Column mode edits the customer's own table — unmissable disclaimer. */}
+                        {copyMode === 'column' && (
+                          <div className="mt-2.5 rounded-card border-[0.5px] p-3.5" style={{ backgroundColor: '#FFF7ED', borderColor: '#FED7AA' }}>
+                            <div className="flex items-start gap-2.5">
+                              <span className="flex items-center justify-center rounded-full flex-shrink-0 mt-0.5"
+                                style={{ width: 16, height: 16, backgroundColor: '#FFEDD5', color: '#C2410C' }}>
+                                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                                  <path d="M5 1L9.3 8.5H0.7L5 1z" stroke="currentColor" strokeWidth="1" strokeLinejoin="round"/>
+                                  <path d="M5 4v2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+                                  <circle cx="5" cy="7.3" r="0.5" fill="currentColor"/>
+                                </svg>
+                              </span>
+                              <div className="text-xs leading-relaxed" style={{ color: '#7C2D12' }}>
+                                <p className="font-semibold mb-1" style={{ color: '#9A3412' }}>This mode edits your source table</p>
+                                <p className="mb-1.5">
+                                  Prism will run ALTER TABLE on your source table to add one new column per connected
+                                  column (e.g. CARRIER → CARRIER_STANDARDIZED), and will then run UPDATE statements
+                                  against the table to keep those added columns filled in.
+                                </p>
+                                <p className="mb-1.5">
+                                  Prism is designed to never touch your existing columns: its write statements can
+                                  only target the companion columns it created, and it refuses to start if a column
+                                  with the companion name already exists. However, in the unlikely event that Prism
+                                  makes an error, Prism is not liable for the consequences of modified or erased
+                                  source data.
+                                </p>
+                                <p>
+                                  We recommend not using this mode on highly important or unrecoverable data — choose
+                                  the Table or View output there instead, or keep a backup of the table.
+                                </p>
+                                <label className="flex items-start gap-2 mt-2.5 cursor-pointer select-none">
+                                  <input
+                                    type="checkbox"
+                                    checked={columnConsent}
+                                    onChange={e => setColumnConsent(e.target.checked)}
+                                    disabled={loading}
+                                    className="mt-0.5"
+                                    style={{ accentColor: '#C2410C' }}
+                                  />
+                                  <span className="text-xs font-medium" style={{ color: '#9A3412' }}>
+                                    I understand — allow Prism to add and maintain standardized columns on this table.
+                                    This grants Prism update access to this specific table only.
+                                  </span>
+                                </label>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Export table/view — single shared destination for all columns (table or view mode only) */}
+                      {needsExportObject && (
                       <div className="mb-5">
                         <label htmlFor="ae-export-fqn" className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>
-                          Export table
+                          {copyMode === 'view' ? 'Export view' : 'Export table'}
                         </label>
                         <input
                           id="ae-export-fqn" type="text" value={exportTableFqn}
                           onChange={e => setExportTableFqn(e.target.value)}
-                          placeholder="DATABASE.SCHEMA.TABLE_STANDARDIZED"
+                          placeholder={copyMode === 'view' ? 'DATABASE.SCHEMA.TABLE_STANDARDIZED_VIEW' : 'DATABASE.SCHEMA.TABLE_STANDARDIZED'}
                           autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
                           disabled={loading}
                           className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"
@@ -1319,76 +1430,56 @@ export default function AutoExportHome() {
                           onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
                           onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
                         />
-                        <p className="mt-1 text-xs" style={{ color: 'var(--text-hint)' }}>This table will be maintained as a copy of the source table with the specified columns replaced with their standardized values</p>
-                      </div>
-
-                      {/* Update mode — applies to the whole table */}
-                      <div className="mb-5">
-                        <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>
-                          Update mode
-                        </label>
-                        <div
-                          className="inline-flex rounded-button overflow-hidden border-[0.5px] w-full"
-                          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}
-                        >
-                          {([
-                            { id: 'auto',   label: 'Automatic' },
-                            { id: 'manual', label: 'Manual' },
-                          ] as const).map(({ id, label }, i) => (
-                            <button
-                              key={id}
-                              type="button"
-                              onClick={() => setUpdateMode(id)}
-                              disabled={loading}
-                              className="flex-1 py-2 text-xs font-medium transition-colors disabled:opacity-50"
-                              style={{
-                                backgroundColor: updateMode === id ? 'var(--accent)' : 'transparent',
-                                color:           updateMode === id ? 'white' : 'var(--text-muted)',
-                                borderRight:     i === 0 ? '0.5px solid var(--border)' : undefined,
-                              }}
-                            >
-                              {label}
-                            </button>
-                          ))}
-                        </div>
-                        <p className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--text-hint)' }}>
-                          {updateMode === 'auto'
-                            ? 'New values are standardized and exported automatically.'
-                            : 'New values are sent to the export file as is and will be standardized when you review and approve the standardizations.'}
+                        <p className="mt-1 text-xs" style={{ color: 'var(--text-hint)' }}>
+                          {copyMode === 'view'
+                            ? 'This view will always reflect the source table live, with the specified columns replaced by their standardized values.'
+                            : 'This table will be maintained as a copy of the source table with the specified columns replaced with their standardized values'}
                         </p>
                       </div>
-
-                      {/* Export unmapped rows — manual mode only */}
-                      {updateMode === 'manual' && (
-                        <div className="mb-5">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <label className="block text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-                                Export unstandardized values
-                              </label>
-                              <p className="mt-0.5 text-xs leading-relaxed" style={{ color: 'var(--text-hint)' }}>
-                                {exportUnmappedRows
-                                  ? 'Unstandardized values appear in the export table with their raw value until standardized.'
-                                  : 'Only values with a confirmed standardization appear in the export table. Values already standardized from a prior run are included automatically.'}
-                              </p>
-                            </div>
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-checked={exportUnmappedRows}
-                              onClick={() => setExportUnmappedRows(v => !v)}
-                              disabled={loading}
-                              className="ml-4 flex-shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50"
-                              style={{ backgroundColor: exportUnmappedRows ? 'var(--accent)' : '#D1D5DB' }}
-                            >
-                              <span
-                                className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
-                                style={{ transform: exportUnmappedRows ? 'translateX(18px)' : 'translateX(3px)' }}
-                              />
-                            </button>
-                          </div>
-                        </div>
                       )}
+
+                      {/* Update time window — applies to the whole table */}
+                      <div className="mb-5">
+                        <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>
+                          Update window
+                        </label>
+                        <UpdateScheduleEditor
+                          value={updateSchedule}
+                          onChange={setUpdateSchedule}
+                          disabled={loading}
+                        />
+                      </div>
+
+                      {/* Export unmapped rows — every schedule (24/7 pipelines also hold
+                          unmapped values between ticks / during backlogs / while paused) */}
+                      <div className="mb-5">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <label className="block text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                              Export unstandardized values
+                            </label>
+                            <p className="mt-0.5 text-xs leading-relaxed" style={{ color: 'var(--text-hint)' }}>
+                              {exportUnmappedRows
+                                ? 'Unstandardized values appear in the export table with their raw value until standardized.'
+                                : 'Only values with a confirmed standardization appear in the export table. Values already standardized from a prior run are included automatically.'}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={exportUnmappedRows}
+                            onClick={() => setExportUnmappedRows(v => !v)}
+                            disabled={loading}
+                            className="ml-4 flex-shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50"
+                            style={{ backgroundColor: exportUnmappedRows ? 'var(--accent)' : '#D1D5DB' }}
+                          >
+                            <span
+                              className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
+                              style={{ transform: exportUnmappedRows ? 'translateX(18px)' : 'translateX(3px)' }}
+                            />
+                          </button>
+                        </div>
+                      </div>
 
                       {/* Columns to standardize */}
                       <div className="mb-5">
@@ -1412,12 +1503,9 @@ export default function AutoExportHome() {
                               hasTable={tableFqn.trim().split('.').filter(Boolean).length === 3}
                               entries={columnEntries}
                               existingColNames={existingColNames}
-                              domains={domains}
-                              domainsLoading={domainsLoading}
                               busy={loading}
                               onToggle={toggleColumnSelection}
-                              onSetDomain={setColumnDomainByName}
-                              onDomainCreated={handleDomainCreated}
+                              onSetSpec={setColumnSpecByName}
                             />
                             <button
                               type="button"
@@ -1427,7 +1515,7 @@ export default function AutoExportHome() {
                               onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }}
                               onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
                             >
-                              Can’t see your columns? Enter them manually
+                              {"Can't see your columns? Enter them manually"}
                             </button>
                           </>
                         ) : (
@@ -1439,60 +1527,50 @@ export default function AutoExportHome() {
                                   className="rounded-[10px] border-[0.5px]"
                                   style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)', padding: '12px 14px' }}
                                 >
-                                  <div className="flex items-center justify-between mb-2.5">
+                                  <div className="flex items-center justify-between gap-2 mb-2.5">
                                     <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
                                       Column {idx + 1}
                                     </span>
-                                    {columnEntries.length > 1 && (
-                                      <button
-                                        type="button"
-                                        onClick={() => removeEntry(entry.id)}
+                                    <div className="flex items-center gap-2 flex-shrink-0">
+                                      <ColumnSpecField
+                                        variant="inline"
+                                        value={entry.spec}
+                                        onChange={s => updateEntrySpec(entry.id, s)}
                                         disabled={loading}
-                                        className="w-5 h-5 flex items-center justify-center rounded transition-colors disabled:opacity-40"
-                                        style={{ color: 'var(--text-muted)', backgroundColor: 'transparent', border: 'none' }}
-                                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
-                                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
-                                        title="Remove this column"
-                                      >
-                                        <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
-                                          <path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                                        </svg>
-                                      </button>
-                                    )}
+                                        columnName={entry.columnName.trim() || undefined}
+                                      />
+                                      {columnEntries.length > 1 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => removeEntry(entry.id)}
+                                          disabled={loading}
+                                          className="w-5 h-5 flex items-center justify-center rounded transition-colors disabled:opacity-40"
+                                          style={{ color: 'var(--text-muted)', backgroundColor: 'transparent', border: 'none' }}
+                                          onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
+                                          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
+                                          title="Remove this column"
+                                        >
+                                          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+                                            <path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                                          </svg>
+                                        </button>
+                                      )}
+                                    </div>
                                   </div>
-                                  <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr' }}>
-                                    <div>
-                                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Column name</label>
-                                      <input
-                                        type="text"
-                                        value={entry.columnName}
-                                        onChange={e => updateEntryColumn(entry.id, e.target.value)}
-                                        placeholder="COLUMN_NAME"
-                                        autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
-                                        disabled={loading}
-                                        className="w-full px-3 py-2 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"
-                                        style={inputStyle}
-                                        onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                                        onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
-                                      />
-                                    </div>
-                                    <div>
-                                      <label className="flex items-center gap-1 text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
-                                        Domain
-                                        <DomainInfoTooltip />
-                                      </label>
-                                      <CompactDomainPicker
-                                        domains={domains}
-                                        isLoading={domainsLoading}
-                                        value={entry.selectedDomain}
-                                        onChange={d => updateEntryDomain(entry.id, d)}
-                                        onDomainCreated={handleDomainCreated}
-                                        disabled={loading}
-                                      />
-                                      <p className="text-[10px] mt-1 leading-tight" style={{ color: 'var(--text-muted)' }}>
-                                        Domains establishes what the data in the column represents – e.g. Mobile Carriers, Drug Names, Company Names
-                                      </p>
-                                    </div>
+                                  <div>
+                                    <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Column name</label>
+                                    <input
+                                      type="text"
+                                      value={entry.columnName}
+                                      onChange={e => updateEntryColumn(entry.id, e.target.value)}
+                                      placeholder="COLUMN_NAME"
+                                      autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
+                                      disabled={loading}
+                                      className="w-full px-3 py-2 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"
+                                      style={inputStyle}
+                                      onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+                                      onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
+                                    />
                                   </div>
                                 </div>
                               ))}
@@ -1520,15 +1598,33 @@ export default function AutoExportHome() {
                               onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }}
                               onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
                             >
-                              Pick from the table’s columns instead
+                              Pick from the table's columns instead
                             </button>
                           </>
                         )}
                       </div>
 
+                      {/* SQL Server only — no inline consent here anymore: if Change
+                          Tracking (or any other permission) is missing, the preflight
+                          check run at submit time shows an unmissable approve/cancel
+                          popup instead, right when it actually matters. */}
+                      {ctStatus === 'no_pk' && (
+                        <p className="mb-5 text-xs leading-relaxed" style={{ color: 'var(--text-hint)' }}>
+                          This table has no primary key, so Change Tracking isn&apos;t available — Prism will use
+                          scheduled scans to detect new, changed, or deleted values instead.
+                        </p>
+                      )}
+
                       {formError && (
                         <div className="rounded-button border-[0.5px] px-4 py-3 mb-4 text-sm" style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA', color: 'var(--confidence-low)' }}>
                           {formError}
+                        </div>
+                      )}
+
+                      {canSubmit && specsIncomplete && !formError && (
+                        <div className="flex items-center gap-2 rounded-button border-[0.5px] px-3.5 py-2.5 mb-4 text-xs" style={{ backgroundColor: '#FFFBEB', borderColor: '#FDE68A', color: '#92400E' }}>
+                          <span className="rounded-full flex-shrink-0" style={{ width: 6, height: 6, backgroundColor: '#F59E0B' }} />
+                          Add standardization specs to each column before continuing.
                         </div>
                       )}
 
@@ -1540,7 +1636,10 @@ export default function AutoExportHome() {
                         onMouseEnter={e => { if (!loading) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
                         onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
                       >
-                        {loadingStep === 'validating' && (
+                        {preflightChecking && (
+                          <span className="inline-flex items-center justify-center gap-2"><Spinner />Checking access…</span>
+                        )}
+                        {!preflightChecking && loadingStep === 'validating' && (
                           <span className="inline-flex items-center justify-center gap-2"><Spinner />Checking table…</span>
                         )}
                         {loadingStep === 'processing' && (
@@ -1551,7 +1650,7 @@ export default function AutoExportHome() {
                               : 'Building initial groups…'}
                           </span>
                         )}
-                        {loadingStep === 'idle' && 'Create initial standardizations'}
+                        {!preflightChecking && loadingStep === 'idle' && 'Create initial standardizations'}
                       </button>
                     </form>
 
@@ -1587,7 +1686,8 @@ export default function AutoExportHome() {
                                 const exp = exportConflict.existingExport;
                                 setExportTableFqnRaw(exp);
                                 setExportTableEdited(true);
-                                void proceedCreate(exp);
+                                setExportConflict(null);
+                                void runPreflightThenCreate(exp);
                               }}
                               className="w-full py-2.5 rounded-button text-white text-sm font-medium transition-colors"
                               style={{ backgroundColor: 'var(--accent)' }}
@@ -1598,7 +1698,7 @@ export default function AutoExportHome() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => { void proceedCreate(exportTableFqn.trim()); }}
+                              onClick={() => { setExportConflict(null); void runPreflightThenCreate(exportTableFqn.trim()); }}
                               className="w-full py-2.5 rounded-button text-sm font-medium transition-colors border-[0.5px]"
                               style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}
                               onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
@@ -1618,7 +1718,79 @@ export default function AutoExportHome() {
                         </div>
                       </div>
                     )}
-                    </>) /* end pipelineSourceType === 'snowflake' */}
+
+                    {/* ── Preflight approve/cancel popup — SQL Server only; shown once,
+                           at the moment of submission, only when something's actually
+                           missing. Approving is the ONLY way any of these grants are
+                           ever attempted. ──────────────────────────────────────── */}
+                    {preflightItems && (
+                      <div
+                        className="fixed inset-0 z-50 flex items-center justify-center"
+                        style={{ backgroundColor: 'rgba(26,26,46,0.35)' }}
+                        onClick={() => { if (!preflightSubmitting) setPreflightItems(null); }}
+                      >
+                        <div
+                          className="rounded-card border-[0.5px] w-full max-w-md mx-4"
+                          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}
+                          onClick={e => e.stopPropagation()}
+                        >
+                          <h3 className="text-base font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+                            Prism needs a few permissions first
+                          </h3>
+                          <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+                            Before creating this pipeline, Prism will enable the following on your SQL Server,
+                            using your saved personal credentials:
+                          </p>
+                          <div className="flex flex-col gap-3 mb-5">
+                            {preflightItems.map(item => (
+                              <div key={item.key} className="rounded-button border-[0.5px] p-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}>
+                                <p className="text-xs font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>{item.label}</p>
+                                <p className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>{item.detail}</p>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-xs mb-4" style={{ color: 'var(--text-hint)' }}>
+                            If Prism can&apos;t apply these automatically (e.g. no saved personal credentials), the
+                            pipeline is still created and flagged with the exact SQL for an admin to run instead —
+                            nothing happens silently either way.
+                          </p>
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setPreflightItems(null)}
+                              disabled={preflightSubmitting}
+                              className="text-[13px] font-medium px-3 py-2 rounded-button border-[0.5px] transition-colors disabled:opacity-50"
+                              style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent' }}
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                setPreflightSubmitting(true);
+                                try {
+                                  await proceedCreate(preflightExport, {
+                                    ct:        preflightItems.some(i => i.key === 'change_tracking'),
+                                    tableMode: preflightItems.some(i => i.key === 'table_mode_access'),
+                                  });
+                                } finally {
+                                  setPreflightSubmitting(false);
+                                }
+                              }}
+                              disabled={preflightSubmitting}
+                              className="text-[13px] font-medium px-4 py-2 rounded-button text-white transition-colors disabled:opacity-50 inline-flex items-center gap-2"
+                              style={{ backgroundColor: 'var(--accent)' }}
+                              onMouseEnter={e => { if (!preflightSubmitting) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
+                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
+                            >
+                              {preflightSubmitting && <Spinner className="w-3 h-3" />}
+                              I approve, continue
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    </>
                   </>
                 )}
 
@@ -1658,12 +1830,6 @@ export default function AutoExportHome() {
                             <span className="text-xs font-mono truncate" style={{ color: 'var(--text-primary)' }} title={c.column_name}>
                               {c.column_name}
                             </span>
-                            {c.domain_name && (
-                              <span className="text-[11px] font-medium rounded-pill px-2.5 py-0.5 flex-shrink-0"
-                                style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)' }}>
-                                {c.domain_name}
-                              </span>
-                            )}
                           </div>
                         ))}
                       </div>
@@ -1680,7 +1846,7 @@ export default function AutoExportHome() {
                     })()}
 
                     {pendingActivation.export_table_fqn && (
-                      <ExportTableDisclosure exportTableFqn={pendingActivation.export_table_fqn} />
+                      <ExportTableDisclosure exportTableFqn={pendingActivation.export_table_fqn} exportKind={pendingActivation.export_kind} warehouseLabel={warehouseLabel} />
                     )}
 
                     {beginError && !beginProgress && (
@@ -1729,7 +1895,8 @@ export default function AutoExportHome() {
                       <>
                         <button
                           onClick={handleBeginStandardization}
-                          className="w-full py-2.5 rounded-button text-sm font-medium transition-colors flex items-center justify-center gap-2 border"
+                          disabled={cancellingPipeline}
+                          className="w-full py-2.5 rounded-button text-sm font-medium transition-colors flex items-center justify-center gap-2 border disabled:opacity-60"
                           style={{ backgroundColor: '#F0FDF4', borderColor: '#86EFAC', color: '#16a34a' }}
                           onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#DCFCE7'; }}
                           onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#F0FDF4'; }}
@@ -1746,12 +1913,14 @@ export default function AutoExportHome() {
 
                         <button
                           onClick={handleCancelPipeline}
-                          className="w-full py-2 rounded-button border-[0.5px] text-xs font-medium transition-colors"
+                          disabled={cancellingPipeline}
+                          className="w-full py-2 rounded-button border-[0.5px] text-xs font-medium transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
                           style={{ borderColor: 'var(--border)', color: 'var(--text-muted)', backgroundColor: 'transparent' }}
-                          onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#FECACA'; (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
+                          onMouseEnter={e => { if (cancellingPipeline) return; (e.currentTarget as HTMLButtonElement).style.borderColor = '#FECACA'; (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
                           onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
                         >
-                          Cancel pipeline
+                          {cancellingPipeline && <Spinner className="w-3 h-3" />}
+                          {cancellingPipeline ? 'Cancelling…' : 'Cancel pipeline'}
                         </button>
                       </>
                     )}
@@ -1760,7 +1929,116 @@ export default function AutoExportHome() {
 
               </div>
 
-              {/* One-time standardization — a one-off, no-pipeline alternative */}
+              {/* Incomplete pipeline cards — only for the current user's pending_baseline pipelines */}
+              {!pendingActivation && accountId != null && (() => {
+                const mine = pendingBaselinePipelines.filter(p => p.created_by === accountId);
+                // Group by table_fqn so multi-column setups show as one card
+                const grouped = new Map<string, Pipeline[]>();
+                for (const p of mine) {
+                  const key = p.table_fqn;
+                  if (!grouped.has(key)) grouped.set(key, []);
+                  grouped.get(key)!.push(p);
+                }
+                if (grouped.size === 0) return null;
+                return (
+                  <div className="flex flex-col gap-3 mt-4">
+                    {[...grouped.entries()].map(([tableFqn, cols]) => (
+                      <div
+                        key={tableFqn}
+                        className="rounded-card border-[0.5px] flex items-center justify-between"
+                        style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)', padding: '14px 18px' }}
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded-pill text-[10px] font-medium"
+                              style={{ backgroundColor: '#FFFBEB', color: '#BA7517', border: '0.5px solid #FDE9C8' }}>
+                              Incomplete
+                            </span>
+                            <span className="text-xs font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                              {tableShortName(tableFqn)}
+                            </span>
+                          </div>
+                          <p className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
+                            {cols.length === 1
+                              ? `${cols[0].column_name} · Initial review not completed`
+                              : `${cols.length} columns · Initial review not completed`}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {(() => {
+                            const continuing = incompleteBusyKey === `continue:${tableFqn}`;
+                            const deleting   = incompleteBusyKey === `delete:${tableFqn}`;
+                            const anyBusy    = incompleteBusyKey != null;
+                            return (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={anyBusy}
+                                  onClick={async () => {
+                                    setIncompleteBusyKey(`continue:${tableFqn}`);
+                                    try {
+                                      // Rebuilds/resumes the review run (may include an LLM grouping pass).
+                                      const res = await fetch(`/api/pipelines/${cols[0].pipeline_id}/create-initial-run`, { method: 'POST' });
+                                      const body = await res.json();
+                                      // Multi-column Sheets pipelines come back with a run PER column —
+                                      // re-establish the same wizard the creation flow sets up, otherwise
+                                      // resuming an abandoned setup would walk only the first column and
+                                      // silently drop the rest (PIPE-16b).
+                                      const runIds: (number | null)[] = body.run_ids ?? [];
+                                      if (runIds.filter(r => r != null).length > 1) {
+                                        const wizard = {
+                                          kind: 'create',
+                                          pids: runIds.map(() => cols[0].pipeline_id),
+                                          cols: body.column_names ?? [],
+                                          runs: runIds,
+                                        };
+                                        try { sessionStorage.setItem('prism_ae_col_wizard', JSON.stringify(wizard)); } catch { /* ignore */ }
+                                      }
+                                      if (body.run_id) { router.push(`/run/${body.run_id}`); return; }
+                                      setIncompleteBusyKey(null);
+                                    } catch { setIncompleteBusyKey(null); }
+                                  }}
+                                  className="text-xs font-medium px-3 py-1.5 rounded-button border-[0.5px] transition-colors inline-flex items-center gap-1.5 disabled:opacity-60"
+                                  style={{ color: 'var(--accent)', borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}
+                                >
+                                  {continuing && <Spinner className="w-3 h-3" />}
+                                  {continuing ? 'Preparing review…' : 'Continue'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={anyBusy}
+                                  onClick={async () => {
+                                    if (!confirm('Delete this incomplete pipeline?')) return;
+                                    setIncompleteBusyKey(`delete:${tableFqn}`);
+                                    try {
+                                      const res = await fetch(`/api/pipelines/${cols[0].pipeline_id}`, { method: 'DELETE' });
+                                      if (res.ok) {
+                                        setPendingBaselinePipelines(prev => prev.filter(p => p.table_fqn !== tableFqn));
+                                      }
+                                    } catch { /* ignore */ } finally { setIncompleteBusyKey(null); }
+                                  }}
+                                  className="inline-flex items-center justify-center rounded-full transition-colors disabled:opacity-60"
+                                  style={{ width: 26, height: 26, color: 'var(--text-muted)', backgroundColor: 'transparent', border: '0.5px solid var(--border)' }}
+                                  aria-label="Delete incomplete pipeline"
+                                >
+                                  {deleting ? (
+                                    <Spinner className="w-3 h-3" />
+                                  ) : (
+                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                                      <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                                    </svg>
+                                  )}
+                                </button>
+                              </>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+
               {!pendingActivation && <OneTimeStandardizationCard />}
             </div>
           </div>
@@ -1800,7 +2078,7 @@ export default function AutoExportHome() {
           </div>
         )}
 
-        {activeTab === 'standardizations' && <StandardizationsView initialOpenDomainId={openDomainId} />}
+        {activeTab === 'history' && <OneTimeArchiveView />}
 
         {/* ════════════════════════════════════════════════════════════════
             HOW IT WORKS TAB
@@ -1809,296 +2087,386 @@ export default function AutoExportHome() {
           <div style={{ padding: '28px 40px' }}>
             <div className="mx-auto" style={{ maxWidth: 1000 }}>
 
-              {/* Hero */}
-              <div className="mb-8">
-                <p className="text-[10px] font-semibold uppercase mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.14em' }}>
-                  HOW IT WORKS
-                </p>
-                <h1 className="text-[28px] font-semibold mb-2" style={{ color: 'var(--text-primary)', lineHeight: 1.25 }}>
-                  From messy values to one standard
-                  <span style={{ color: 'var(--border)', fontWeight: 400 }}> | </span>
-                  Continuous and Automatic
-                </h1>
-                <p className="text-[14px] leading-relaxed mb-6" style={{ color: 'var(--text-secondary)', maxWidth: 560 }}>
-                  Prism recognizes when different values in your database mean the same thing — and standardizes them across your database continuously and automatically.
-                </p>
-
-                {/* Hero before → after diagram */}
-                <div className="flex items-center gap-8">
-                  {/* Before column */}
-                  <div className="rounded-card border-[0.5px] overflow-hidden" style={{ width: 216, backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}>
-                    <div className="px-4 py-2.5" style={{ borderBottom: '0.5px solid var(--border)', backgroundColor: 'var(--page-bg)' }}>
-                      <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--text-muted)' }}>COMPANY_NAME</span>
-                    </div>
-                    {[
-                      { value: 'Prism Inc', dot: '#16a34a' },
-                      { value: 'PRISM', dot: '#DC2626' },
-                      { value: 'prism.io', dot: '#DC2626' },
-                    ].map(({ value, dot }, i) => (
-                      <div key={i} className="flex items-center gap-2.5 px-4 py-2.5"
-                        style={{ borderBottom: i < 2 ? '0.5px solid var(--border-subtle)' : undefined }}>
-                        <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: dot, flexShrink: 0 }} />
-                        <span className="text-[13px] font-mono" style={{ color: 'var(--text-secondary)' }}>{value}</span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Arrow + Prism mark */}
-                  <div className="flex flex-col items-center gap-2 flex-shrink-0">
-                    <svg width="56" height="10" viewBox="0 0 56 10" fill="none" style={{ color: 'var(--accent)' }}>
-                      <path d="M1 5h50M46 1l9 4-9 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                    <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill"
-                      style={{ backgroundColor: 'var(--accent-tint)', border: '0.5px solid var(--accent-border)' }}>
-                      <svg width="8" height="7" viewBox="0 0 8 7" fill="none" aria-hidden="true">
-                        <path d="M4 0L8 7H0L4 0Z" fill="var(--accent)" />
-                      </svg>
-                      <span className="text-[11px] font-semibold" style={{ color: 'var(--accent)' }}>Prism</span>
-                    </div>
-                  </div>
-
-                  {/* After column */}
-                  <div className="rounded-card border-[0.5px] overflow-hidden" style={{ width: 216, backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)' }}>
-                    <div className="px-4 py-2.5" style={{ borderBottom: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}>
-                      <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--accent)' }}>COMPANY_NAME</span>
-                    </div>
-                    {['Prism', 'Prism', 'Prism'].map((v, i) => (
-                      <div key={i} className="flex items-center gap-2.5 px-4 py-2.5"
-                        style={{ borderBottom: i < 2 ? '0.5px solid var(--border-subtle)' : undefined }}>
-                        <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#16a34a', flexShrink: 0 }} />
-                        <span className="text-[13px] font-mono font-semibold" style={{ color: 'var(--accent-strong)' }}>{v}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Step 01: text left, data-flow graphic right */}
-              <div className="flex items-start gap-12 py-8" style={{ borderTop: '0.5px solid var(--border)' }}>
-                <div style={{ flex: '0 0 38%', paddingTop: 2 }}>
-                  <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>01 —</p>
-                  <h2 className="text-[20px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
-                    Data arrives from everywhere, spelled differently
-                  </h2>
-                  <p className="text-[14px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                    Many data sources e.g. Salesforce, Stripe, Internal Databases, have their own naming convention of the same value. They all land in your warehouse as raw, inconsistent values.
+              {/* Hero — split layout */}
+              <div className="flex items-center gap-12 mb-8" style={{ minHeight: '55vh' }}>
+                {/* Left: text + checklist */}
+                <div style={{ flex: '0 0 45%' }}>
+                  <p className="text-[10px] font-semibold uppercase mb-3" style={{ color: 'var(--text-muted)', letterSpacing: '0.14em' }}>
+                    How it works
                   </p>
+                  <h1 className="text-[28px] font-semibold mb-4" style={{ color: 'var(--text-primary)', lineHeight: 1.25 }}>
+                    From messy values to one standard
+                  </h1>
+                  <p className="text-[14px] leading-relaxed mb-5" style={{ color: 'var(--text-secondary)' }}>
+                    Prism recognizes when different values in your database mean the same thing, standardizes them, and keeps them clean — automatically.
+                  </p>
+                  <div className="flex flex-col gap-3 mb-6">
+                    {[
+                      'Recognizes when different values mean the same thing',
+                      'Standardizes and applies Naming Conventions across your database',
+                      'Automatically updates as new data is provided',
+                    ].map((item, i) => (
+                      <div key={i} className="flex items-start gap-3">
+                        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" style={{ flexShrink: 0, marginTop: 1 }}>
+                          <path d="M4.5 9.5l3 3 6-6" stroke="var(--accent)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        <span className="text-[14px] leading-snug" style={{ color: 'var(--text-secondary)' }}>{item}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
+
+                {/* Right: before → after diagram */}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  {/* DATA SOURCES diagram */}
-                  <div className="rounded-[10px] border-[0.5px] px-4 py-3.5"
-                    style={{ backgroundColor: 'var(--page-bg)', borderColor: 'var(--border)', borderStyle: 'dashed' }}>
-                    <p className="text-[10px] font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>DATA SOURCES</p>
-                    <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr' }}>
-                      {([
-                        { name: 'Salesforce',  svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><ellipse cx="7" cy="7" rx="5" ry="3.5" stroke="#00A1E0" strokeWidth="1.2"/><path d="M2.5 7h9" stroke="#00A1E0" strokeWidth="1.2" strokeLinecap="round"/><path d="M5 4l-.5 6M9 4l.5 6" stroke="#00A1E0" strokeWidth="1.2" strokeLinecap="round"/></svg> },
-                        { name: 'Stripe',      svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="2" y="4" width="10" height="6" rx="1" stroke="#6366F1" strokeWidth="1.2"/><path d="M2 6.5h10" stroke="#6366F1" strokeWidth="1.2"/></svg> },
-                        { name: 'Customer DB', svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><ellipse cx="7" cy="4" rx="4" ry="1.4" stroke="#6B7280" strokeWidth="1.2"/><path d="M3 4v6c0 .77 1.79 1.4 4 1.4s4-.63 4-1.4V4" stroke="#6B7280" strokeWidth="1.2"/><path d="M3 7c0 .77 1.79 1.4 4 1.4s4-.63 4-1.4" stroke="#6B7280" strokeWidth="1.2"/></svg> },
-                        { name: 'CSV uploads', svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M8.5 2H3.5A1 1 0 002.5 3v8A1 1 0 003.5 12h7a1 1 0 001-1V5L8.5 2z" stroke="#0F6E56" strokeWidth="1.2"/><path d="M8.5 2v3h3" stroke="#0F6E56" strokeWidth="1.2" strokeLinejoin="round"/><path d="M5 8h4M5 10h2.5" stroke="#0F6E56" strokeWidth="1.2" strokeLinecap="round"/></svg> },
-                      ] as { name: string; svg: React.ReactNode }[]).map(s => (
-                        <div key={s.name} className="flex items-center gap-2.5 rounded-button border-[0.5px] px-3.5 py-2.5"
-                          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', color: 'var(--text-secondary)' }}>
-                          {s.svg}
-                          <span className="text-[12px] font-medium">{s.name}</span>
+                  <div className="flex items-center justify-center gap-6">
+                    {/* Before column */}
+                    <div className="rounded-card border-[0.5px] overflow-hidden" style={{ width: 216, backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}>
+                      <div className="px-4 py-2.5" style={{ borderBottom: '0.5px solid var(--border)', backgroundColor: 'var(--page-bg)' }}>
+                        <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--text-muted)' }}>COMPANY_NAME</span>
+                      </div>
+                      {[
+                        { value: 'JP Morgan Chase', dot: '#DC2626' },
+                        { value: 'JPMorgan', dot: '#DC2626' },
+                        { value: 'JPM', dot: '#DC2626' },
+                      ].map(({ value, dot }, i) => (
+                        <div key={i} className="flex items-center gap-2.5 px-4 py-2.5"
+                          style={{ borderBottom: i < 2 ? '0.5px solid var(--border-subtle)' : undefined }}>
+                          <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: dot, flexShrink: 0 }} />
+                          <span className="text-[13px] font-mono" style={{ color: 'var(--text-secondary)' }}>{value}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Arrow + Prism mark */}
+                    <div className="flex flex-col items-center gap-2 flex-shrink-0">
+                      <svg width="56" height="10" viewBox="0 0 56 10" fill="none" style={{ color: 'var(--accent)' }}>
+                        <path d="M1 5h50M46 1l9 4-9 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-pill"
+                        style={{ backgroundColor: 'var(--accent-tint)', border: '0.5px solid var(--accent-border)' }}>
+                        <svg width="18" height="14" viewBox="0 0 28 22" fill="none" aria-hidden="true">
+                          <polygon points="0,0 0,22 14,11" fill="#1A1A2E" />
+                          <polygon points="28,0 28,22 14,11" fill="#378ADD" />
+                          <circle cx="14" cy="11" r="1.4" fill="white" />
+                        </svg>
+                        <span className="text-[11px] font-semibold" style={{ color: 'var(--accent)' }}>Prism</span>
+                      </div>
+                    </div>
+
+                    {/* After column */}
+                    <div className="rounded-card border-[0.5px] overflow-hidden" style={{ width: 216, backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)' }}>
+                      <div className="px-4 py-2.5" style={{ borderBottom: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}>
+                        <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--accent)' }}>COMPANY_NAME</span>
+                      </div>
+                      {['JP Morgan', 'JP Morgan', 'JP Morgan'].map((v, i) => (
+                        <div key={i} className="flex items-center gap-2.5 px-4 py-2.5"
+                          style={{ borderBottom: i < 2 ? '0.5px solid var(--border-subtle)' : undefined }}>
+                          <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#16a34a', flexShrink: 0 }} />
+                          <span className="text-[13px] font-mono font-semibold" style={{ color: 'var(--accent-strong)' }}>{v}</span>
                         </div>
                       ))}
                     </div>
                   </div>
-                  {/* Down arrow */}
-                  <div className="flex justify-center py-2.5">
-                    <svg width="12" height="16" viewBox="0 0 12 16" fill="none" style={{ color: 'var(--text-muted)' }}>
-                      <path d="M6 1v12M1 10l5 4 5-4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </div>
-                  {/* RAW TABLE diagram */}
-                  <div className="rounded-[10px] border-[0.5px] overflow-hidden" style={{ backgroundColor: 'var(--surface)', borderColor: '#FECACA' }}>
-                    <div className="flex items-center justify-between px-4 py-2.5"
-                      style={{ backgroundColor: '#FEF2F2', borderBottom: '0.5px solid #FECACA' }}>
-                      <span className="text-[10px] font-semibold uppercase tracking-widest" style={{ color: '#A32D2D' }}>RAW TABLE</span>
-                      <span className="text-[10px] px-2 py-0.5 rounded-pill font-medium"
-                        style={{ backgroundColor: '#FEE2E2', color: '#991B1B', border: '0.5px solid #FECACA' }}>
-                        inconsistent
-                      </span>
+                </div>
+              </div>
+
+              {/* Tutorial — starting a pipeline */}
+              <div className="py-8 mb-8" style={{ borderTop: '1px solid var(--border)' }}>
+                <p className="text-[10px] font-semibold uppercase mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.14em' }}>
+                  Tutorial
+                </p>
+                <h2 className="text-[20px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                  Starting a pipeline
+                </h2>
+                <p className="text-[14px] leading-relaxed mb-6" style={{ color: 'var(--text-secondary)', maxWidth: 560 }}>
+                  Follow along with these walkthroughs to set up your first pipeline from start to finish.
+                </p>
+                {(() => {
+                  const activeVideoRef = { current: null as HTMLVideoElement | null };
+                  const tutorialVideo = (src: string) => (
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <video
+                        ref={(el) => {
+                          if (!el) return;
+                          const obs = new IntersectionObserver(
+                            ([entry]) => {
+                              if (entry.isIntersecting) {
+                                if (activeVideoRef.current && activeVideoRef.current !== el) {
+                                  activeVideoRef.current.pause();
+                                  activeVideoRef.current.currentTime = 0;
+                                }
+                                activeVideoRef.current = el;
+                                el.currentTime = 0;
+                                el.play().catch(() => {});
+                              } else {
+                                if (activeVideoRef.current === el) activeVideoRef.current = null;
+                                el.pause();
+                              }
+                            },
+                            { threshold: 0.5 },
+                          );
+                          obs.observe(el);
+                        }}
+                        src={src}
+                        muted
+                        playsInline
+                        preload="metadata"
+                        style={{ width: '100%', display: 'block', borderRadius: 'var(--radius-card)' }}
+                      />
                     </div>
-                    {([
-                      ['JPMorgan', 'Salesforce'],
-                      ['Chase',    'Stripe'],
-                      ['JPM',      'Customer DB'],
-                    ] as [string, string][]).map(([name, src], i) => (
-                      <div key={i} className="flex items-center justify-between px-4 py-2.5"
-                        style={{ borderBottom: i < 2 ? '0.5px solid #FEE2E2' : undefined }}>
-                        <span className="text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>{name}</span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-pill font-medium"
-                          style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-muted)', border: '0.5px solid var(--border)' }}>
-                          {src}
+                  );
+                  return (<>
+                    {/* Tutorial 01 */}
+                    <div className="flex items-center gap-12" style={{ borderTop: '1px solid var(--border)', paddingTop: 56, paddingBottom: 40 }}>
+                      <div className="flex flex-col justify-center" style={{ flex: '0 0 30%' }}>
+                        <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>01 —</p>
+                        <h2 className="text-[22px] font-semibold mb-3" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                          Connect Prism to your source table for standardization
+                        </h2>
+                        <div className="text-[14px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          <p className="mb-2">1. Specify which table you want standardized</p>
+                          <p className="mb-2">2. Select how you want to access the standardized data (i.e. table, column, view, lookup table)</p>
+                          <p>3. Select if you want standardizations updated automatically or upon your approval</p>
+                        </div>
+                      </div>
+                      {tutorialVideo('/tutorial-1.mov')}
+                    </div>
+
+                    {/* Output types — below Tutorial 01 */}
+                    <h2 className="text-[15px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)' }}>
+                      Output types
+                    </h2>
+                    <p className="text-[13.5px] leading-relaxed mb-3" style={{ color: 'var(--text-secondary)', maxWidth: 720 }}>
+                      Each pipeline maintains one of {outputExplainers.length === 4 ? 'four' : 'three'} outputs, chosen at setup based on how the standardized data will be used.
+                    </p>
+                    <div className="grid gap-3 mb-10" style={{ gridTemplateColumns: `repeat(${outputExplainers.length}, 1fr)` }}>
+                      {outputExplainers.map((o, i) => (
+                        <div key={i} className="rounded-card border-[0.5px]"
+                          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}>
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
+                              style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-secondary)', border: '0.5px solid var(--border)' }}>{o.badge}</span>
+                          </div>
+                          <p className="text-[13px] leading-relaxed mt-1.5" style={{ color: 'var(--text-secondary)' }}>{o.desc}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Update windows — below output types */}
+                    <h2 className="text-[15px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)' }}>
+                      Update windows
+                    </h2>
+                    <p className="text-[13.5px] leading-relaxed mb-3" style={{ color: 'var(--text-secondary)', maxWidth: 720 }}>
+                      Each pipeline has an update window that controls when Prism standardizes new values automatically. New values are always detected and queued as they arrive; updates run at every 10-minute mark on the clock (1:00, 1:10, 1:20, …) — the window only decides which of those marks are allowed to run.
+                    </p>
+                    <div className="grid gap-3 mb-10" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                      <div className="rounded-card border-[0.5px]"
+                        style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)', padding: 'var(--card-padding)' }}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
+                            style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)' }}>Time window</span>
+                          <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>default: Mon–Fri, 9 AM–5 PM</span>
+                        </div>
+                        <p className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          Prism auto-updates every 10 minutes, but only during the days and hours you pick. Values that arrive outside the window queue up and go out at the first mark after it opens — nothing is lost in between.
+                        </p>
+                      </div>
+                      <div className="rounded-card border-[0.5px]"
+                        style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
+                            style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-secondary)', border: '0.5px solid var(--border)' }}>24/7</span>
+                        </div>
+                        <p className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          New values are standardized and exported around the clock, at every 10-minute mark. Values already standardized before are re-applied from the lookup table without using any AI.
+                        </p>
+                      </div>
+                      <div className="rounded-card border-[0.5px]"
+                        style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
+                            style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-secondary)', border: '0.5px solid var(--border)' }}>Manual only</span>
+                        </div>
+                        <p className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          Prism never updates on its own. New values queue up until you trigger standardization — Prism then generates the standardizations for you to approve or modify before they reach the export.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Tutorial 02 */}
+                    <div className="flex items-center gap-12" style={{ borderTop: '1px solid var(--border)', paddingTop: 72, paddingBottom: 40 }}>
+                      {tutorialVideo('/tutorial-2.mov')}
+                      <div className="flex flex-col justify-center" style={{ flex: '0 0 30%' }}>
+                        <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>02 —</p>
+                        <h2 className="text-[22px] font-semibold mb-3" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                          Select the columns to standardize and describe them
+                        </h2>
+                        <p className="text-[14px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          Each column gets its own spec — what its values represent, plus optional naming conventions and grouping rules. More info below:
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Column specs — below Tutorial 02 */}
+                    <h2 className="text-[15px] font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
+                      Column specs
+                    </h2>
+                    <p className="text-[13px] mb-3" style={{ color: 'var(--text-muted)' }}>
+                      Tells Prism what a column&rsquo;s values represent and how to standardize them
+                    </p>
+                    <p className="text-[13.5px] leading-relaxed mb-3" style={{ color: 'var(--text-secondary)', maxWidth: 720 }}>
+                      Every standardized column carries its own spec, set at setup. Prism applies it whenever it standardizes that column&rsquo;s values. A spec has:
+                    </p>
+                    <ul className="mb-4 flex flex-col gap-1.5 list-disc" style={{ paddingLeft: 24 }}>
+                      <li className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>Description of the data (required — e.g. &ldquo;legal company names&rdquo;)</li>
+                      <li className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>Naming convention (optional — e.g. lowercase)</li>
+                      <li className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>Grouping rules (optional — e.g. group subsidiary companies together)</li>
+                    </ul>
+                    <p className="text-[13.5px] font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>
+                      Refer to the example below:
+                    </p>
+
+                    {/* Example column-spec diagram */}
+                    <div className="rounded-[10px] border-[0.5px] px-8 py-6 mb-10"
+                      style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)', border: '2px solid var(--accent-border)' }}>
+
+                      {/* Column-spec header */}
+                      <div className="flex items-center gap-2.5 mb-1.5">
+                        <p className="text-[10px] font-semibold uppercase tracking-widest" style={{ color: 'var(--accent)' }}>Column spec</p>
+                      </div>
+                      <p className="text-[17px] font-semibold mb-3 font-mono" style={{ color: 'var(--text-primary)' }}>CLIENT_COMPANY</p>
+                      <div className="flex flex-wrap gap-2 mb-5">
+                        <span className="inline-block text-[11px] font-medium rounded-pill px-2.5 py-1"
+                          style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)', border: '0.5px solid var(--accent-border)' }}>
+                          Description: legal company names
+                        </span>
+                        <span className="inline-block text-[11px] font-medium rounded-pill px-2.5 py-1"
+                          style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)', border: '0.5px solid var(--accent-border)' }}>
+                          Naming convention: alphanumeric + underscores, lowercase
+                        </span>
+                        <span className="inline-block text-[11px] font-medium rounded-pill px-2.5 py-1"
+                          style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)', border: '0.5px solid var(--accent-border)' }}>
+                          Grouping rules: group subsidiaries under the parent
                         </span>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
 
-              {/* Step 02: graphic left, text right */}
-              <div className="flex items-start gap-12 py-8" style={{ borderTop: '0.5px solid var(--border)' }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  {/* Standardization flow diagram */}
-                  <div className="rounded-[10px] border-[0.5px] px-5 py-4"
-                    style={{ backgroundColor: 'var(--page-bg)', borderColor: 'var(--border)', borderStyle: 'dashed' }}>
-                    <p className="text-[10px] font-semibold uppercase tracking-widest mb-3.5" style={{ color: 'var(--text-muted)' }}>STANDARDIZATION</p>
-                    <div className="flex items-center gap-5">
-                      {/* Input chips (raw) */}
-                      <div className="flex flex-col gap-2" style={{ flex: 1 }}>
-                        {['JPMorgan', 'Chase', 'JPM'].map((v, i) => (
-                          <div key={i} className="px-3.5 py-2.5 rounded-button border-[0.5px] text-[12px] font-medium"
-                            style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA', color: '#991B1B' }}>
-                            {v}
+                      <div className="flex items-center gap-5" style={{ borderTop: '0.5px solid var(--border)', paddingTop: 20 }}>
+                        {/* Two pipelines stacked under one heading */}
+                        <div style={{ flex: '0 0 auto', minWidth: 200 }}>
+                          <p className="text-[10px] font-semibold uppercase tracking-widest mb-2" style={{ color: 'var(--text-muted)' }}>Pipelines</p>
+                          <div className="flex flex-col gap-4">
+                            {[
+                              { column: 'CLIENT_COMPANY',  value: 'JP Morgan Chase' },
+                              { column: 'PARTNER_COMPANY', value: 'JPM' },
+                            ].map((s, i) => (
+                              <div key={i} className="rounded-button overflow-hidden" style={{ backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)' }}>
+                                <div className="px-3.5 py-1.5" style={{ borderBottom: '1px solid var(--border)' }}>
+                                  <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--text-muted)' }}>{s.column}</span>
+                                </div>
+                                <div className="px-3.5 py-1 text-center" style={{ borderBottom: '1px solid var(--border)' }}>
+                                  <span className="text-[14px] font-semibold tracking-widest" style={{ color: 'var(--text-muted)' }}>···</span>
+                                </div>
+                                <div className="px-3.5 py-2" style={{ borderLeft: '2px solid var(--accent)', backgroundColor: 'var(--accent-tint)' }}>
+                                  <span className="text-[12px] font-mono font-semibold" style={{ color: 'var(--accent-strong)' }}>{s.value}</span>
+                                </div>
+                              </div>
+                            ))}
                           </div>
-                        ))}
-                      </div>
-                      {/* Prism transform arrow */}
-                      <div className="flex flex-col items-center gap-1.5 flex-shrink-0">
-                        <svg width="8" height="7" viewBox="0 0 8 7" fill="none" aria-hidden="true">
-                          <path d="M4 0L8 7H0L4 0Z" fill="var(--accent)" />
-                        </svg>
-                        <svg width="36" height="10" viewBox="0 0 36 10" fill="none" style={{ color: 'var(--accent)' }}>
-                          <path d="M1 5h31M27 1l8 4-8 4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                        <span className="text-[10px] font-semibold" style={{ color: 'var(--accent)' }}>Prism</span>
-                      </div>
-                      {/* Output chips (canonical) */}
-                      <div className="flex flex-col gap-2" style={{ flex: 1 }}>
-                        {['JP Morgan', 'JP Morgan', 'JP Morgan'].map((v, i) => (
-                          <div key={i} className="px-3.5 py-2.5 rounded-button border-[0.5px] text-[12px] font-semibold"
-                            style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)', color: 'var(--accent-strong)' }}>
-                            {v}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <div style={{ flex: '0 0 38%', paddingTop: 2 }}>
-                  <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>02 —</p>
-                  <h2 className="text-[20px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
-                    Prism groups the variants into one standardized name
-                  </h2>
-                  <p className="text-[14px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                    AI groups the variants together and renames them. You do 1 initial review and approval. From then on, every new value is mapped automatically when the source table updates — no manual work, no CASE WHEN blocks.
-                  </p>
-                </div>
-              </div>
-
-              {/* Step 03: text left, standardized table + consumers right */}
-              <div className="flex items-start gap-12 py-8 mb-8" style={{ borderTop: '0.5px solid var(--border)' }}>
-                <div style={{ flex: '0 0 38%', paddingTop: 2 }}>
-                  <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>03 —</p>
-                  <h2 className="text-[20px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
-                    Every downstream tool reads clean values automatically
-                  </h2>
-                  <p className="text-[14px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                    Prism maintains a copy of the source table with the standardized values. The standardized table updates continuously based on the source table. Dashboards stop double-counting. Analytics finally add up. LLMs produce accurate results supplied with consistent data.
-                  </p>
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  {/* STANDARDIZED TABLE diagram */}
-                  <div className="rounded-[10px] border-[0.5px] overflow-hidden" style={{ backgroundColor: 'var(--surface)', borderColor: '#BBF7D0' }}>
-                    <div className="flex items-center justify-between px-4 py-2.5"
-                      style={{ backgroundColor: '#F0FDF4', borderBottom: '0.5px solid #BBF7D0' }}>
-                      <span className="text-[10px] font-semibold uppercase tracking-widest" style={{ color: '#15803D' }}>STANDARDIZED TABLE</span>
-                      <span className="inline-flex items-center gap-1.5 text-[10px] font-medium rounded-pill px-2 py-0.5"
-                        style={{ backgroundColor: '#DCFCE7', color: '#15803D', border: '0.5px solid #BBF7D0' }}>
-                        <span style={{ width: 5, height: 5, borderRadius: '50%', backgroundColor: '#16a34a', display: 'inline-block', flexShrink: 0 }} />
-                        Live · auto-updating
-                      </span>
-                    </div>
-                    {['JP Morgan', 'JP Morgan', 'JP Morgan'].map((v, i) => (
-                      <div key={i} className="flex items-center gap-2.5 px-4 py-2.5"
-                        style={{ borderBottom: i < 2 ? '0.5px solid #D1FAE5' : undefined }}>
-                        <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#16a34a', flexShrink: 0 }} />
-                        <span className="text-[13px] font-medium" style={{ color: '#15803D' }}>{v}</span>
-                      </div>
-                    ))}
-                  </div>
-                  {/* Down arrow */}
-                  <div className="flex justify-center py-2.5">
-                    <svg width="12" height="16" viewBox="0 0 12 16" fill="none" style={{ color: 'var(--text-muted)' }}>
-                      <path d="M6 1v12M1 10l5 4 5-4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </div>
-                  {/* DOWNSTREAM CONSUMERS diagram */}
-                  <div className="rounded-[10px] border-[0.5px] px-4 py-3.5"
-                    style={{ backgroundColor: 'var(--page-bg)', borderColor: 'var(--border)', borderStyle: 'dashed' }}>
-                    <p className="text-[10px] font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>DOWNSTREAM CONSUMERS</p>
-                    <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr' }}>
-                      {([
-                        { name: 'LLMs',       svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2.5 10.5V8.5A4.5 4.5 0 0111.5 8.5v2" stroke="#7C3AED" strokeWidth="1.2" strokeLinecap="round"/><circle cx="7" cy="4.5" r="2" stroke="#7C3AED" strokeWidth="1.2"/></svg> },
-                        { name: 'Dashboards', svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1.5" y="1.5" width="4" height="4" rx="0.7" stroke="#4285F4" strokeWidth="1.2"/><rect x="8.5" y="1.5" width="4" height="4" rx="0.7" stroke="#4285F4" strokeWidth="1.2"/><rect x="1.5" y="8.5" width="4" height="4" rx="0.7" stroke="#4285F4" strokeWidth="1.2"/><rect x="8.5" y="8.5" width="4" height="4" rx="0.7" stroke="#4285F4" strokeWidth="1.2"/></svg> },
-                        { name: 'Analytics',  svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1.5 11l3-4 2.5 2.5 3-6 2.5 3.5" stroke="#0F6E56" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/></svg> },
-                        { name: 'dbt models', svg: <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1.5l5 3v5l-5 3-5-3v-5l5-3z" stroke="#FF694A" strokeWidth="1.2" strokeLinejoin="round"/></svg> },
-                      ] as { name: string; svg: React.ReactNode }[]).map(t => (
-                        <div key={t.name} className="flex items-center gap-2.5 rounded-button border-[0.5px] px-3.5 py-2.5"
-                          style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', color: 'var(--text-secondary)' }}>
-                          {t.svg}
-                          <span className="text-[12px] font-medium">{t.name}</span>
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
 
-              {/* Auto vs manual */}
-              <h2 className="text-[15px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)' }}>
-                Automatic vs. manual mode
-              </h2>
-              <div className="grid gap-3 mb-6" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
-                <div className="rounded-card border-[0.5px]"
-                  style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--accent-border)', padding: 'var(--card-padding)' }}>
-                  <div className="flex items-center gap-2 mb-1.5">
-                    <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
-                      style={{ backgroundColor: 'var(--accent-tint)', color: 'var(--accent)' }}>Automatic</span>
-                    <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>recommended</span>
-                  </div>
-                  <p className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                    New values are standardized and exported on their own — when the queue crosses
-                    25 items or on the hourly sweep. Hands-off once it&rsquo;s live.
-                  </p>
-                </div>
-                <div className="rounded-card border-[0.5px]"
-                  style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}>
-                  <div className="flex items-center gap-2 mb-1.5">
-                    <span className="text-[11px] font-semibold rounded-pill px-2 py-0.5"
-                      style={{ backgroundColor: 'var(--page-bg)', color: 'var(--text-secondary)', border: '0.5px solid var(--border)' }}>Manual</span>
-                  </div>
-                  <p className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                    New values are sent to the export file as is and will be standardized when you review and approve the standardizations.
-                  </p>
-                </div>
-              </div>
-
-              {/* Good to know */}
-              <h2 className="text-[15px] font-semibold mb-2.5" style={{ color: 'var(--text-primary)' }}>
-                Good to know
-              </h2>
-              <div className="rounded-card border-[0.5px] mb-6"
-                style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)' }}>
-                <ul className="flex flex-col gap-2.5">
-                  {[
-                    'A domain is locked once a pipeline is created — choose it deliberately up front.',
-                    'The Standardizations tab is your canonical library: review and edit the confirmed name for any value across every pipeline.',
-                    'Matching is case- and whitespace-insensitive, so byte-variant spellings collapse to the same canonical name automatically.',
-                    'Mass events (a bulk reload, TRUNCATE, or a Time-Travel restore) are caught by an hourly safety rebuild even if the stream misses them.',
-                  ].map((tip, i) => (
-                    <li key={i} className="flex items-start gap-2.5">
-                      <span className="flex-shrink-0 mt-0.5" style={{ color: 'var(--accent)' }}>
-                        <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-                          <path d="M3 8l3 3 6-7" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                        {/* Arrow: pipelines → lookup table */}
+                        <svg width="36" height="20" viewBox="0 0 36 20" fill="none" style={{ color: 'var(--accent)', flexShrink: 0 }} aria-hidden="true">
+                          <path d="M2 10H28" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                          <path d="M24 5l8 5-8 5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
                         </svg>
-                      </span>
-                      <span className="text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{tip}</span>
-                    </li>
-                  ))}
-                </ul>
+
+                        {/* Shared lookup table */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <p className="text-[10px] font-semibold uppercase tracking-widest mb-2" style={{ color: 'var(--text-muted)' }}>Lookup table</p>
+                          <div className="rounded-button overflow-hidden" style={{ backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)' }}>
+                            <div className="flex" style={{ borderBottom: '1px solid var(--border)' }}>
+                              <div className="px-3.5 py-1.5" style={{ flex: 1, borderRight: '1px solid var(--border)' }}>
+                                <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--text-muted)' }}>RAW VALUE</span>
+                              </div>
+                              <div className="px-3.5 py-1.5" style={{ flex: 1 }}>
+                                <span className="text-[10px] font-semibold tracking-widest font-mono" style={{ color: 'var(--text-muted)' }}>STANDARDIZED</span>
+                              </div>
+                            </div>
+                            {[
+                              { raw: 'JP Morgan Chase', std: 'jp_morgan' },
+                              { raw: 'JPM',             std: 'jp_morgan' },
+                            ].map((m, i) => (
+                              <div key={i} className="flex" style={{ borderBottom: i === 0 ? '1px solid var(--border)' : undefined }}>
+                                <div className="px-3.5 py-2" style={{ flex: 1, borderRight: '1px solid var(--border)' }}>
+                                  <span className="text-[12px] font-mono" style={{ color: 'var(--text-secondary)' }}>{m.raw}</span>
+                                </div>
+                                <div className="px-3.5 py-2" style={{ flex: 1 }}>
+                                  <span className="text-[12px] font-mono font-semibold" style={{ color: 'var(--accent-strong)' }}>{m.std}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Arrow: lookup table → standardized output */}
+                        <svg width="36" height="20" viewBox="0 0 36 20" fill="none" style={{ color: 'var(--accent)', flexShrink: 0 }} aria-hidden="true">
+                          <path d="M2 10H28" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                          <path d="M24 5l8 5-8 5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+
+                        {/* Single standardized output */}
+                        <div style={{ flexShrink: 0 }}>
+                          <div className="rounded-button border-[0.5px] px-5 py-4 text-center"
+                            style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)' }}>
+                            <p className="text-[10px] font-medium mb-1" style={{ color: 'var(--accent)' }}>Both resolve to:</p>
+                            <span className="text-[17px] font-semibold" style={{ color: 'var(--accent-strong)' }}>jp_morgan</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Tutorial 03 */}
+                    <div className="flex items-center gap-12" style={{ borderTop: '1px solid var(--border)', paddingTop: 72, paddingBottom: 48 }}>
+                      <div className="flex flex-col justify-center" style={{ flex: '0 0 30%' }}>
+                        <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>03 —</p>
+                        <h2 className="text-[22px] font-semibold mb-3" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                          Set initial standardizations
+                        </h2>
+                        <ol className="text-[14px] leading-relaxed flex flex-col gap-2 list-decimal" style={{ color: 'var(--text-secondary)', paddingLeft: 20 }}>
+                          <li>Prism will show the initial set of standardizations for the values in the table</li>
+                          <li>Modify and approve the standardizations</li>
+                          <li>Accept and Prism will continuously standardize your table</li>
+                        </ol>
+                      </div>
+                      {tutorialVideo('/tutorial-3.mov')}
+                    </div>
+
+                    {/* Tutorial 04 */}
+                    <div className="flex items-center gap-12" style={{ borderTop: '1px solid var(--border)', paddingTop: 72, paddingBottom: 48 }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <img
+                          src="/tutorial-4.png"
+                          alt="Pipeline dashboard showing live status, source values, standardized count, and column details"
+                          style={{ width: '100%', display: 'block', borderRadius: 'var(--radius-card)' }}
+                        />
+                      </div>
+                      <div className="flex flex-col justify-center" style={{ flex: '0 0 30%' }}>
+                        <p className="text-[10px] font-semibold mb-2" style={{ color: 'var(--text-muted)', letterSpacing: '0.12em' }}>04 —</p>
+                        <h2 className="text-[22px] font-semibold mb-3" style={{ color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                          Monitor your pipeline
+                        </h2>
+                        <p className="text-[14px] leading-relaxed mb-3" style={{ color: 'var(--text-secondary)' }}>
+                          Your pipeline is now live — Prism checks your source for new values every minute and updates your dashboard automatically as they&rsquo;re detected and standardized.
+                        </p>
+                        <ol className="text-[14px] leading-relaxed flex flex-col gap-2 list-decimal" style={{ color: 'var(--text-secondary)', paddingLeft: 20 }}>
+                          <li>Track counts for updating source values, standardized items, and items awaiting standardization</li>
+                          <li>Export the lookup table containing all standardizations for the table</li>
+                          <li>View the mappings or unstandardized items in the queue as needed</li>
+                        </ol>
+                      </div>
+                    </div>
+                  </>);
+                })()}
               </div>
 
               {/* CTA */}

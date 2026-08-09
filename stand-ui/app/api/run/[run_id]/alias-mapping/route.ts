@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { getDb } from '@/app/api/_lib/sqlite';
 import { loadOpRunState } from '@/app/api/_lib/op-auto-group';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 type AliasMap = Record<
   string,
@@ -22,30 +23,22 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ run_id: string }> }
 ) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { run_id } = await params;
 
   try {
-    return await withSnowflake(async (connection) => {
-      // Verify run exists.
-      const runRows = await new Promise<any[]>((resolve, reject) => {
-        connection.execute({
-          sqlText: `SELECT run_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ? LIMIT 1`,
-          binds:   [run_id],
-          complete: (err, _stmt, rows) => {
-            if (err) reject(err);
-            else     resolve(rows || []);
-          },
-        });
-      });
-
-      if (runRows.length === 0) {
+    {
+      // Verify run exists (RUNS lives in SQLite).
+      const runRow = getDb().prepare(`SELECT run_id FROM runs WHERE run_id = ?`).get(Number(run_id));
+      if (!runRow) {
         return Response.json({ error: 'Run not found' }, { status: 404 });
       }
 
       // Load the state blob that is written at run-creation time and updated by
       // every auto-group call.  RUNS.state is the single source of
       // truth for items and groupings.
-      const state = await loadOpRunState(connection, Number(run_id));
+      const state = await loadOpRunState(Number(run_id));
 
       const aliasMap: AliasMap = {};
 
@@ -59,18 +52,31 @@ export async function GET(
         // Populate a bucket per group. Singleton groups the LLM couldn't place
         // carry needs_review=true (self-mapped + written to the lookup, so the
         // pipeline queue stays empty) — flag their items so the UI highlights them.
+        // A literal must appear once per group. Auto-group now guarantees this at
+        // write time, but older/broken blobs can carry the same literal twice in a
+        // group (a merge that concatenated overlapping members) — which would
+        // collide React keys and duplicate/omit items in the review UI. Dedup on
+        // literal_value defensively while serving, so a bad blob renders cleanly
+        // without forcing a re-run.
         for (const group of state.groups) {
           const key = `g_${group.group_id}`;
           const groupNeedsReview = group.needs_review === true;
+          const seen = new Set<string>();
           aliasMap[key] = {
             group_id:     group.group_id,
             display_name: group.alias_name,
-            items:        group.items.map((gi) => ({
-              run_item_id:     itemIdMap.get(gi.literal_value) ?? 0,
-              literal_value:   gi.literal_value,
-              confidence_score: null,
-              ...(groupNeedsReview ? { needs_review: true } : {}),
-            })),
+            items:        group.items
+              .filter((gi) => {
+                if (seen.has(gi.literal_value)) return false;
+                seen.add(gi.literal_value);
+                return true;
+              })
+              .map((gi) => ({
+                run_item_id:     itemIdMap.get(gi.literal_value) ?? 0,
+                literal_value:   gi.literal_value,
+                confidence_score: null,
+                ...(groupNeedsReview ? { needs_review: true } : {}),
+              })),
           };
         }
 
@@ -108,9 +114,9 @@ export async function GET(
           },
         }
       );
-    });
+    }
   } catch (error) {
     console.error('Database error:', error);
-    return snowflakeErrorResponse(error, 'Failed to fetch alias mapping');
+    return Response.json({ error: 'Failed to fetch alias mapping' }, { status: 500 });
   }
 }

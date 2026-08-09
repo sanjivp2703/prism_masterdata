@@ -15,6 +15,8 @@
 
 import 'server-only';
 
+import { getDb } from './sqlite';
+
 import {
   loadOpRunState,
   saveOpRunState,
@@ -27,6 +29,9 @@ import { hasAnyRule } from './convention-rules';
 import { pickBestAliasName } from './namescore';
 import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
+import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
+import { readOneTimeDistinctValues } from './op-one-time-file';
 
 // ---------------------------------------------------------------------------
 // Identifier helpers (mirror auto-export/source + export-table)
@@ -51,16 +56,6 @@ export function isSimpleIdent(s: string): boolean {
   return true;
 }
 
-async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => (err ? reject(err) : resolve(rows ?? [])),
-    });
-  });
-}
-
 // ---------------------------------------------------------------------------
 // stats_snapshot helpers — one-time metadata lives here (not in the lookup)
 // ---------------------------------------------------------------------------
@@ -68,7 +63,16 @@ async function exec(connection: any, sqlText: string, binds?: any[]): Promise<an
 export interface OneTimeMeta {
   one_time_session: string;
   convention:       NamingConvention | null;
+  standardization_rules: string[] | null;
+  /** Optional free-text description of what the column's values are — fed to the
+   *  grouping LLM as the concept definition (the one-time analog of a spec/domain
+   *  description). */
+  description?:     string | null;
   accepted:         boolean;
+  /** Which Snowflake connection this run reads/writes with: the workspace
+   *  service connection (default) or the creator's PERSONAL credentials
+   *  (tables PRISM_SERVICE can't see). Export must use the same one. */
+  connection?:      'service' | 'user';
 }
 
 function safeJsonParse(s: unknown): any {
@@ -78,29 +82,51 @@ function safeJsonParse(s: unknown): any {
 }
 
 export async function loadOneTimeMeta(connection: any, runId: number): Promise<OneTimeMeta | null> {
-  const rows = await exec(
-    connection,
-    `SELECT stats_snapshot FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ? AND run_type = 'one_time'`,
-    [runId],
-  );
-  if (!rows.length) return null;
-  const raw = (rows[0] as any).STATS_SNAPSHOT ?? (rows[0] as any).stats_snapshot;
+  const row = getDb()
+    .prepare(`SELECT stats_snapshot FROM runs WHERE run_id = ? AND run_type = 'one_time'`)
+    .get(runId) as { stats_snapshot?: string | null } | undefined;
+  if (!row) return null;
+  const raw = row.stats_snapshot;
   const parsed = safeJsonParse(raw) ?? {};
+  const stdRules = Array.isArray(parsed.standardization_rules) ? parsed.standardization_rules : null;
   return {
     one_time_session: String(parsed.one_time_session ?? ''),
     convention:       parsed.convention ?? null,
+    standardization_rules: stdRules,
+    description:      parsed.description != null ? String(parsed.description) : null,
     accepted:         parsed.accepted === true,
+    connection:       parsed.connection === 'user' ? 'user' : 'service',
   };
 }
 
 export async function saveOneTimeMeta(connection: any, runId: number, meta: OneTimeMeta): Promise<void> {
-  await exec(
-    connection,
-    `UPDATE STAND_DB.STAND_INTERNAL.RUNS
-     SET stats_snapshot = PARSE_JSON(?), updated_at = CURRENT_TIMESTAMP()
-     WHERE run_id = ?`,
-    [JSON.stringify(meta), runId],
-  );
+  getDb()
+    .prepare(
+      `UPDATE runs
+       SET stats_snapshot = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE run_id = ?`,
+    )
+    .run(JSON.stringify(meta), runId);
+}
+
+// ---------------------------------------------------------------------------
+// Size guard
+// ---------------------------------------------------------------------------
+
+/** Max distinct (normalized) values a one-time column may have. */
+export const ONE_TIME_MAX_DISTINCT = 20_000;
+
+/** Thrown when a one-time column exceeds ONE_TIME_MAX_DISTINCT — the create
+ *  route converts it to a clear 400 instead of a sanitized Snowflake error. */
+export class OneTimeTooLargeError extends Error {
+  constructor(public columnName: string, public distinctCount: number) {
+    super(
+      `Column "${columnName}" has ${distinctCount.toLocaleString()} distinct values — ` +
+      `more than the ${ONE_TIME_MAX_DISTINCT.toLocaleString()} a one-time standardization supports. ` +
+      `Connect this column as a pipeline instead: it processes large columns automatically in batches.`,
+    );
+    this.name = 'OneTimeTooLargeError';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +157,20 @@ export interface CreateOneTimeRunArgs {
   createdBy:       number;
   sessionNonce:    string;
   convention:      NamingConvention | null;
+  standardization_rules?: string[] | null;
+  /** Optional description of the column's values (grouping concept definition). */
+  description?:    string | null;
+  /** Connection the caller scanned the source with — recorded so the export
+   *  uses the same one. Default 'service'. */
+  connectionSource?: 'service' | 'user';
+  /**
+   * FILE/SHEET sessions: read the column's distinct values from
+   * INTERNAL.ONE_TIME_FILE_ROWS (already uploaded under this nonce) instead of
+   * scanning a warehouse table. `source_relation` then carries a display label
+   * rather than a real FQN, so the identifier checks and the table scan below
+   * are both skipped.
+   */
+  fileSession?: boolean;
 }
 
 /**
@@ -139,46 +179,71 @@ export interface CreateOneTimeRunArgs {
  */
 export async function createOneTimeRun(connection: any, args: CreateOneTimeRunArgs): Promise<number> {
   const { source_relation, column_name, createdBy, sessionNonce, convention } = args;
-  const { db, schema, table } = parseFqn(source_relation);
 
-  if (![db, schema, table, column_name].every(isSimpleIdent)) {
-    throw new Error('Table or column name contains unsupported characters.');
+  // A file/sheet session has no source table: values were uploaded under this
+  // nonce and source_relation is a display label (a file name or sheet tab),
+  // which would fail parseFqn and isSimpleIdent for perfectly legitimate names.
+  const isFileSession = args.fileSession === true;
+
+  let tableRef = '';
+  let colRef   = '';
+  // Kept in the outer scope: the mssql scan below addresses the source by its
+  // unquoted three-part name, so it needs the parts too.
+  let parts: { db: string; schema: string; table: string } = { db: '', schema: '', table: '' };
+  if (!isFileSession) {
+    parts = parseFqn(source_relation);
+    if (![parts.db, parts.schema, parts.table, column_name].every(isSimpleIdent)) {
+      throw new Error('Table or column name contains unsupported characters.');
+    }
+    tableRef = `${quoteIdent(parts.db)}.${quoteIdent(parts.schema)}.${quoteIdent(parts.table)}`;
+    colRef   = quoteIdent(column_name);
   }
-
-  const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
-  const colRef   = quoteIdent(column_name);
 
   // Dedupe by the normalized form (a representative original kept via ANY_VALUE)
   // so byte-variant spellings collapse to one item — and so the export's
   // normalized join key is unique (no last-write-wins collision).
-  const valueRows = await exec(
-    connection,
-    `SELECT ANY_VALUE(TO_VARCHAR(${colRef})) AS literal_value,
-            COUNT(*) AS source_frequency
-     FROM ${tableRef}
-     WHERE ${colRef} IS NOT NULL
-     GROUP BY STAND_DB.STAND_INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
-     ORDER BY source_frequency DESC`,
-  );
+  // SQL Server: the detection engine's diff scan does the same dedup with
+  // app-side normalizeLiteral (no SQL normalize exists there); its 20k cap
+  // equals ONE_TIME_MAX_DISTINCT, so truncation ⇒ over the cap.
+  let valueRows: any[];
+  if (isFileSession) {
+    // Uploaded rows: dedup happens app-side in readOneTimeDistinctValues so
+    // both warehouses group identically (SQL Server has no PRISM_NORMALIZE).
+    valueRows = await readOneTimeDistinctValues(connection, sessionNonce, column_name);
+  } else if (getWarehouseAdapter().kind === 'mssql') {
+    const scan = await diffScan(connection, `${parts.db}.${parts.schema}.${parts.table}`, column_name);
+    if (scan.truncated) throw new OneTimeTooLargeError(column_name, DIFF_SCAN_MAX_DISTINCT + 1);
+    valueRows = scan.values.map(v => ({ literal_value: v.literal_value, source_frequency: v.frequency }));
+  } else {
+    valueRows = await exec(
+      connection,
+      `SELECT ANY_VALUE(TO_VARCHAR(${colRef})) AS literal_value,
+              COUNT(*) AS source_frequency
+       FROM ${tableRef}
+       WHERE ${colRef} IS NOT NULL
+       GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+       ORDER BY source_frequency DESC`,
+    );
+  }
+
+  // Hard cap: the one-time flow assumes a single review sitting and a single
+  // merge pass — neither holds for tens of thousands of distinct values (and
+  // the merge prompt would exceed the model context). Columns this large
+  // belong on a pipeline, which processes in 5 000-value installments.
+  if (valueRows.length > ONE_TIME_MAX_DISTINCT) {
+    throw new OneTimeTooLargeError(column_name, valueRows.length);
+  }
 
   const nonce = `ot_${sessionNonce}_${column_name}`;
-  await exec(
-    connection,
-    `INSERT INTO STAND_DB.STAND_INTERNAL.RUNS
-       (concept_key, source_relation, source_column, mode, domain_id, run_type, created_by,
-        run_status, creation_nonce, created_at, updated_at)
-     VALUES ('one_time', ?, ?, 'manual', NULL, 'one_time', ${Number(createdBy)},
-             'created', ?, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`,
-    [source_relation, column_name, nonce],
-  );
-
-  const idRows = await exec(
-    connection,
-    `SELECT run_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE creation_nonce = ? ORDER BY run_id DESC LIMIT 1`,
-    [nonce],
-  );
-  if (!idRows.length) throw new Error('One-time run was created but the run ID could not be retrieved.');
-  const runId = Number((idRows[0] as any).RUN_ID ?? (idRows[0] as any).run_id);
+  const insertRes = getDb()
+    .prepare(
+      `INSERT INTO runs
+         (concept_key, source_relation, source_column, mode, domain_id, run_type, created_by,
+          run_status, creation_nonce)
+       VALUES ('one_time', ?, ?, 'manual', NULL, 'one_time', ?, 'created', ?)`,
+    )
+    .run(source_relation, column_name, Number(createdBy), nonce);
+  const runId = Number(insertRes.lastInsertRowid);
 
   const initialState: OpRunState = {
     status: 'created',
@@ -194,8 +259,15 @@ export async function createOneTimeRun(connection: any, args: CreateOneTimeRunAr
       matched_from_lookup: false,
     })),
   };
-  await saveOpRunState(connection, runId, initialState);
-  await saveOneTimeMeta(connection, runId, { one_time_session: sessionNonce, convention, accepted: false });
+  await saveOpRunState(runId, initialState);
+  await saveOneTimeMeta(connection, runId, {
+    one_time_session: sessionNonce,
+    connection: args.connectionSource === 'user' ? 'user' : 'service',
+    convention,
+    standardization_rules: args.standardization_rules ?? null,
+    description: args.description ?? null,
+    accepted: false,
+  });
 
   return runId;
 }
@@ -213,7 +285,7 @@ export async function groupOneTimeRun(
   connection: any,
   runId:      number,
 ): Promise<OneTimeMapping[]> {
-  const state = await loadOpRunState(connection, runId);
+  const state = await loadOpRunState(runId);
   if (!state) throw new Error(`Run state not found for run_id=${runId}.`);
   const meta = await loadOneTimeMeta(connection, runId);
 
@@ -225,7 +297,7 @@ export async function groupOneTimeRun(
   const items = state.items ?? [];
   if (items.length === 0) {
     const empty: OpRunState = { status: 'complete', items: [], groups: [], ungrouped: [] };
-    await saveOpRunState(connection, runId, empty);
+    await saveOpRunState(runId, empty);
     return [];
   }
 
@@ -238,9 +310,10 @@ export async function groupOneTimeRun(
     norm_tokens:         [],
   }));
 
-  // No domain context, no existing alias names, no standardization rules — just
-  // the LLM's world knowledge plus the optional naming convention.
-  const result = await runOnePromptGrouping(runItems, '', '', [], convention, null);
+  const stdRules = meta?.standardization_rules ?? null;
+  // The optional description is fed as the grouping concept definition.
+  const conceptDef = meta?.description?.trim() || '';
+  const result = await runOnePromptGrouping(runItems, '', conceptDef, [], convention, stdRules);
 
   const runItemsById = new Map(runItems.map((ri) => [ri.run_item_id, ri]));
   const ordered = [
@@ -253,10 +326,17 @@ export async function groupOneTimeRun(
   const groupedLiterals = new Set<string>();
 
   for (const g of ordered) {
-    const groupItems: OpGroupItem[] = g.member_ids
-      .map((id) => runItemsById.get(id))
-      .filter((ri): ri is RunItemForPairing => ri != null)
-      .map((ri) => ({ literal_value: ri.literal_value, matched_from_lookup: false }));
+    // Each literal must land in exactly one group. A merge that concatenates
+    // member_ids (or an LLM that repeats an index) can otherwise place the same
+    // value twice — duplicating it in the blob, which collides React keys in the
+    // review UI. First placement wins; later duplicates are dropped here.
+    const groupItems: OpGroupItem[] = [];
+    for (const id of g.member_ids) {
+      const ri = runItemsById.get(id);
+      if (!ri || groupedLiterals.has(ri.literal_value)) continue;
+      groupedLiterals.add(ri.literal_value);
+      groupItems.push({ literal_value: ri.literal_value, matched_from_lookup: false });
+    }
     if (groupItems.length === 0) continue;
 
     const proposed = (g.proposed_name ?? '').trim();
@@ -264,7 +344,6 @@ export async function groupOneTimeRun(
       g.member_ids.map((id) => runItemsById.get(id)).filter((m): m is RunItemForPairing => m != null),
     ).literal_value || groupItems[0].literal_value;
 
-    for (const gi of groupItems) groupedLiterals.add(gi.literal_value);
     groups.push({
       group_id:          nextGroupId++,
       alias_name:        name,
@@ -298,7 +377,7 @@ export async function groupOneTimeRun(
     groups,
     ungrouped: [],
   };
-  await saveOpRunState(connection, runId, newState);
+  await saveOpRunState(runId, newState);
 
   return mappingsFromState(newState);
 }
@@ -360,7 +439,11 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
   // Only standardize columns that actually exist on the source.
   const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
 
-  const mapTable = `STAND_DB.STAND_INTERNAL.${quoteIdent(`OTS_MAP_${nonce}`)}`;
+  if (getWarehouseAdapter().kind === 'mssql') {
+    return await exportOneTimeToMssqlTarget(connection, { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched });
+  }
+
+  const mapTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_MAP_${nonce}`)}`;
 
   try {
     // ── Build the transient mapping table ──────────────────────────────────
@@ -409,7 +492,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       joinClauses.push(
         `LEFT JOIN ${mapTable} ${alias}
            ON ${alias}.column_name = ${literal}
-          AND ${alias}.normalized_value = STAND_DB.STAND_INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.column_name)}))`,
+          AND ${alias}.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.column_name)}))`,
       );
     });
 
@@ -423,7 +506,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
 
     if (mode === 'overwrite') {
       // Prefer CREATE OR REPLACE (atomic schema + data swap). Falls back to
-      // DELETE + INSERT when STAND_ADMIN doesn't own the existing table —
+      // DELETE + INSERT when PRISM_SERVICE doesn't own the existing table —
       // that path only needs INSERT/DELETE privileges, not OWNERSHIP.
       try {
         await exec(connection, `CREATE OR REPLACE TABLE ${targetRef} AS ${selectSQL}`);
@@ -435,9 +518,9 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
           m.includes('access control error') || m.includes('sql access control');
         if (!isPermErr) throw replaceErr;
 
-        // Build staging table in STAND_INTERNAL (always writable), then
+        // Build staging table in INTERNAL (always writable), then
         // overwrite target rows. Target schema must match the source.
-        const stageRef = `STAND_DB.STAND_INTERNAL.${quoteIdent(`OTS_FALLBACK_${nonce}`)}`;
+        const stageRef = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_FALLBACK_${nonce}`)}`;
         try {
           await exec(connection, `CREATE OR REPLACE TEMPORARY TABLE ${stageRef} AS ${selectSQL}`);
           await exec(connection, `DELETE FROM ${targetRef} WHERE TRUE`);
@@ -460,5 +543,139 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
+  }
+}
+
+// ── SQL Server one-time export (port Phase 7) ────────────────────────────────
+// No SQL-side normalize exists on this warehouse, so the mapping table is
+// keyed by RAW value: read each watched column's distinct raw values,
+// normalize app-side, resolve the standardized name from the run's mappings,
+// and join on raw equality (BIN2 — exact match). Same fall-through semantics
+// as the Snowflake writer: unmapped/NULL values keep their raw value.
+async function exportOneTimeToMssqlTarget(
+  connection: any,
+  args: {
+    source_relation: string; target_fqn: string; mode: 'create' | 'overwrite';
+    nonce: string; sourceRef: string; targetRef: string; sourceCols: string[];
+    watched: OneTimeExportColumn[];
+  },
+): Promise<{ rows_written: number }> {
+  const { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched } = args;
+  const BIN2 = 'Latin1_General_100_BIN2';
+  const mapTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_MAP_${nonce}`)}`;
+  const stageTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_STAGE_${nonce}`)}`;
+
+  try {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
+    await exec(
+      connection,
+      `CREATE TABLE ${mapTable} (
+         column_name        NVARCHAR(200) COLLATE ${BIN2} NOT NULL,
+         raw_value          NVARCHAR(800) COLLATE ${BIN2} NOT NULL,
+         standardized_value NVARCHAR(800) NOT NULL,
+         CONSTRAINT ${quoteIdent(`PK_OTS_MAP_${nonce}`)} PRIMARY KEY (column_name, raw_value)
+       )`,
+    );
+
+    for (const w of watched) {
+      const stdByNorm = new Map<string, string>();
+      for (const m of w.mappings) {
+        if (m.raw != null && m.standardized != null && m.standardized !== '') {
+          stdByNorm.set(normalizeLiteral(m.raw), m.standardized);
+        }
+      }
+      if (stdByNorm.size === 0) continue;
+
+      const colRef = quoteIdent(w.column_name);
+      // COLLATE is load-bearing — same defect as KI-138 in the pipeline export
+      // path, filed separately here as KI-82 because the one-time flow builds
+      // its own staging table. Without it this DISTINCT runs under the SOURCE
+      // database's collation, which is case-insensitive by default
+      // (SQL_Latin1_General_CP1_CI_AS), so 'ATT' and 'att' collapse to one
+      // representative — while the join that applies the mapping below is
+      // explicitly BIN2 (`m.raw_value = src.<col> COLLATE ${BIN2}`). Every row
+      // whose bytes differ from the surviving representative then matches
+      // nothing and exports unstandardized. Distinct-ing under the SAME
+      // collation the join uses keeps the two halves consistent.
+      const distinctRows = await exec(
+        connection,
+        `SELECT DISTINCT ${colRef} COLLATE ${BIN2} AS v FROM ${sourceRef} WHERE ${colRef} IS NOT NULL`,
+      );
+      const stagingRows: Array<[string, string, string]> = [];
+      const seenRaw = new Set<string>();
+      for (const r of distinctRows) {
+        const raw = String(r.v);
+        if (raw.length > 800 || seenRaw.has(raw)) continue;
+        const std = stdByNorm.get(normalizeLiteral(raw));
+        if (std == null) continue;
+        seenRaw.add(raw);
+        stagingRows.push([w.column_name, raw, std]);
+      }
+      const BATCH = 500; // 3 binds/row → 1500, inside the ~2.1k ceiling
+      for (let i = 0; i < stagingRows.length; i += BATCH) {
+        const slice = stagingRows.slice(i, i + BATCH);
+        const valuesSql = slice.map(() => '(?, ?, ?)').join(', ');
+        await exec(
+          connection,
+          `INSERT INTO ${mapTable} (column_name, raw_value, standardized_value) VALUES ${valuesSql}`,
+          slice.flat(),
+        );
+      }
+    }
+
+    const replaceMap = new Map<string, string>();
+    const joinClauses: string[] = [];
+    watched.forEach((w, i) => {
+      const alias = `m_${i}`;
+      const literal = `'${w.column_name}'`; // isSimpleIdent-validated upstream
+      replaceMap.set(
+        w.column_name.toUpperCase(),
+        // Both COALESCE arms forced to one collation — staging is BIN2 while
+        // source columns carry arbitrary collations (conflict otherwise).
+        `COALESCE(${alias}.standardized_value COLLATE DATABASE_DEFAULT, src.${quoteIdent(w.column_name)} COLLATE DATABASE_DEFAULT) AS ${quoteIdent(w.column_name)}`,
+      );
+      joinClauses.push(
+        `LEFT JOIN ${mapTable} ${alias}
+           ON ${alias}.column_name = ${literal}
+          AND ${alias}.raw_value = src.${quoteIdent(w.column_name)} COLLATE ${BIN2}`,
+      );
+    });
+
+    const selectList = sourceCols
+      .map((c) => replaceMap.get(c.toUpperCase()) ?? `src.${quoteIdent(c)}`)
+      .join(',\n      ');
+    const fromClause = `FROM ${sourceRef} src\n       ${joinClauses.join('\n       ')}`;
+    const selectInto = (dest: string) =>
+      `SELECT\n         ${selectList}\n       INTO ${dest}\n       ${fromClause}`;
+
+    if (mode === 'overwrite') {
+      const tgt = parseFqn(target_fqn);
+      const bracketRef = `[${tgt.db.replace(/]/g, ']]')}].[${tgt.schema.replace(/]/g, ']]')}].[${tgt.table.replace(/]/g, ']]')}]`;
+      const existsRows = await exec(connection, `SELECT OBJECT_ID(?) AS oid`, [bracketRef]);
+      if (existsRows[0]?.oid != null) {
+        // Preserve the target's identity/permissions: stage the result, then
+        // DELETE + INSERT (needs only DELETE/INSERT on the target — the same
+        // privilege bar as the Snowflake fallback path).
+        await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`);
+        await exec(connection, selectInto(stageTable));
+        await exec(connection, `DELETE FROM ${targetRef}`);
+        await exec(connection, `INSERT INTO ${targetRef} SELECT * FROM ${stageTable}`);
+      } else {
+        await exec(connection, selectInto(targetRef));
+      }
+    } else {
+      await exec(connection, selectInto(targetRef));
+    }
+
+    const cntRows = await exec(connection, `SELECT COUNT(*) AS cnt FROM ${targetRef}`);
+    const rows_written = Number(cntRows[0]?.cnt ?? 0);
+    console.log(
+      `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
+      `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
+    );
+    return { rows_written };
+  } finally {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
+    await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`).catch(() => {});
   }
 }

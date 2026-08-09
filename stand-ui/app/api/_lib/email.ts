@@ -108,7 +108,7 @@ function inviteHtml(inviterName: string, inviterEmail: string, acceptUrl: string
                 <strong>${inviterName || inviterEmail}</strong> has invited you to join
                 <strong>Prism</strong> as a <strong>${ROLE_DESCRIPTIONS[role].label}</strong> — a data
                 standardisation platform for unifying inconsistent categorical values across
-                Snowflake tables.
+                your data warehouse's tables.
               </p>
 
               ${roleBlock(role)}

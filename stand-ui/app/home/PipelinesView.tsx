@@ -4,10 +4,17 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import PipelineDetail from './PipelineDetail';
-import CompactDomainPicker from '@/app/components/CompactDomainPicker';
+import {
+  emptyColumnSpecDraft, columnSpecDraftValid, columnSpecDraftToApiSpec,
+  type ColumnSpecDraft,
+} from '@/app/components/ColumnSpecEditor';
+import ColumnSpecField from '@/app/components/ColumnSpecField';
 import ExportLookupModal from '@/app/components/ExportLookupModal';
 import { showToast } from '@/app/components/Toast';
-import type { Domain } from '@/app/components/domain-types';
+import type { ColumnSpec } from '@/app/components/spec-types';
+import { parseStoredSchedule, scheduleLabel, type UpdateSchedule } from '@/app/api/_lib/update-schedule';
+import { sanitizeConventionRules, describeConventionRules, hasAnyRule } from '@/app/api/_lib/convention-rules';
+import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -19,11 +26,16 @@ export interface Pipeline {
   table_fqn:           string;
   column_name:         string;
   export_table_fqn:    string | null;
+  export_kind:         'table' | 'view' | 'column'; // meaningless when export_table_fqn is null; 'column' ⇒ export_table_fqn = table_fqn
   domain_id:           number | null;
   domain_name:         string | null;
   status:               PipelineStatus;
   status_message:       string | null;
-  mode:                 string;
+  // Machine-readable code alongside status_message — set only when there's a
+  // real fix action attached (currently 'table_mode_access'). Drives the
+  // "Grant automatically" disclosure instead of a plain text banner.
+  status_reason:        string | null;
+  update_schedule:      UpdateSchedule;
   export_unmapped_rows: boolean;
   queue_size:           number;
   total_new_values:    number;
@@ -31,13 +43,15 @@ export interface Pipeline {
   total_source_values: number;
   last_polled_at:      string | null;
   last_queue_empty_at: string | null;
+  fully_synced_at:     string | null;
   created_by:          number | null;
   created_at:          string | null;
   updated_at:          string | null;
   // File-based pipeline fields
-  source_type:         string;
-  file_source_meta:    any | null;
-  file_export_meta:    any | null;
+  // Change-detection mode (SQL Server warehouses): 'stream' (Snowflake),
+  // 'ct' (Change Tracking) or 'diff' (scheduled scan); null for file pipelines.
+  detection_mode:      string | null;
+  detection_reason:    string | null;
 }
 
 /**
@@ -48,14 +62,12 @@ export interface Pipeline {
 export interface PipelineGroup {
   key:                 string;        // export_table_fqn, or `__pid_<id>` when none
   export_table_fqn:    string | null;
+  export_kind:         'table' | 'view' | 'column'; // from the first member; meaningless when export_table_fqn is null
   table_fqn:           string;        // from the first member
   name:                string | null; // card name (first member with a name)
   columns:             Pipeline[];    // member pipelines, ordered by source ordinal
-  primaryDomainId:     number | null;
-  primaryDomainName:   string | null;
-  multipleDomains:     boolean;
   status:               PipelineStatus; // derived: any pending_baseline → pending_baseline; all active → active; else paused
-  mode:                 'auto' | 'manual' | 'mixed';
+  update_schedule:      UpdateSchedule; // shared by all columns of a table (from the first)
   export_unmapped_rows: boolean;        // from first column; false = mapped rows only in export
   total_source_values: number;        // summed across columns
   total_mapped:        number;        // summed across columns
@@ -64,6 +76,9 @@ export interface PipelineGroup {
   created_at:          string | null; // earliest
   last_polled_at:      string | null; // latest
   last_queue_empty_at: string | null; // latest
+  /** EARLIEST across columns (all must be synced for the table to be fully up
+   *  to date) — last time the standardized table was verified complete. */
+  fully_synced_at:     string | null;
 }
 
 interface Alert {
@@ -142,15 +157,14 @@ function groupName(g: PipelineGroup): string {
 /** The card key a pipeline belongs to: its export file, or table_fqn for file pipelines, else a per-pipeline key. */
 function groupKeyFor(p: Pipeline): string {
   if (p.export_table_fqn && p.export_table_fqn.trim()) return `exp:${p.export_table_fqn}`;
-  // File pipelines (sheets, csv, excel) have no export_table_fqn; group by table_fqn so
+  // Lookup-only pipelines have no export_table_fqn; group by table_fqn so
   // virtual multi-column entries sharing the same pipeline_id land on one card.
-  if (p.source_type && p.source_type !== 'snowflake') return `file:${p.table_fqn}`;
   return `__pid_${p.pipeline_id}`;
 }
 
 /**
  * Collapse pipelines into cards by export file. All columns sharing an
- * export_table_fqn become one card (a table + its standardized columns); domain
+ * export_table_fqn become one card (a table + its standardized columns); spec
  * differences within a card are allowed. Columns are ordered by source ordinal
  * when known. The card's metrics are summed across columns.
  */
@@ -177,22 +191,15 @@ function buildPipelineGroups(
       return a.column_name.localeCompare(b.column_name);
     });
 
-    // Primary domain = the oldest member's domain (used for the bucket + label).
-    const oldest = [...columns].sort((a, b) =>
-      (a.created_at ? new Date(a.created_at).getTime() : 0) -
-      (b.created_at ? new Date(b.created_at).getTime() : 0))[0];
-    const distinctDomains = new Set(columns.map(c => c.domain_id ?? -1));
-
     // Derived status: any setting-up → setting up; all live → live; else paused.
     const status: PipelineStatus =
       columns.some(c => c.status === 'pending_baseline') ? 'pending_baseline'
         : columns.every(c => c.status === 'active') ? 'active'
           : 'paused';
 
-    const distinctModes = new Set(columns.map(c => c.mode));
-    const mode: PipelineGroup['mode'] = distinctModes.size > 1
-      ? 'mixed'
-      : (columns[0].mode === 'manual' ? 'manual' : 'auto');
+    // All columns of a table share one update schedule (settings/creation apply
+    // it to every column); tolerate raw rows by re-parsing defensively.
+    const update_schedule = parseStoredSchedule(columns[0].update_schedule);
 
     // All columns of a table share the same export_unmapped_rows value; use the first.
     const export_unmapped_rows = columns[0].export_unmapped_rows !== false;
@@ -200,14 +207,12 @@ function buildPipelineGroups(
     groups.push({
       key,
       export_table_fqn:    members[0].export_table_fqn,
+      export_kind:         members[0].export_kind,
       table_fqn:           members[0].table_fqn,
       name:                columns.find(c => c.name)?.name ?? null,
       columns,
-      primaryDomainId:     oldest.domain_id,
-      primaryDomainName:   oldest.domain_name,
-      multipleDomains:     distinctDomains.size > 1,
       status,
-      mode,
+      update_schedule,
       export_unmapped_rows,
       total_source_values: columns.reduce((s, c) => s + (c.total_source_values || 0), 0),
       total_mapped:        columns.reduce((s, c) => s + (c.total_mapped || 0), 0),
@@ -216,6 +221,10 @@ function buildPipelineGroups(
       created_at:          columns.reduce<string | null>((acc, c) => minIso(acc, c.created_at), null),
       last_polled_at:      columns.reduce<string | null>((acc, c) => maxIso(acc, c.last_polled_at), null),
       last_queue_empty_at: columns.reduce<string | null>((acc, c) => maxIso(acc, c.last_queue_empty_at), null),
+      // Min, not max: the card is only as fresh as its least-synced column.
+      fully_synced_at:     columns.every(c => c.fully_synced_at)
+        ? columns.reduce<string | null>((acc, c) => minIso(acc, c.fully_synced_at), null)
+        : null,
     });
   }
   return groups;
@@ -261,11 +270,201 @@ function StatusPill({ status }: { status: PipelineStatus }) {
   );
 }
 
+/** A column spec's details for the hover tooltip — description, standardization
+ *  rules, and naming convention, as heading + lines sections. */
+function columnSpecSections(spec: ColumnSpec): { heading: string; lines: string[] }[] {
+  const sections: { heading: string; lines: string[] }[] = [];
+  if (spec.description?.trim()) {
+    sections.push({ heading: 'Description', lines: [spec.description.trim()] });
+  }
+  try {
+    const raw = spec.standardization_rules;
+    const rules = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(rules) && rules.length > 0) {
+      sections.push({ heading: 'Standardization rules', lines: rules.map(r => String(r)) });
+    }
+  } catch { /* unreadable rules JSON — omit the section */ }
+  const convLines: string[] = [];
+  try {
+    const raw = spec.convention_rules;
+    const cr = sanitizeConventionRules(typeof raw === 'string' ? JSON.parse(raw) : raw);
+    if (hasAnyRule(cr)) convLines.push(...describeConventionRules(cr));
+  } catch { /* no structured convention */ }
+  if (spec.convention_type === 'regex' && spec.convention_value) {
+    convLines.push(`Names must match the pattern: ${spec.convention_value}`);
+  } else if (spec.convention_type === 'natural' && spec.convention_value) {
+    convLines.push(spec.convention_value);
+  } else if (spec.convention_type === 'examples' && spec.convention_value) {
+    convLines.push(`Names follow the style of: ${spec.convention_value}`);
+  }
+  if (convLines.length > 0) sections.push({ heading: 'Naming convention', lines: convLines });
+  return sections;
+}
+
+/** ⓘ icon revealing a column's spec (description + standardization rules +
+ *  naming convention) on hover OR click. PORTALED (position: fixed) — card rows
+ *  and panels clip absolute children. Used next to each column in the Activity
+ *  tab's per-column breakdown (exported for PipelineDetail). */
+export function SpecInfoIcon({ spec }: { spec: ColumnSpec | null }) {
+  const iconRef = useRef<HTMLSpanElement>(null);
+  const [tipPos, setTipPos] = useState<{ left: number; top: number } | null>(null);
+  const [pinned, setPinned] = useState(false);
+
+  const show = () => {
+    const r = iconRef.current?.getBoundingClientRect();
+    if (!r) return;
+    // Exact width + clamp to the viewport so the fixed panel never overflows.
+    setTipPos({ left: Math.min(r.left - 8, window.innerWidth - 296), top: r.bottom + 6 });
+  };
+
+  // A clicked-open (pinned) panel closes on any outside click.
+  useEffect(() => {
+    if (!pinned) return;
+    const close = () => { setPinned(false); setTipPos(null); };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [pinned]);
+
+  if (!spec) return null;
+  const sections = columnSpecSections(spec);
+
+  return (
+    <span
+      ref={iconRef}
+      onMouseEnter={show}
+      onMouseLeave={() => { if (!pinned) setTipPos(null); }}
+      onMouseDown={e => e.stopPropagation()}
+      onClick={e => {
+        e.stopPropagation();
+        if (pinned) { setPinned(false); setTipPos(null); }
+        else { setPinned(true); show(); }
+      }}
+      style={{ display: 'inline-flex', cursor: 'help', color: 'var(--accent)', flexShrink: 0 }}
+      aria-label={`Description, standardization rules, and naming convention for the ${spec.column_name} column`}
+    >
+      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+        <circle cx="6" cy="6" r="5.4" stroke="currentColor" strokeWidth="1" />
+        <path d="M6 5.4v3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+        <circle cx="6" cy="3.6" r="0.65" fill="currentColor" />
+      </svg>
+      {tipPos && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{
+            position: 'fixed', left: tipPos.left, top: tipPos.top, zIndex: 9999,
+            width: 288, maxHeight: 320, overflowY: 'auto', pointerEvents: 'none',
+            backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)',
+            borderRadius: 'var(--radius-button)', boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+            padding: '10px 12px',
+          }}
+        >
+          <p className="text-[11px] font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>{spec.column_name}</p>
+          {sections.length === 0 ? (
+            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              No description, standardization rules, or naming convention set for this column.
+            </p>
+          ) : sections.map(s => (
+            <div key={s.heading} className="mt-1.5">
+              <p className="text-[10px] font-medium mb-0.5" style={{ color: 'var(--text-muted)' }}>{s.heading}</p>
+              {s.lines.map((line, i) => (
+                <p key={i} className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                  {s.lines.length > 1 ? '• ' : ''}{line}
+                </p>
+              ))}
+            </div>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </span>
+  );
+}
+
+// ── Fixable pause: table-mode export permissions (mssql only) ────────────────
+
+// Replaces the plain status_message banner for this specific pause reason
+// with an explanation + a one-click "Grant automatically" action, instead of
+// just text the user has to act on manually.
+function TableModeAccessBanner({
+  pipeline, multiColumn, onFixAccess,
+}: {
+  pipeline:    Pipeline;
+  multiColumn: boolean;
+  onFixAccess: (pipelineId: number) => Promise<{ fixed: boolean; error?: string; manual_sql?: string }>;
+}) {
+  const [attempting, setAttempting] = useState(false);
+  const [manualSql,  setManualSql]  = useState<string | null>(null);
+  const [copied,     setCopied]     = useState(false);
+
+  async function tryFix() {
+    setAttempting(true);
+    setManualSql(null);
+    try {
+      const result = await onFixAccess(pipeline.pipeline_id);
+      if (!result.fixed) {
+        setManualSql(result.manual_sql ?? null);
+        showToast(result.error ?? "Couldn't grant access automatically.", 'error');
+      }
+    } finally {
+      setAttempting(false);
+    }
+  }
+
+  function copySql() {
+    if (!manualSql) return;
+    navigator.clipboard?.writeText(manualSql).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
+  return (
+    <div className="px-4 py-3 text-[11px]" style={{ backgroundColor: '#FFFBEB', borderTop: '0.5px solid #FDE9C8', color: '#92400E' }}>
+      {multiColumn && <span className="font-medium">{pipeline.column_name}: </span>}
+      <p className="mb-1.5" style={{ lineHeight: 1.55 }}>
+        Prism paused this pipeline — it needs <span className="font-mono">CREATE TABLE</span> and{' '}
+        <span className="font-mono">ALTER</span> permissions on the destination schema to rebuild the standardized
+        export table. These let Prism create and replace its own export table there. They do not touch any of your
+        other existing tables — but they are schema-wide grants, so they would technically also let Prism (or anyone
+        else holding them) create or modify other new tables in that same schema.
+      </p>
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={tryFix}
+          disabled={attempting}
+          className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors disabled:opacity-50"
+          style={{ borderColor: '#F59E0B', color: '#92400E', backgroundColor: 'transparent' }}
+        >
+          {attempting ? 'Granting…' : 'Grant automatically'}
+        </button>
+        {manualSql && (
+          <button
+            type="button"
+            onClick={copySql}
+            className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors"
+            style={{ borderColor: '#F59E0B', color: '#92400E', backgroundColor: 'transparent' }}
+          >
+            {copied ? 'Copied!' : 'Copy fix SQL'}
+          </button>
+        )}
+      </div>
+      {manualSql && (
+        <pre
+          className="mt-2 text-[10px] p-2 rounded-button overflow-x-auto"
+          style={{ backgroundColor: '#FEF3C7', color: '#78350F', whiteSpace: 'pre-wrap' }}
+        >
+          {manualSql}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 // ── Pipeline row ──────────────────────────────────────────────────────────────
 
 interface GroupRowProps {
   group:                    PipelineGroup;
-  variant:                  'table' | 'domain';
+  variant:                  'table' | 'spec';
   isExpanded:               boolean;
   expandedTab:              string | null;
   onToggle:                 () => void;
@@ -279,11 +478,14 @@ interface GroupRowProps {
   onAutoStandardize:        (g: PipelineGroup) => void;
   onManualStandardize:      (g: PipelineGroup) => void;
   onUpdateMember:           (p: Pipeline, patch: Partial<Pipeline>) => void;
-  onDeleteMember:           (p: Pipeline) => void;
+  onDeleteMember:           (p: Pipeline) => void | Promise<void>;
+  onFixAccess:              (pipelineId: number) => Promise<{ fixed: boolean; error?: string; manual_sql?: string }>;
   busy:                     boolean;
+  /** True while THIS card's delete request is in flight (subset of busy). */
+  deleting:                 boolean;
   running:                  boolean;
-  scanning:                 boolean;
-  cycleResetMs:             number;
+  /** Full column-spec records (from /api/column-specs, keyed by spec_id) for the spec tooltip. */
+  specsById:                Map<number, ColumnSpec>;
 }
 
 function GroupRow({
@@ -291,7 +493,7 @@ function GroupRow({
   onUpdateStandardizations, onAutoStandardize, onManualStandardize, onReviewInitial,
   onPause, onResume, onDelete,
   onAddColumn, addableColumns,
-  onUpdateMember, onDeleteMember, busy, running, scanning, cycleResetMs,
+  onUpdateMember, onDeleteMember, onFixAccess, busy, deleting, running, specsById,
 }: GroupRowProps) {
   const columnsLabel = g.columns.map(c => c.column_name).join(', ');
   const messages = g.columns.filter(c => c.status_message);
@@ -313,8 +515,36 @@ function GroupRow({
     prevRunning.current = running;
   }, [running]);
 
-  const title   = variant === 'domain' ? (g.columns[0].name ?? g.columns[0].column_name) : groupName(g);
-  const subline = variant === 'domain' ? g.table_fqn : columnsLabel;
+  const title   = variant === 'spec' ? (g.columns[0].name ?? g.columns[0].column_name) : groupName(g);
+  const subline = variant === 'spec' ? g.table_fqn : columnsLabel;
+
+  // WHERE THE STANDARDIZED DATA ACTUALLY LANDS.
+  //
+  // The card's sub-line names the SOURCE, and until now the destination
+  // appeared nowhere on a warehouse card at all — so the one thing a user most
+  // needs ("where do I read the clean data?") was the one thing they had to go
+  // hunting for.
+  //
+  // Every output kind gets an answer here, including the two that don't create
+  // an object, because "Prism didn't make you a table, and that's the setting
+  // you chose" is a legitimate answer and better than silence.
+  const destination = (() => {
+    if (!g.export_table_fqn) {
+      return { label: 'Lookup table only — no output object', href: null, mono: false };
+    }
+    if (g.export_kind === 'column') {
+      // Destination is pinned to the source; the real artifact is the companion
+      // column, which is what the user has to go and SELECT.
+      const cols = g.columns.map(c => `${c.column_name}_STANDARDIZED`).join(', ');
+      return { label: `${g.export_table_fqn} · ${cols}`, href: null, mono: true };
+    }
+    return { label: g.export_table_fqn, href: null, mono: true };
+  })();
+  const destinationKindLabel =
+    g.export_kind === 'column' ? 'Standardized column'
+      : g.export_kind === 'view'   ? 'Output view'
+      : g.export_table_fqn         ? 'Output table'
+      : 'Output';
 
   function openStdMenu() {
     if (stdTriggerRef.current) {
@@ -343,7 +573,7 @@ function GroupRow({
       <div
         className="grid items-center cursor-pointer"
         style={{
-          gridTemplateColumns: '20px minmax(140px,2fr) 100px 75px 1fr',
+          gridTemplateColumns: '20px minmax(140px,2fr) 100px 170px 1fr',
           padding: '11px 16px',
           gap: 14,
           transition: 'background-color 0.1s',
@@ -369,6 +599,27 @@ function GroupRow({
           <p className="text-[11px] font-mono truncate mt-0.5" style={{ color: 'var(--text-muted)' }} title={`${g.table_fqn} — ${columnsLabel}`}>
             {subline}
           </p>
+          {/* Where the standardized data lands — the answer users came for. */}
+          {variant !== 'spec' && (
+            <p className="text-[11px] truncate mt-0.5 flex items-center gap-1" style={{ color: 'var(--text-hint)' }}
+               title={`${destinationKindLabel}: ${destination.label}`}>
+              <span style={{ flexShrink: 0 }}>{destinationKindLabel}:</span>
+              {destination.href ? (
+                <a
+                  href={destination.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={e => e.stopPropagation()}
+                  className="truncate hover:underline"
+                  style={{ color: 'var(--accent)', textDecoration: 'none' }}
+                >
+                  {destination.label} ↗
+                </a>
+              ) : (
+                <span className={`truncate ${destination.mono ? 'font-mono' : ''}`}>{destination.label}</span>
+              )}
+            </p>
+          )}
         </div>
 
         {/* Status */}
@@ -376,30 +627,33 @@ function GroupRow({
           <StatusPill status={g.status} />
         </div>
 
-        {/* Mode + export-unmapped indicator */}
+        {/* Update window + export-unmapped indicator */}
         <div className="flex flex-col items-start gap-1">
           <span
-            className="text-[9px] font-medium uppercase tracking-wide px-1.5 py-0.5 rounded self-start"
+            className="text-[9px] font-medium px-1.5 py-0.5 rounded self-start whitespace-nowrap"
+            title="Update window — when Prism auto-updates the standardized table"
             style={{
-              backgroundColor: g.mode === 'auto' ? '#F5F3FF' : 'var(--page-bg)',
-              color:           g.mode === 'auto' ? '#7C3AED' : 'var(--text-muted)',
-              border:          `0.5px solid ${g.mode === 'auto' ? '#DDD6FE' : 'var(--border)'}`,
+              backgroundColor: g.update_schedule.type !== 'manual' ? '#F5F3FF' : 'var(--page-bg)',
+              color:           g.update_schedule.type !== 'manual' ? '#7C3AED' : 'var(--text-muted)',
+              border:          `0.5px solid ${g.update_schedule.type !== 'manual' ? '#DDD6FE' : 'var(--border)'}`,
             }}
           >
-            {g.mode}
+            {scheduleLabel(g.update_schedule)}
           </span>
-          {g.mode !== 'auto' && !g.export_unmapped_rows && (
-            <span
-              className="text-[9px] font-medium px-1.5 py-0.5 rounded self-start whitespace-nowrap"
-              style={{
-                backgroundColor: '#FFF7ED',
-                color:           '#C2410C',
-                border:          '0.5px solid #FED7AA',
-              }}
-            >
-              Mapped only
+          {running ? (
+            <span className="inline-flex items-center gap-1.5 text-[10px] font-medium whitespace-nowrap" style={{ color: '#B45309' }}>
+              <PulseDot color="#D97706" />
+              Standardizing…
             </span>
-          )}
+          ) : g.fully_synced_at ? (
+            <span
+              className="text-[10px] leading-snug"
+              title={`Standardized table last updated ${new Date(g.fully_synced_at).toLocaleString()} — the source was checked and every value was standardized and in the export`}
+              style={{ color: 'var(--text-hint)' }}
+            >
+              Standardized table last updated {relativeTime(g.fully_synced_at)}
+            </span>
+          ) : null}
         </div>
 
         {/* Actions — operate on the whole card (all columns) */}
@@ -437,7 +691,7 @@ function GroupRow({
                   else { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-tint)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'; }
                 }}
               >
-                {running && <Spinner className="w-3 h-3" />}
+                {(running || busy) && <Spinner className="w-3 h-3" />}
                 {stdJustDone && (
                   <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
                     <path d="M2 6.5l3 3 5-6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
@@ -456,7 +710,7 @@ function GroupRow({
                   style={{
                     position: 'fixed', top: menuPos.top, right: menuPos.right, zIndex: 9999,
                     backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)',
-                    borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+                    borderRadius: 'var(--radius-card)', boxShadow: '0 4px 16px rgba(0,0,0,0.12)',  // radius was a hardcoded 6px (UI-01)
                     width: 220, overflow: 'hidden',
                   }}
                 >
@@ -509,7 +763,7 @@ function GroupRow({
             </button>
           )}
 
-          {g.status === 'active' && g.mode !== 'manual' && (
+          {g.status === 'active' && g.update_schedule.type !== 'manual' && (
             <button
               onClick={() => onPause(g)}
               disabled={busy}
@@ -534,52 +788,6 @@ function GroupRow({
               Resume
             </button>
           )}
-
-          {/* File pipeline export actions */}
-          {(() => {
-            const srcType = g.columns[0]?.source_type ?? 'snowflake';
-            const firstPid = g.columns[0]?.pipeline_id;
-            const fileMeta = g.columns[0]?.file_export_meta;
-
-            if (srcType === 'csv' || srcType === 'excel') {
-              return (
-                <a
-                  href={`/api/pipelines/${firstPid}/download`}
-                  download
-                  className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors whitespace-nowrap inline-flex items-center gap-1.5"
-                  style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent', textDecoration: 'none' }}
-                  onMouseEnter={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLAnchorElement).style.color = 'var(--accent)'; }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLAnchorElement).style.color = 'var(--text-secondary)'; }}
-                >
-                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M6 2v6M3.5 5.5L6 8l2.5-2.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                    <path d="M2 10h8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-                  </svg>
-                  Download standardized table
-                </a>
-              );
-            }
-            if (srcType === 'sheets' && (fileMeta?.output_spreadsheet_url || fileMeta?.spreadsheet_url)) {
-              return (
-                <a
-                  href={fileMeta.output_spreadsheet_url ?? fileMeta.spreadsheet_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[11px] font-medium px-2.5 py-1 rounded-button border-[0.5px] transition-colors whitespace-nowrap inline-flex items-center gap-1.5"
-                  style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'transparent', textDecoration: 'none' }}
-                  onMouseEnter={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLAnchorElement).style.color = 'var(--accent)'; }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLAnchorElement).style.color = 'var(--text-secondary)'; }}
-                >
-                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M5 2H2a1 1 0 00-1 1v7a1 1 0 001 1h8a1 1 0 001-1V7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
-                    <path d="M8 1h3v3M11 1L7 5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
-                  View Standardized Table
-                </a>
-              );
-            }
-            return null;
-          })()}
 
           {/* Download Lookup Table */}
           {g.status !== 'pending_baseline' && (
@@ -611,29 +819,43 @@ function GroupRow({
 
           <button
             onClick={() => onDelete(g)}
-            className="w-7 h-7 flex items-center justify-center rounded-button border-[0.5px] transition-colors"
+            disabled={busy}
+            className="w-7 h-7 flex items-center justify-center rounded-button border-[0.5px] transition-colors disabled:opacity-50"
             style={{ borderColor: 'var(--border)', color: 'var(--text-muted)', backgroundColor: 'transparent' }}
-            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#FCA5A5'; (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
+            onMouseEnter={e => { if (busy) return; (e.currentTarget as HTMLButtonElement).style.borderColor = '#FCA5A5'; (e.currentTarget as HTMLButtonElement).style.color = '#DC2626'; }}
             onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)'; (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-muted)'; }}
             title="Delete pipeline"
           >
-            <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true">
-              <path d="M2 3.5h9M5 3.5V2.5a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M5.5 6v3.5M7.5 6v3.5M3 3.5l.5 7a.5.5 0 00.5.5h5a.5.5 0 00.5-.5l.5-7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
+            {deleting ? (
+              <Spinner className="w-3 h-3" />
+            ) : (
+              <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true">
+                <path d="M2 3.5h9M5 3.5V2.5a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M5.5 6v3.5M7.5 6v3.5M3 3.5l.5 7a.5.5 0 00.5.5h5a.5.5 0 00.5-.5l.5-7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            )}
           </button>
         </div>
       </div>
 
       {/* ── Status messages (persistent reasons while paused/blocked) ─────── */}
       {messages.map(c => (
-        <div
-          key={`msg-${c.pipeline_id}`}
-          className="px-4 py-2 text-[11px]"
-          style={{ backgroundColor: '#FFFBEB', borderTop: '0.5px solid #FDE9C8', color: '#BA7517' }}
-        >
-          {g.columns.length > 1 && <span className="font-medium">{c.column_name}: </span>}
-          {c.status_message}
-        </div>
+        c.status_reason === 'table_mode_access' ? (
+          <TableModeAccessBanner
+            key={`msg-${c.pipeline_id}`}
+            pipeline={c}
+            multiColumn={g.columns.length > 1}
+            onFixAccess={onFixAccess}
+          />
+        ) : (
+          <div
+            key={`msg-${c.pipeline_id}`}
+            className="px-4 py-2 text-[11px]"
+            style={{ backgroundColor: '#FFFBEB', borderTop: '0.5px solid #FDE9C8', color: '#BA7517' }}
+          >
+            {g.columns.length > 1 && <span className="font-medium">{c.column_name}: </span>}
+            {c.status_message}
+          </div>
+        )
       ))}
 
       {/* ── Expanded detail ──────────────────────────────────────────────── */}
@@ -642,8 +864,7 @@ function GroupRow({
           group={g}
           initialTab={(expandedTab as 'activity' | 'mappings' | 'queue' | 'settings' | null) ?? 'activity'}
           isStandardizing={running}
-          isScanning={scanning}
-          cycleResetMs={cycleResetMs}
+          specsById={specsById}
           onUpdateMember={onUpdateMember}
           onDeleteMember={onDeleteMember}
           onDeleteGroup={() => onDelete(g)}
@@ -656,42 +877,48 @@ function GroupRow({
 
 // ── Add-column modal ──────────────────────────────────────────────────────────
 // Lets the user standardize additional eligible columns on an existing table,
-// assigning each a domain. Creates pending_baseline pipelines that share the
-// table's export file, then the parent opens the review wizard for them.
+// authoring a spec (description + optional rules/convention) for each. Creates
+// pending_baseline pipelines that share the table's export file, then the parent
+// opens the review wizard for them.
+export type AddColumnSelection = { column_name: string; spec: ReturnType<typeof columnSpecDraftToApiSpec> };
+
 function AddColumnModal({
-  group, columns, busy, onCancel, onSubmit,
+  group, columns, ctStatus, busy, onCancel, onSubmit,
 }: {
   group:    PipelineGroup;
   columns:  string[];
+  ctStatus?: 'enabled' | 'available' | 'no_pk';
   busy:     boolean;
   onCancel: () => void;
-  onSubmit: (selections: { column_name: string; domain_id: number }[]) => void;
+  onSubmit: (selections: AddColumnSelection[], ctConsent: boolean) => void;
 }) {
-  const [domains, setDomains] = useState<Domain[]>([]);
-  const [loadingDomains, setLoadingDomains] = useState(true);
   const [checked, setChecked] = useState<Set<string>>(new Set());
-  const [domainByCol, setDomainByCol] = useState<Record<string, Domain | null>>({});
-
-  useEffect(() => {
-    fetch('/api/domains')
-      .then(r => r.json())
-      .then(b => setDomains(b.domains ?? []))
-      .catch(() => {})
-      .finally(() => setLoadingDomains(false));
-  }, []);
+  const [specByCol, setSpecByCol] = useState<Record<string, ColumnSpecDraft>>({});
+  const [ctConsent, setCtConsent] = useState(false);
 
   function toggle(col: string) {
     setChecked(prev => {
       const next = new Set(prev);
-      if (next.has(col)) next.delete(col); else next.add(col);
+      if (next.has(col)) next.delete(col);
+      else { next.add(col); setSpecByCol(p => (p[col] ? p : { ...p, [col]: emptyColumnSpecDraft() })); }
       return next;
     });
   }
 
-  const selections = [...checked]
-    .map(col => { const d = domainByCol[col]; return d ? { column_name: col, domain_id: d.domain_id } : null; })
-    .filter((s): s is { column_name: string; domain_id: number } => s !== null);
-  const canSubmit = !busy && checked.size > 0 && selections.length === checked.size;
+  const selections: AddColumnSelection[] = [...checked]
+    .map(col => {
+      const d = specByCol[col];
+      return d && columnSpecDraftValid(d) ? { column_name: col, spec: columnSpecDraftToApiSpec(d) } : null;
+    })
+    .filter((s): s is AddColumnSelection => s !== null);
+  // Structural gate only; incomplete specs are directed, not silently disabled.
+  const canSubmit = !busy && checked.size > 0;
+  const specsIncomplete = selections.length !== checked.size;
+
+  function attemptSubmit() {
+    if (specsIncomplete) return; // the directed hint below already explains why
+    onSubmit(selections, ctStatus === 'available' && ctConsent);
+  }
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center" style={{ backgroundColor: 'rgba(26,26,46,0.35)' }} onClick={busy ? undefined : onCancel}>
@@ -703,24 +930,23 @@ function AddColumnModal({
         <h3 className="text-base font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>Standardize another column</h3>
         <p className="text-xs mb-4 font-mono truncate" style={{ color: 'var(--text-muted)' }} title={group.table_fqn}>{group.table_fqn}</p>
 
-        <p className="text-xs mb-2" style={{ color: 'var(--text-secondary)' }}>Pick the column(s) to standardize and assign each a domain.</p>
+        <p className="text-xs mb-2" style={{ color: 'var(--text-secondary)' }}>Pick the column(s) to standardize and describe each.</p>
 
-        {/* No overflow-hidden wrapper here: each checked column reveals a
-            CompactDomainPicker whose dropdown must be free to overflow the row. */}
-        <div className="flex flex-col gap-2 mb-4">
+        <div className="flex flex-col gap-2 mb-4 overflow-y-auto" style={{ maxHeight: '52vh' }}>
           {columns.map((col) => {
             const on = checked.has(col);
             return (
               <div
                 key={col}
-                className="rounded-button border-[0.5px]"
+                className="rounded-button border-[0.5px] flex items-center gap-3 px-3 py-2"
                 style={{ borderColor: on ? 'var(--accent-border)' : 'var(--border)', backgroundColor: on ? 'var(--accent-tint)' : 'var(--surface)' }}
               >
                 <button
                   type="button"
                   onClick={() => toggle(col)}
                   disabled={busy}
-                  className="w-full flex items-center gap-3 px-3 py-2 text-left disabled:cursor-not-allowed"
+                  className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:cursor-not-allowed"
+                  style={{ background: 'none', border: 'none', padding: 0 }}
                 >
                   <span
                     className="flex items-center justify-center flex-shrink-0"
@@ -735,24 +961,64 @@ function AddColumnModal({
                   <span className="text-xs font-mono flex-1 truncate" style={{ color: 'var(--text-primary)' }} title={col}>{col}</span>
                 </button>
                 {on && (
-                  <div className="px-3 pb-2.5 pt-0.5 flex items-center gap-2">
-                    <span className="text-[11px] font-medium flex-shrink-0" style={{ color: 'var(--text-secondary)' }}>Domain</span>
-                    <div className="flex-1 min-w-0">
-                      <CompactDomainPicker
-                        domains={domains}
-                        isLoading={loadingDomains}
-                        value={domainByCol[col] ?? null}
-                        onChange={d => setDomainByCol(prev => ({ ...prev, [col]: d }))}
-                        onDomainCreated={d => setDomains(prev => [d, ...prev])}
-                        disabled={busy}
-                      />
-                    </div>
-                  </div>
+                  <ColumnSpecField
+                    variant="inline"
+                    value={specByCol[col] ?? emptyColumnSpecDraft()}
+                    onChange={d => setSpecByCol(prev => ({ ...prev, [col]: d }))}
+                    disabled={busy}
+                    columnName={col}
+                  />
                 )}
               </div>
             );
           })}
         </div>
+
+        {canSubmit && specsIncomplete && (
+          <div className="flex items-center gap-2 rounded-button border-[0.5px] px-3 py-2 mb-3 text-xs" style={{ backgroundColor: '#FFFBEB', borderColor: '#FDE68A', color: '#92400E' }}>
+            <span className="rounded-full flex-shrink-0" style={{ width: 6, height: 6, backgroundColor: '#F59E0B' }} />
+            Add standardization specs to each selected column before creating.
+          </div>
+        )}
+
+        {/* Column-mode pipelines edit the source table — restate the consent
+            for each newly added companion column (sent as column_write_consent). */}
+        {group.export_kind === 'column' && checked.size > 0 && (
+          <div className="rounded-button border-[0.5px] px-3 py-2 mb-3 text-xs leading-relaxed" style={{ backgroundColor: '#FFF7ED', borderColor: '#FED7AA', color: '#7C2D12' }}>
+            This pipeline uses the Column output: creating these standardizations adds a new{' '}
+            <span className="font-mono">&lt;column&gt;_STANDARDIZED</span> column to{' '}
+            <span className="font-mono">{tableShort(group.table_fqn)}</span> for each selected column and keeps it updated.
+            Prism will not modify any other column. In the unlikely event of an error, Prism is not
+            liable for consequences of modified or erased source data.
+          </div>
+        )}
+
+        {/* SQL Server only — offered once per table, same as the connect form. */}
+        {ctStatus === 'available' && checked.size > 0 && (
+          <div className="rounded-button border-[0.5px] px-3 py-2 mb-3 text-xs leading-relaxed" style={{ backgroundColor: '#EFF6FF', borderColor: '#BFDBFE', color: '#1E3A8A' }}>
+            <p className="font-semibold mb-1" style={{ color: '#1E40AF' }}>Enable Change Tracking on this table?</p>
+            <p className="mb-1.5">
+              Lets Prism spot new, changed, or deleted values within about a minute instead of on a
+              scheduled scan. Runs <span className="font-mono">ALTER DATABASE ... SET CHANGE_TRACKING = ON</span>{' '}
+              and <span className="font-mono">ALTER TABLE ... ENABLE CHANGE_TRACKING</span> against your SQL
+              Server (using your saved personal credentials if the service login can&apos;t make schema changes
+              itself). Optional — Prism falls back to scheduled scans automatically.
+            </p>
+            <label className="flex items-start gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={ctConsent}
+                onChange={e => setCtConsent(e.target.checked)}
+                disabled={busy}
+                className="mt-0.5"
+                style={{ accentColor: '#1D4ED8' }}
+              />
+              <span className="font-medium" style={{ color: '#1E40AF' }}>
+                Yes, have Prism try to enable Change Tracking on this table automatically.
+              </span>
+            </label>
+          </div>
+        )}
 
         <div className="flex justify-end gap-2">
           <button
@@ -763,10 +1029,10 @@ function AddColumnModal({
             Cancel
           </button>
           <button
-            type="button" onClick={() => onSubmit(selections)} disabled={!canSubmit}
+            type="button" onClick={attemptSubmit} disabled={!canSubmit || specsIncomplete}
             className="px-4 py-2 text-xs font-medium rounded-button text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ backgroundColor: 'var(--accent)' }}
-            onMouseEnter={e => { if (canSubmit) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
+            onMouseEnter={e => { if (canSubmit && !specsIncomplete) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
             onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
           >
             {busy ? 'Creating…' : 'Create standardizations'}
@@ -781,31 +1047,50 @@ function AddColumnModal({
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }: Props) {
+  const warehouseLabel = useWarehouseLabel();
   const router = useRouter();
   const [pipelines,     setPipelines]     = useState<Pipeline[]>([]);
   const [loading,       setLoading]       = useState(true);
   const [error,         setError]         = useState<string | null>(null);
   const [busyKey,          setBusyKey]          = useState<string | null>(null);  // group key running a pause/delete/review action
+  const [deletingKey,      setDeletingKey]      = useState<string | null>(null);  // group key with a delete in flight (drives the trash spinner)
   const [autoStdBusyKey,  setAutoStdBusyKey]   = useState<string | null>(null); // group key running an auto-standardize fetch
   const [expandedKey,    setExpandedKey]   = useState<string | null>(null);
   const [expandedTab,   setExpandedTab]   = useState<string | null>(null);
   const [search,        setSearch]        = useState('');
   const [autoExpanded,  setAutoExpanded]  = useState(false);
   const [standardizingPipelines, setStandardizingPipelines] = useState<Set<number>>(new Set());
-  const [scanningPipelines, setScanningPipelines] = useState<Set<number>>(new Set());
-  // Per-pipeline client-clock timestamp of the last scan/standardize completion.
-  // Lets the ring reset to 0% the instant a cycle ends, without waiting for the
-  // async metrics refetch to deliver a fresh server-side last_polled_at.
-  const [cycleResetAt, setCycleResetAt] = useState<Map<number, number>>(new Map());
-  const markCycleReset = useCallback((pid: number) => {
-    setCycleResetAt(prev => new Map(prev).set(pid, Date.now()));
-  }, []);
   const [alerts,        setAlerts]        = useState<Alert[]>([]);
+  // Re-render every 30 s so relative labels ("Updated 5m ago") stay fresh even
+  // when no SSE event lands (e.g. paused pipelines) — no page reload needed.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setClockTick(x => x + 1), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Full column-spec records for each column's spec tooltip (keyed by spec_id,
+  // which lives in the column/pipeline's historical `domain_id` slot).
+  const [specsById, setSpecsById] = useState<Map<number, ColumnSpec>>(new Map());
+  useEffect(() => {
+    fetch('/api/column-specs')
+      .then(r => r.json())
+      .then(b => {
+        const m = new Map<number, ColumnSpec>();
+        for (const s of (b.specs ?? []) as ColumnSpec[]) m.set(Number(s.spec_id), s);
+        setSpecsById(m);
+      })
+      .catch(() => {});
+  }, []);
 
   // Column ordinal positions per table_fqn — used to order columns within a card.
   const [columnOrders, setColumnOrders] = useState<Map<string, Record<string, number>>>(new Map());
   // Per-table eligible (text) column names, used to offer "Standardize another column".
   const [tableFields,  setTableFields]  = useState<Map<string, { name: string; isText: boolean }[]>>(new Map());
+  // SQL Server only — per-table Change Tracking status ('ct_status' is absent
+  // from the /api/columns response on Snowflake). Drives AddColumnModal's
+  // disclosure for adding a column to a CT-eligible-but-not-yet-enabled table.
+  const [tableCtStatus, setTableCtStatus] = useState<Map<string, 'enabled' | 'available' | 'no_pk'>>(new Map());
   const [addColumnGroup, setAddColumnGroup] = useState<PipelineGroup | null>(null);
 
   const fetchPipelines = useCallback(async () => {
@@ -824,7 +1109,6 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
 
   useEffect(() => { fetchPipelines(); }, [fetchPipelines]);
 
-  // Fetch column ordinal positions for all unique tables (to order columns within a card).
   useEffect(() => {
     if (pipelines.length === 0) return;
     const tables = [...new Set(pipelines.map(p => p.table_fqn))];
@@ -836,9 +1120,10 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         const res  = await fetch(`/api/columns?table_fqn=${encodeURIComponent(t)}`);
         const body = await res.json().catch(() => ({}));
         return {
-          table:   t,
-          columns: body.columns as Record<string, number> ?? {},
-          fields:  (body.fields as { name: string; isText: boolean }[]) ?? [],
+          table:     t,
+          columns:   body.columns as Record<string, number> ?? {},
+          fields:    (body.fields as { name: string; isText: boolean }[]) ?? [],
+          ct_status: body.ct_status as 'enabled' | 'available' | 'no_pk' | undefined,
         };
       }),
     ).then(results => {
@@ -853,6 +1138,13 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         const next = new Map(prev);
         for (const r of results) {
           if (r.status === 'fulfilled') next.set(r.value.table, r.value.fields);
+        }
+        return next;
+      });
+      setTableCtStatus(prev => {
+        const next = new Map(prev);
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value.ct_status) next.set(r.value.table, r.value.ct_status);
         }
         return next;
       });
@@ -876,25 +1168,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         };
         if (event.type === 'metrics_updated') {
           fetchPipelines();
-        } else if (event.type === 'scanning_started' && event.pipeline_id != null) {
-          setScanningPipelines(prev => new Set([...prev, event.pipeline_id!]));
-        } else if (event.type === 'scanning_finished' && event.pipeline_id != null) {
-          setScanningPipelines(prev => {
-            const next = new Set(prev);
-            next.delete(event.pipeline_id!);
-            return next;
-          });
-          // The cycle restarts NOW — anchor the ring to this instant so it resumes
-          // from 0% immediately, before the metrics_updated refetch lands.
-          markCycleReset(event.pipeline_id!);
         } else if (event.type === 'standardizing_started' && event.pipeline_id != null) {
-          // Standardization supersedes scanning — drop the scanning flag so the ring
-          // transitions cleanly from teal "checking" to amber "standardizing".
-          setScanningPipelines(prev => {
-            const next = new Set(prev);
-            next.delete(event.pipeline_id!);
-            return next;
-          });
           setStandardizingPipelines(prev => new Set([...prev, event.pipeline_id!]));
         } else if (event.type === 'standardizing_finished' && event.pipeline_id != null) {
           setStandardizingPipelines(prev => {
@@ -902,9 +1176,6 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
             next.delete(event.pipeline_id!);
             return next;
           });
-          // Standardization is the end of the cycle too — anchor the ring so it
-          // resumes counting from 0% (next poll is one interval from now).
-          markCycleReset(event.pipeline_id!);
           fetchPipelines();
         } else if (event.type === 'alert' && event.message) {
           const id = Date.now() + Math.random();
@@ -924,7 +1195,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     };
 
     return () => source.close();
-  }, [fetchPipelines, markCycleReset]);
+  }, [fetchPipelines]);
 
   useEffect(() => {
     const interval = setInterval(fetchPipelines, 60_000);
@@ -986,10 +1257,26 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     finally { setBusyKey(null); }
   }
 
+  async function handleFixAccess(pipelineId: number): Promise<{ fixed: boolean; error?: string; manual_sql?: string }> {
+    try {
+      const res  = await fetch(`/api/pipelines/${pipelineId}/fix-access`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { fixed: false, error: body?.error ?? `HTTP ${res.status}` };
+      if (body.fixed) {
+        showToast('Access granted — export rebuilt.', 'info');
+        await fetchPipelines();
+      }
+      return { fixed: Boolean(body.fixed), error: body.error, manual_sql: body.manual_sql };
+    } catch {
+      return { fixed: false, error: "Couldn't reach the server — check your connection." };
+    }
+  }
+
   async function handleDelete(g: PipelineGroup) {
     const label = `${groupName(g)}${g.columns.length > 1 ? ` (${g.columns.length} columns)` : ''}`;
     if (!confirm(`Delete the pipeline for ${label}? This cannot be undone.`)) return;
     setBusyKey(g.key);
+    setDeletingKey(g.key);
     try {
       // Dedup: virtual multi-column entries share a pipeline_id; only delete each once.
       const seen = new Set<number>();
@@ -1001,7 +1288,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
       const ids = new Set(g.columns.map(m => m.pipeline_id));
       setPipelines(prev => prev.filter(x => !ids.has(x.pipeline_id)));
       if (expandedKey === g.key) setExpandedKey(null);
-    } finally { setBusyKey(null); }
+    } finally { setBusyKey(null); setDeletingKey(null); }
   }
 
   // Delete a single column from a card (per-column delete in Settings).
@@ -1016,7 +1303,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
 
   // Open a review wizard over the given columns. kind='create' builds runs from
   // the full source (create-initial-run); kind='standardize' builds them from the
-  // queue (standardize-run, used by manual mode). Walks the column wizard so a
+  // queue (standardize-run, the manual trigger). Walks the column wizard so a
   // multi-column table reviews each column in sequence.
   async function startReviewWizard(columns: Pipeline[], kind: 'create' | 'standardize', key: string) {
     if (columns.length === 0) return;
@@ -1065,14 +1352,11 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     }
   }
 
-  // Update Standardizations — navigates to the domain mappings page.
-  // The page detects the queue on load, auto-standardizes if needed, and defaults
-  // to a "new items only" filtered view when there are queued values.
+  // Update Standardizations — runs the standardization pass directly now that the
+  // per-domain mappings editor is gone. (Specs are per-column; there is no shared
+  // domain library page to open.)
   function handleUpdateStandardizations(g: PipelineGroup) {
-    const params = new URLSearchParams();
-    if (g.primaryDomainId != null) params.set('domain_id', String(g.primaryDomainId));
-    params.set('pipeline_ids', g.columns.map(c => c.pipeline_id).join(','));
-    router.push(`/global-standardizations?${params.toString()}`);
+    void handleAutoStandardize(g);
   }
 
   // Auto Standardize — fire process-queue for every unique pipeline in the group.
@@ -1117,12 +1401,11 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
 
   // Standardize an additional column on a table that already has a pipeline:
   // create a pending_baseline pipeline per chosen column (sharing the table's
-  // export file + mode), then open the review wizard for them.
-  async function handleAddColumns(g: PipelineGroup, selections: { column_name: string; domain_id: number }[]) {
+  // export file + update schedule), then open the review wizard for them.
+  async function handleAddColumns(g: PipelineGroup, selections: AddColumnSelection[], ctConsent: boolean) {
     setAddColumnGroup(null);
     if (selections.length === 0) return;
     setBusyKey(g.key);
-    const mode = g.mode === 'mixed' ? (g.columns[0]?.mode ?? 'auto') : g.mode;
     const created: Pipeline[] = [];
     for (const sel of selections) {
       try {
@@ -1132,9 +1415,17 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           body:    JSON.stringify({
             table_fqn:            g.table_fqn,
             column_name:          sel.column_name,
-            domain_id:            sel.domain_id,
+            spec:                 sel.spec,
             export_table_fqn:     g.export_table_fqn,
-            mode,
+            // Without this, a new sibling silently reverted to 'table' — which
+            // for view groups broke the shared view, and for column groups
+            // would trip the source==destination rebuild guard.
+            export_kind:          g.export_kind,
+            // Consent restated in AddColumnModal's notice for column groups —
+            // the server refuses a new column-mode pipeline without it.
+            ...(g.export_kind === 'column' ? { column_write_consent: true } : {}),
+            ...(ctConsent ? { change_tracking_consent: true } : {}),
+            update_schedule:      g.update_schedule,
             export_unmapped_rows: g.export_unmapped_rows,
             status:               'pending_baseline',
           }),
@@ -1194,14 +1485,13 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     !(p.export_table_fqn != null && incompleteExports.has(p.export_table_fqn)),
   );
 
-  // Filter by search (matches on table, domain, any column name)
+  // Filter by search (matches on table, any column name, export)
   const filtered = ready.filter(p => {
     if (!search) return true;
     const q = search.toLowerCase();
     return (
       displayName(p).toLowerCase().includes(q) ||
       p.table_fqn.toLowerCase().includes(q) ||
-      (p.domain_name ?? '').toLowerCase().includes(q) ||
       p.column_name.toLowerCase().includes(q) ||
       (p.export_table_fqn ?? '').toLowerCase().includes(q)
     );
@@ -1233,9 +1523,10 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           <AddColumnModal
             group={addColumnGroup}
             columns={cols}
+            ctStatus={tableCtStatus.get(addColumnGroup.table_fqn)}
             busy={busyKey === addColumnGroup.key}
             onCancel={() => setAddColumnGroup(null)}
-            onSubmit={(sel) => handleAddColumns(addColumnGroup, sel)}
+            onSubmit={(sel, ctConsent) => handleAddColumns(addColumnGroup, sel, ctConsent)}
           />
         );
       })()}
@@ -1286,7 +1577,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search by name, table, domain…"
+              placeholder="Search by name, table, column spec…"
               className="text-xs rounded-button border-[0.5px] outline-none pl-7 pr-3 py-1.5 w-60"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             />
@@ -1316,7 +1607,21 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           </svg>
           <p className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>No pipelines yet</p>
           <p className="text-xs text-center" style={{ color: 'var(--text-muted)', maxWidth: 240 }}>
-            Use the Connect tab to set up your first Snowflake pipeline.
+            Use the Connect tab to set up your first {warehouseLabel} pipeline.
+          </p>
+        </div>
+      )}
+
+      {!loading && !error && pipelines.length > 0 && tableGroups.length === 0 && (
+        <div className="flex flex-col items-center justify-center py-20 gap-3">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" aria-hidden="true" style={{ opacity: 0.2 }}>
+            <rect x="4" y="12" width="40" height="26" rx="5" stroke="currentColor" strokeWidth="2.5" />
+            <path d="M16 24h16M16 30h10" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+            <circle cx="38" cy="12" r="6" fill="currentColor" />
+          </svg>
+          <p className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>Pipeline setup not complete</p>
+          <p className="text-xs text-center" style={{ color: 'var(--text-muted)', maxWidth: 280 }}>
+            Your pipeline was created but the initial review wasn&apos;t finished. Go to the Connect tab to continue or cancel it.
           </p>
         </div>
       )}
@@ -1329,7 +1634,7 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           <div
             className="grid text-[10px] font-semibold uppercase tracking-wider"
             style={{
-              gridTemplateColumns: '20px minmax(140px,2fr) 100px 75px 1fr',
+              gridTemplateColumns: '20px minmax(140px,2fr) 100px 170px 1fr',
               padding: '0 16px',
               gap: 14,
               color: 'var(--text-muted)',
@@ -1338,11 +1643,11 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
             <span />
             <span>Pipeline</span>
             <span>Status</span>
-            <span>Mode</span>
+            <span>Updates</span>
             <span className="text-right">Actions</span>
           </div>
 
-          <div style={{ border: '0.5px solid var(--border)', borderRadius: 7, overflow: 'hidden', backgroundColor: 'var(--surface)' }}>
+          <div style={{ border: '0.5px solid var(--border)', borderRadius: 'var(--radius-card)', overflow: 'hidden', backgroundColor: 'var(--surface)' }}>
             {tableGroups.map(g => {
               const covered = new Set(g.columns.map(c => c.column_name.toUpperCase()));
               const addableColumns = (tableFields.get(g.table_fqn) ?? [])
@@ -1367,10 +1672,11 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
                 addableColumns={addableColumns}
                 onUpdateMember={handleUpdateMember}
                 onDeleteMember={handleDeleteMember}
+                onFixAccess={handleFixAccess}
                 busy={busyKey === g.key}
+                deleting={deletingKey === g.key}
                 running={g.columns.some(c => standardizingPipelines.has(c.pipeline_id)) || autoStdBusyKey === g.key}
-                scanning={g.columns.some(c => scanningPipelines.has(c.pipeline_id))}
-                cycleResetMs={g.columns.reduce((m, c) => Math.max(m, cycleResetAt.get(c.pipeline_id) ?? 0), 0)}
+                specsById={specsById}
               />
               );
             })}

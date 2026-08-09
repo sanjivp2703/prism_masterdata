@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useWarehouseKind } from '@/app/components/use-warehouse-label';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -14,7 +15,7 @@ interface ColumnOption {
 export interface ExportLookupModalProps {
   /** Pipeline context: let the user pick a column first. */
   columns?: ColumnOption[];
-  /** Domain context: pre-selected domain (skip column picker). */
+  /** Spec context: pre-selected column spec (skip column picker). */
   domainId?: number;
   domainName?: string;
   onClose: () => void;
@@ -79,8 +80,29 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
   const [success,  setSuccess]  = useState<string | null>(null);
   const [sheetUrl, setSheetUrl] = useState<string | null>(null);
 
+  // Which warehouse this installation actually runs on.
+  //
+  // This modal had no warehouse awareness at all, while the SERVER route it
+  // posts to does: global-standardizations/export picks schema EXPORTS on
+  // mssql and PUBLIC on Snowflake. So a SQL Server user was shown a
+  // `PRISM_DB.PUBLIC.…` default destination while their table was actually
+  // written to `PRISM_DB.EXPORTS.…`, and the option was labelled "Snowflake"
+  // — a destination that is not the destination, not merely a wrong label
+  // (SEC-07 follow-up).
+  //
+  // Deliberately the SHARED hook rather than a local fetch. The hook seeds its
+  // state from a module-level cache SYNCHRONOUSLY, and this modal's own parent
+  // (PipelinesView) already calls it, so the cache is warm before the modal
+  // ever mounts. A local fetch re-opened a window between mount and resolve in
+  // which an mssql user saw the "Snowflake" label and a PRISM_DB.PUBLIC.…
+  // placeholder — reintroducing, briefly, the exact wrong-schema string this
+  // fix exists to remove — and issued a duplicate request to boot.
+  const warehouseKind   = useWarehouseKind();
+  const warehouseLabel  = warehouseKind === 'mssql' ? 'SQL Server' : 'Snowflake';
+  const defaultSchema   = warehouseKind === 'mssql' ? 'EXPORTS' : 'PUBLIC';
+
   async function handleExport() {
-    if (resolvedDomainId == null) { setError('No domain selected.'); return; }
+    if (resolvedDomainId == null) { setError('No column selected.'); return; }
     setBusy(true);
     setError(null);
     setSuccess(null);
@@ -88,7 +110,7 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
     try {
       if (format === 'csv' || format === 'excel') {
         const rows = await fetchMappings(resolvedDomainId);
-        if (rows.length === 0) { setError('No mappings found for this domain.'); setBusy(false); return; }
+        if (rows.length === 0) { setError('No mappings found for this column.'); setBusy(false); return; }
 
         const safeName = (resolvedDomainName ?? 'lookup').replace(/[^a-zA-Z0-9_-]/g, '_');
 
@@ -133,7 +155,7 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
           window.open(body.url, '_blank');
           setSuccess(`Created Google Sheet with ${body.rows ?? 0} mappings.`);
         } else if (format === 'snowflake') {
-          setSuccess(`Created Snowflake table ${body.table_fqn ?? ''} with ${body.rows ?? 0} mappings.`);
+          setSuccess(`Created ${warehouseLabel} table ${body.table_fqn ?? ''} with ${body.rows ?? 0} mappings.`);
         }
       }
     } catch (e) {
@@ -147,7 +169,7 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
     { key: 'csv',       label: 'CSV',            desc: 'Download as .csv file' },
     { key: 'excel',     label: 'Excel',          desc: 'Download as .xlsx file' },
     { key: 'sheets',    label: 'Google Sheets',  desc: 'Create a new Google Sheet' },
-    { key: 'snowflake', label: 'Snowflake',      desc: 'Create a Snowflake table' },
+    { key: 'snowflake', label: warehouseLabel,   desc: `Create a ${warehouseLabel} table` },
   ];
 
   return createPortal(
@@ -199,10 +221,10 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
           </div>
         )}
 
-        {/* Single-column info or domain name */}
+        {/* Single-column info or spec name */}
         {!needsColumnPick && (columns?.length === 1 || propDomainName) && (
           <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-            {resolvedDomainName ? `Domain: ${resolvedDomainName}` : columns?.[0]?.column_name ? `Column: ${columns[0].column_name}` : ''}
+            {columns?.[0]?.column_name ? `Column: ${columns[0].column_name}` : resolvedDomainName ? `Column: ${resolvedDomainName}` : ''}
           </p>
         )}
 
@@ -227,7 +249,7 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
           ))}
         </div>
 
-        {/* Snowflake table name */}
+        {/* Warehouse table name */}
         {format === 'snowflake' && (
           <div className="mb-4">
             <label className="text-[11px] font-medium block mb-1.5" style={{ color: 'var(--text-secondary)' }}>Target table</label>
@@ -235,9 +257,15 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
               type="text"
               value={sfTable}
               onChange={e => setSfTable(e.target.value)}
+              // Mirrors the server's defaultFqn EXACTLY (see the export route) —
+              // including the no-column-name fallback, which used to show a
+              // generic 'DB.SCHEMA.TABLE_NAME' hint while the server would
+              // actually create PRISM_DB.<schema>.GLOBAL_CANONICAL_MAPPINGS.
+              // The label below promises "leave blank to use default", so the
+              // placeholder has to BE that default, not a shape hint.
               placeholder={resolvedDomainName
-                ? `STAND_DB.PUBLIC.${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
-                : 'DB.SCHEMA.TABLE_NAME'}
+                ? `PRISM_DB.${defaultSchema}.${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+                : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`}
               className="text-xs rounded-button border-[0.5px] outline-none px-3 py-1.5 w-full font-mono"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             />

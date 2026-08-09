@@ -34,6 +34,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   no_code:               'No authorization code was received from Google.',
   token_exchange_failed: 'Could not exchange the Google code for tokens. Please try again.',
   no_profile:            'Could not retrieve your Google profile. Please try again.',
+  no_access:             "This Google account hasn't been invited to this workspace. Ask an admin to send you an invite.",
 };
 
 interface Props {
@@ -140,7 +141,8 @@ export default async function LoginPage({ searchParams }: Props) {
           <a href="/privacy" style={{ color: 'var(--text-hint)', textDecoration: 'underline' }}>
             Privacy policy
           </a>
-          .
+          . Signing in uses your Google account for identity only. Prism asks for
+          spreadsheet access separately, and only if you connect or export a Google Sheet.
         </p>
       </div>
     </div>

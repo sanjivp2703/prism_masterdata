@@ -2,15 +2,41 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import {
+  applyConventionRules,
+  validateConventionViolations,
+  hasAnyRule,
+  sanitizeConventionRules,
+  type ConventionRules,
+} from '@/app/api/_lib/convention-rules';
+import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface ColMeta { run_id: number; column_name: string }
+interface ColMeta {
+  run_id: number;
+  column_name: string;
+  /** Per-column naming convention from the session meta — renames must conform. */
+  convention?: { type: string | null; value: string; rules: ConventionRules | null } | null;
+}
 
 /** alias_name → group; key changes on rename (same pattern as RunReviewClient). */
 type AliasMap = Record<string, { needs_review: boolean; items: string[] }>;
 
-type Snapshot = { aliasMap: AliasMap; checkedAliases: Set<string> };
+/** Trigger a client-side file download from a Blob. */
+function triggerDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/** Output formats a one-time session can be exported in. Only file/paste
+ *  sessions offer a choice; a warehouse session always writes a table. */
+type ExportFormat = 'warehouse' | 'csv' | 'excel' | 'sheets';
+
+type Snapshot = { aliasMap: AliasMap };
 
 interface PageState {
   status:   'grouping' | 'ready' | 'error';
@@ -26,7 +52,14 @@ type DragPayload =
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function toAliasMap(raw: any[]): AliasMap {
-  const m: AliasMap = {};
+  // Object.create(null), NOT {}: this map is keyed by ALIAS NAMES, which the
+  // user types. On a plain object `m['__proto__']` and `m['constructor']`
+  // resolve to inherited, TRUTHY members, so the `if (!m[alias])` guards
+  // throughout this file fail to create the group and the following
+  // `.items.push` throws — mid-drag, in the middle of a review session, with
+  // unsaved work on screen. Same defect class as the one that 500'd
+  // /api/global-standardizations for an entire install.
+  const m: AliasMap = Object.create(null);
   for (const g of raw ?? []) {
     const alias = String(g?.alias_name ?? '').trim();
     if (!alias) continue;
@@ -81,14 +114,6 @@ function DragDots() {
   );
 }
 
-function CheckmarkIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-      <path d="M2.5 7L5.5 10L11.5 4" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
 // ── Export modal ───────────────────────────────────────────────────────────────
 
 function CopyButton({ text }: { text: string }) {
@@ -113,30 +138,70 @@ function CopyButton({ text }: { text: string }) {
 }
 
 function ExportModal({
-  defaultTarget, sourceRelation, onClose, onExport, busy, error, grantsNeeded,
+  defaultTarget, sourceRelation, onClose, onExport, busy, error, grantsNeeded, grantsRunAs,
+  isFileSession,
 }: {
   defaultTarget:  string;
   sourceRelation: string;
+  /** File/paste sessions can be exported in any format; a warehouse session
+   *  writes a table, which is the only thing it has ever done. */
+  isFileSession: boolean;
   onClose:     () => void;
-  onExport:    (target: string, mode: 'create' | 'overwrite') => void;
+  onExport:    (target: string, mode: 'create' | 'overwrite', format: ExportFormat) => void;
   busy:        boolean;
   error:       string | null;
   grantsNeeded: string | null;
+  /** Who must run the grants SQL — differs by warehouse (OT-07). */
+  grantsRunAs: string;
 }) {
+  const warehouseLabel = useWarehouseLabel();
   const [mode, setMode]     = useState<'create' | 'overwrite'>('create');
   const [target, setTarget] = useState(defaultTarget);
+  const [format, setFormat] = useState<ExportFormat>(isFileSession ? 'csv' : 'warehouse');
   const overwritingSource = target.trim().toUpperCase() === sourceRelation.trim().toUpperCase();
+  // Only the warehouse format needs a destination table; the others produce a
+  // download or a new spreadsheet.
+  const needsTarget = format === 'warehouse';
 
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center" style={{ backgroundColor: 'rgba(26,26,46,0.35)' }} onClick={busy ? undefined : onClose}>
       <div className="rounded-card border-[0.5px] w-full max-w-md mx-4 overflow-y-auto"
         style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: 'var(--card-padding)', maxHeight: '88vh' }}
         onClick={e => e.stopPropagation()}>
-        <h3 className="text-base font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>Export to Snowflake</h3>
+        <h3 className="text-base font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
+          {isFileSession ? 'Export standardized data' : `Export to ${warehouseLabel}`}
+        </h3>
         <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-          Write a standardized copy of your source table. This does not affect any domain lookup.
+          {isFileSession
+            ? 'Your standardized values, in whichever format you need. This does not affect the shared lookup.'
+            : 'Write a standardized copy of your source table. This does not affect the shared lookup.'}
         </p>
 
+        {isFileSession && (
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            {([
+              { id: 'csv',       label: 'CSV',            desc: 'Download .csv' },
+              { id: 'excel',     label: 'Excel',          desc: 'Download .xlsx' },
+              { id: 'sheets',    label: 'Google Sheets',  desc: 'Create a sheet' },
+              { id: 'warehouse', label: warehouseLabel,   desc: 'Create a table' },
+            ] as const).map(({ id, label, desc }) => (
+              <button key={id} type="button" disabled={busy} onClick={() => setFormat(id)}
+                className="text-left px-3 py-2 rounded-button border-[0.5px] transition-colors disabled:opacity-50"
+                style={{
+                  borderColor:     format === id ? 'var(--accent-border)' : 'var(--border)',
+                  backgroundColor: format === id ? 'var(--accent-tint)'   : 'transparent',
+                }}>
+                <span className="block text-xs font-medium" style={{ color: format === id ? 'var(--accent-strong)' : 'var(--text-primary)' }}>{label}</span>
+                <span className="block text-[10px]" style={{ color: 'var(--text-hint)' }}>{desc}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Create/overwrite and the destination only mean anything for a
+            warehouse table — a CSV download or a new spreadsheet has no
+            "overwrite existing" to speak of. */}
+        {needsTarget && (
         <div className="inline-flex rounded-button overflow-hidden border-[0.5px] w-full mb-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}>
           {([
             { id: 'create',    label: 'Create new table' },
@@ -153,7 +218,9 @@ function ExportModal({
             </button>
           ))}
         </div>
+        )}
 
+        {needsTarget && (<>
         <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
           {mode === 'create' ? 'New table' : 'Existing table to overwrite'}
         </label>
@@ -180,6 +247,7 @@ function ExportModal({
             This is your source table — overwriting it replaces the original data.
           </p>
         )}
+        </>)}
 
         {/* Grant access section */}
         {grantsNeeded && (
@@ -189,7 +257,7 @@ function ExportModal({
                 Prism needs write access to this location
               </p>
               <p className="text-[11px] leading-relaxed" style={{ color: '#92400E' }}>
-                Run the SQL below in Snowflake as <strong>ACCOUNTADMIN</strong> or <strong>SYSADMIN</strong>, then retry the export.
+                Run the SQL below as <strong>{grantsRunAs}</strong>, then retry the export.
               </p>
             </div>
             <div className="relative" style={{ backgroundColor: '#1A1A2E' }}>
@@ -215,10 +283,15 @@ function ExportModal({
             style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}>
             Cancel
           </button>
-          <button type="button" onClick={() => onExport(target.trim(), mode)} disabled={busy || !target.trim()}
+          <button type="button" onClick={() => onExport(target.trim(), mode, format)} disabled={busy || (needsTarget && !target.trim())}
             className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-button text-white disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ backgroundColor: 'var(--accent)' }}>
-            {busy ? <><Spinner /> Exporting…</> : grantsNeeded ? 'Retry export' : `Export ${mode === 'create' ? 'to new table' : '(overwrite)'}`}
+            {busy ? <><Spinner /> Exporting…</>
+              : grantsNeeded ? 'Retry export'
+              : format === 'csv'    ? 'Download CSV'
+              : format === 'excel'  ? 'Download Excel'
+              : format === 'sheets' ? 'Create Google Sheet'
+              : `Export ${mode === 'create' ? 'to new table' : '(overwrite)'}`}
           </button>
         </div>
       </div>
@@ -230,10 +303,12 @@ function ExportModal({
 
 export default function OneTimeReviewClient({ session }: { session: string }) {
   const router = useRouter();
+  const warehouseLabel = useWarehouseLabel();
 
   const [loading, setLoading]       = useState(true);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [sourceRelation, setSourceRelation] = useState('');
+  const [isFileSession, setIsFileSession] = useState(false);
   const [columns, setColumns]       = useState<ColMeta[]>([]);
   const [pages, setPages]           = useState<Record<number, PageState>>({});
   const [active, setActive]         = useState(0);
@@ -242,15 +317,21 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   const [exporting, setExporting]     = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportGrants, setExportGrants] = useState<string | null>(null);
+  // WHO must run the grants SQL — supplied by the route, because it differs by
+  // warehouse. The panel used to hardcode "in Snowflake as ACCOUNTADMIN or
+  // SYSADMIN" even while displaying valid T-SQL on a SQL Server install, so the
+  // instruction contradicted the SQL directly beneath it (OT-07).
+  const [exportGrantsRunAs, setExportGrantsRunAs] = useState<string>('ACCOUNTADMIN or SYSADMIN in Snowflake');
   const [done, setDone]               = useState<{ target: string; rows: number } | null>(null);
 
   // ── Per-active-column editing state (resets on tab switch) ─────────────────
-  const [checkedAliases, setCheckedAliases]     = useState<Set<string>>(new Set());
   const [editingKey, setEditingKey]             = useState<string | null>(null);
   const [editingValue, setEditingValue]         = useState('');
+  const [renameError, setRenameError]           = useState<string | null>(null);
   const [dragOverAlias, setDragOverAlias]       = useState<string | null>(null);
   const [draggingGroup, setDraggingGroup]       = useState<string | null>(null);
-  const [openMenu, setOpenMenu]                 = useState<string | null>(null);
+  const [hoveredDividerIdx, setHoveredDividerIdx] = useState<number | null>(null);
+  const [groupOrder, setGroupOrder]               = useState<string[] | null>(null);
   const [undoStack, setUndoStack]               = useState<Snapshot[]>([]);
   const [redoStack, setRedoStack]               = useState<Snapshot[]>([]);
   const [acceptError, setAcceptError]           = useState<string | null>(null);
@@ -259,12 +340,12 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   // Reset editing state when active column changes.
   useEffect(() => {
-    setCheckedAliases(new Set());
     setEditingKey(null);
     setEditingValue('');
     setDragOverAlias(null);
     setDraggingGroup(null);
-    setOpenMenu(null);
+    setGroupOrder(null);
+    setHoveredDividerIdx(null);
     setUndoStack([]);
     setRedoStack([]);
     setAcceptError(null);
@@ -299,8 +380,23 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         if (!res.ok) throw new Error(body?.error ?? 'Failed to load session.');
         if (cancelled) return;
         setSourceRelation(body.source_relation ?? '');
+        setIsFileSession(body.is_file_session === true);
         const cols: any[] = body.columns ?? [];
-        setColumns(cols.map((c) => ({ run_id: c.run_id, column_name: c.column_name })));
+        setColumns(cols.map((c) => {
+          // Parse the per-column convention into the shape the rename guard needs.
+          let convention: ColMeta['convention'] = null;
+          const raw = c.convention;
+          if (raw && typeof raw === 'object') {
+            const type  = typeof raw.type === 'string' && raw.type ? String(raw.type) : null;
+            const value = String(raw.value ?? '');
+            const rules = raw.rules ? sanitizeConventionRules(raw.rules) : null;
+            const validRules = rules && hasAnyRule(rules) ? rules : null;
+            if (validRules || (type === 'regex' && value.trim())) {
+              convention = { type, value, rules: validRules };
+            }
+          }
+          return { run_id: c.run_id, column_name: c.column_name, convention };
+        }));
         setLoading(false);
 
         if (body.exported) { setDone({ target: '', rows: 0 }); return; }
@@ -344,7 +440,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   // ── History helpers ───────────────────────────────────────────────────────
 
   function snapshot(): Snapshot {
-    return { aliasMap: structuredClone(activeMap), checkedAliases: new Set(checkedAliases) };
+    return { aliasMap: structuredClone(activeMap) };
   }
 
   function pushHistory() {
@@ -356,9 +452,8 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   function applySnapshot(s: Snapshot) {
     if (!activeCol) return;
     setPage(activeCol.run_id, p => ({ ...p, aliasMap: s.aliasMap, accepted: false }));
-    setCheckedAliases(s.checkedAliases);
     setEditingKey(null); setEditingValue('');
-    setDragOverAlias(null); setDraggingGroup(null); setOpenMenu(null);
+    setDragOverAlias(null); setDraggingGroup(null);
   }
 
   function undo() {
@@ -397,51 +492,81 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   // ── Group mutations ───────────────────────────────────────────────────────
 
-  function addGroup() {
+  function addGroup(afterIdx?: number) {
     pushHistory();
-    const name = makeName('Unnamed Group', activeMap);
     const key  = nextTempKey();
     mutateMap(m => { m[key] = { needs_review: false, items: [] }; return m; });
-    // Rename immediately so user sees a blank name input.
+    if (typeof afterIdx === 'number') {
+      setGroupOrder(prev => {
+        const order = prev ?? sortedEntries.map(([k]) => k);
+        const copy = [...order];
+        copy.splice(Math.min(afterIdx, copy.length), 0, key);
+        return copy;
+      });
+    } else {
+      setGroupOrder(prev => {
+        const order = prev ?? sortedEntries.map(([k]) => k);
+        return [...order, key];
+      });
+    }
     setEditingKey(key);
     setEditingValue('');
   }
 
-  function deleteGroup(aliasKey: string) {
-    const group = activeMap[aliasKey];
-    if (!group) return;
-    pushHistory();
-    mutateMap(m => {
-      const displaced = m[aliasKey]?.items ?? [];
-      delete m[aliasKey];
-      for (const v of displaced) {
-        const k = nextTempKey();
-        m[k] = { needs_review: true, items: [v] };
-      }
-      return m;
-    });
-    setCheckedAliases(prev => { const s = new Set(prev); s.delete(aliasKey); return s; });
-    if (editingKey === aliasKey) cancelRename();
-    if (openMenu === aliasKey) setOpenMenu(null);
-  }
 
   // ── Rename ────────────────────────────────────────────────────────────────
 
   function startRename(key: string) {
+    setRenameError(null);
     setEditingKey(key);
     setEditingValue(key.startsWith('__new_') ? '' : key);
-    setOpenMenu(null);
   }
 
   function cancelRename() {
+    setRenameError(null);
     setEditingKey(null);
     setEditingValue('');
   }
 
   function commitRename(oldKey: string) {
-    const desired = editingValue.trim() || 'Unnamed Group';
+    let desired = editingValue.trim() || 'Unnamed Group';
+    if (desired === oldKey && !oldKey.startsWith('__new_')) { cancelRename(); return; }
+
+    // Same 200-char cap the LLM's proposed names get — also bounds the string
+    // any convention regex is tested against.
+    if (desired.length > 200) {
+      setRenameError('Alias names are limited to 200 characters.');
+      return;
+    }
+
+    // Enforce this column's deterministic naming convention — same treatment as
+    // the main review UI: auto-apply the mechanical form rules, then block if
+    // the result still violates the regex/constraints (edit stays open).
+    const convention = columns[active]?.convention;
+    if (convention) {
+      if (hasAnyRule(convention.rules)) {
+        desired = applyConventionRules(desired, convention.rules) || desired;
+        if (desired === oldKey && !oldKey.startsWith('__new_')) { cancelRename(); return; }
+      }
+      const problems = validateConventionViolations(desired, convention.rules ?? null);
+      if (convention.type === 'regex' && convention.value.trim()) {
+        let re: RegExp | null = null;
+        try { re = new RegExp(`^(?:${convention.value.trim()})$`); } catch { re = null; }
+        if (re && !re.test(desired)) {
+          problems.unshift(`must match this column's naming pattern: ${convention.value.trim()}`);
+        }
+      }
+      if (problems.length > 0) {
+        setRenameError(
+          `"${desired}" doesn't meet this column's naming convention — ${problems.join('; ')}. ` +
+          `The group keeps its previous name until the new one conforms.`,
+        );
+        return;
+      }
+    }
+    setRenameError(null);
     cancelRename();
-    if (desired === oldKey && !oldKey.startsWith('__new_')) return;
+    setEditingValue('');
     pushHistory();
     mutateMap(m => {
       const group = m[oldKey];
@@ -449,11 +574,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
       const newKey = makeName(desired, m, oldKey);
       delete m[oldKey];
       m[newKey] = group;
-      setCheckedAliases(prev => {
-        const s = new Set(prev);
-        if (s.has(oldKey)) { s.delete(oldKey); s.add(newKey); }
-        return s;
-      });
+      setGroupOrder(prev => prev?.map(k => k === oldKey ? newKey : k) ?? null);
       return m;
     });
   }
@@ -501,7 +622,6 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         const existing = new Set(to.items);
         to.items = [...to.items, ...from.items.filter(v => !existing.has(v))];
         delete m[fromAlias];
-        setCheckedAliases(prev => { const s = new Set(prev); s.delete(fromAlias); return s; });
         return m;
       });
       return;
@@ -518,39 +638,36 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
     });
   }
 
-  // ── Check ─────────────────────────────────────────────────────────────────
-
-  function toggleCheck(key: string) {
-    setCheckedAliases(prev => {
-      const s = new Set(prev);
-      s.has(key) ? s.delete(key) : s.add(key);
-      return s;
-    });
-  }
-
-  function checkAll() {
-    setCheckedAliases(new Set(Object.keys(activeMap)));
-  }
-
   // ── Computed ──────────────────────────────────────────────────────────────
 
   const sortedEntries = useMemo(() => {
     const e = Object.entries(activeMap);
-    e.sort((a, b) => {
-      const ar = a[1].needs_review ? 1 : 0;
-      const br = b[1].needs_review ? 1 : 0;
-      return br - ar;
-    });
+    if (groupOrder) {
+      const orderMap = new Map(groupOrder.map((k, i) => [k, i]));
+      e.sort((a, b) => {
+        const ai = orderMap.get(a[0]);
+        const bi = orderMap.get(b[0]);
+        if (ai != null && bi != null) return ai - bi;
+        if (ai != null) return -1;
+        if (bi != null) return 1;
+        return 0;
+      });
+    } else {
+      e.sort((a, b) => {
+        const ar = a[1].needs_review ? 1 : 0;
+        const br = b[1].needs_review ? 1 : 0;
+        return br - ar;
+      });
+    }
     return e;
-  }, [activeMap]);
+  }, [activeMap, groupOrder]);
 
   const reviewCount = useMemo(
     () => Object.values(activeMap).filter(g => g.needs_review).length,
     [activeMap]
   );
 
-  const totalGroups    = sortedEntries.length;
-  const uncheckedCount = totalGroups - checkedAliases.size;
+  const totalGroups = sortedEntries.length;
 
   // ── Accept page ───────────────────────────────────────────────────────────
 
@@ -579,16 +696,26 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   // ── Export ────────────────────────────────────────────────────────────────
 
-  async function doExport(target: string, mode: 'create' | 'overwrite') {
+  async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse') {
     setExporting(true); setExportError(null); setExportGrants(null);
     try {
       const r = await fetch('/api/one-time/export', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session, target_fqn: target, mode }),
+        // target_fqn is still sent for the non-warehouse formats: the route
+        // validates it up front regardless, and sending a placeholder would
+        // mean two different validation paths to keep in step.
+        body: JSON.stringify({ session, target_fqn: target, mode, format }),
       });
       const b = await r.json().catch(() => ({}));
+      // Sheets export needs the lazily-granted Google scopes; sign-in itself
+      // requests identity only, so first use lands here.
+      if (r.status === 401 && b?.needsAuth) {
+        window.location.href = '/api/auth/google?returnTo=' + encodeURIComponent(window.location.pathname);
+        return;
+      }
       if (r.status === 403 && b?.needs_grants) {
         setExportGrants(String(b.grants_sql ?? ''));
+        if (b.grants_run_as) setExportGrantsRunAs(String(b.grants_run_as));
         return;
       }
       if (!r.ok) {
@@ -596,8 +723,37 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         const detail = b?.details ? `\n\nDetails: ${b.details}` : '';
         throw new Error(msg + detail);
       }
+      // CSV/Excel come back as DATA, not a file — built client-side, the same
+      // way the lookup export does it, so the server never holds a whole
+      // workbook in memory.
+      if (format === 'csv' || format === 'excel') {
+        const headers: string[] = b.headers ?? [];
+        const rows: string[][]  = b.rows ?? [];
+        const safe = (sourceRelation || 'standardized').replace(/[^a-zA-Z0-9_-]/g, '_');
+        if (format === 'csv') {
+          const esc = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+          const csv = [headers.map(esc).join(','), ...rows.map(r => r.map(v => esc(String(v ?? ''))).join(','))].join('\n');
+          triggerDownload(new Blob([csv], { type: 'text/csv' }), `${safe}_standardized.csv`);
+        } else {
+          const XLSX = await import('xlsx');
+          const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, 'Standardized');
+          const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+          triggerDownload(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `${safe}_standardized.xlsx`);
+        }
+        setShowExport(false); setExportGrants(null);
+        setDone({ target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx', rows: b.rows_written ?? rows.length });
+        return;
+      }
+      if (format === 'sheets' && b?.url) {
+        window.open(b.url, '_blank');
+        setShowExport(false); setExportGrants(null);
+        setDone({ target: b.url, rows: b.rows_written ?? 0 });
+        return;
+      }
       setShowExport(false); setExportGrants(null);
-      setDone({ target: b.target_fqn ?? target, rows: b.rows_written ?? 0 });
+      setDone({ target: b.target_fqn ?? b.target ?? target, rows: b.rows_written ?? 0 });
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed.');
     } finally {
@@ -645,7 +801,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   // ── Render: main ─────────────────────────────────────────────────────────
 
   return (
-    <div onClick={() => setOpenMenu(null)} style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh' }}>
+    <div style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh' }}>
       {/* Sticky top bar */}
       <div className="sticky top-0 z-30" style={{ backgroundColor: 'var(--surface)', borderBottom: '0.5px solid var(--border)' }}>
         <div className="mx-auto flex items-center justify-between gap-4" style={{ maxWidth: 980, padding: '14px 24px' }}>
@@ -662,7 +818,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
             <button onClick={() => setShowExport(true)} disabled={!allAccepted}
               className="text-xs font-medium rounded-button px-4 py-2 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               style={{ backgroundColor: 'var(--accent)' }}
-              title={allAccepted ? 'Export to Snowflake' : 'Accept every column to enable export'}>
+              title={allAccepted ? `Export to ${warehouseLabel}` : 'Accept every column to enable export'}>
               Export
             </button>
           </div>
@@ -673,7 +829,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
             const p = pages[c.run_id];
             const isActive = i === active;
             return (
-              <button key={c.run_id} onClick={() => setActive(i)}
+              <button key={c.run_id} onClick={() => { setActive(i); setRenameError(null); }}
                 className="flex items-center gap-1.5 text-xs font-medium rounded-button px-3 py-1.5 border-[0.5px] whitespace-nowrap transition-colors"
                 style={{
                   borderColor:     isActive ? 'var(--accent)' : 'var(--border)',
@@ -694,6 +850,15 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
       {/* Page content */}
       <div className="mx-auto" style={{ maxWidth: 980, padding: '24px' }}>
+        {/* Rename blocked by naming convention */}
+        {renameError && (
+          <div
+            className="rounded-button border-[0.5px] px-4 py-3 mb-4 text-sm"
+            style={{ backgroundColor: '#FFFBEB', borderColor: '#FDE68A', color: '#92400E' }}
+          >
+            {renameError}
+          </div>
+        )}
         {!activePage || activePage.status === 'grouping' ? (
           <div className="flex items-center justify-center gap-2 py-20">
             <Spinner className="w-5 h-5" /><span className="text-sm" style={{ color: 'var(--text-muted)' }}>Grouping values…</span>
@@ -714,9 +879,8 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-sm" style={{ color: 'var(--text-muted)' }}>
-                  Checked{' '}
-                  <span className="font-medium" style={{ color: 'var(--accent)' }}>{checkedAliases.size}</span>
-                  {' / '}{totalGroups}
+                  <span className="font-medium" style={{ color: 'var(--accent)' }}>{totalGroups}</span>
+                  {' '}group{totalGroups !== 1 ? 's' : ''}
                 </span>
                 {/* Undo */}
                 <button
@@ -777,18 +941,15 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
             {/* Column headers */}
             <div className="grid items-center mb-1 pb-2 border-b-[0.5px]"
-              style={{ gridTemplateColumns: '36px 36px 160px 1fr 32px', borderColor: 'var(--border-subtle)' }}>
-              <div />
+              style={{ gridTemplateColumns: '36px 160px 1fr', borderColor: 'var(--border-subtle)' }}>
               <div />
               <div className="px-3 text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-hint)' }}>Alias name</div>
               <div className="px-2 text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-hint)' }}>Matched values</div>
-              <div />
             </div>
 
             {/* Group rows */}
             <div>
               {sortedEntries.map(([aliasKey, group], idx) => {
-                const isChecked        = checkedAliases.has(aliasKey);
                 const isGroupDragOver  = dragOverAlias === aliasKey && draggingGroup !== null && draggingGroup !== aliasKey;
                 const isItemDragOver   = dragOverAlias === aliasKey && draggingGroup === null;
                 const isDragOver       = isGroupDragOver || isItemDragOver;
@@ -797,11 +958,57 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
                 return (
                   <div key={aliasKey}>
-                    {idx > 0 && <div className="mx-3 border-t-[0.5px]" style={{ borderColor: 'var(--border-subtle)' }} />}
+                    {idx > 0 && (
+                      <div
+                        className="relative mx-3"
+                        style={{ height: 0 }}
+                        onMouseEnter={() => setHoveredDividerIdx(idx)}
+                        onMouseLeave={() => setHoveredDividerIdx(prev => prev === idx ? null : prev)}
+                      >
+                        <div className="absolute left-0 right-0" style={{ top: -6, height: 12, zIndex: 1, cursor: 'default' }} />
+                        <div
+                          className="absolute left-0 right-0"
+                          style={{
+                            height: '0.5px',
+                            top: 0,
+                            backgroundColor: hoveredDividerIdx === idx ? 'var(--accent)' : 'var(--border-subtle)',
+                            transition: 'background-color 0.15s',
+                          }}
+                        />
+                        {hoveredDividerIdx === idx && (
+                          <button
+                            type="button"
+                            onClick={() => addGroup(idx)}
+                            className="absolute rounded-full"
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              width: 18,
+                              height: 18,
+                              left: -3,
+                              top: '50%',
+                              transform: 'translateY(-50%)',
+                              backgroundColor: 'var(--accent)',
+                              color: '#fff',
+                              padding: 0,
+                              zIndex: 2,
+                              border: 'none',
+                              cursor: 'pointer',
+                            }}
+                            title="Add a group"
+                          >
+                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{ display: 'block' }}>
+                              <path d="M5 1v8M1 5h8" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    )}
                     <div
                       className="grid items-start py-[13px] rounded-row transition-colors"
                       style={{
-                        gridTemplateColumns: '36px 36px 160px 1fr 32px',
+                        gridTemplateColumns: '36px 160px 1fr',
                         opacity: isBeingDragged ? 0.4 : 1,
                         ...(isDragOver ? { backgroundColor: 'var(--accent-tint)', borderLeft: '2px solid var(--accent)', paddingLeft: 10 } : {}),
                       }}
@@ -811,20 +1018,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
                       onDrop={e => onDropOnAlias(e, aliasKey)}
                       onDragLeave={e => onDragLeaveAlias(e, aliasKey)}
                     >
-                      {/* Col 1: Checkbox */}
-                      <div className="flex justify-center pt-0.5">
-                        <button type="button" onClick={() => toggleCheck(aliasKey)}
-                          aria-label={isChecked ? 'Uncheck group' : 'Check group'}
-                          className="w-[26px] h-[26px] rounded-full flex items-center justify-center flex-shrink-0 transition-colors"
-                          style={isChecked
-                            ? { backgroundColor: 'var(--accent)', border: 'none' }
-                            : { backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)' }
-                          }>
-                          {isChecked && <CheckmarkIcon />}
-                        </button>
-                      </div>
-
-                      {/* Col 2: Drag handle */}
+                      {/* Col 1: Drag handle */}
                       <div className="flex justify-center pt-1.5">
                         {editingKey !== aliasKey && (
                           <span draggable
@@ -884,60 +1078,10 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
                         )}
                       </div>
 
-                      {/* Col 5: More menu */}
-                      <div className="relative flex justify-center pt-0.5">
-                        {editingKey !== aliasKey && (
-                          <>
-                            <button type="button"
-                              onClick={e => { e.stopPropagation(); setOpenMenu(prev => prev === aliasKey ? null : aliasKey); }}
-                              className="w-7 h-7 rounded-[6px] border-[0.5px] flex items-center justify-center text-sm transition-colors"
-                              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-hint)' }}
-                              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface)'; }}
-                              title="Group actions" aria-label="Group actions">
-                              ···
-                            </button>
-                            {openMenu === aliasKey && (
-                              <div className="absolute right-0 top-8 w-32 rounded-button border-[0.5px] z-10 overflow-hidden"
-                                style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}
-                                onClick={e => e.stopPropagation()}>
-                                <button type="button"
-                                  onClick={() => { startRename(aliasKey); setOpenMenu(null); }}
-                                  className="w-full text-left px-3 py-2 text-sm transition-colors"
-                                  style={{ color: 'var(--text-secondary)' }}
-                                  onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--surface-hover)'; }}
-                                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = ''; }}>
-                                  Rename
-                                </button>
-                                <button type="button"
-                                  onClick={() => deleteGroup(aliasKey)}
-                                  className="w-full text-left px-3 py-2 text-sm transition-colors"
-                                  style={{ color: 'var(--confidence-low)' }}
-                                  onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#FEF2F2'; }}
-                                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = ''; }}>
-                                  Delete
-                                </button>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
                     </div>
                   </div>
                 );
               })}
-            </div>
-
-            {/* Add group */}
-            <div className="flex justify-center mt-4 mb-1">
-              <button type="button" onClick={addGroup}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-button border-[0.5px] border-dashed text-sm transition-colors"
-                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-hint)' }}
-                onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.backgroundColor = 'var(--accent-tint)'; b.style.borderColor = 'var(--accent)'; b.style.color = 'var(--accent)'; }}
-                onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.backgroundColor = 'var(--surface)'; b.style.borderColor = 'var(--border)'; b.style.color = 'var(--text-hint)'; }}>
-                <span className="text-base leading-none">+</span>
-                Add a group
-              </button>
             </div>
           </div>
         )}
@@ -947,11 +1091,13 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         <ExportModal
           defaultTarget={sourceRelation ? `${sourceRelation}_STANDARDIZED` : ''}
           sourceRelation={sourceRelation}
+          isFileSession={isFileSession}
           onClose={() => { setShowExport(false); setExportError(null); setExportGrants(null); }}
           onExport={doExport}
           busy={exporting}
           error={exportError}
           grantsNeeded={exportGrants}
+          grantsRunAs={exportGrantsRunAs}
         />
       )}
     </div>

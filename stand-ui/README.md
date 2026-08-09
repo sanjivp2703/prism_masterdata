@@ -8,7 +8,7 @@ This Next.js application provides a web interface for viewing data standardizati
 
 - Node.js 20+ 
 - Access to a Snowflake account with the Stand database configured
-- Snowflake credentials with at least `STAND_USER` role access
+- Snowflake credentials with at least `PRISM_USER` role access
 
 ## Setup Instructions
 
@@ -105,11 +105,11 @@ Each run creates groups that organize similar raw values together. Users can rev
 The UI interacts with these Snowflake objects:
 
 - **Tables**: 
-  - `STAND_DB.STAND_INTERNAL.RUNS`
-  - `STAND_DB.STAND_INTERNAL.RUN_GROUPS`
-  - `STAND_DB.STAND_INTERNAL.RUN_ITEMS`
-  - `STAND_DB.STAND_INTERNAL.CLASSIFICATION_METADATA_PROFILES`
-  - `STAND_DB.STAND_INTERNAL.ALIASES`
+  - `PRISM_DB.INTERNAL.RUNS`
+  - `PRISM_DB.INTERNAL.RUN_GROUPS`
+  - `PRISM_DB.INTERNAL.RUN_ITEMS`
+  - `PRISM_DB.INTERNAL.CLASSIFICATION_METADATA_PROFILES`
+  - `PRISM_DB.INTERNAL.ALIASES`
 
 ## Troubleshooting
 

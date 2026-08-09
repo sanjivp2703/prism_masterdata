@@ -14,8 +14,10 @@ import {
   type OpGroupItem,
   type OpGroup,
 } from './op-auto-group';
-import { runOnePromptGrouping, writeOnePromptBreakdown, type NamingConvention } from './llm-one-prompt-grouping';
-import { sanitizeConventionRules, hasAnyRule } from './convention-rules';
+import { getDb } from './sqlite';
+import { runOnePromptGrouping, writeOnePromptBreakdown, fixNamesForConvention, type NamingConvention } from './llm-one-prompt-grouping';
+import { sanitizeConventionRules, hasAnyRule, applyConventionRules, validateConventionViolations, conventionMatches} from './convention-rules';
+import { compileSafeRegex } from './safe-regex';
 import { appendTiming } from './timing';
 
 function safeJsonParse(s: string): unknown {
@@ -24,19 +26,7 @@ function safeJsonParse(s: string): unknown {
 import { pickBestAliasName } from './namescore';
 import { normalizeLiteral } from './normalize';
 import type { RunItemForPairing } from './grouping-types';
-
-async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows ?? []);
-      },
-    });
-  });
-}
+import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
 
 /**
  * Backfill missing run_item_ids with sequential unique ids so legacy blobs
@@ -115,44 +105,43 @@ export async function runAutoGroupForRun(
   apiKey:     string,
   options:    AutoGroupOptions = {},
 ): Promise<AutoGroupResult> {
-  const state = await loadOpRunState(connection, runId);
+  const state = await loadOpRunState(runId);
   if (!state) {
     throw new Error(`Run state not found for run_id=${runId}.`);
   }
 
-  const conceptRows = await exec(
-    connection,
-    `SELECT concept_key, domain_id FROM STAND_DB.STAND_INTERNAL.RUNS WHERE run_id = ?`,
-    [runId],
-  );
-  const conceptKeyName = conceptRows.length > 0
-    ? String((conceptRows[0] as any).CONCEPT_KEY ?? (conceptRows[0] as any).concept_key ?? '')
-    : '';
-  const runDomainId: number | null =
-    conceptRows.length > 0
-      ? (Number((conceptRows[0] as any).DOMAIN_ID ?? (conceptRows[0] as any).domain_id) || null)
-      : null;
+  const conceptRow = getDb()
+    .prepare(`SELECT concept_key, source_column, domain_id FROM runs WHERE run_id = ?`)
+    .get(runId) as any;
+  const conceptKeyName = conceptRow ? String(conceptRow.concept_key ?? '') : '';
+  const sourceColumn   = conceptRow ? String(conceptRow.source_column ?? '') : '';
+  // The historical `domain_id` column now holds this run's per-column spec_id —
+  // the lookup scope. See column-specs.ts / SQLite migration 011.
+  const runDomainId: number | null = conceptRow
+    ? (Number(conceptRow.domain_id) || null)
+    : null;
 
-  // Naming convention + description + standardization rules for this domain.
+  // Description + standardization rules + naming convention for this column, read
+  // from its per-column spec (spec_id === the run's scope integer). The LLM
+  // concept NAME is now the column name; the DEFINITION is the spec description.
   let namingConvention: NamingConvention | null = null;
-  let effectiveConceptName = conceptKeyName;
+  let effectiveConceptName = sourceColumn || conceptKeyName;
   let effectiveConceptDef  = '';
   let standardizationRules: string[] | null = null;
 
   if (runDomainId != null) {
-    const convRows = await exec(
-      connection,
-      `SELECT name, description, standardization_rules, convention_type, convention_value, convention_rules
-       FROM STAND_DB.STAND_INTERNAL.DOMAINS WHERE domain_id = ?`,
-      [runDomainId],
-    );
+    const specRow = getDb()
+      .prepare(
+        `SELECT description, standardization_rules, convention_type, convention_value, convention_rules
+         FROM column_specs WHERE spec_id = ?`,
+      )
+      .get(runDomainId);
+    const convRows = specRow ? [specRow] : [];
     if (convRows.length > 0) {
-      const domainName = String((convRows[0] as any).NAME ?? (convRows[0] as any).name ?? '').trim();
-      const domainDesc = String((convRows[0] as any).DESCRIPTION ?? (convRows[0] as any).description ?? '').trim();
+      const specDesc = String((convRows[0] as any).DESCRIPTION ?? (convRows[0] as any).description ?? '').trim();
       const stdRulesRaw = (convRows[0] as any).STANDARDIZATION_RULES ?? (convRows[0] as any).standardization_rules ?? null;
 
-      if (!effectiveConceptName && domainName) effectiveConceptName = domainName;
-      if (domainDesc) effectiveConceptDef = domainDesc;
+      if (specDesc) effectiveConceptDef = specDesc;
 
       if (stdRulesRaw) {
         const parsed = safeJsonParse(typeof stdRulesRaw === 'string' ? stdRulesRaw : JSON.stringify(stdRulesRaw));
@@ -218,24 +207,30 @@ export async function runAutoGroupForRun(
   if (literals.length > 0) {
     const normLiterals = Array.from(new Set(literals.map(normalizeLiteral))).filter(Boolean);
     if (normLiterals.length > 0) {
-      const placeholders = normLiterals.map(() => '?').join(', ');
       const domainFilter = runDomainId != null
         ? `AND lam.domain_id = ${Number(runDomainId)}`
         : `AND lam.domain_id IS NULL`;
-      const lookupRows = await exec(
-        connection,
-        `SELECT lam.normalized_value AS norm_key, aan.alias_name
-         FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
-           ON lam.alias_id = aan.alias_id
-         WHERE lam.normalized_value IN (${placeholders})
-           ${domainFilter}`,
-        normLiterals,
-      );
-      for (const row of lookupRows) {
-        const key = String((row as any).NORM_KEY   ?? (row as any).norm_key   ?? '');
-        const an  = String((row as any).ALIAS_NAME ?? (row as any).alias_name ?? '');
-        if (key && an) lookupMap.set(key, an);
+      // Batched under the adapter's bind budget (a 5k-value queue drain would
+      // otherwise blow SQL Server's ~2.1k-parameter statement ceiling).
+      const IN_BATCH = Math.max(100, getWarehouseAdapter().bindLimit - 100);
+      for (let i = 0; i < normLiterals.length; i += IN_BATCH) {
+        const batch = normLiterals.slice(i, i + IN_BATCH);
+        const placeholders = batch.map(() => '?').join(', ');
+        const lookupRows = await exec(
+          connection,
+          `SELECT lam.normalized_value AS norm_key, aan.alias_name
+           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+             ON lam.alias_id = aan.alias_id
+           WHERE lam.normalized_value IN (${placeholders})
+             ${domainFilter}`,
+          batch,
+        );
+        for (const row of lookupRows) {
+          const key = String((row as any).NORM_KEY   ?? (row as any).norm_key   ?? '');
+          const an  = String((row as any).ALIAS_NAME ?? (row as any).alias_name ?? '');
+          if (key && an) lookupMap.set(key, an);
+        }
       }
     }
   }
@@ -259,22 +254,37 @@ export async function runAutoGroupForRun(
   // lookup alias_name always wins) instead of creating a case-variant duplicate.
   const normNameIndex = new Map<string, string>();
 
+  // Every literal must land in exactly ONE group. The chunk LLM (or a merge that
+  // concatenates member_ids) can emit the same member in two overlapping groups;
+  // left unchecked that duplicates the value inside the persisted blob, which
+  // then collides React keys and double-counts the value in review. First
+  // placement wins; later duplicates (across groups OR within one group's batch)
+  // are dropped here at the single assembly chokepoint.
+  const placedLiterals = new Set<string>();
   const addToPendingGroup = (
     displayName: string,
     items:       OpGroupItem[],
     fromLookup:  boolean,
     confidence:  Conf,
   ): void => {
+    const fresh: OpGroupItem[] = [];
+    for (const it of items) {
+      if (placedLiterals.has(it.literal_value)) continue;
+      placedLiterals.add(it.literal_value);
+      fresh.push(it);
+    }
+    if (fresh.length === 0) return;
+
     const normKey     = normalizeLiteral(displayName) || displayName;
     const existingKey = normNameIndex.get(normKey);
     if (existingKey !== undefined) {
       const entry = pendingGroupMap.get(existingKey)!;
-      entry.items.push(...items);
+      entry.items.push(...fresh);
       // Lookup groups keep 'h'; LLM-LLM merges keep the worse confidence.
       if (!entry.from_lookup) entry.confidence = worseConf(entry.confidence, confidence);
       return;
     }
-    pendingGroupMap.set(displayName, { items: [...items], from_lookup: fromLookup, confidence });
+    pendingGroupMap.set(displayName, { items: [...fresh], from_lookup: fromLookup, confidence });
     normNameIndex.set(normKey, displayName);
   };
 
@@ -302,22 +312,74 @@ export async function runAutoGroupForRun(
     const aliasFilter = runDomainId != null
       ? `WHERE domain_id = ${Number(runDomainId)}`
       : `WHERE domain_id IS NULL`;
+    // T-SQL sorts NULLs lowest, so plain DESC already means NULLS LAST there.
     const existingAliasRows = await exec(
       connection,
-      `SELECT alias_name FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
-       ${aliasFilter}
-       ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
-       LIMIT 200`,
+      getWarehouseAdapter().kind === 'mssql'
+        ? `SELECT TOP (200) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+           ${aliasFilter}
+           ORDER BY usage_count DESC, last_used_at DESC`
+        : `SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+           ${aliasFilter}
+           ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
+           LIMIT 200`,
     );
     const approvedAliasNames = existingAliasRows
       .map((r) => String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '').trim())
       .filter(Boolean);
 
+    // Retrieval slice: when the domain has MORE approved names than the top-200
+    // usage window, also pull in approved names whose first word matches a first
+    // word in this batch — the entities demonstrably in play. Without this, a
+    // new variant of alias #201+ gets a freshly coined near-duplicate name.
+    // Plain LOWER/SPLIT_PART (no UDF): this is a user-action path, and the
+    // approximation only needs to be good enough for retrieval.
+    if (existingAliasRows.length >= 200) {
+      const batchFirstTokens = Array.from(new Set(
+        unmatchedItems
+          .map((it) => normalizeLiteral(it.literal_value).split(' ')[0])
+          .filter((t) => t.length >= 2),
+      )).slice(0, 300);
+      if (batchFirstTokens.length > 0) {
+        try {
+          const tokenPlaceholders = batchFirstTokens.map(() => '?').join(', ');
+          // First-word extraction: SPLIT_PART is Snowflake-only; T-SQL uses
+          // LEFT + CHARINDEX (with a trailing-space sentinel for one-word names).
+          const relatedRows = await exec(
+            connection,
+            getWarehouseAdapter().kind === 'mssql'
+              ? `SELECT TOP (100) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+                 ${aliasFilter}
+                   AND LOWER(LEFT(LTRIM(RTRIM(alias_name)), CHARINDEX(' ', LTRIM(RTRIM(alias_name)) + ' ') - 1)) IN (${tokenPlaceholders})
+                 ORDER BY usage_count DESC`
+              : `SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+                 ${aliasFilter}
+                   AND LOWER(SPLIT_PART(TRIM(alias_name), ' ', 1)) IN (${tokenPlaceholders})
+                 ORDER BY usage_count DESC NULLS LAST
+                 LIMIT 100`,
+            batchFirstTokens,
+          );
+          for (const r of relatedRows) {
+            const n = String((r as any).ALIAS_NAME ?? (r as any).alias_name ?? '').trim();
+            if (n) approvedAliasNames.push(n);
+          }
+        } catch (e) {
+          console.warn('[op-auto-group-run] related-alias retrieval failed (continuing with top-200 only):', e);
+        }
+      }
+    }
+
     // Include this run's lookup-group alias names so the merge/grouping prompts
     // treat them as protected canonical names (lookup names always win) even if
     // they fall outside the top-200 usage window.
     const lookupAliasNames  = Array.from(new Set(lookupMap.values()));
-    const existingAliasNames = Array.from(new Set([...lookupAliasNames, ...approvedAliasNames]));
+    // Also include the run's OWN current group names — unexported, so invisible
+    // to the DB queries above. Without these, a second grouping pass on the same
+    // run (failed-export retry picking up new queue values, or a future partial
+    // re-group) can coin a different name for an entity the first pass already
+    // named ("Verizon Wireless" vs "Verizon"), splitting one entity in two.
+    const inRunGroupNames = state.groups.map((g) => g.alias_name).filter(Boolean);
+    const existingAliasNames = Array.from(new Set([...lookupAliasNames, ...inRunGroupNames, ...approvedAliasNames]));
 
     const _groupStart = Date.now();
     const onePromptResult = await runOnePromptGrouping(runItems, effectiveConceptName, effectiveConceptDef, existingAliasNames, namingConvention, standardizationRules);
@@ -387,39 +449,85 @@ export async function runAutoGroupForRun(
 
   const specLiterals = new Set(newGroupSpecs.flatMap((g) => g.items.map((gi) => gi.literal_value)));
 
-  // Items whose chunk LLM call FAILED (even after retries): honest fallback
-  // singletons — self-mapped, confidence 'l', needs_review, source 'llm_failed'.
-  // Never presented as confident groupings.
-  for (const lv of llmFailedLiterals) {
-    if (specLiterals.has(lv)) continue;
-    specLiterals.add(lv);
-    newGroupSpecs.push({
-      alias_name:        lv,
-      alias_name_source: 'llm_failed',
-      confidence:        'l',
-      from_lookup_chunk: false,
-      needs_review:      true,
-      items:             [{ literal_value: lv, matched_from_lookup: false }],
-    });
+  // ── Convention-compliant self-map names ────────────────────────────────────
+  // Values the LLM couldn't place still ALWAYS become singleton groups (nothing
+  // is ever left unmapped), but their alias names must respect the domain's
+  // naming convention — a raw literal usually won't. Deterministic form rules
+  // are applied first; names still violating the regex/constraints get one
+  // batched LLM fix attempt (skipped for llm_failed literals — the API is
+  // unhealthy right then). Anything still non-conforming keeps the deterministic
+  // best-effort name and stays needs_review for the human.
+  // RE2, not `new RegExp` — this pattern is user-authored and is matched against
+  // raw source literals on the single Node thread, where a backtracking hang is
+  // a whole-installation outage that cannot be interrupted. RE2 is linear-time.
+  // Null (unsupported construct) means "cannot enforce", never "fall back to
+  // the backtracking engine".
+  const anchoredConventionRegex =
+    namingConvention?.type === 'regex' && namingConvention.value.trim()
+      ? compileSafeRegex(namingConvention.value)
+      : null;
+  const violatesConvention = (name: string): boolean => {
+    if (!name) return true;
+    // Length-capped match — see conventionMatches / MAX_CONVENTION_TEST_LEN.
+    // `name` here can be a raw source literal, which has no length cap.
+    if (anchoredConventionRegex && !conventionMatches(anchoredConventionRegex, name)) return true;
+    return validateConventionViolations(name, namingConvention?.rules ?? null).length > 0;
+  };
+  const llmFailedSet   = new Set(llmFailedLiterals);
+  const allSelfLiterals = [...new Set([...llmFailedLiterals, ...ungroupedFromLLM])];
+  const selfMapNames = new Map<string, string>(); // literal → convention-adjusted alias name
+  for (const lv of allSelfLiterals) {
+    const name = namingConvention?.rules && hasAnyRule(namingConvention.rules)
+      ? (applyConventionRules(lv, namingConvention.rules) || lv)
+      : lv;
+    selfMapNames.set(lv, name);
+  }
+  if (namingConvention) {
+    const fixable = allSelfLiterals.filter(
+      (lv) => !llmFailedSet.has(lv) && violatesConvention(selfMapNames.get(lv)!),
+    );
+    if (fixable.length > 0) {
+      try {
+        const fixes = await fixNamesForConvention(
+          fixable.map((lv) => ({ id: lv, current: selfMapNames.get(lv)!, reps: [lv] })),
+          namingConvention, effectiveConceptName, apiKey,
+        );
+        for (const [lv, fixed] of fixes) {
+          if (!violatesConvention(fixed)) selfMapNames.set(lv, fixed);
+        }
+      } catch (e) {
+        console.warn('[op-auto-group-run] convention name-fix for self-mapped singletons failed:', e);
+      }
+    }
   }
 
-  // Items the LLM couldn't confidently place become their OWN singleton group,
-  // self-mapped (canonical = the raw value) and flagged needs_review. This keeps
-  // EVERY processed value written to the lookup — nothing is left ungrouped and
-  // unmapped — so a freshly committed pipeline starts with an empty queue, while
-  // these still surface in yellow for the user to confirm or rename.
-  for (const lv of ungroupedFromLLM) {
-    if (specLiterals.has(lv)) continue;
+  // Self-mapped singletons: llm_failed = the chunk LLM call failed after retries
+  // (honest fallback, never a confident group); llm_proposed = the LLM left the
+  // item unassigned. Both confidence 'l' + needs_review. Literals whose
+  // convention-adjusted names collide share one group (post-transform equals).
+  const selfMapSpecByName = new Map<string, GroupSpec>();
+  const addSelfMapSingleton = (lv: string, source: 'llm_failed' | 'llm_proposed'): void => {
+    if (specLiterals.has(lv)) return;
     specLiterals.add(lv);
-    newGroupSpecs.push({
-      alias_name:        lv,
-      alias_name_source: 'llm_proposed',
+    const aliasName = selfMapNames.get(lv) ?? lv;
+    const existing  = selfMapSpecByName.get(aliasName);
+    if (existing) {
+      existing.items.push({ literal_value: lv, matched_from_lookup: false });
+      return;
+    }
+    const spec: GroupSpec = {
+      alias_name:        aliasName,
+      alias_name_source: source,
       confidence:        'l',
       from_lookup_chunk: false,
       needs_review:      true,
       items:             [{ literal_value: lv, matched_from_lookup: false }],
-    });
-  }
+    };
+    selfMapSpecByName.set(aliasName, spec);
+    newGroupSpecs.push(spec);
+  };
+  for (const lv of llmFailedLiterals) addSelfMapSingleton(lv, 'llm_failed');
+  for (const lv of ungroupedFromLLM)  addSelfMapSingleton(lv, 'llm_proposed');
 
   const processedLiterals = new Set(itemsToProcess.map((it) => it.literal_value));
 
@@ -442,11 +550,32 @@ export async function runAutoGroupForRun(
       appendGroups.push({ ...spec, group_id: nextGroupId++, items: itemsLeft });
     }
 
+    // Initial-standardization stamps for LLM-grouped items (Case C referee
+    // baseline): record each item's first-proposed group alias/id/confidence.
+    // Lookup groups are excluded — Case A already covers those.
+    const initialByLiteral = new Map<string, { alias: string; gid: number; conf: 'h' | 'm' | 'l' }>();
+    for (const g of appendGroups) {
+      if (g.from_lookup_chunk) continue;
+      for (const gi of g.items) {
+        initialByLiteral.set(gi.literal_value, { alias: g.alias_name, gid: g.group_id, conf: g.confidence });
+      }
+    }
+
     const updatedItems = fresh.items.map((item) => {
       const alias = lookupMap.get(normalizeLiteral(item.literal_value));
-      return alias !== undefined
-        ? { ...item, matched_from_lookup: true, alias_name: alias }
-        : item;
+      if (alias !== undefined) {
+        return { ...item, matched_from_lookup: true, alias_name: alias };
+      }
+      const init = initialByLiteral.get(item.literal_value);
+      if (init && item.initial_alias_name == null) {
+        return {
+          ...item,
+          initial_alias_name: init.alias,
+          initial_group_id:   init.gid,
+          initial_confidence: init.conf,
+        };
+      }
+      return item;
     });
 
     // Only previously-ungrouped items that weren't reprocessed this pass stay
@@ -469,9 +598,9 @@ export async function runAutoGroupForRun(
 
   let persisted: { merged: OpRunState; appended: number } | null = null;
   for (let attempt = 0; attempt < 2 && !persisted; attempt++) {
-    const fresh = (await loadOpRunState(connection, runId)) ?? state;
+    const fresh = (await loadOpRunState(runId)) ?? state;
     const built = buildMergedState(fresh);
-    const saved = await saveOpRunStateWithRev(connection, runId, built.merged, Number(fresh.rev ?? 0));
+    const saved = await saveOpRunStateWithRev(runId, built.merged, Number(fresh.rev ?? 0));
     if (saved) {
       persisted = built;
     } else {
@@ -479,10 +608,10 @@ export async function runAutoGroupForRun(
     }
   }
   if (!persisted) {
-    const fresh = (await loadOpRunState(connection, runId)) ?? state;
+    const fresh = (await loadOpRunState(runId)) ?? state;
     const built = buildMergedState(fresh);
     console.warn(`[op-auto-group-run] Run ${runId}: rev conflict persisted after retry — force-saving rebased state.`);
-    await saveOpRunState(connection, runId, { ...built.merged, rev: Number(fresh.rev ?? 0) + 1 });
+    await saveOpRunState(runId, { ...built.merged, rev: Number(fresh.rev ?? 0) + 1 });
     persisted = built;
   }
 

@@ -14,6 +14,7 @@ function isPublicPath(pathname: string): boolean {
   if (pathname === '/api/debug-sentry') return true; // monitoring self-test; 404s unless SENTRY_DSN is set
   if (pathname.startsWith('/api/auth/login'))  return true;
   if (pathname.startsWith('/api/auth/google')) return true;
+  if (pathname === '/api/auth/logout') return true; // must clear a stale/expired cookie unconditionally
   return false;
 }
 

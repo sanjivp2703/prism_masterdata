@@ -7,24 +7,20 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
+import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import { loadOpRunState } from '@/app/api/_lib/op-auto-group';
 import { groupOneTimeRun } from '@/app/api/_lib/op-one-time';
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({ sqlText, binds, complete: (e: any, _s: any, r: any[]) => (e ? reject(e) : resolve(r || [])) });
-  });
-}
-
 export async function POST(_request: Request, { params }: { params: Promise<{ run_id: string }> }) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return Response.json({ error: 'LLM grouping is not configured (ANTHROPIC_API_KEY missing).' }, { status: 503 });
+  if (!getAnthropicApiKey()) {
+    return Response.json({ error: 'LLM grouping is not configured — add an Anthropic API key on the setup page.' }, { status: 503 });
   }
 
   const { run_id } = await params;
@@ -32,17 +28,17 @@ export async function POST(_request: Request, { params }: { params: Promise<{ ru
   if (!Number.isFinite(runId)) return Response.json({ error: 'Invalid run_id' }, { status: 400 });
 
   try {
-    return await withSnowflake(async (conn) => {
-      const ownRows = await exec(
-        conn,
-        `SELECT source_column FROM STAND_DB.STAND_INTERNAL.RUNS
-         WHERE run_id = ? AND run_type = 'one_time' AND created_by = ?`,
-        [runId, Number(session.accountId)],
-      );
-      if (!ownRows.length) return Response.json({ error: 'Not found' }, { status: 404 });
+    {
+      const ownRow = getDb()
+        .prepare(
+          `SELECT source_column FROM runs
+           WHERE run_id = ? AND run_type = 'one_time' AND created_by = ?`,
+        )
+        .get(runId, Number(session.accountId));
+      if (!ownRow) return Response.json({ error: 'Not found' }, { status: 404 });
 
-      await groupOneTimeRun(conn, runId);
-      const state = await loadOpRunState(conn, runId);
+      await groupOneTimeRun(null, runId);
+      const state = await loadOpRunState(runId);
       const groups = (state?.groups ?? []).map((g) => ({
         group_id:     g.group_id,
         alias_name:   g.alias_name,
@@ -52,13 +48,13 @@ export async function POST(_request: Request, { params }: { params: Promise<{ ru
       }));
       return Response.json({
         run_id: runId,
-        source_column: String((ownRows[0] as any).SOURCE_COLUMN ?? (ownRows[0] as any).source_column ?? ''),
+        source_column: String((ownRow as any)?.source_column ?? ''),
         grouped: true,
         accepted: false,
         groups,
       });
-    });
+    }
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to group one-time run');
+    return warehouseErrorResponse(err, 'Failed to group one-time run');
   }
 }

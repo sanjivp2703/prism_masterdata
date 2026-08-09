@@ -116,6 +116,7 @@ function humanDate(value: string | null | undefined): string {
 
 interface GrantsResult {
   applied: number;
+  skipped?: number;
   failed: number;
   errors: { sql: string; error: string | null }[];
   conn_error: string | null;
@@ -123,7 +124,8 @@ interface GrantsResult {
 
 function GrantsPanel({ grants }: { grants: GrantsResult }) {
   const [expanded, setExpanded] = useState(false);
-  const allOk = grants.applied > 0 && grants.failed === 0 && !grants.conn_error;
+  const skipped = grants.skipped ?? 0;
+  const allOk = (grants.applied > 0 || skipped > 0) && grants.failed === 0 && !grants.conn_error;
   const color = allOk ? 'var(--confidence-high)' : 'var(--confidence-low)';
   const bg    = allOk ? '#F2FAF7' : '#FDF4F4';
   const border = allOk ? '#BFE3D6' : '#F3C6C6';
@@ -133,13 +135,14 @@ function GrantsPanel({ grants }: { grants: GrantsResult }) {
       <p style={{ fontWeight: 500, color, margin: 0 }}>
         {grants.conn_error
           ? 'Could not connect to apply grants'
-          : `${grants.applied} grant${grants.applied !== 1 ? 's' : ''} applied${grants.failed > 0 ? `, ${grants.failed} failed` : ''}`}
+          : `${grants.applied} grant${grants.applied !== 1 ? 's' : ''} applied${skipped > 0 ? ` · ${skipped} already in place from install` : ''}${grants.failed > 0 ? ` · ${grants.failed} failed` : ''}`}
       </p>
       {grants.conn_error && <p style={{ color, margin: '2px 0 0' }}>{grants.conn_error}</p>}
       {grants.failed > 0 && !grants.conn_error && (
         <>
           <p style={{ color: 'var(--confidence-low)', margin: '2px 0 0' }}>
-            Some grants require ACCOUNTADMIN. Run them manually in Snowflake.
+            These statements need ACCOUNTADMIN and their objects weren&apos;t found — run
+            01_internal_tables.sql as ACCOUNTADMIN, or re-save with an elevated role.
           </p>
           <button
             type="button"
@@ -168,14 +171,99 @@ function maskAccount(account: string): string {
   return `${visible}${'•'.repeat(Math.max(3, locator.length - visible.length))}${suffix}`;
 }
 
+/**
+ * The REAL service-connection state — the one pipelines, the poller and every
+ * export actually use.
+ *
+ * Fixes KI-37: the status line above it is derived from ACCOUNTS.sf_* (the
+ * caller's personal row), which createSnowflakeConnection never reads. So this
+ * page could report "configured" while the connection running the pipelines was
+ * broken, or the reverse — and it disagreed with /setup, which reads the true
+ * source. An admin who lands here to diagnose a failing pipeline needs the
+ * honest answer and a pointer to where it is actually changed.
+ *
+ * Reads the same endpoint the setup wizard does, so the two can no longer
+ * disagree. That route is admin-only, so this renders nothing for non-admins —
+ * correct, since a non-admin cannot fix a workspace-level connection anyway and
+ * the personal section above is the part that concerns them.
+ */
+function ServiceConnectionStatus() {
+  const [state, setState] = useState<
+    | { kind: 'loading' }
+    | { kind: 'hidden' }                                   // non-admin, or unreadable
+    | { kind: 'ready'; source: string; account: string | null; user: string | null; hasKey: boolean; hasPassword: boolean }
+  >({ kind: 'loading' });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/workspace-snowflake', { cache: 'no-store' })
+      .then(async (r) => {
+        if (!r.ok) return { kind: 'hidden' as const };     // 401/403 for non-admins
+        const b = await r.json().catch(() => ({}));
+        return {
+          kind: 'ready' as const,
+          source:  String(b?.source ?? 'none'),
+          account: b?.sf_account ?? null,
+          user:    b?.sf_user ?? null,
+          // Auth KIND of the service connection. The response has carried these
+          // all along; Settings just never rendered them, so an admin checking
+          // "is the service connection on key-pair auth?" had nowhere to look —
+          // the only "X auth" text on the page describes their own PERSONAL
+          // credentials row, which is usually empty and is a different thing
+          // entirely (SET-S16). Secrets are never sent, only these booleans.
+          hasKey:      b?.has_private_key === true,
+          hasPassword: b?.has_password === true,
+        };
+      })
+      .then((s) => { if (!cancelled) setState(s); })
+      .catch(() => { if (!cancelled) setState({ kind: 'hidden' }); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (state.kind !== 'ready') return null;
+
+  const { source, account, user, hasKey, hasPassword } = state;
+  // Key-pair wins when both are present — that is what the connection actually
+  // uses, and saying "password auth" there would be actively misleading.
+  const authKind = hasKey ? 'key-pair auth' : hasPassword ? 'password auth' : null;
+  const connected = source === 'workspace' || source === 'env';
+  const where =
+    source === 'workspace' ? 'workspace credentials'
+    : source === 'env'     ? 'server environment variables'
+    : 'not configured';
+
+  return (
+    <div
+      className="mt-2 px-3 py-2 rounded-button text-xs"
+      style={{
+        backgroundColor: connected ? 'var(--accent-tint)' : '#FFFBEB',
+        border: `0.5px solid ${connected ? 'var(--accent-border)' : '#FDE9C8'}`,
+        color: connected ? 'var(--accent-strong)' : '#BA7517',
+      }}
+    >
+      <strong>Service connection (used by all pipelines): </strong>
+      {connected
+        ? <>{where}{account ? ` · account ${maskAccount(String(account))}` : ''}{user ? ` · user ${String(user)}` : ''}{authKind ? ` · ${authKind}` : ''}</>
+        : <>not configured — pipelines cannot run</>}
+      {' '}
+      <a href="/setup" className="underline font-medium">
+        {connected ? 'Change it in setup' : 'Set it up'}
+      </a>
+      <div style={{ marginTop: 2, opacity: 0.85 }}>
+        Saving the personal credentials below does <strong>not</strong> change this.
+      </div>
+    </div>
+  );
+}
+
 function SnowflakeSection() {
   const [loadState, setLoadState] = useState<'loading' | 'error' | 'ready'>('loading');
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [sfAccount, setSfAccount]       = useState('');
   const [sfUser, setSfUser]             = useState('');
-  const [sfWarehouse, setSfWarehouse]   = useState('');
-  const [sfRole, setSfRole]             = useState('');
+  const [sfWarehouse, setSfWarehouse]   = useState('PRISM_WH');
+  const [sfRole, setSfRole]             = useState('PRISM_SERVICE');
   const [authMode, setAuthMode]         = useState<'password' | 'key'>('password');
   const [sfPassword, setSfPassword]     = useState('');
   const [sfPrivateKey, setSfPrivateKey] = useState('');
@@ -183,7 +271,7 @@ function SnowflakeSection() {
   const [hasKey, setHasKey]             = useState(false);
 
   const [testing, setTesting]           = useState(false);
-  const [testResult, setTestResult]     = useState<{ ok: boolean; msg: string } | null>(null);
+  const [testResult, setTestResult]     = useState<{ ok: boolean; msg: string; warning?: string } | null>(null);
   const [saving, setSaving]             = useState(false);
   const [saveError, setSaveError]       = useState<string | null>(null);
   const [grantsResult, setGrantsResult] = useState<GrantsResult | null>(null);
@@ -199,8 +287,8 @@ function SnowflakeSection() {
         if (!r.ok) throw new Error(d?.error ?? `HTTP ${r.status}`);
         setSfAccount(d.sf_account ?? '');
         setSfUser(d.sf_user ?? '');
-        setSfWarehouse(d.sf_warehouse ?? '');
-        setSfRole(d.sf_role ?? '');
+        setSfWarehouse(d.sf_warehouse ?? 'PRISM_WH');
+        setSfRole(d.sf_role ?? 'PRISM_SERVICE');
         setHasPassword(Boolean(d.has_password));
         setHasKey(Boolean(d.has_private_key));
         setAuthMode(d.has_private_key ? 'key' : 'password');
@@ -217,7 +305,7 @@ function SnowflakeSection() {
   const hasCredential = authMode === 'password'
     ? (sfPassword.trim() !== '' || hasPassword)
     : (sfPrivateKey.trim() !== '' || hasKey);
-  const canAct = !!(sfAccount.trim() && sfUser.trim() && sfWarehouse.trim() && hasCredential);
+  const canAct = !!(sfAccount.trim() && sfUser.trim() && sfWarehouse.trim() && sfRole.trim() && hasCredential);
 
   function buildBody() {
     return {
@@ -239,7 +327,13 @@ function SnowflakeSection() {
         body: JSON.stringify(buildBody()),
       });
       const b = await r.json();
-      setTestResult({ ok: b.ok, msg: b.ok ? `Connected — Snowflake ${b.version}` : (b.error ?? 'Connection failed') });
+      setTestResult({
+        ok: b.ok,
+        msg: b.ok
+          ? `Connected — Snowflake ${b.version}${b.used === 'saved' ? ' (saved credentials)' : ''}`
+          : (b.error ?? 'Connection failed'),
+        warning: b.warning || undefined,
+      });
     } catch { setTestResult({ ok: false, msg: 'Network error' }); }
     finally { setTesting(false); }
   }
@@ -281,18 +375,30 @@ function SnowflakeSection() {
     finally { setClearing(false); }
   }
 
+  // NOTE: this describes the caller's PERSONAL credentials (ACCOUNTS.sf_*),
+  // which is what this section reads and writes. It is deliberately NOT called
+  // "workspace" any more — createSnowflakeConnection never reads this row, so
+  // the old wording claimed a pipeline-affecting change this page cannot make
+  // (KI-38). The real service-connection state is shown separately below.
   const configured = Boolean(sfAccount.trim() && (hasPassword || hasKey));
   const statusLine = configured
-    ? `Configured — account ${maskAccount(sfAccount.trim())} · ${hasKey ? 'private key' : 'password'} auth`
-    : 'No workspace credentials saved — using environment defaults';
+    ? `Saved — account ${maskAccount(sfAccount.trim())} · ${hasKey ? 'private key' : 'password'} auth`
+    : 'No personal credentials saved (optional — see below)';
 
   return (
     <section style={card}>
       <div style={{ marginBottom: 16 }}>
-        <h2 style={sectionTitle}>Snowflake connection</h2>
+        <h2 style={sectionTitle}>Your personal Snowflake credentials <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(optional)</span></h2>
         <p style={sectionHint}>
-          Workspace credentials for reading source tables and writing standardizations. Saving also applies all Prism role grants.
+          Stored encrypted against your own account. Pipelines, the poller and all exports use
+          the workspace service connection, not these. Prism uses yours in three situations,
+          always on tables you choose to connect: one-time standardizations of a table the
+          service connection can&rsquo;t see; turning on change tracking for a pipeline when the
+          service role can&rsquo;t; and granting the service role access to one table when you
+          enable an output mode that writes to it. The last two change settings on that table,
+          not just read from it.
         </p>
+        <ServiceConnectionStatus />
       </div>
 
       {loadState === 'loading' && (
@@ -331,11 +437,11 @@ function SnowflakeSection() {
             </div>
             <div>
               <label style={labelStyle}>Warehouse</label>
-              <input style={inputStyle} value={sfWarehouse} onChange={e => setSfWarehouse(e.target.value)} placeholder="COMPUTE_WH" />
+              <input style={inputStyle} value={sfWarehouse} onChange={e => setSfWarehouse(e.target.value)} placeholder="PRISM_WH" />
             </div>
             <div>
-              <label style={labelStyle}>Role (optional)</label>
-              <input style={inputStyle} value={sfRole} onChange={e => setSfRole(e.target.value)} placeholder="ACCOUNTADMIN" />
+              <label style={labelStyle}>Role</label>
+              <input style={inputStyle} value={sfRole} onChange={e => setSfRole(e.target.value)} placeholder="PRISM_SERVICE" />
             </div>
           </div>
 
@@ -391,6 +497,11 @@ function SnowflakeSection() {
               {testResult.ok ? '✓' : '✗'} {testResult.msg}
             </p>
           )}
+          {testResult?.warning && (
+            <p style={{ fontSize: 12, margin: 0, color: 'var(--confidence-med)' }}>
+              ⚠ {testResult.warning}
+            </p>
+          )}
           {saveError && <p style={{ fontSize: 12, margin: 0, color: 'var(--confidence-low)' }}>✗ {saveError}</p>}
           {clearMsg  && <p style={{ fontSize: 12, margin: 0, color: 'var(--confidence-high)' }}>✓ {clearMsg}</p>}
           {grantsResult && <GrantsPanel grants={grantsResult} />}
@@ -400,7 +511,12 @@ function SnowflakeSection() {
               {testing ? 'Testing…' : 'Test connection'}
             </button>
             <button type="button" onClick={handleSave} disabled={!canAct || saving} style={disabledStyle(primaryBtn, !canAct || saving)}>
-              {saving ? 'Saving and applying grants…' : 'Save and apply grants'}
+              {/* Not "…and apply grants": the grants pass only runs when the
+                  caller is an admin (snowflake-config returns {grants:null}
+                  otherwise), so the old label promised a non-admin something
+                  that silently did not happen. GrantsPanel below reports the
+                  result whenever grants DID run. */}
+              {saving ? 'Saving…' : 'Save credentials'}
             </button>
             {(sfAccount || hasPassword || hasKey) && (
               <button type="button" onClick={handleClear} disabled={clearing} style={{ ...disabledStyle(dangerBtn, clearing), marginLeft: 'auto' }}>
@@ -449,6 +565,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
   const [loadError, setLoadError] = useState<string | null>(null);
   const [members, setMembers]     = useState<Member[]>([]);
   const [busyId, setBusyId]       = useState<number | null>(null);
+  const [busyAction, setBusyAction] = useState<'role' | 'remove' | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -476,7 +593,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
     if (busyId !== null || newRole === member.role) return;
     const label = newRole === 'admin' ? 'an admin' : 'a member';
     if (!window.confirm(`Make ${member.name || member.email} ${label}?`)) return;
-    setBusyId(member.account_id); setActionError(null);
+    setBusyId(member.account_id); setBusyAction('role'); setActionError(null);
     try {
       const r = await fetch(`/api/accounts/members/${member.account_id}`, {
         method: 'PATCH',
@@ -489,14 +606,14 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Failed to update role');
     } finally {
-      setBusyId(null);
+      setBusyId(null); setBusyAction(null);
     }
   }
 
   async function removeMember(member: Member) {
     if (busyId !== null) return;
     if (!window.confirm(`Remove ${member.name || member.email} from this workspace? Their active sessions will end immediately.`)) return;
-    setBusyId(member.account_id); setActionError(null);
+    setBusyId(member.account_id); setBusyAction('remove'); setActionError(null);
     try {
       const r = await fetch(`/api/accounts/members/${member.account_id}`, { method: 'DELETE' });
       const b = await r.json().catch(() => ({}));
@@ -505,7 +622,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Failed to remove member');
     } finally {
-      setBusyId(null);
+      setBusyId(null); setBusyAction(null);
     }
   }
 
@@ -525,7 +642,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
         <div>
           <h2 style={sectionTitle}>Team</h2>
-          <p style={sectionHint}>Everyone with access to this workspace.</p>
+          <p style={sectionHint}>Everyone with access to this workspace. Every member can view all pipelines, mappings, and the data values Prism standardizes.</p>
         </div>
         <a href="/invite" style={{ ...primaryBtn, textDecoration: 'none', display: 'inline-block' }}>
           Invite teammate
@@ -605,7 +722,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
                     <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                       {m.role === 'user' ? (
                         <button type="button" disabled={busy} style={disabledStyle(smallActionBtn, busy)} onClick={() => changeRole(m, 'admin')}>
-                          Make admin
+                          {busy && busyAction === 'role' ? 'Updating…' : 'Make admin'}
                         </button>
                       ) : (
                         <button
@@ -615,7 +732,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
                           style={disabledStyle(smallActionBtn, busy || !canDemote)}
                           onClick={() => changeRole(m, 'user')}
                         >
-                          Make member
+                          {busy && busyAction === 'role' ? 'Updating…' : 'Make member'}
                         </button>
                       )}
                       <button
@@ -625,7 +742,7 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
                         style={disabledStyle({ ...smallActionBtn, color: 'var(--confidence-low)', borderColor: '#F3C6C6' }, busy || !canRemove)}
                         onClick={() => removeMember(m)}
                       >
-                        Remove
+                        {busy && busyAction === 'remove' ? 'Removing…' : 'Remove'}
                       </button>
                     </div>
                   </div>

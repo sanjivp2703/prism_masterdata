@@ -14,20 +14,10 @@
  */
 import 'server-only';
 
-import { withSnowflake } from './snowflake';
+import { getDb } from './sqlite';
 import { broadcastPipelineEvent, type AlertLevel } from './pipeline-broadcaster';
 
 const DEFAULT_TTL_MS = 12_000;
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows ?? [])),
-    });
-  });
-}
 
 /**
  * Pause a pipeline and record a human-readable reason.  Idempotent: only writes
@@ -39,22 +29,19 @@ export async function pausePipelineWithMessage(
   pipelineId: number,
   message:    string,
   level:      AlertLevel = 'error',
+  reason?:    string,
 ): Promise<boolean> {
   let changed = false;
   try {
-    await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET status = 'paused', status_message = ?, updated_at = CURRENT_TIMESTAMP()
+    const res = getDb()
+      .prepare(
+        `UPDATE pipelines
+         SET status = 'paused', status_message = ?, status_reason = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE pipeline_id = ?
            AND NOT (status = 'paused' AND status_message = ?)`,
-        [message, pipelineId, message],
-      );
-      // Snowflake returns "number of rows updated" in the result of an UPDATE.
-      const affected = Number((rows[0] as any)?.['number of rows updated'] ?? 0);
-      changed = affected > 0;
-    });
+      )
+      .run(message, reason ?? null, pipelineId, message);
+    changed = res.changes > 0;
   } catch (e) {
     console.error(`[Alert] Failed to pause pipeline ${pipelineId}:`, e);
     return false;
@@ -74,43 +61,68 @@ export async function pausePipelineWithMessage(
  */
 export async function clearPipelineStatusMessage(pipelineId: number): Promise<void> {
   try {
-    await withSnowflake(async (conn) => {
-      await exec(
-        conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET status_message = NULL, updated_at = CURRENT_TIMESTAMP()
+    getDb()
+      .prepare(
+        `UPDATE pipelines
+         SET status_message = NULL, status_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE pipeline_id = ? AND status_message IS NOT NULL`,
-        [pipelineId],
-      );
-    });
+      )
+      .run(pipelineId);
   } catch (e) {
     console.error(`[Alert] Failed to clear status message for pipeline ${pipelineId}:`, e);
   }
 }
 
 /**
+ * status_reason values that mean "this pipeline must NOT be standardized right
+ * now", even though its status is still 'active' and the poller keeps watching
+ * it so it can auto-recover.
+ *
+ * Every automatic standardization entry point — the 10-minute tick, the
+ * top-of-hour reconciliation sweep, and the manual process-queue route — must
+ * exclude pipelines carrying one of these.  Standardizing through a masking or
+ * row-access policy is not a cosmetic bug: the service role sees masked or
+ * filtered values, and the export writes them into LITERAL_ALIAS_MATCHES
+ * permanently, where they look exactly like legitimately confirmed mappings.
+ */
+export const PIPELINE_BLOCK_REASONS = ['policy_blocked'] as const;
+
+/** SQL fragment for the above — usable directly in a WHERE clause. */
+export const NOT_BLOCKED_SQL =
+  `(status_reason IS NULL OR status_reason NOT IN (${PIPELINE_BLOCK_REASONS.map((r) => `'${r}'`).join(', ')}))`;
+
+/**
  * Set a pipeline's status_message WITHOUT pausing it (status stays 'active').
  * Used for "skip this cycle but keep polling" conditions like a masking/row-access
  * policy — the pipeline auto-recovers when the condition clears.  Idempotent +
  * toast-once so repeated poll cycles don't churn.
+ *
+ * `reason` is the MACHINE-READABLE half of the flag, written to
+ * pipelines.status_reason. status_message is human prose for the card and must
+ * never be pattern-matched in code; anything that needs to *act* on a flag
+ * filters on status_reason instead.  This exists because the masking-policy
+ * flag was, in practice, advisory only: it told the user "standardization
+ * skipped" while the 10-minute tick and the hourly reconciliation sweep — both
+ * of which read PIPELINES without ever looking at status_message — happily
+ * pulled the masked values, LLM-standardized them, and wrote them permanently
+ * into the lookup and the export.  See PIPELINE_BLOCK_REASONS below.
  */
 export async function flagPipelineMessage(
   pipelineId: number,
   message:    string,
   level:      AlertLevel = 'warning',
+  reason:     string | null = null,
 ): Promise<void> {
   let changed = false;
   try {
-    await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET status_message = ?, updated_at = CURRENT_TIMESTAMP()
-         WHERE pipeline_id = ? AND (status_message IS NULL OR status_message <> ?)`,
-        [message, pipelineId, message],
-      );
-      changed = Number((rows[0] as any)?.['number of rows updated'] ?? 0) > 0;
-    });
+    const res = getDb()
+      .prepare(
+        `UPDATE pipelines
+         SET status_message = ?, status_reason = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE pipeline_id = ? AND (status_message IS NULL OR status_message <> ? OR status_reason IS NOT ?)`,
+      )
+      .run(message, reason, pipelineId, message, reason);
+    changed = res.changes > 0;
   } catch (e) {
     console.error(`[Alert] Failed to flag pipeline ${pipelineId}:`, e);
     return;

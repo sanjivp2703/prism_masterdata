@@ -14,11 +14,14 @@
 import 'server-only';
 import { type NextRequest } from 'next/server';
 import { subscribePipelineEvents } from '@/app/api/_lib/pipeline-broadcaster';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function GET(request: NextRequest) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const encoder = new TextEncoder();
 
   let unsubscribe: (() => void) | null = null;

@@ -1,5 +1,28 @@
 // PLACEHOLDER LEGAL TEXT — have counsel review/replace before selling. Generated 2026-07-02.
 
+import { getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+
+/**
+ * The warehouse this installation is actually configured for.
+ *
+ * Same fix as /privacy (SEC-07): this page hardcoded "Snowflake" in five
+ * user-visible places, including the SUBPROCESSOR list — so a SQL Server
+ * customer was told, in a legal document, that their data resides in a
+ * Snowflake account "under your agreement with Snowflake", naming a vendor
+ * they have no relationship with and that never touches their data.
+ *
+ * Falls back to neutral wording rather than throwing: this page is PUBLIC
+ * (linked from /login, /privacy and the accept-invite disclosure), so it has to
+ * render even if the workspace config cannot be read.
+ */
+function warehouseName(): string {
+  try {
+    return getWarehouseAdapter().kind === 'mssql' ? 'SQL Server' : 'Snowflake';
+  } catch {
+    return 'your data warehouse';
+  }
+}
+
 export const metadata = {
   title: 'Terms of service — Prism',
 };
@@ -26,6 +49,7 @@ const listStyle: React.CSSProperties = {
 };
 
 export default function TermsPage() {
+  const warehouse = warehouseName();
   return (
     <div style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh', padding: '48px 24px' }}>
       <div style={{ maxWidth: 720, margin: '0 auto' }}>
@@ -75,12 +99,13 @@ export default function TermsPage() {
 
           <h2 style={sectionTitle}>2. Description of the service</h2>
           <p style={bodyText}>
-            Prism connects to data sources you designate — including your Snowflake data warehouse
+            Prism connects to data sources you designate — including your {warehouse} data warehouse
             and Google Sheets — using credentials you provide, and helps you standardize
             inconsistent text values into canonical names. Confirmed mappings are stored in a
-            lookup table within your connected Snowflake environment and, depending on your
+            lookup table within your connected {warehouse} environment and, depending on your
             configuration, may be written back to export tables or spreadsheets you control. The
-            Service uses a third-party large language model provider (Anthropic) to propose
+            Service uses a third-party large language model provider — Anthropic by default, or
+            OpenAI or Google if your workspace admin configures one — to propose
             groupings and canonical names for the data values you submit for standardization.
           </p>
 
@@ -92,7 +117,7 @@ export default function TermsPage() {
           </p>
           <ul style={listStyle}>
             <li>
-              You are responsible for the credentials you provide (Snowflake credentials, Google
+              You are responsible for the credentials you provide ({warehouse} credentials, Google
               account authorization) and for ensuring you are authorized to connect the data
               sources you configure.
             </li>
@@ -113,14 +138,15 @@ export default function TermsPage() {
           </p>
           <ul style={listStyle}>
             <li>
-              <strong>Snowflake</strong> — your connected warehouse stores mappings, run state, and
-              pipeline configuration. Data resides in your Snowflake account, under your
-              agreement with Snowflake.
+              <strong>{warehouse}</strong> — your connected warehouse stores mappings, run state, and
+              pipeline configuration. Data resides in your {warehouse} account, under your
+              agreement with {warehouse}.
             </li>
             <li>
-              <strong>Anthropic</strong> — distinct data values (not credentials, and not full
-              source rows beyond the values being standardized) are sent to Anthropic&rsquo;s API to
-              propose groupings and canonical names.
+              <strong>AI provider (Anthropic by default; OpenAI or Google if your
+              workspace configures one)</strong> — distinct data values (not credentials, and not full
+              source rows beyond the values being standardized) are sent to the configured
+              provider&rsquo;s API to propose groupings and canonical names.
             </li>
             <li>
               <strong>Google</strong> — used for sign-in (OAuth) and, when you connect them, for
@@ -166,7 +192,7 @@ export default function TermsPage() {
             You may stop using the Service at any time. We may suspend or terminate your access if
             you materially breach these Terms and do not cure the breach within a reasonable
             period after notice, or immediately for serious violations. Upon termination, your
-            right to use the Service ends; mappings and export tables stored in your own Snowflake
+            right to use the Service ends; mappings and export tables stored in your own {warehouse}
             account or spreadsheets remain under your control. Sections that by their nature
             should survive termination (including ownership, limitation of liability, and
             governing terms) will survive.

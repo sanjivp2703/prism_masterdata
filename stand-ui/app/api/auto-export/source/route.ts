@@ -1,5 +1,6 @@
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { clearBaseline } from '@/app/api/_lib/auto-export-seen';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 function quoteIdent(ident: string) {
   return `"${String(ident).replace(/"/g, '""')}"`;
@@ -24,19 +25,6 @@ function isSimpleIdent(s: string) {
   return true;
 }
 
-async function exec(connection: any, sqlText: string, binds?: any[]) {
-  return await new Promise<any[]>((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      },
-    });
-  });
-}
-
 /**
  * GET /api/auto-export/source?table_fqn=DB.SCHEMA.TABLE&column_name=COL
  *
@@ -44,6 +32,8 @@ async function exec(connection: any, sqlText: string, binds?: any[]) {
  * Used by the auto_export mode polling loop on the home page.
  */
 export async function GET(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { searchParams } = new URL(request.url);
   const table_fqn   = searchParams.get('table_fqn')?.trim()   ?? '';
   const column_name = searchParams.get('column_name')?.trim() ?? '';
@@ -70,18 +60,25 @@ export async function GET(request: Request) {
   }
 
   try {
-    return await withSnowflake(async (connection) => {
+    return await withWarehouse(async (connection) => {
       const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
       const colRef   = quoteIdent(column_name);
 
       let rows: any[];
       try {
+        // SQL Server: columns are already text-typed (the picker gates on
+        // that) and TO_VARCHAR doesn't exist — select the column directly.
         rows = await exec(
           connection,
-          `SELECT DISTINCT TO_VARCHAR(${colRef}) AS literal_value
-           FROM ${tableRef}
-           WHERE ${colRef} IS NOT NULL
-           ORDER BY literal_value`
+          getWarehouseAdapter().kind === 'mssql'
+            ? `SELECT DISTINCT ${colRef} AS literal_value
+               FROM ${tableRef}
+               WHERE ${colRef} IS NOT NULL
+               ORDER BY literal_value`
+            : `SELECT DISTINCT TO_VARCHAR(${colRef}) AS literal_value
+               FROM ${tableRef}
+               WHERE ${colRef} IS NOT NULL
+               ORDER BY literal_value`
         );
       } catch (e: any) {
         const msg = String(e?.message ?? e ?? '');
@@ -104,7 +101,7 @@ export async function GET(request: Request) {
       return Response.json({ values, count: values.length });
     });
   } catch (error) {
-    return snowflakeErrorResponse(error, 'Failed to fetch source values');
+    return warehouseErrorResponse(error, 'Failed to fetch source values');
   }
 }
 
@@ -115,6 +112,8 @@ export async function GET(request: Request) {
  * Called when the user disconnects and wants to reset.
  */
 export async function DELETE(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { searchParams } = new URL(request.url);
   const table_fqn   = searchParams.get('table_fqn')?.trim()   ?? '';
   const column_name = searchParams.get('column_name')?.trim() ?? '';

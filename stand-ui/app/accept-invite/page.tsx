@@ -1,18 +1,4 @@
-import { withSnowflake } from '@/app/api/_lib/snowflake';
-
-function row(r: any, key: string) {
-  return r[key.toUpperCase()] ?? r[key.toLowerCase()];
-}
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
+import { getDb } from '@/app/api/_lib/sqlite';
 
 function GoogleMark() {
   return (
@@ -47,33 +33,26 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
     return <ErrorState message={ERROR_MESSAGES[urlError] ?? 'Something went wrong. Please contact the person who invited you.'} />;
   }
 
-  // Validate the token. Return the status from the callback (rather than mutating
-  // an outer variable) so TypeScript's control-flow analysis can see the result
-  // type — assignments inside the callback are otherwise invisible to it.
+  // Validate the token against the local SQLite invitations table.
   let invitedEmail = '';
   let inviteStatus: InviteStatus;
   try {
-    inviteStatus = await withSnowflake(async (conn): Promise<InviteStatus> => {
-      const rows = await exec(
-        conn,
-        `SELECT invited_email, status, expires_at
-         FROM STAND_DB.STAND_INTERNAL.INVITATIONS
-         WHERE token = ?`,
-        [token],
-      );
+    const invite = getDb()
+      .prepare(`SELECT invited_email, status, expires_at FROM invitations WHERE token = ?`)
+      .get(token) as { invited_email: string; status: string; expires_at: string } | undefined;
 
-      if (!rows.length) return 'invalid';
-
-      const status    = String(row(rows[0], 'status'));
-      const expiresAt = new Date(row(rows[0], 'expires_at'));
-
-      if (status === 'accepted') return 'already_accepted';
-      if (status === 'revoked') return 'revoked';
-      if (status !== 'pending' || expiresAt < new Date()) return 'expired';
-
-      invitedEmail = String(row(rows[0], 'invited_email'));
-      return 'valid';
-    });
+    if (!invite) {
+      inviteStatus = 'invalid';
+    } else if (invite.status === 'accepted') {
+      inviteStatus = 'already_accepted';
+    } else if (invite.status === 'revoked') {
+      inviteStatus = 'revoked';
+    } else if (invite.status !== 'pending' || new Date(invite.expires_at) < new Date()) {
+      inviteStatus = 'expired';
+    } else {
+      invitedEmail = String(invite.invited_email);
+      inviteStatus = 'valid';
+    }
   } catch {
     inviteStatus = 'db_error';
   }
@@ -128,7 +107,12 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
             By accepting this invitation you will gain access to the Prism workspace and may be
             able to view data standardised by other workspace members. Only proceed if you
             consent to this access.{' '}
-            <strong>Prism is not liable for any consequences related to data shared on this platform.</strong>
+            Signing in uses your Google account for identity only — Prism asks for
+            spreadsheet access separately, and only if you later connect a Google Sheet.{' '}
+            <strong>Prism is not liable for any consequences related to data shared on this platform.</strong>{' '}
+            By continuing you agree to the{' '}
+            <a href="/terms" style={{ color: '#78350F', textDecoration: 'underline' }}>Terms</a> and{' '}
+            <a href="/privacy" style={{ color: '#78350F', textDecoration: 'underline' }}>Privacy policy</a>.
           </div>
 
           <a

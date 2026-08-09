@@ -1,50 +1,51 @@
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
-
-async function exec(connection: any, sqlText: string, binds?: any[]) {
-  return new Promise<any[]>((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      },
-    });
-  });
-}
+import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { upsertApprovedAliasMssql, bulkUpsertLiteralMatchesMssql } from '@/app/api/_lib/warehouse/mssql/mappings';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
 
 // ── GET /api/global-standardizations ──────────────────────────────────────────
 // Returns all LITERAL_ALIAS_MATCHES grouped by alias_name.
 // Optionally filters by domain_id query param.
 
 export async function GET(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { searchParams } = new URL(request.url);
   const domainIdParam = searchParams.get('domain_id');
   const domainId = domainIdParam != null && domainIdParam !== '' ? Number(domainIdParam) : null;
 
   try {
-    return await withSnowflake(async (connection) => {
+    return await withWarehouse(async (connection) => {
       const rows = await exec(
         connection,
         domainId != null
           ? `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
-             FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-             JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+             JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
                ON lam.alias_id = aan.alias_id
              WHERE lam.domain_id = ?
              ORDER BY aan.alias_name, lam.literal_value`
           : `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
-             FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-             JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+             JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
                ON lam.alias_id = aan.alias_id
              ORDER BY aan.alias_name, lam.literal_value`,
         domainId != null ? [domainId] : undefined,
       );
 
+      // Object.create(null), NOT {}: alias names are user-authored (the review
+      // UI's rename guard checks only length and newlines), and on a plain
+      // object literal `grouped['__proto__']` and `grouped['constructor']`
+      // resolve to inherited members that are TRUTHY. The `if (!grouped[name])`
+      // guard below therefore skipped creating the group, and the next line's
+      // .items.push threw — 500-ing this route for the ENTIRE install, not just
+      // the offending spec, which takes out the Mappings tab and the CSV/Excel
+      // exports for every column. Live-reproduced with a single alias named
+      // `__proto__`. A null-prototype object has nothing to inherit.
       const grouped: Record<
         string,
         { items: Array<{ literal_value: string; run_id: number; confirmed_at: string }> }
-      > = {};
+      > = Object.create(null);
 
       for (const r of rows) {
         const aliasName   = String(r.ALIAS_NAME    ?? r.alias_name    ?? '');
@@ -62,7 +63,7 @@ export async function GET(request: Request) {
       );
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to fetch global standardizations');
+    return warehouseErrorResponse(err, 'Failed to fetch global standardizations');
   }
 }
 
@@ -76,6 +77,8 @@ export async function GET(request: Request) {
 //   pipeline_ids_to_dequeue: number[]           — remove accepted literals from PIPELINE_QUEUE
 
 export async function POST(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   try {
     const body = await request.json().catch(() => ({}));
     const {
@@ -95,20 +98,32 @@ export async function POST(request: Request) {
     const domainId: number | null = (rawDomainId != null && Number.isFinite(Number(rawDomainId)))
       ? Number(rawDomainId) : null;
 
-    return await withSnowflake(async (connection) => {
+    return await withWarehouse(async (connection) => {
       // ── Write new items (proposed queue groupings) ───────────────────────
       const domainIdLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
       const domainFilter    = domainId != null
         ? `AND t.domain_id = ${domainIdLiteral}`
         : `AND t.domain_id IS NULL`;
 
+      const isMssql = getWarehouseAdapter().kind === 'mssql';
+
       for (const [aliasName, literals] of Object.entries(new_items)) {
         if (!literals.length) continue;
+
+        if (isMssql) {
+          const aliasId = await upsertApprovedAliasMssql(connection, aliasName, domainId);
+          await bulkUpsertLiteralMatchesMssql(
+            connection,
+            literals.map(lv => ({ literalValue: lv, aliasId })),
+            domainId, 0,
+          );
+          continue;
+        }
 
         // Upsert alias
         await exec(
           connection,
-          `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES t
+          `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES t
            USING (SELECT ? AS alias_name) s
              ON t.alias_name = s.alias_name ${domainFilter}
            WHEN MATCHED THEN UPDATE SET
@@ -121,7 +136,7 @@ export async function POST(request: Request) {
 
         const aliasRows = await exec(
           connection,
-          `SELECT alias_id FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+          `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
            WHERE alias_name = ? ${domainFilter} LIMIT 1`,
           [aliasName],
         );
@@ -132,15 +147,15 @@ export async function POST(request: Request) {
         for (const litVal of literals) {
           await exec(
             connection,
-            `MERGE INTO STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES t
+            `MERGE INTO PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES t
              USING (SELECT ? AS literal_value) s
-               ON t.normalized_value = PRISM_NORMALIZE(s.literal_value)
+               ON t.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value)
                   ${domainFilter}
              WHEN MATCHED THEN UPDATE SET
                alias_id     = ${aliasId},
                confirmed_at = CURRENT_TIMESTAMP()
              WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
-               VALUES (s.literal_value, PRISM_NORMALIZE(s.literal_value), ${aliasId}, ${domainIdLiteral}, 0, CURRENT_TIMESTAMP())`,
+               VALUES (s.literal_value, PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value), ${aliasId}, ${domainIdLiteral}, 0, CURRENT_TIMESTAMP())`,
             [litVal],
           );
         }
@@ -148,9 +163,14 @@ export async function POST(request: Request) {
 
       // ── Apply item moves (existing literal → different alias) ────────────
       for (const [litVal, newAlias] of Object.entries(item_moves)) {
+        if (isMssql) {
+          const aliasId = await upsertApprovedAliasMssql(connection, newAlias, domainId);
+          await bulkUpsertLiteralMatchesMssql(connection, [{ literalValue: litVal, aliasId }], domainId, 0);
+          continue;
+        }
         await exec(
           connection,
-          `MERGE INTO STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES t
+          `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES t
            USING (SELECT ? AS alias_name) s
              ON t.alias_name = s.alias_name AND t.domain_id IS NULL
            WHEN MATCHED THEN UPDATE SET
@@ -162,7 +182,7 @@ export async function POST(request: Request) {
         );
         const aliasRows = await exec(
           connection,
-          `SELECT alias_id FROM STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES
+          `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
            WHERE alias_name = ? AND domain_id IS NULL`,
           [newAlias],
         );
@@ -170,7 +190,7 @@ export async function POST(request: Request) {
         const aliasId = Number((aliasRows[0] as any).ALIAS_ID ?? (aliasRows[0] as any).alias_id);
         await exec(
           connection,
-          `UPDATE STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
+          `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
            SET alias_id = ?
            WHERE literal_value = ?`,
           [aliasId, litVal],
@@ -181,7 +201,7 @@ export async function POST(request: Request) {
       for (const litVal of deleted_literals) {
         await exec(
           connection,
-          `DELETE FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES
+          `DELETE FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
            WHERE literal_value = ?`,
           [litVal],
         );
@@ -194,7 +214,7 @@ export async function POST(request: Request) {
         const litPh  = allNewLiterals.map(() => '?').join(', ');
         await exec(
           connection,
-          `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
+          `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
            WHERE pipeline_id IN (${pidPh}) AND literal_value IN (${litPh})`,
           [...pipeline_ids_to_dequeue, ...allNewLiterals],
         );
@@ -202,23 +222,19 @@ export async function POST(request: Request) {
         for (const pid of pipeline_ids_to_dequeue) {
           const cntRows = await exec(
             connection,
-            `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+            `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
             [pid],
           );
           const queueSize = Number((cntRows[0] as any).CNT ?? (cntRows[0] as any).cnt ?? 0);
-          await exec(
-            connection,
-            `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-             SET queue_size = ?, updated_at = CURRENT_TIMESTAMP()
-             WHERE pipeline_id = ?`,
-            [queueSize, pid],
-          );
+          getDb()
+            .prepare(`UPDATE pipelines SET queue_size = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE pipeline_id = ?`)
+            .run(queueSize, pid);
         }
       }
 
       return Response.json({ success: true });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to save global standardizations');
+    return warehouseErrorResponse(err, 'Failed to save global standardizations');
   }
 }

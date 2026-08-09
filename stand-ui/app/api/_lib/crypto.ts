@@ -6,7 +6,7 @@ import 'server-only';
  * Protects secrets stored at rest in Snowflake VARIANT/VARCHAR columns:
  *   - sf_password           (Snowflake password auth fallback)
  *   - sf_private_key        (Snowflake key-pair PEM)
- *   - Google refresh_token  (stored in PIPELINES.file_source_meta for Sheets polling)
+ *   - Google refresh_token  (per-user Sheets access, held in cookies)
  *
  * Key management:
  *   - Key lives in process.env.PRISM_ENCRYPTION_KEY — 64 hex chars (32 bytes).

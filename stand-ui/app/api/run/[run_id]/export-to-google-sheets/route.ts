@@ -1,22 +1,12 @@
+import { reportError, googleErrorMessage } from '@/app/api/_lib/report-error';
 import { NextRequest } from 'next/server';
 import { cookies } from 'next/headers';
 import { google } from 'googleapis';
-import { snowflakeErrorResponse, withSnowflake } from '@/app/api/_lib/snowflake';
+import { warehouseErrorResponse, withWarehouse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
 
 // ── Snowflake helpers ─────────────────────────────────────────────────────────
-
-async function exec(connection: any, sqlText: string, binds?: any[]) {
-  return await new Promise<any[]>((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      },
-    });
-  });
-}
 
 // ── Google OAuth helpers ──────────────────────────────────────────────────────
 
@@ -37,6 +27,8 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ run_id: string }> },
 ) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REDIRECT_URI) {
     return Response.json(
       { error: 'Google Sheets export is not configured on this server.' },
@@ -83,20 +75,16 @@ export async function POST(
   let sourceColumn: string;
 
   try {
-    const result = await withSnowflake(async (connection) => {
-      const runRows = await exec(
-        connection,
-        `SELECT source_relation, source_column, stats_snapshot
-         FROM STAND_DB.STAND_INTERNAL.RUNS
-         WHERE run_id = ?`,
-        [runIdNum],
-      );
+    const result = await withWarehouse(async (connection) => {
+      const runRowDb = getDb()
+        .prepare(`SELECT source_relation, source_column, stats_snapshot FROM runs WHERE run_id = ?`)
+        .get(runIdNum) as any;
 
-      if (runRows.length === 0) {
+      if (!runRowDb) {
         return Response.json({ error: 'Run not found' }, { status: 404 });
       }
 
-      const runRow         = runRows[0];
+      const runRow         = runRowDb;
       const sourceRelation = String(runRow.SOURCE_RELATION ?? runRow.source_relation ?? '');
       const srcCol         = String(runRow.SOURCE_COLUMN   ?? runRow.source_column   ?? '');
       const statsSnapshot  = runRow.STATS_SNAPSHOT ?? runRow.stats_snapshot ?? null;
@@ -104,15 +92,20 @@ export async function POST(
       const mappingRows = await exec(
         connection,
         `SELECT lam.literal_value AS original_value, aan.alias_name AS standardized_value
-         FROM STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN STAND_DB.STAND_INTERNAL.APPROVED_ALIAS_NAMES   aan
+         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
+         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
            ON lam.alias_id = aan.alias_id
          WHERE lam.run_id = ?
          ORDER BY aan.alias_name, lam.literal_value`,
         [runIdNum],
       );
 
-      const mapping: Record<string, string> = {};
+      // Object.create(null) — keyed by raw customer literal values. On a plain
+      // object a value of `__proto__` is silently swallowed by Object.prototype's
+      // setter and read back as the prototype itself, writing a garbage cell into
+      // the customer's Google Sheet with no error. Same defect as
+      // export-mapping/route.ts.
+      const mapping: Record<string, string> = Object.create(null);
       for (const r of mappingRows) {
         const orig = String(r.ORIGINAL_VALUE    ?? r.original_value    ?? '');
         const std  = String(r.STANDARDIZED_VALUE ?? r.standardized_value ?? '');
@@ -136,7 +129,8 @@ export async function POST(
 
         const rws: Record<string, string>[] = tableData.rows.map((r) => {
           const originalVal = colIdx >= 0 ? (r[colIdx] ?? '') : '';
-          const rowObj: Record<string, string> = {};
+          // Keyed by the user's own column headers — same reasoning as `mapping`.
+          const rowObj: Record<string, string> = Object.create(null);
           tableData.headers.forEach((h, i) => { rowObj[h] = r[i] ?? ''; });
           rowObj[stdColName] = originalVal ? (mapping[originalVal] ?? '') : '';
           return rowObj;
@@ -158,7 +152,7 @@ export async function POST(
       };
     });
 
-    // If withSnowflake returned a Response (error), forward it.
+    // If withWarehouse returned a Response (error), forward it.
     if (result instanceof Response) return result;
 
     ({ headers, rows, title, sourceColumn } = result as {
@@ -169,7 +163,7 @@ export async function POST(
     });
   } catch (err) {
     console.error('export-to-google-sheets snowflake error:', err);
-    return snowflakeErrorResponse(err, 'Failed to load export data');
+    return warehouseErrorResponse(err, 'Failed to load export data');
   }
 
   // ── Apply includeOriginalCol transformation ───────────────────────────────
@@ -271,8 +265,9 @@ export async function POST(
       return Response.json({ needsAuth: true }, { status: 401 });
     }
 
+    reportError(err, { route: 'app/api/run/[run_id]/export-to-google-sheets/route.ts' });
     return Response.json(
-      { error: err?.message || 'Failed to create Google Sheet' },
+      { error: googleErrorMessage(err) },
       { status: 500 },
     );
   }

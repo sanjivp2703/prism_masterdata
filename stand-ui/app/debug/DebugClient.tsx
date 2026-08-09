@@ -8,8 +8,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 const TABLES = [
   'RUNS',
+  'RUN_STATE',
   'LITERAL_ALIAS_MATCHES',
   'APPROVED_ALIAS_NAMES',
+  'COLUMN_SPECS',
   'VALIDATION_LOG',
 ];
 

@@ -1,5 +1,6 @@
 import { cookies } from 'next/headers';
 import { google } from 'googleapis';
+import { requireValidSession } from '@/app/api/_lib/account-security';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -17,6 +18,8 @@ const COOKIE_OPTS    = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE
  * Returns a flat array of non-empty values from the given column range.
  */
 export async function GET(request: Request) {
+  const authz = await requireValidSession();
+  if (authz instanceof Response) return authz;
   const { searchParams } = new URL(request.url);
   const spreadsheetId = searchParams.get('id') ?? '';
   const range         = searchParams.get('range') ?? '';

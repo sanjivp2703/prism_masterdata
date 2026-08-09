@@ -20,3 +20,8 @@ boost_confidence_breakdown.json
 
 # OS
 .DS_Store
+
+# Snowflake key-pair credentials — NEVER commit
+rsa_key.p8
+rsa_key.pub
+*.p8

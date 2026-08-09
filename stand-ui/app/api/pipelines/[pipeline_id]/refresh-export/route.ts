@@ -6,26 +6,20 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
 import { refreshExportTable } from '@/app/api/_lib/export-table';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
+import { asExportKind } from '@/app/api/_lib/export-kind';
+import { clearPipelineStatusMessage } from '@/app/api/_lib/pipeline-alerts';
 
 export async function POST(
   _request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
@@ -35,17 +29,12 @@ export async function POST(
 
   try {
     // Fetch the pipeline so we have all the info needed for the refresh.
-    const row = await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `SELECT table_fqn, column_name, export_table_fqn, domain_id
-         FROM STAND_DB.STAND_INTERNAL.PIPELINES
-         WHERE pipeline_id = ?
-         LIMIT 1`,
-        [pid],
-      );
-      return rows[0] as any ?? null;
-    });
+    const row = getDb()
+      .prepare(
+        `SELECT table_fqn, column_name, export_table_fqn, export_kind, domain_id, status
+         FROM pipelines WHERE pipeline_id = ?`,
+      )
+      .get(pid) as any ?? null;
 
     if (!row) {
       return Response.json({ error: `Pipeline ${pid} not found` }, { status: 404 });
@@ -59,16 +48,28 @@ export async function POST(
       );
     }
 
+    const exportKind = asExportKind(row.EXPORT_KIND ?? row.export_kind);
+
     const tableFqn   = String(row.TABLE_FQN   ?? row.table_fqn   ?? '');
     const columnName = String(row.COLUMN_NAME ?? row.column_name ?? '');
     const domainId   = (row.DOMAIN_ID ?? row.domain_id) != null
       ? Number(row.DOMAIN_ID ?? row.domain_id) : null;
 
     // Run the refresh synchronously so any error is surfaced to the caller.
-    const result = await refreshExportTable(tableFqn, columnName, exportTableFqn, domainId, pid);
+    // For a VIEW this is the repair path: a view is normally created once at
+    // activation, and if that single fire-and-forget attempt failed (missing
+    // CREATE VIEW grant, etc.) NOTHING else ever retries it — this route's
+    // CREATE OR REPLACE VIEW is how the user fixes a missing/dropped view.
+    const result = await refreshExportTable(tableFqn, columnName, exportTableFqn, domainId, pid, exportKind);
 
-    return Response.json({ ok: true, rows_written: result.rows_written, export_table_fqn: exportTableFqn });
+    // A successful build resolves any earlier export-failure flag. Only for
+    // active pipelines — a paused pipeline's status_message is its pause reason.
+    if (String(row.STATUS ?? row.status ?? '') === 'active') {
+      await clearPipelineStatusMessage(pid).catch(() => {});
+    }
+
+    return Response.json({ ok: true, rows_written: result.rows_written, export_table_fqn: exportTableFqn, export_kind: exportKind });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to refresh export table');
+    return warehouseErrorResponse(err, 'Failed to refresh export table');
   }
 }

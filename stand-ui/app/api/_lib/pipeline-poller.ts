@@ -13,13 +13,16 @@
  *   • Dropped when the pipeline is deleted.
  */
 
-import { withSnowflake } from './snowflake';
-import { isPipelineStandardizing, beginStandardization, endStandardization } from './pipeline-coordination';
-import { QUEUE_STANDARDIZE_THRESHOLD, fetchPipelineById, processPipelineQueue, runHourlyStandardization, reconcilePipelineQueue, standardizeTable, isStandardizationBackedOff, type PipelineForProcessing } from './pipeline-hourly-processor';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { pollOneMssqlPipeline } from './pipeline-poller-mssql';
+import { getDb } from './sqlite';
+import { isPipelineStandardizing } from './pipeline-coordination';
+import { reconcilePipelineQueue } from './pipeline-hourly-processor';
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
-import { refreshSheetsFileRows } from './op-file-pipeline';
 import { sqlStringLiteral } from './normalize';
+import { parseStoredSchedule, isScheduleActiveNow, type UpdateSchedule } from './update-schedule';
+import { type ExportKind, asExportKind } from './export-kind';
 import {
   pausePipelineWithMessage,
   clearPipelineStatusMessage,
@@ -27,7 +30,8 @@ import {
   broadcastGlobalAlert,
 } from './pipeline-alerts';
 
-const POLL_INTERVAL_MS = 30_000;
+// Poll passes fire at every wall-clock multiple of this interval (minute marks).
+const POLL_INTERVAL_MS = 60_000;
 
 // Pipelines whose stream has been confirmed (this process) to be a standard,
 // delete-aware stream — not a legacy APPEND_ONLY one.  Checked once per pipeline
@@ -35,16 +39,44 @@ const POLL_INTERVAL_MS = 30_000;
 const verifiedStandardStreams = new Set<number>();
 
 // ── Source-health check throttling ────────────────────────────────────────────
-// checkSourceHealth runs INFORMATION_SCHEMA + POLICY_REFERENCES queries; doing
-// that every 30 s per column is pure query churn.  Run it only every Nth cycle
-// per pipeline — plus whenever the previous cycle errored, or a status_message
-// is set (so 'skip' conditions like masking policies still auto-recover
-// promptly).  On skipped cycles the source is assumed healthy.
+// checkSourceHealth's column check is a metadata-only SHOW COLUMNS (free), but
+// its POLICY_REFERENCES probe still wakes the warehouse.  Run the check only
+// every Nth cycle per pipeline — plus whenever the previous cycle errored, or
+// a status_message is set (so 'skip' conditions like masking policies still
+// auto-recover).  On skipped cycles the source is assumed healthy.
 const HEALTH_CHECK_EVERY_N_CYCLES = 10;
 // Cycles since checkSourceHealth last ran per pipeline; absent = never (check now).
 const cyclesSinceHealthCheck = new Map<number, number>();
 // Pipelines whose previous poll cycle errored — force a health check next cycle.
 const lastPollErrored = new Set<number>();
+
+// Backoff for re-checking a pipeline flagged unhealthy via status_message
+// (masking / row-access 'skip' conditions).  Re-confirming an unchanged policy
+// every cycle kept the warehouse permanently resumed; instead re-check after
+// 2, 4, 8, ... cycles, capped at UNHEALTHY_RECHECK_MAX_CYCLES (~10 min at the
+// 1-minute cadence), so policy removal is still picked up promptly.
+const UNHEALTHY_RECHECK_MAX_CYCLES = 10;
+const unhealthyRecheck = new Map<number, { streak: number; cyclesSinceCheck: number }>();
+
+/** True when a status_message-forced re-check is due; otherwise counts the cycle. */
+function unhealthyRecheckDue(pid: number): boolean {
+  const s = unhealthyRecheck.get(pid);
+  if (!s) return true; // no recorded unhealthy check (e.g. fresh process) — check now
+  const gap = Math.min(2 ** s.streak, UNHEALTHY_RECHECK_MAX_CYCLES);
+  if (s.cyclesSinceCheck + 1 >= gap) return true;
+  s.cyclesSinceCheck++;
+  return false;
+}
+
+function recordUnhealthyCheck(pid: number): void {
+  const s = unhealthyRecheck.get(pid);
+  unhealthyRecheck.set(pid, { streak: (s?.streak ?? 0) + 1, cyclesSinceCheck: 0 });
+}
+
+// File-based fallback metrics (static CSV/Excel rows) recompute cadence:
+// every Nth 1-minute cycle ≈ every 10 minutes per pipeline.
+const FILE_METRICS_EVERY_N_CYCLES = 10;
+const fileMetricsCycleCounter = new Map<number, number>();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -53,7 +85,41 @@ function quoteIdent(ident: string) {
 }
 
 function parseFqn(fqn: string) {
-  const parts = String(fqn).split('.').map(p => p.trim());
+  // Trim the WHOLE string, not each part.
+  //
+  // Per-part trimming silently rewrote any identifier with a genuine leading or
+  // trailing space — a legal (if unpleasant) name both warehouses accept. The
+  // poller then built SQL for a table that does not exist, stream creation
+  // failed, and the pipeline was paused with "not found or not accessible — may
+  // have been dropped, renamed, or access revoked" about a table that was
+  // present and readable the whole time (DET-S10). A misleading diagnosis is
+  // worse than the original problem: it sends the customer looking at
+  // permissions and DDL history instead of at the name.
+  //
+  // Whitespace around a separator is genuinely ambiguous in an unquoted dotted
+  // string — in `DB.S.TBL `, only the customer knows whether the table is named
+  // `TBL` or `TBL `. Rather than guess, this preserves each part exactly and
+  // trims only the whole string (which handles the common copy-paste case).
+  //
+  // KNOWN RESIDUAL LIMITATION, stated so nobody assumes otherwise: a table whose
+  // real name ENDS in a space (or a database whose name STARTS with one) still
+  // loses it, because that character sits at the FQN boundary and is
+  // indistinguishable from copy-paste whitespace. Live-reproduced with a table
+  // literally named `DETS10Z TRAIL SRC2 ` (DET-S10). Interior spaces —
+  // `DB.S.MY TABLE`, or a space after a separator — are preserved correctly,
+  // which covers every realistic case; a trailing space in a table name is
+  // pathological and unrepresentable here without requiring quoted input.
+  //
+  // The failure is now at least benign: the name resolves to the un-spaced
+  // table, so the poller either finds a real table or reports a genuine
+  // not-found — it no longer mangles a name and then blames the customer for
+  // dropping a table that exists. Fixing it properly means accepting quoted
+  // FQNs (`DB.S."TBL "`) end to end, which touches every warehouse path.
+  // Preserving is the safe direction: the parts are wrapped in quoteIdent
+  // before they reach SQL, so a genuinely-spaced name now resolves, and a name
+  // that never had a space is unaffected.
+  // Whole string trimmed (copy-paste whitespace), parts preserved VERBATIM.
+  const parts = String(fqn).trim().split('.');
   if (parts.length !== 3) throw new Error(`Expected DB.SCHEMA.TABLE, got: ${fqn}`);
   return { db: parts[0], schema: parts[1], table: parts[2] };
 }
@@ -71,30 +137,121 @@ function isSimpleIdent(s: string) {
   return true;
 }
 
-async function exec(connection: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    connection.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _stmt: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      },
-    });
-  });
+/** last_polled_at lives on the SQLite pipelines row now.
+ *  A check that finds nothing pending also advances fully_synced_at — the
+ *  customer-facing "standardized table verified fully up to date" timestamp
+ *  (queue empty ⇒ every known value is already standardized and exported).
+ *  Only call this from paths that GENUINELY consulted the source; pass
+ *  `claimSynced: false` from stream-reset/recovery paths, where gap rows may
+ *  exist that the freshly-created stream never saw (recovery re-stamps once
+ *  the export rebuild lands). */
+function touchLastPolled(pipelineId: number, opts: { claimSynced?: boolean } = {}): void {
+  const { claimSynced = true } = opts;
+  const syncedClause = claimSynced
+    ? `fully_synced_at = CASE WHEN queue_size = 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE fully_synced_at END,`
+    : '';
+  getDb()
+    .prepare(
+      `UPDATE pipelines
+       SET last_polled_at  = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+           ${syncedClause}
+           updated_at      = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE pipeline_id = ?`,
+    )
+    .run(pipelineId);
 }
 
 /** Fully-qualified name of the stream for a given pipeline (unquoted — safe because pipeline_id is always a positive integer). */
 function streamFqn(pipeline_id: number): string {
-  return `STAND_DB.STAND_INTERNAL.PIPELINE_STREAM_${pipeline_id}`;
+  return `PRISM_DB.INTERNAL.PIPELINE_STREAM_${pipeline_id}`;
 }
 
-// Snowflake's INFORMATION_SCHEMA reports VARCHAR/CHAR/STRING all as 'TEXT'.
+/**
+ * Creating the FIRST stream on a table auto-enables change tracking, which
+ * requires MODIFY on the table — the service role typically has only SELECT.
+ * Snowflake's error: "Insufficient privileges to operate on stream source
+ * without CHANGE_TRACKING enabled '<table>'. Your primary role ... must have
+ * MODIFY granted ...". This is a persistent, user-fixable condition (enable
+ * change tracking, or grant MODIFY) — pause with instructions, never retry-loop.
+ */
+export function isChangeTrackingPrivilegeError(e: unknown): boolean {
+  const msg = String((e as any)?.message ?? e ?? '');
+  return /CHANGE_TRACKING/i.test(msg) && /privileg|MODIFY/i.test(msg);
+}
+
+/** The pause/flag message when change tracking can't be enabled automatically. */
+export function changeTrackingFixMessage(tableFqn: string): string {
+  return (
+    `Prism can't watch ${tableFqn} for changes: change tracking is not enabled on the table and the service role can't enable it. ` +
+    `Run in Snowflake as the table owner or an admin: ALTER TABLE ${tableFqn} SET CHANGE_TRACKING = TRUE; then resume this pipeline. ` +
+    `(Alternatively: GRANT MODIFY ON TABLE ${tableFqn} TO ROLE PRISM_SERVICE; or save your own Snowflake credentials in Setup so Prism can enable it for you.)`
+  );
+}
+
+// Change-tracking auto-fix attempts in flight, per pipeline — the fix is
+// fire-and-forget (it opens its own connections; never nest inside the poll
+// cycle's connection), so consecutive poll cycles must not double-start it.
+const ctFixInFlight = new Set<number>();
+
+/**
+ * Try to unblock a source table whose first stream can't be created because
+ * change tracking is off: enable it using the PIPELINE CREATOR'S saved
+ * personal Snowflake credentials (the same mechanism the one-time flow uses
+ * for access the service role lacks — creators typically own or can modify
+ * the tables they connect), then create the stream with the service
+ * connection and run gap recovery. Falls back to pausing the pipeline with
+ * the exact fix SQL when the creator has no saved credentials or the ALTER
+ * fails.
+ */
+function attemptChangeTrackingFix(p: PipelineRef): void {
+  const pid = p.pipeline_id;
+  if (ctFixInFlight.has(pid)) return;
+  ctFixInFlight.add(pid);
+  (async () => {
+    let tableRef: string;
+    try {
+      const { db, schema, table } = parseFqn(p.table_fqn);
+      tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+    } catch {
+      return; // unparseable FQN — the poll cycle itself already reports this
+    }
+    const createdByRaw = (getDb()
+      .prepare(`SELECT created_by FROM pipelines WHERE pipeline_id = ?`)
+      .get(pid) as any)?.created_by;
+    const createdBy = createdByRaw != null ? Number(createdByRaw) : null;
+
+    if (createdBy != null && hasUserWarehouseConfig(createdBy)) {
+      try {
+        await withUserWarehouse(createdBy, async (conn) => {
+          await exec(conn, `ALTER TABLE ${tableRef} SET CHANGE_TRACKING = TRUE`);
+        });
+        await withWarehouse(async (conn) => {
+          await exec(conn, `CREATE STREAM IF NOT EXISTS ${streamFqn(pid)} ON TABLE ${tableRef}`);
+        });
+        verifiedStandardStreams.add(pid);
+        console.log(`[Poller] Pipeline ${pid}: enabled change tracking on ${p.table_fqn} using the creator's saved credentials — stream created, recovering gap rows`);
+        await clearPipelineStatusMessage(pid).catch(() => {});
+        recoverAfterStreamReset(p);
+        return;
+      } catch (fixErr: any) {
+        console.warn(`[Poller] Pipeline ${pid}: automatic change-tracking fix failed:`, fixErr?.message ?? fixErr);
+      }
+    }
+    await pausePipelineWithMessage(pid, changeTrackingFixMessage(p.table_fqn)).catch(() => {});
+    invalidateActivePipelinesCache();
+  })().finally(() => ctFixInFlight.delete(pid));
+}
+
+// SHOW COLUMNS reports VARCHAR/CHAR/STRING all as type 'TEXT' in its data_type JSON.
 const STRING_DATA_TYPES = new Set(['TEXT']);
 
 type SourceHealth =
   | { ok: true }
-  | { ok: false; action: 'pause' | 'skip'; message: string };
+  // `reason` is the machine-readable counterpart to `message` — see
+  // PIPELINE_BLOCK_REASONS in pipeline-alerts.ts. A 'skip' that carries a
+  // blocking reason halts the standardization tick and sweep as well, not just
+  // this poll cycle's queuing.
+  | { ok: false; action: 'pause' | 'skip'; message: string; reason?: string };
 
 /**
  * Pre-flight check before each poll: verify the source table + watched column
@@ -107,23 +264,30 @@ async function checkSourceHealth(
   connection: any,
   db: string, schema: string, table: string, columnName: string, tableFqn: string,
 ): Promise<SourceHealth> {
-  const colRows = await exec(
-    connection,
-    `SELECT COLUMN_NAME, DATA_TYPE
-     FROM ${quoteIdent(db)}.INFORMATION_SCHEMA.COLUMNS
-     WHERE UPPER(TABLE_SCHEMA) = UPPER(?) AND UPPER(TABLE_NAME) = UPPER(?)`,
-    [schema, table],
-  );
-
-  if (colRows.length === 0) {
-    return {
-      ok: false, action: 'pause',
-      message: `Source table ${tableFqn} not found or not accessible — it may have been dropped, renamed, or access was revoked. Fix the source or update the pipeline, then resume.`,
-    };
+  // SHOW COLUMNS is a metadata-layer command — unlike a SELECT against
+  // INFORMATION_SCHEMA.COLUMNS it never wakes the warehouse.  (The old
+  // INFORMATION_SCHEMA query was the account's single most expensive query:
+  // each run resumed the warehouse for a 60 s billing minimum, and on forced
+  // every-cycle checks it kept the warehouse resumed around the clock.)
+  // A missing/inaccessible table THROWS here instead of returning zero rows.
+  let colRows: any[];
+  try {
+    colRows = await exec(
+      connection,
+      `SHOW COLUMNS IN TABLE ${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`,
+    );
+  } catch (e: any) {
+    if (/does not exist|not authorized/i.test(String(e?.message ?? e))) {
+      return {
+        ok: false, action: 'pause',
+        message: `Source table ${tableFqn} not found or not accessible — it may have been dropped, renamed, or access was revoked. Fix the source or update the pipeline, then resume.`,
+      };
+    }
+    throw e; // other errors → outer poll-error classification (transient/global)
   }
 
   const watched = colRows.find((r: any) =>
-    String(r.COLUMN_NAME ?? r.column_name ?? '').toUpperCase() === columnName.toUpperCase());
+    String(r.column_name ?? r.COLUMN_NAME ?? '').toUpperCase() === columnName.toUpperCase());
   if (!watched) {
     return {
       ok: false, action: 'pause',
@@ -131,7 +295,14 @@ async function checkSourceHealth(
     };
   }
 
-  const dataType = String((watched as any).DATA_TYPE ?? (watched as any).data_type ?? '').toUpperCase();
+  // SHOW COLUMNS returns data_type as a JSON blob, e.g. {"type":"TEXT",...}.
+  const rawType = String((watched as any).data_type ?? (watched as any).DATA_TYPE ?? '');
+  let dataType: string;
+  try {
+    dataType = String(JSON.parse(rawType)?.type ?? '').toUpperCase();
+  } catch {
+    dataType = rawType.toUpperCase(); // defensive: treat as plain type name
+  }
   if (!STRING_DATA_TYPES.has(dataType)) {
     return {
       ok: false, action: 'pause',
@@ -140,12 +311,30 @@ async function checkSourceHealth(
   }
 
   // Masking / row-access policy detection (best-effort; unavailable on some editions).
+  //
+  // REF_ENTITY_NAME must carry QUOTED identifier parts. Snowflake resolves the
+  // name inside this string as an identifier, so an unquoted one is case-folded
+  // to upper case before lookup — meaning any source table whose real name is
+  // not already all-upper-case simply failed to resolve, and policy detection
+  // was silently skipped for it (console.warn only: no pause, no
+  // status_message, no flag). That is a safety guard quietly not running on a
+  // large fraction of real tables, which is how a masked column could keep
+  // being standardized. Live-reproduced both ways: an ALL-CAPS name containing
+  // a space resolved fine, while a mixed-case name with no space at all did
+  // not. CLAUDE.md previously blamed spaces; the real trigger is case-folding,
+  // and it is strictly broader.
+  //
+  // sqlStringLiteral escapes the quoted name for embedding in the SQL string
+  // literal, so a name containing a quote or backslash cannot break out of it.
+  const policyEntityName = sqlStringLiteral(
+    `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`,
+  );
   try {
     const polRows = await exec(
       connection,
       `SELECT POLICY_KIND, REF_COLUMN_NAME
        FROM TABLE(${quoteIdent(db)}.INFORMATION_SCHEMA.POLICY_REFERENCES(
-         REF_ENTITY_NAME => '${db}.${schema}.${table}',
+         REF_ENTITY_NAME => '${policyEntityName}',
          REF_ENTITY_DOMAIN => 'TABLE'))`,
     );
     for (const r of polRows) {
@@ -153,13 +342,13 @@ async function checkSourceHealth(
       const col  = String((r as any).REF_COLUMN_NAME ?? (r as any).ref_column_name ?? '');
       if (kind.includes('MASKING') && col.toUpperCase() === columnName.toUpperCase()) {
         return {
-          ok: false, action: 'skip',
+          ok: false, action: 'skip', reason: 'policy_blocked',
           message: `Watched column "${columnName}" has a masking policy — standardization skipped to avoid mapping masked values. Resumes automatically when the policy is removed.`,
         };
       }
       if (kind.includes('ROW_ACCESS')) {
         return {
-          ok: false, action: 'skip',
+          ok: false, action: 'skip', reason: 'policy_blocked',
           message: `Source table has a row access policy — standardization skipped because the service role may see only a filtered subset. Resumes automatically when the policy is removed.`,
         };
       }
@@ -184,6 +373,14 @@ function classifyPollError(e: any): 'global' | 'pipeline' | 'transient' {
   if (/warehouse|no active warehouse|cannot be resumed|exceeded.*(credit|quota)|out of credit/.test(msg)) return 'global';
   if (/read-only|secondary database|replication/.test(msg)) return 'global';
   if (/insufficient privileges|not authorized|unauthorized|does not exist/.test(msg)) return 'pipeline';
+  // Stream-side phrasing for the SAME condition. When SELECT is revoked on a
+  // source table that already has a stream, Snowflake does not say "not
+  // authorized" — it reports the base table as dropped: "Base table ...
+  // dropped, cannot read from stream ...". Without this pattern that message
+  // fell through to 'transient', so a permanent access revocation was retried
+  // forever instead of pausing the pipeline with a message (DET-S12, matched
+  // against error strings captured live from a real REVOKE).
+  if (/cannot read from stream|base table .*(dropped|altered)|stream .*(is stale|became stale)/.test(msg)) return 'pipeline';
   return 'transient';
 }
 
@@ -195,9 +392,12 @@ export interface PipelineRef {
   column_name:      string;
   domain_id:        number | null;
   export_table_fqn: string | null;
-  mode:             string;
+  export_kind:      ExportKind;
+  update_schedule:  UpdateSchedule;
   status_message:   string | null;
-  source_type:      string;
+  // mssql only — consent to Prism attempting to enable Change Tracking
+  // automatically (schema-modifying DDL); see pipeline-poller-mssql.ts.
+  change_tracking_consent: boolean;
 }
 
 /**
@@ -212,17 +412,40 @@ export interface PipelineRef {
  * Both run fire-and-forget on their own connections.
  */
 function recoverAfterStreamReset(p: PipelineRef): void {
-  reconcilePipelineQueue(p).catch((e) =>
-    console.error(`[Poller] Pipeline ${p.pipeline_id}: gap reconciliation after stream reset failed:`, e),
-  );
-  const refresh = p.export_table_fqn
-    ? refreshExportTable(p.table_fqn, p.column_name, p.export_table_fqn, p.domain_id, p.pipeline_id)
-    : updatePipelineMappedCount(p.table_fqn, p.column_name, p.domain_id, p.pipeline_id);
-  refresh
-    .then(() => broadcastPipelineEvent({ type: 'metrics_updated' }))
-    .catch((e) =>
-      console.error(`[Poller] Pipeline ${p.pipeline_id}: export refresh after stream reset failed:`, e),
-    );
+  // Reconcile FIRST, then refresh — these used to be two independent
+  // fire-and-forget promises racing each other, and the order matters for one
+  // specific reason.
+  //
+  // `refreshExportTable`'s metric UPDATE stamps `fully_synced_at` whenever the
+  // SQLite `queue_size` mirror reads 0. Started in parallel, the refresh could
+  // read that mirror BEFORE reconcile had queued the gap rows it was in the
+  // middle of finding — so the pipeline stamped "verified up to date" while
+  // unqueued unmapped values were still outstanding, and the card said so.
+  // Self-correcting on the next cycle, but wrong in the window, and this is the
+  // one path whose whole job is recovering rows the stream never reported.
+  // Found independently by two live test runs (OPS-07A and DET-S12).
+  //
+  // Awaiting reconcile costs nothing here: the caller already treats this whole
+  // function as background work.
+  void (async () => {
+    try {
+      await reconcilePipelineQueue(p);
+    } catch (e) {
+      console.error(`[Poller] Pipeline ${p.pipeline_id}: gap reconciliation after stream reset failed:`, e);
+      // Fall through to the refresh anyway — a failed reconcile must not also
+      // cost the export rebuild that already-mapped gap rows depend on.
+    }
+    try {
+      // A view has no gap to backfill — it's always live — so only a table export
+      // needs the full rebuild here; metrics still need recomputing either way.
+      await ((p.export_table_fqn && p.export_kind !== 'view')
+        ? refreshExportTable(p.table_fqn, p.column_name, p.export_table_fqn, p.domain_id, p.pipeline_id, p.export_kind)
+        : updatePipelineMappedCount(p.table_fqn, p.column_name, p.domain_id, p.pipeline_id));
+      broadcastPipelineEvent({ type: 'metrics_updated' });
+    } catch (e) {
+      console.error(`[Poller] Pipeline ${p.pipeline_id}: export refresh after stream reset failed:`, e);
+    }
+  })();
 }
 
 // ── Fetch active pipelines ────────────────────────────────────────────────────
@@ -243,27 +466,27 @@ async function fetchActivePipelines(): Promise<PipelineRef[]> {
     return activePipelinesCache.pipelines;
   }
   try {
-    const pipelines = await withSnowflake(async (conn) => {
-      const rows = await exec(
-        conn,
-        `SELECT pipeline_id, table_fqn, column_name, domain_id, export_table_fqn, mode, status_message,
-                COALESCE(source_type, 'snowflake') AS source_type
-         FROM STAND_DB.STAND_INTERNAL.PIPELINES
-         WHERE status = 'active'`,
-      );
+    const pipelines = await (async () => {
+      const rows = getDb()
+        .prepare(
+          `SELECT pipeline_id, table_fqn, column_name, domain_id, export_table_fqn, export_kind, update_schedule, status_message,
+                  change_tracking_consent
+           FROM pipelines
+           WHERE status = 'active'`,
+        )
+        .all() as any[];
       return rows.map(r => ({
-        pipeline_id:      Number(r.PIPELINE_ID  ?? r.pipeline_id),
-        table_fqn:        String(r.TABLE_FQN    ?? r.table_fqn    ?? ''),
-        column_name:      String(r.COLUMN_NAME  ?? r.column_name  ?? ''),
-        domain_id:        (r.DOMAIN_ID ?? r.domain_id) != null
-          ? Number(r.DOMAIN_ID ?? r.domain_id)
-          : null,
-        export_table_fqn: r.EXPORT_TABLE_FQN ?? r.export_table_fqn ?? null,
-        mode:             String(r.MODE ?? r.mode ?? 'auto'),
-        status_message:   r.STATUS_MESSAGE ?? r.status_message ?? null,
-        source_type:      String(r.SOURCE_TYPE ?? r.source_type ?? 'snowflake'),
+        pipeline_id:      Number(r.pipeline_id),
+        table_fqn:        String(r.table_fqn    ?? ''),
+        column_name:      String(r.column_name  ?? ''),
+        domain_id:        r.domain_id != null ? Number(r.domain_id) : null,
+        export_table_fqn: r.export_table_fqn ?? null,
+        export_kind:      asExportKind(r.export_kind),
+        update_schedule:  parseStoredSchedule(r.update_schedule),
+        status_message:   r.status_message ?? null,
+        change_tracking_consent: r.change_tracking_consent === 1,
       }));
-    });
+    })();
     activePipelinesCache = { fetchedAt: Date.now(), pipelines };
     return pipelines;
   } catch (e) {
@@ -283,7 +506,7 @@ async function fetchActivePipelines(): Promise<PipelineRef[]> {
 
 export async function dropPipelineStream(pipeline_id: number): Promise<void> {
   try {
-    await withSnowflake(async (conn) => {
+    await withWarehouse(async (conn) => {
       await exec(conn, `DROP STREAM IF EXISTS ${streamFqn(pipeline_id)}`);
     });
     console.log(`[Poller] Dropped stream for pipeline ${pipeline_id}`);
@@ -299,22 +522,20 @@ export async function dropPipelineStream(pipeline_id: number): Promise<void> {
 //   1. Non-consuming SELECT classifies new stream values into:
 //        list A — value already has a confirmed mapping (no LLM needed)
 //        list B — value is new / unmapped (needs standardization)
-//   2. COUNT(*) source table → total_source_values
-//   3. Push initial metrics: total_source_values updated, total_mapped += list A
-//      frequency (those rows are immediately standardized by definition)
-//   4. Consuming MERGE: list B values → PIPELINE_QUEUE (accumulates frequency
-//      for values already queued from prior polls)
-//   5. If queue > threshold after merge → LLM standardization fires inline;
-//      after LLM, total_mapped is recomputed from source (full accurate recount)
+//      (the split is informational — for logs; both lists are queued)
+//   2. Consuming MERGE: ALL new values (list A + list B) → PIPELINE_QUEUE
+//      (accumulates frequency for values already queued from prior polls)
+//   3. COUNT(*) source table → total_source_values; queue_size updated
+//   4. That's it — the poller never standardizes. The queue drains at the next
+//      10-minute wall-clock tick (startQueueProcessor): lookup hits map for
+//      free, unmatched values go to the LLM, then ONE export rebuild publishes
+//      everything together and total_mapped is recomputed from source.
 //
-// Total = Standardized + Unstandardized at all times.
-// Unstandardized is derived in the UI: total_source_values − total_mapped.
+// The export table is therefore always a consistent snapshot as of its last
+// standardization pass — new values (even already-known ones) never trickle in
+// mid-cycle. Unstandardized is derived in the UI: total_source_values − total_mapped.
 
 export interface PollResult {
-  /** True when this column's queue crossed the standardization threshold this cycle
-   *  (auto mode). When polling as part of a table batch (deferStandardization),
-   *  the caller standardizes the whole table together instead of this column alone. */
-  willStandardize: boolean;
   /** True when this cycle's changes require the pipeline's EXPORT TABLE to be
    *  rebuilt (only ever set for pipelines with an export_table_fqn). When polling
    *  as part of a table batch (deferStandardization), the rebuild is deferred to
@@ -322,13 +543,22 @@ export interface PollResult {
    *  export_table_fqn for the whole table — sibling columns share one export, so
    *  per-column rebuilds were identical back-to-back full rebuilds. */
   needsExportRefresh: boolean;
+  /** True when this cycle actually consulted the source (stream checked and,
+   *  if it had data, classified + queued). False on any skip/early-error —
+   *  the caller must NOT stamp fully_synced_at for an unchecked pipeline. */
+  checked: boolean;
 }
 
 export async function pollOnePipeline(
   p: PipelineRef,
   opts: { deferStandardization?: boolean } = {},
 ): Promise<PollResult> {
-  if (isPipelineStandardizing(p.pipeline_id)) return { willStandardize: false, needsExportRefresh: false };
+  if (isPipelineStandardizing(p.pipeline_id)) {
+    // Loudly, not silently: a leaked standardizing lock once starved a pipeline
+    // of polling forever with zero log output — keep this visible.
+    console.log(`[Poller] Pipeline ${p.pipeline_id}: standardization in progress — skipping this poll cycle`);
+    return { needsExportRefresh: false, checked: false };
+  }
 
   const { pipeline_id, table_fqn, column_name, domain_id } = p;
   const pid = pipeline_id;
@@ -339,12 +569,12 @@ export async function pollOnePipeline(
     db = fqn.db; schema = fqn.schema; table = fqn.table;
   } catch (e) {
     console.error(`[Poller] Pipeline ${pid}: invalid table_fqn "${table_fqn}":`, e);
-    return { willStandardize: false, needsExportRefresh: false };
+    return { needsExportRefresh: false, checked: false };
   }
 
   if (!isSimpleIdent(db) || !isSimpleIdent(schema) || !isSimpleIdent(table) || !isSimpleIdent(column_name)) {
     console.error(`[Poller] Pipeline ${pid}: table/column contains unsupported characters.`);
-    return { willStandardize: false, needsExportRefresh: false };
+    return { needsExportRefresh: false, checked: false };
   }
 
   const tableRef  = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
@@ -356,108 +586,155 @@ export async function pollOnePipeline(
     ? `AND lam.domain_id = ${Number(domain_id)}`
     : `AND lam.domain_id IS NULL`;
 
-  // True if this poller cycle called beginStandardization and has not yet
-  // handed cleanup off to processPipelineQueue.  Used in the finally block to
-  // ensure the ring always unpauses even if an error occurs mid-cycle.
-  let standardizationOwned = false;
-
-  // Hoisted out of withSnowflake so the export rebuild and LLM run open fresh
-  // top-level connections — no nested withSnowflake contention.
+  // Hoisted out of withWarehouse so the export rebuild opens a fresh top-level
+  // connection — no nested withWarehouse contention.
   interface ClassifiedRow { literal_value: string; new_row_count: number; already_mapped: boolean }
   let listA:              ClassifiedRow[] = [];
   let hasDeletes          = false;
-  let willStandardize     = false;
-  let hasNewUnmapped      = false;   // listB non-empty — used by manual mode to export raw values
   let hasNullInserts      = false;   // new rows with a NULL in this column — exported as-is (NULL passthrough)
   let needsExportRefresh  = false;   // export-table rebuild required this cycle (see step 8)
+  let sourceChecked       = false;   // the stream/source was genuinely consulted this cycle
+  // Set when this cycle deliberately flags the pipeline for a forced health
+  // check. Load-bearing: the `return`s inside the withWarehouse callback below
+  // only exit the CALLBACK, so control still reaches the
+  // `lastPollErrored.delete(pid)` at the end of the try — which erased the very
+  // flag the cycle had just set. A dropped/renamed/revoked source table
+  // therefore never triggered the next cycle's health check and the pipeline
+  // stayed 'active' with no status_message forever (live-reproduced over nine
+  // cycles and a process restart). See KI-92 / KI-100.
+  let cycleErrored        = false;
 
   try {
-    await withSnowflake(async (connection) => {
+    await withWarehouse(async (connection) => {
 
       // ── Pre-flight: source table / column / type / policy health ──────────
       // Catches dropped/renamed/revoked tables, dropped/renamed or non-text
       // columns, and masking/row-access policies BEFORE we touch the stream.
-      // Throttled: runs every HEALTH_CHECK_EVERY_N_CYCLES cycles per pipeline
-      // (INFORMATION_SCHEMA + POLICY_REFERENCES every 30 s was query churn),
-      // plus whenever the previous cycle errored or a status_message is set —
-      // so 'skip' conditions (masking/row-access policy) still re-check every
-      // cycle until they clear.  Skipped cycles assume the source is healthy.
-      const sinceHealthCheck = cyclesSinceHealthCheck.get(pid) ?? Number.POSITIVE_INFINITY;
-      const shouldCheckHealth =
-        sinceHealthCheck >= HEALTH_CHECK_EVERY_N_CYCLES - 1 ||
-        lastPollErrored.has(pid) ||
-        p.status_message != null;
-      if (shouldCheckHealth) {
+      //
+      // IDLE-CYCLE DISCIPLINE (warehouse cost): the health check's
+      // POLICY_REFERENCES probe can wake the warehouse (its column check is a
+      // metadata-only SHOW COLUMNS). It therefore runs immediately only when
+      // FORCED (previous cycle errored, or a status_message is set — 'skip'
+      // conditions like masking policies re-check on an exponential backoff,
+      // ≤ ~5 min, until they clear). The routine every-N-cycles
+      // check runs further down, only on cycles where the stream HAS data —
+      // i.e. cycles that were going to wake the warehouse anyway. Idle cycles
+      // stay warehouse-free: SYSTEM$STREAM_HAS_DATA, SHOW STREAMS, and
+      // CREATE STREAM IF NOT EXISTS are all metadata-layer operations.
+      // A dropped/renamed source still gets caught promptly: the stream
+      // operations below throw for a missing table, which sets
+      // lastPollErrored and forces the health check on the next cycle.
+      const runHealthCheck = async (): Promise<boolean> => {
         const health = await checkSourceHealth(connection, db, schema, table, column_name, table_fqn);
         if (!health.ok) {
-          // Unhealthy — make sure the check runs again next cycle (auto-recovery).
+          // Unhealthy — make sure the check runs again next data-bearing cycle,
+          // and start/extend the forced-recheck backoff (auto-recovery).
           cyclesSinceHealthCheck.set(pid, HEALTH_CHECK_EVERY_N_CYCLES);
           if (health.action === 'pause') {
+            unhealthyRecheck.delete(pid); // paused pipelines stop polling — resume starts fresh
             await pausePipelineWithMessage(pid, health.message);
             invalidateActivePipelinesCache(); // status changed — don't poll it off stale data
           } else {
             // 'skip' — keep polling (auto-recovers), just don't standardize this cycle.
-            await flagPipelineMessage(pid, health.message, 'warning');
+            recordUnhealthyCheck(pid);
+            // Pass the machine-readable reason through: a 'skip' condition must
+            // block the standardization tick and the sweep too, not just this
+            // poll cycle's queuing (they read status_reason, never the prose).
+            await flagPipelineMessage(pid, health.message, 'warning', health.reason ?? null);
           }
-          await exec(connection,
-            `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-             SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-             WHERE pipeline_id = ?`,
-            [pid]);
-          return;
+          touchLastPolled(pid);
+          return false;
         }
         cyclesSinceHealthCheck.set(pid, 0);
+        unhealthyRecheck.delete(pid);
         // Source is healthy — clear any stale block message from a prior cycle.
         // Only when one is actually set, so healthy pipelines skip the extra write.
         if (p.status_message) await clearPipelineStatusMessage(pid);
-      } else {
-        cyclesSinceHealthCheck.set(pid, sinceHealthCheck + 1);
+        return true;
+      };
+
+      // Forced health checks: an errored previous cycle re-checks immediately;
+      // a persistent status_message re-checks on the exponential backoff above
+      // instead of every cycle (POLICY_REFERENCES wakes the warehouse).
+      const forcedHealthCheck = lastPollErrored.has(pid) || p.status_message != null;
+      if (forcedHealthCheck) {
+        if (!lastPollErrored.has(pid) && !unhealthyRecheckDue(pid)) {
+          touchLastPolled(pid);
+          return; // still in backoff — assume unchanged, re-check in a later cycle
+        }
+        if (!(await runHealthCheck())) return;
       }
 
       // ── Ensure stream exists and is valid ─────────────────────────────────
       // A standard (NOT append-only) stream captures inserts, updates, AND
-      // deletes — deletes/updates let us drop rows from the export promptly so
-      // values no longer in the source don't linger.  CREATE STREAM IF NOT
-      // EXISTS is idempotent — it will NOT replace a stale stream that points to
-      // a dropped/recreated table.  We validate via SYSTEM$STREAM_HAS_DATA
-      // below; if that throws, we drop and recreate.
-      try {
-        await exec(connection, `
-          CREATE STREAM IF NOT EXISTS ${streamRef}
-          ON TABLE ${tableRef}`);
-      } catch (e: any) {
-        console.error(`[Poller] Pipeline ${pid}: failed to create stream:`, e?.message ?? e);
-        return;
-      }
-
-      // One-time per process: upgrade a legacy APPEND_ONLY stream (created before
-      // delete detection existed) to a standard delete-aware stream.  Recreating
-      // resets the offset, so we reconcile from the source afterward to recover
-      // any unconsumed inserts, then skip the rest of this cycle (stream is empty).
+      // deletes.  Once per process per pipeline, check existence + mode via
+      // SHOW STREAMS (metadata-layer, free):
+      //   • MISSING — the stream was never created (initial-run pre-create
+      //     failed) or was dropped. Rows inserted while it didn't exist are
+      //     INVISIBLE to a fresh stream, so creating one is a gap: create it,
+      //     then run full gap recovery — unmapped values are queued for the
+      //     next standardization tick, already-mapped rows go straight into
+      //     the export via a rebuild (with metrics recounted). Never silently
+      //     CREATE IF NOT EXISTS without recovery — that loses the gap rows
+      //     until the hourly safety rebuild.
+      //   • APPEND_ONLY — legacy stream from before delete detection; upgrade
+      //     to a standard stream (offset resets ⇒ same gap recovery).
+      //   • Standard — verified; later cycles skip straight to the data check
+      //     (a stream dropped mid-process makes SYSTEM$STREAM_HAS_DATA throw,
+      //     and that path recreates + recovers).
       if (!verifiedStandardStreams.has(pid)) {
+        let streamRows: any[] | null = null;
         try {
-          const streamRows = await exec(connection,
-            `SHOW STREAMS LIKE 'PIPELINE_STREAM_${pid}' IN SCHEMA STAND_DB.STAND_INTERNAL`);
-          const mode = streamRows.length
-            ? String((streamRows[0] as any).mode ?? (streamRows[0] as any).MODE ?? '').toUpperCase()
-            : '';
+          streamRows = await exec(connection,
+            `SHOW STREAMS LIKE 'PIPELINE_STREAM_${pid}' IN SCHEMA PRISM_DB.INTERNAL`);
+        } catch (showErr: any) {
+          // SHOW STREAMS failed (privileges / transient) — non-fatal; the
+          // SYSTEM$STREAM_HAS_DATA check below still catches a missing stream.
+          console.warn(`[Poller] Pipeline ${pid}: could not verify stream:`, showErr?.message ?? showErr);
+        }
+        if (streamRows && streamRows.length === 0) {
+          try {
+            await exec(connection, `
+              CREATE STREAM IF NOT EXISTS ${streamRef}
+              ON TABLE ${tableRef}`);
+          } catch (e: any) {
+            console.error(`[Poller] Pipeline ${pid}: failed to create stream:`, e?.message ?? e);
+            if (isChangeTrackingPrivilegeError(e)) {
+              // Creating the FIRST stream on a table auto-enables change
+              // tracking, which needs MODIFY — the service role typically has
+              // only SELECT. The source-health check can't catch this (SELECT
+              // works fine), so this must never fail invisibly. Try the
+              // automatic fix (creator's saved credentials); fire-and-forget on
+              // its own connections — it pauses with the exact fix SQL if it
+              // can't unblock the table.
+              attemptChangeTrackingFix(p);
+              return;
+            }
+            // Likely a dropped/renamed/revoked source table — force the health
+            // check next cycle so the pipeline pauses with a clear message
+            // instead of erroring silently every cycle.
+            lastPollErrored.add(pid);
+            cycleErrored = true;   // must survive to the end-of-cycle delete
+            return;
+          }
+          verifiedStandardStreams.add(pid);
+          console.log(`[Poller] Pipeline ${pid}: stream was missing — created it and recovering gap rows (unmapped → queue, mapped → export)`);
+          touchLastPolled(pid, { claimSynced: false });
+          recoverAfterStreamReset(p);
+          return; // fresh stream has nothing to read this cycle
+        }
+        if (streamRows && streamRows.length > 0) {
+          const mode = String((streamRows[0] as any).mode ?? (streamRows[0] as any).MODE ?? '').toUpperCase();
           if (mode === 'APPEND_ONLY') {
             await exec(connection, `CREATE OR REPLACE STREAM ${streamRef} ON TABLE ${tableRef}`);
             verifiedStandardStreams.add(pid);
             console.log(`[Poller] Pipeline ${pid}: upgraded APPEND_ONLY stream to standard (delete-aware)`);
-            await exec(connection,
-              `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-               SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-               WHERE pipeline_id = ?`,
-              [pid]);
+            touchLastPolled(pid, { claimSynced: false });
             // Offset was reset — recover gap rows (unmapped → queue, mapped → export).
             recoverAfterStreamReset(p);
             return;
           }
           verifiedStandardStreams.add(pid);
-        } catch (modeErr: any) {
-          // SHOW STREAMS failed (privileges / transient) — non-fatal, retry next poll.
-          console.warn(`[Poller] Pipeline ${pid}: could not verify stream mode:`, modeErr?.message ?? modeErr);
         }
       }
 
@@ -484,12 +761,24 @@ export async function pollOnePipeline(
           console.log(`[Poller] Pipeline ${pid}: stream recreated — new inserts will be detected on next poll`);
         } catch (recreateErr: any) {
           console.error(`[Poller] Pipeline ${pid}: failed to recreate stream:`, recreateErr?.message ?? recreateErr);
+          if (isChangeTrackingPrivilegeError(recreateErr)) {
+            // The base table was likely recreated (CREATE OR REPLACE wipes
+            // change tracking). Try the automatic fix; it pauses with the
+            // exact fix SQL if it can't unblock the table.
+            attemptChangeTrackingFix(p);
+            return;
+          }
+          // ANY OTHER recreate failure — most importantly a DROPPED or renamed
+          // source table — must force next cycle's health check so the pipeline
+          // pauses with a real reason. Without this the failure was logged and
+          // then forgotten: live-reproduced with a real DROP TABLE, where five
+          // consecutive cycles (and a full process restart) left the pipeline
+          // 'active' with status_message NULL, silently detecting nothing.
+          // See KI-100.
+          lastPollErrored.add(pid);
+          cycleErrored = true;
         }
-        await exec(connection,
-          `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-           SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-           WHERE pipeline_id = ?`,
-          [pid]);
+        touchLastPolled(pid, { claimSynced: false });
 
         // Dropping the stream discards its unconsumed offset, so any rows that
         // arrived while it was stale (e.g. during a long pause, or before a
@@ -504,41 +793,27 @@ export async function pollOnePipeline(
       }
 
       if (!hasData) {
-        // Even with no new stream data, the queue may hold items from a previous
-        // standardization that failed or timed out under load.  If the queue is
-        // still above the threshold, re-trigger standardization now rather than
-        // waiting up to an hour for the hourly sweep.
-        if (p.mode === 'auto') {
-          const [qRow] = await exec(connection,
-            `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
-            [pid]);
-          const queueSize = Number(qRow?.CNT ?? qRow?.cnt ?? 0);
-          if (queueSize > QUEUE_STANDARDIZE_THRESHOLD) {
-            if (isStandardizationBackedOff(pid)) {
-              console.log(`[Poller] Pipeline ${pid}: queue=${queueSize} > threshold but standardization is backing off after failures — skipping this cycle`);
-            } else {
-              willStandardize = true;
-              if (!opts.deferStandardization) {
-                beginStandardization(pid);
-                standardizationOwned = true;
-              }
-              console.log(`[Poller] Pipeline ${pid}: no new stream data but queue=${queueSize} > threshold — draining backlog`);
-            }
-          }
-        }
-
-        await exec(connection,
-          `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-           SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-           WHERE pipeline_id = ?`,
-          [pid]);
-        if (!willStandardize) {
-          console.log(`[Poller] Pipeline ${pid}: no new rows in stream`);
-        }
+        // Nothing new — any queued backlog waits for the next 10-minute
+        // standardization tick (the poller no longer standardizes inline).
+        // Idle cycles stay warehouse-free.
+        sourceChecked = true;
+        touchLastPolled(pid);
+        console.log(`[Poller] Pipeline ${pid}: no new rows in stream`);
         return;
       }
 
       console.log(`[Poller] Pipeline ${pid}: stream has data — classifying (table: ${table_fqn}, col: ${column_name})`);
+
+      // Routine (throttled) health check — only on data-bearing cycles, which
+      // wake the warehouse anyway. Forced checks already ran above.
+      if (!forcedHealthCheck) {
+        const sinceHealthCheck = cyclesSinceHealthCheck.get(pid) ?? Number.POSITIVE_INFINITY;
+        if (sinceHealthCheck >= HEALTH_CHECK_EVERY_N_CYCLES - 1) {
+          if (!(await runHealthCheck())) return;
+        } else {
+          cyclesSinceHealthCheck.set(pid, sinceHealthCheck + 1);
+        }
+      }
 
       // ── Steps 1–3: classify + consume stream in one explicit transaction ───
       //
@@ -576,12 +851,12 @@ export async function pollOnePipeline(
             COUNT(*)                                                        AS new_row_count,
             MAX(CASE WHEN lam.literal_value IS NOT NULL THEN 1 ELSE 0 END) AS already_mapped
           FROM ${streamRef} s
-          LEFT JOIN STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-            ON lam.normalized_value = PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
+          LEFT JOIN PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+            ON lam.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
             ${domainJoinCond}
           WHERE s.METADATA$ACTION = 'INSERT'
             AND TO_VARCHAR(s.${colRef}) IS NOT NULL
-          GROUP BY PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))`);
+          GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))`);
 
         // Step 1b: Detect removals in the SAME snapshot.  DELETE rows cover both
         // pure deletes and the delete-half of updates.  We don't touch the lookup
@@ -605,28 +880,31 @@ export async function pollOnePipeline(
           console.log(`[Poller] Pipeline ${pid}: ${nullCnt} new row(s) with NULL "${column_name}" — will rebuild export to include them as-is`);
         }
 
-        // Step 2: Consuming MERGE — push list B into PIPELINE_QUEUE (within tx)
-        // IMPORTANT: this DML always runs, even when listB is empty.  Referencing
-        // the stream in ANY DML advances the stream offset on COMMIT — skipping this
-        // would leave SYSTEM$STREAM_HAS_DATA true forever and re-count the same data
-        // on every poll.  When listB is empty the USING subquery produces 0 rows so
-        // no queue rows are inserted/updated, but the stream is still consumed.
+        // Step 2: Consuming MERGE — push ALL new values into PIPELINE_QUEUE
+        // (within tx). List A (already in the lookup) is queued alongside list B:
+        // already-mapped values no longer fast-path into the export at the end of
+        // the poll cycle — they wait in the queue and reach the export together
+        // with everything else at the next 10-minute standardization tick, so the
+        // export is always a consistent snapshot as of the last update. Lookup-hit
+        // values cost nothing at that point (hash match, no LLM).
+        // IMPORTANT: this DML always runs, even when the classify found nothing.
+        // Referencing the stream in ANY DML advances the stream offset on COMMIT —
+        // skipping this would leave SYSTEM$STREAM_HAS_DATA true forever and
+        // re-count the same data on every poll.  With no new values the USING
+        // subquery produces 0 rows so no queue rows are inserted/updated, but the
+        // stream is still consumed.
         await exec(connection, `
-          MERGE INTO STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE AS tgt
+          MERGE INTO PRISM_DB.INTERNAL.PIPELINE_QUEUE AS tgt
           USING (
             SELECT
               ANY_VALUE(TO_VARCHAR(s.${colRef})) AS literal_value,
               COUNT(*)                           AS new_row_count
             FROM ${streamRef} s
-            LEFT JOIN STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-              ON lam.normalized_value = PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
-              ${domainJoinCond}
             WHERE s.METADATA$ACTION = 'INSERT'
               AND TO_VARCHAR(s.${colRef}) IS NOT NULL
-              AND lam.literal_value IS NULL
-            GROUP BY PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
+            GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
           ) AS src
-            ON tgt.pipeline_id = ${pid} AND PRISM_NORMALIZE(tgt.literal_value) = PRISM_NORMALIZE(src.literal_value)
+            ON tgt.pipeline_id = ${pid} AND PRISM_DB.INTERNAL.PRISM_NORMALIZE(tgt.literal_value) = PRISM_DB.INTERNAL.PRISM_NORMALIZE(src.literal_value)
           WHEN MATCHED THEN UPDATE SET
             tgt.source_frequency = tgt.source_frequency + src.new_row_count
           WHEN NOT MATCHED THEN INSERT (pipeline_id, literal_value, source_frequency)
@@ -649,73 +927,44 @@ export async function pollOnePipeline(
 
       console.log(`[Poller] Pipeline ${pid}: classify returned ${classified.length} distinct value(s) — samples: [${classified.slice(0,3).map(r=>r.literal_value).join(', ')}]`);
 
-      listA              = classified.filter(r =>  r.already_mapped); // already confirmed — hoisted
+      listA              = classified.filter(r =>  r.already_mapped); // already confirmed (lookup hit)
       const listB        = classified.filter(r => !r.already_mapped); // needs standardization
-      hasNewUnmapped     = listB.length > 0;                          // hoisted — manual mode exports these raw
-      const listAFreqSum = listA.reduce((s, r) => s + r.new_row_count, 0);
       const totalNewRows = classified.reduce((s, r) => s + r.new_row_count, 0);
 
       // ── Step 4: Get queue size + source row count after consuming ─────────
       console.log(`[Poller] Pipeline ${pid}: stream consumed (MERGE complete)`);
       const [postMergeRow] = await exec(connection,
-        `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+        `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
         [pid]);
-      const queueAfter  = Number(postMergeRow?.CNT ?? postMergeRow?.cnt ?? 0);
+      const queueAfter = Number(postMergeRow?.CNT ?? postMergeRow?.cnt ?? 0);
 
       const [srcRow] = await exec(connection,
         `SELECT COUNT(*) AS cnt FROM ${tableRef} WHERE ${colRef} IS NOT NULL`);
       const totalSourceValues = Number(srcRow?.CNT ?? srcRow?.cnt ?? 0);
 
-      // ── Step 5: Determine if LLM standardization will run this cycle ──────
-      //
-      // Trigger whenever the queue is above the threshold after consuming the
-      // stream — regardless of whether the queue grew this cycle or was already
-      // above from a previous, partially-failed standardization run.
-      //
-      // Old behaviour keyed off crossedThreshold || grewWhileOver (listB.length > 0),
-      // which missed the case where a prior standardization failed or timed out
-      // under load and left items in the queue: the next poll would have listB=[]
-      // (no new unmapped values) so grewWhileOver was false, and the backlog sat
-      // until the hourly sweep.
-      //
-      // Manual-mode pipelines still detect and queue new values, but the owner
-      // triggers standardization explicitly (process-queue route) — the
-      // background threshold path must not fire for them.
-      // A pipeline in failure backoff (repeated standardization failures) is
-      // also skipped, so the LLM isn't re-fired every 30 s against the same
-      // failing queue.
-      willStandardize = queueAfter > QUEUE_STANDARDIZE_THRESHOLD && p.mode === 'auto'
-        && !isStandardizationBackedOff(pid); // hoisted
-      if (queueAfter > QUEUE_STANDARDIZE_THRESHOLD && p.mode === 'auto' && !willStandardize) {
-        console.log(`[Poller] Pipeline ${pid}: queue=${queueAfter} > threshold but standardization is backing off after failures — skipping this cycle`);
-      }
+      // The poller never standardizes inline — queued values (mapped or not)
+      // drain at the next 10-minute standardization tick (see
+      // startQueueProcessor in pipeline-hourly-processor.ts), which also
+      // respects the pipeline's update window and the failure backoff.
 
-      // ── Step 6: If LLM will run, pause this pipeline's ring NOW ───────────
-      // Ring turns amber in the UI and next poll cycle is skipped for this
-      // pipeline.  This happens BEFORE the metrics push so the UI sees the
-      // "Standardizing" state simultaneously with the pre-LLM metric snapshot.
-      // When deferring (table batch), the caller's standardizeTable owns the
-      // begin/end lifecycle for the whole table, so we don't begin here.
-      if (willStandardize && !opts.deferStandardization) {
-        beginStandardization(pid);
-        standardizationOwned = true;
-      }
-
-      // ── Step 7: Push pre-LLM metrics in a single UPDATE ───────────────────
+      // ── Step 5: Push pre-standardization metrics in a single UPDATE ───────
       // total_source_values = current source row count
-      // total_mapped       += list A frequency (rows instantly confirmed by existing mappings)
-      // queue_size          = after MERGE
-      // If LLM runs, total_mapped will be further updated inside processPipelineQueue.
-      await exec(connection, `
-        UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
+      // queue_size          = after MERGE (now includes lookup-hit values —
+      //                       everything waits in the queue until the next
+      //                       standardization pass)
+      // total_mapped is NOT touched here: it's recomputed absolutely when the
+      // export is next rebuilt (standardization pass / hourly sweep), so the
+      // card's counters describe the exported snapshot, not the live source.
+      getDb().prepare(`
+        UPDATE pipelines
         SET total_source_values = ?,
-            total_mapped        = total_mapped + ?,
             total_new_values    = total_new_values + ?,
             queue_size          = ?,
-            last_polled_at      = CURRENT_TIMESTAMP(),
-            updated_at          = CURRENT_TIMESTAMP()
-        WHERE pipeline_id = ?`,
-        [totalSourceValues, listAFreqSum, totalNewRows, queueAfter, pid]);
+            last_polled_at      = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            fully_synced_at     = CASE WHEN ? = 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE fully_synced_at END,
+            updated_at          = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE pipeline_id = ?`)
+        .run(totalSourceValues, totalNewRows, queueAfter, queueAfter, pid);
       // When polled as part of a table batch, the metrics here are intermediate
       // (an incremental total_mapped that the export rebuild below overwrites with
       // the absolute count) and last_polled_at isn't yet synced across columns.
@@ -728,35 +977,29 @@ export async function pollOnePipeline(
         console.log(`[Poller] Pipeline ${pid}: detected removed/updated rows — export will be rebuilt`);
       }
 
-      if (listB.length === 0) {
-        console.log(
-          `[Poller] Pipeline ${pid}: ${totalNewRows} new row(s), ` +
-          `all ${listA.length} distinct value(s) already mapped — stream consumed, metrics updated`,
-        );
-      } else {
-        console.log(
-          `[Poller] Pipeline ${pid}: ${totalNewRows} new row(s) — ` +
-          `${listA.length} distinct already mapped (${listAFreqSum} rows), ` +
-          `${listB.length} distinct queued (queue: ${queueAfter})`,
-        );
-      }
-      // Export rebuild and LLM standardization run AFTER this connection closes
-      // (see below) to avoid nested withSnowflake calls on the same process.
+      console.log(
+        `[Poller] Pipeline ${pid}: ${totalNewRows} new row(s) queued — ` +
+        `${listA.length} distinct already in the lookup, ` +
+        `${listB.length} distinct need standardization (queue: ${queueAfter})`,
+      );
+      sourceChecked = true;
+      // The export rebuild (if any) runs AFTER this connection closes (see
+      // below) to avoid nested withWarehouse calls on the same process.
     });
 
-    // ── Step 8: Export rebuild — runs on a fresh top-level connection ─────────
-    // Moved outside the outer withSnowflake so there is no nested connection
-    // contention.  Needed when:
-    //   • listA.length > 0 — already-mapped values were inserted; they need to
-    //     appear in the export immediately, not wait for the next LLM run.
+    // ── Step 6: Export rebuild — runs on a fresh top-level connection ─────────
+    // Moved outside the outer withWarehouse so there is no nested connection
+    // contention.  NEW VALUES never trigger a rebuild here — mapped or not, they
+    // wait in the queue and reach the export together at the next 10-minute
+    // standardization tick (or a manual trigger), keeping the export a consistent
+    // snapshot as of its last update.  The remaining row-level hygiene triggers:
     //   • hasDeletes — source rows were removed/updated; stale rows must drop out.
-    //   • manual mode + hasNewUnmapped — new (unmapped) values must appear in the
-    //     export in their RAW form right away (refreshExportTable LEFT JOINs in
-    //     manual mode); they also stay queued for the user's manual review.
     //   • hasNullInserts (export table only) — new rows with a NULL in this column
-    //     export as-is; rebuild so they appear without waiting for the hourly sweep.
-    // Safe to run even when willStandardize is true; the post-LLM refresh in
-    // processPipelineQueue overlays the same data.
+    //     have nothing to standardize and never queue; rebuild so they appear
+    //     as-is without waiting for the next tick.
+    // (Note: any rebuild is CREATE OR REPLACE from the live source, so these
+    // hygiene rebuilds may incidentally surface queued values early — acceptable;
+    // the guarantee is "no rebuild is CAUSED by new values".)
     //
     // When polling as part of a table batch (deferStandardization) AND the
     // pipeline has an export table, the rebuild itself is DEFERRED to
@@ -764,26 +1007,27 @@ export async function pollOnePipeline(
     // export_table_fqn after all columns — sibling columns share one export
     // table and refreshExportTable rebuilds every watched column at once, so
     // per-column rebuilds here were identical back-to-back full rebuilds.
-    const rebuildNeeded =
-      listA.length > 0 || hasDeletes || (p.mode === 'manual' && hasNewUnmapped) || (hasNullInserts && p.export_table_fqn != null);
-    needsExportRefresh = rebuildNeeded && p.export_table_fqn != null;
+    // A view is live already — it never needs the periodic rebuild a table does,
+    // so it's treated the same as "no export object" for this trigger.
+    const isTableExport = p.export_table_fqn != null && p.export_kind !== 'view';
+    const rebuildNeeded = hasDeletes || (hasNullInserts && isTableExport);
+    needsExportRefresh = rebuildNeeded && isTableExport;
     if (rebuildNeeded) {
-      if (p.export_table_fqn && opts.deferStandardization) {
+      if (isTableExport && opts.deferStandardization) {
         // Deferred — pollOneTable rebuilds this export once for the whole cycle.
       } else {
         try {
-          if (p.export_table_fqn) {
+          if (isTableExport) {
             await refreshExportTable(
               table_fqn,
               column_name,
-              p.export_table_fqn,
+              p.export_table_fqn as string,
               domain_id,
               pid,
+              p.export_kind,
             );
           } else {
-            // No export table: recompute total_mapped absolutely.
-            // Called for list A values too (not just deletes) so the absolute count
-            // stays accurate even without an export table.
+            // No export table: recompute total_mapped absolutely after deletes.
             await updatePipelineMappedCount(table_fqn, column_name, domain_id, pid);
           }
           // Suppressed during a table batch — syncTableLastPolled broadcasts once
@@ -795,23 +1039,10 @@ export async function pollOnePipeline(
       }
     }
 
-    // ── Step 9: LLM standardization when queue exceeds threshold ─────────────
-    // processPipelineQueue handles its own beginStandardization (idempotent),
-    // runs LLM, writes lookup + export, updates total_mapped, then calls
-    // endStandardization in its finally block — which broadcasts
-    // standardizing_finished and unpauses the ring.
-    //
-    // When deferring (table batch), the caller standardizes the whole table
-    // together via standardizeTable — we only report whether this column wants it.
-    if (willStandardize && !opts.deferStandardization) {
-      const pipeline = await fetchPipelineById(pid);
-      if (pipeline) {
-        standardizationOwned = false; // hand off cleanup to processPipelineQueue
-        await processPipelineQueue(pipeline, 'threshold');
-      }
-      // if pipeline not found: standardizationOwned remains true → finally block cleans up
-    }
-    lastPollErrored.delete(pid); // clean cycle — health check can stay throttled
+    // Only a genuinely CLEAN cycle may clear the flag. A cycle that returned
+    // early after flagging a stream/source problem must leave it set so the
+    // next cycle runs checkSourceHealth and pauses with a real message.
+    if (!cycleErrored) lastPollErrored.delete(pid);
   } catch (e) {
     console.error(`[Poller] Pipeline ${pid}: poll error:`, e);
     lastPollErrored.add(pid); // force a source-health check on the next cycle
@@ -831,211 +1062,50 @@ export async function pollOnePipeline(
       invalidateActivePipelinesCache(); // status changed — don't poll it off stale data
     }
     // 'transient' — logged above; retried next cycle.
-  } finally {
-    // Safety net: if beginStandardization was called but processPipelineQueue
-    // never took ownership (pipeline lookup failed or exception thrown), ensure
-    // the ring is always unpaused.
-    if (standardizationOwned) {
-      endStandardization(pid);
-    }
+    sourceChecked = false;
   }
 
-  return { willStandardize, needsExportRefresh };
+  return { needsExportRefresh, checked: sourceChecked };
 }
 
 // ── Poll one table (all its columns as a single cycle) ─────────────────────────
 
-/** Overwrite last_polled_at for all of a table's columns with one timestamp so the
- *  table card's polling ring is a single synchronized animation. */
-async function syncTableLastPolled(pipelineIds: number[]): Promise<void> {
+/** Overwrite last_polled_at for all of a table's columns with one shared
+ *  timestamp. fully_synced_at advances ONLY for `verifiedIds` — pipelines whose
+ *  poll this cycle actually consulted the source (PollResult.checked). A column
+ *  whose poll was skipped (standardizing) or errored must not have its
+ *  "verified fully up to date" timestamp advanced by the table-wide sync. */
+async function syncTableLastPolled(pipelineIds: number[], verifiedIds: number[]): Promise<void> {
   if (pipelineIds.length === 0) return;
   try {
-    await withSnowflake(async (conn) => {
-      const placeholders = pipelineIds.map(() => '?').join(', ');
-      await exec(conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-         WHERE pipeline_id IN (${placeholders})`,
-        pipelineIds);
-    });
+    const db = getDb();
+    const placeholders = pipelineIds.map(() => '?').join(', ');
+    db.prepare(
+      `UPDATE pipelines
+       SET last_polled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+           updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE pipeline_id IN (${placeholders})`,
+    ).run(...pipelineIds);
+    if (verifiedIds.length > 0) {
+      const vPlaceholders = verifiedIds.map(() => '?').join(', ');
+      db.prepare(
+        `UPDATE pipelines
+         SET fully_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE pipeline_id IN (${vPlaceholders}) AND queue_size = 0`,
+      ).run(...verifiedIds);
+    }
     broadcastPipelineEvent({ type: 'metrics_updated' });
   } catch (e) {
     console.warn(`[Poller] Failed to sync last_polled_at for table columns:`, e);
   }
 }
 
-/**
- * Poll for file-based pipelines (sheets, csv, excel).
- *
- * For Sheets pipelines that have a stored refresh_token: re-reads the Google
- * Sheet, replaces PIPELINE_FILE_ROWS with the current data, and recomputes
- * total_source_values / total_mapped / queue_size so new sheet rows appear in
- * the metrics automatically each cycle.
- *
- * For CSV / Excel (or Sheets without a refresh_token): just refreshes
- * queue_size from the existing PIPELINE_FILE_ROWS vs LITERAL_ALIAS_MATCHES.
- * last_polled_at is synced by syncTableLastPolled after this returns.
- */
-async function pollOneFilePipeline(p: PipelineRef): Promise<void> {
-  try {
-    // Fetch the pipeline's file_source_meta to get the stored refresh_token.
-    const meta = await withSnowflake(async (conn) => {
-      const rows = await exec(conn,
-        `SELECT file_source_meta FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE pipeline_id = ?`,
-        [p.pipeline_id]);
-      if (!rows.length) return null;
-      const raw = (rows[0] as any).FILE_SOURCE_META ?? (rows[0] as any).file_source_meta;
-      if (typeof raw === 'string') { try { return JSON.parse(raw); } catch { return {}; } }
-      return raw ?? {};
-    });
-    if (!meta) return;
-
-    const colNames = Array.isArray(meta.columns) ? meta.columns.map((c: any) => c.column_name) : [];
-    console.log(`[Poller] File pipeline ${p.pipeline_id} (${p.source_type}): columns=[${colNames.join(', ')}], has_refresh_token=${!!meta.refresh_token}`);
-
-    // Sheets with a stored refresh_token: re-read the sheet and refresh file rows.
-    if (p.source_type === 'sheets' && meta.refresh_token) {
-      const metrics = await refreshSheetsFileRows(p.pipeline_id, meta);
-      if (metrics) {
-        console.log(`[Poller] File pipeline ${p.pipeline_id}: writing metrics → source=${metrics.totalSourceValues}, mapped=${metrics.totalMapped}, queue=${metrics.queueSize}`);
-        await withSnowflake(async (conn) => {
-          await exec(conn,
-            `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-             SET total_source_values = ?,
-                 total_mapped        = ?,
-                 queue_size          = ?,
-                 updated_at          = CURRENT_TIMESTAMP()
-             WHERE pipeline_id = ?`,
-            [metrics.totalSourceValues, metrics.totalMapped, metrics.queueSize, p.pipeline_id]);
-        });
-        broadcastPipelineEvent({ type: 'metrics_updated' });
-        return;
-      }
-      console.warn(`[Poller] File pipeline ${p.pipeline_id}: Sheets re-read returned null — using cached PIPELINE_FILE_ROWS for metrics`);
-    } else if (p.source_type === 'sheets' && !meta.refresh_token) {
-      console.warn(`[Poller] File pipeline ${p.pipeline_id}: no refresh_token stored in file_source_meta — cannot re-read sheet`);
-    }
-
-    // CSV / Excel (or Sheets without token): recompute queue_size from existing file rows.
-    console.log(`[Poller] File pipeline ${p.pipeline_id}: using lightweight fallback (PIPELINE_FILE_ROWS)`);
-    let metricsUpdated = false;
-    await withSnowflake(async (conn) => {
-      // Guard: if PIPELINE_FILE_ROWS has no data for this pipeline, skip the update.
-      // Sheets pipelines don't populate this table at creation — only refreshSheetsFileRows
-      // does (which requires a refresh_token). Overwriting with 0 would erase the initial
-      // metrics set by the export flow.
-      const [countRow] = await exec(conn,
-        `SELECT COUNT(*) AS cnt FROM STAND_DB.STAND_INTERNAL.PIPELINE_FILE_ROWS WHERE pipeline_id = ?`,
-        [p.pipeline_id]);
-      const fileRowCount = Number((countRow as any).CNT ?? (countRow as any).cnt ?? 0);
-      if (fileRowCount === 0) {
-        console.log(`[Poller] File pipeline ${p.pipeline_id}: PIPELINE_FILE_ROWS is empty — skipping metrics update to preserve existing values`);
-        return;
-      }
-
-      const columns: Array<Record<string, any>> =
-        Array.isArray(meta.columns) && meta.columns.length > 0
-          ? meta.columns.map((c: any) => ({
-              column_name: String(c.column_name ?? ''),
-              domain_id:   c.domain_id != null ? Number(c.domain_id) : null,
-            }))
-          : [{ column_name: String(meta.column_name ?? p.column_name ?? ''), domain_id: null }];
-
-      let totalSourceValues = 0;
-      let totalMapped       = 0;
-      const updatedColumns: Array<Record<string, any>> = [];
-
-      for (const col of columns) {
-        if (!col.column_name) { updatedColumns.push(col); continue; }
-        const safeCol    = sqlStringLiteral(col.column_name);
-        const domainCond = col.domain_id != null
-          ? `AND lam.domain_id = ${col.domain_id}`
-          : 'AND lam.domain_id IS NULL';
-
-        const rows = await exec(conn, `
-          WITH src AS (
-            SELECT DISTINCT PRISM_NORMALIZE(column_data['${safeCol}']::VARCHAR) AS nv
-            FROM STAND_DB.STAND_INTERNAL.PIPELINE_FILE_ROWS
-            WHERE pipeline_id = ?
-              AND column_data['${safeCol}']::VARCHAR IS NOT NULL
-              AND TRIM(column_data['${safeCol}']::VARCHAR) != ''
-          )
-          SELECT
-            COUNT(*)               AS total,
-            COUNT(lam.literal_value) AS mapped
-          FROM src
-          LEFT JOIN STAND_DB.STAND_INTERNAL.LITERAL_ALIAS_MATCHES lam
-            ON PRISM_NORMALIZE(lam.literal_value) = src.nv
-            ${domainCond}
-        `, [p.pipeline_id]);
-
-        const colTotal  = rows.length > 0 ? Number((rows[0] as any).TOTAL  ?? (rows[0] as any).total  ?? 0) : 0;
-        const colMapped = rows.length > 0 ? Number((rows[0] as any).MAPPED ?? (rows[0] as any).mapped ?? 0) : 0;
-        console.log(`[Poller] File pipeline ${p.pipeline_id} fallback: column "${col.column_name}" (domain ${col.domain_id}) → total=${colTotal}, mapped=${colMapped}`);
-        totalSourceValues += colTotal;
-        totalMapped       += colMapped;
-        updatedColumns.push({
-          column_name: col.column_name,
-          domain_id:   col.domain_id,
-          total_source_values: colTotal,
-          total_mapped:        colMapped,
-        });
-      }
-
-      // Write per-column metrics into file_source_meta for the GET route's
-      // virtual expansion.  Re-SELECT the CURRENT meta first and merge only the
-      // computed metrics into that fresh copy — the `meta` read at the top of
-      // this cycle may be stale (a user's mid-cycle column add or re-auth would
-      // otherwise be reverted by writing the old blob back).
-      let freshMeta: any = meta;
-      try {
-        const freshRows = await exec(conn,
-          `SELECT file_source_meta FROM STAND_DB.STAND_INTERNAL.PIPELINES WHERE pipeline_id = ?`,
-          [p.pipeline_id]);
-        if (freshRows.length) {
-          const rawFresh = (freshRows[0] as any).FILE_SOURCE_META ?? (freshRows[0] as any).file_source_meta;
-          if (typeof rawFresh === 'string') {
-            try { freshMeta = JSON.parse(rawFresh) ?? meta; } catch { /* keep stale meta */ }
-          } else if (rawFresh != null) {
-            freshMeta = rawFresh;
-          }
-        }
-      } catch (freshErr) {
-        console.warn(`[Poller] File pipeline ${p.pipeline_id}: could not re-read file_source_meta — merging into cycle-start copy:`, freshErr);
-      }
-      const metricsByCol = new Map(updatedColumns.map(c => [String(c.column_name), c]));
-      const freshColumns = Array.isArray(freshMeta.columns) && freshMeta.columns.length > 0
-        ? freshMeta.columns.map((c: any) => {
-            const m = metricsByCol.get(String(c.column_name));
-            return m && m.total_source_values != null
-              ? { ...c, total_source_values: m.total_source_values, total_mapped: m.total_mapped }
-              : c;
-          })
-        : updatedColumns;
-      const updatedMeta = { ...freshMeta, columns: freshColumns };
-      await exec(conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET file_source_meta   = PARSE_JSON(?),
-             total_source_values = ?,
-             total_mapped        = ?,
-             queue_size          = ?,
-             updated_at          = CURRENT_TIMESTAMP()
-         WHERE pipeline_id = ?`,
-        [JSON.stringify(updatedMeta), totalSourceValues, totalMapped,
-         Math.max(0, totalSourceValues - totalMapped), p.pipeline_id]);
-      metricsUpdated = true;
-    });
-    if (metricsUpdated) broadcastPipelineEvent({ type: 'metrics_updated' });
-  } catch (e) {
-    console.warn(`[Poller] File pipeline ${p.pipeline_id}: metrics update failed:`, e);
-  }
-}
 
 /**
  * Poll all columns of one table as a single cycle: each column's stream is
  * polled (with standardization deferred), then last_polled_at is synchronized
- * across the table, and if any auto-mode column crossed its threshold, every
- * auto column of the table is standardized together via standardizeTable.
+ * across the table. Standardization is NOT triggered here — queued values drain
+ * at the next 10-minute tick (startQueueProcessor) or via the manual trigger.
  */
 async function pollOneTable(cols: PipelineRef[]): Promise<void> {
   const pipelineIds = cols.map(c => c.pipeline_id);
@@ -1043,10 +1113,10 @@ async function pollOneTable(cols: PipelineRef[]): Promise<void> {
   // The whole table shares ONE "Checking for new values" span, fired EVERY cycle
   // (not only when data is found). The UI ring fills to 100%, then instead of
   // animating a reset it switches straight into this teal span for the duration of
-  // the poll; when the span ends the ring resumes the cycle from 0% — or, if the
-  // queue crossed the threshold, standardizing_started supersedes it (teal → amber).
-  // One span for all columns ⇒ a multi-column card shows a single check, not one
-  // per column.
+  // the poll; when the span ends the ring resumes the cycle from 0%. (The amber
+  // "standardizing" state now comes from the 10-minute tick's own events, not
+  // from within a poll cycle.) One span for all columns ⇒ a multi-column card
+  // shows a single check, not one per column.
   let scanStarted = false;
   const startScan = () => {
     if (scanStarted) return;
@@ -1063,24 +1133,29 @@ async function pollOneTable(cols: PipelineRef[]): Promise<void> {
     // Enter the "checking" state immediately, before touching any column's stream.
     startScan();
 
-    // File-based pipelines (sheets/csv/excel) have no Snowflake stream — just
-    // refresh their queue_size metric and let syncTableLastPolled stamp last_polled_at.
-    const sfCols   = cols.filter(c => c.source_type === 'snowflake');
-    const fileCols = cols.filter(c => c.source_type !== 'snowflake');
-    for (const col of fileCols) {
-      await pollOneFilePipeline(col);
-    }
+    // Every pipeline is a live warehouse table now — files and Google Sheets
+    // moved to the one-time flow, so there is no non-streaming column class to
+    // handle separately.
+    const sfCols = cols;
 
-    let anyStandardize = false;
     // Export rebuilds flagged this cycle, deduped by export table — sibling
     // columns share one export table and refreshExportTable replaces ALL watched
     // columns in a single CREATE OR REPLACE, so one rebuild per export per cycle
     // is complete (previously two columns with deletes ran two identical
     // back-to-back full rebuilds).
     const exportRefreshes = new Map<string, PipelineRef>();
+    // A column qualifies as verified only when its poll reports checked — not
+    // skipped, not errored.
+    const verifiedIds: number[] = [];
+    // Live-table pipelines poll through the active warehouse adapter:
+    // Snowflake → streams (pollOnePipeline); SQL Server → Change Tracking /
+    // tiered diff scans (pollOneMssqlPipeline). Same result contract.
+    const isMssql = getWarehouseAdapter().kind === 'mssql';
     for (const col of sfCols) {
-      const res = await pollOnePipeline(col, { deferStandardization: true });
-      if (res.willStandardize) anyStandardize = true;
+      const res = isMssql
+        ? await pollOneMssqlPipeline(col)
+        : await pollOnePipeline(col, { deferStandardization: true });
+      if (res.checked) verifiedIds.push(col.pipeline_id);
       if (res.needsExportRefresh && col.export_table_fqn && !exportRefreshes.has(col.export_table_fqn)) {
         exportRefreshes.set(col.export_table_fqn, col);
       }
@@ -1091,40 +1166,30 @@ async function pollOneTable(cols: PipelineRef[]): Promise<void> {
     // ring/event semantics are unchanged.
     for (const [exportFqn, col] of exportRefreshes) {
       try {
-        await refreshExportTable(col.table_fqn, col.column_name, exportFqn, col.domain_id, col.pipeline_id);
+        await refreshExportTable(col.table_fqn, col.column_name, exportFqn, col.domain_id, col.pipeline_id, col.export_kind);
       } catch (exportErr) {
         console.error(`[Poller] Table ${col.table_fqn}: export rebuild for ${exportFqn} failed:`, exportErr);
       }
     }
 
     // One synchronized poll timestamp for the whole table (broadcasts metrics_updated).
-    await syncTableLastPolled(pipelineIds);
+    await syncTableLastPolled(pipelineIds, verifiedIds);
 
-    // Standardize every auto-mode Snowflake column of the table together (manual
-    // columns still only queue; file-based pipelines never auto-standardize here).
-    // Kept inside the try so the scanning span stays open until standardizing_started
-    // takes over on the client — teal flows straight into amber with no gap.
-    if (anyStandardize) {
-      const autoCols = sfCols.filter(c => c.mode === 'auto');
-      const toProcess: PipelineForProcessing[] = [];
-      for (const c of autoCols) {
-        const pf = await fetchPipelineById(c.pipeline_id);
-        if (pf) toProcess.push(pf);
-      }
-      if (toProcess.length > 0) {
-        console.log(`[Poller] Table ${cols[0].table_fqn}: standardizing ${toProcess.length} column(s) together`);
-        await standardizeTable(toProcess, 'threshold');
-      }
-    }
+    // No standardization here — the poller only detects and queues. Queued
+    // values drain at the next 10-minute tick (startQueueProcessor) or via the
+    // manual "Update Standardizations" trigger.
   } finally {
-    // End the check (in a finally so it never sticks teal on error). For columns
-    // that standardized, the client already left the scanning state when
-    // standardizing_started arrived, so this is just a no-op cleanup for them.
+    // End the check (in a finally so it never sticks teal on error).
     endScan();
   }
 }
 
 // ── Background loop ───────────────────────────────────────────────────────────
+
+/** ms until the next wall-clock minute mark (2:33:00, 2:34:00, …). */
+function msUntilNextMinute(): number {
+  return Math.max(250, POLL_INTERVAL_MS - (Date.now() % POLL_INTERVAL_MS));
+}
 
 export function startPoller(): void {
   // Guard against hot-reload creating multiple intervals in development
@@ -1132,102 +1197,42 @@ export function startPoller(): void {
   if (g.__pipelinePollerStarted) return;
   g.__pipelinePollerStarted = true;
 
-  // Per-table independent poll loops.
-  //
-  // Each source table polls on its OWN self-chaining cadence (next cycle 30 s
-  // after this one fully completes), anchored to its own last_polled_at. Why not
-  // one global loop sweeping all tables:
-  //   • A global chain polls each table at the chain's phase, not the table's, so
-  //     a freshly-activated table's first poll lands at an arbitrary point in the
-  //     ring's countdown — the "ring picks up at a random time" the first time a
-  //     value is added. Per-table loops fire the first poll exactly one interval
-  //     after the table is anchored, so detection lands at the cycle boundary.
-  //   • With several tables, a global chain's 30 s tail is shared, so each table's
-  //     ring drifts by the others' poll durations. Independent loops don't drift.
-  //
-  // (All COLUMNS of a table still poll together inside pollOneTable and share one
-  // synchronized last_polled_at — that's what keeps a multi-column card's ring a
-  // single aligned animation.)
-  const tableTimers: Map<string, ReturnType<typeof setTimeout>> =
-    g.__pipelineTableTimers ?? (g.__pipelineTableTimers = new Map());
-
-  async function pollTableLoop(tableFqn: string): Promise<void> {
-    let reschedule = true;
-    try {
-      const all  = await fetchActivePipelines();
-      const cols = all.filter(p => p.table_fqn === tableFqn);
-      if (cols.length === 0) {
-        reschedule = false; // table no longer active — stop its loop (supervisor restarts it if it returns)
-      } else {
-        await pollOneTable(cols);
+  // One clock-aligned poll pass at every minute mark (2:33:00, 2:34:00, …) —
+  // anchored to the wall clock, not to process start or pipeline creation.
+  // Each pass fetches the active pipelines fresh (newly activated ones are
+  // picked up at the next mark, ≤ 60 s), groups them by source table, and
+  // polls every table concurrently — all COLUMNS of a table still poll
+  // together inside pollOneTable and share one synchronized last_polled_at.
+  // Self-chaining: the next mark is computed AFTER the pass completes, so
+  // passes never overlap and a pass longer than a minute skips to the next
+  // mark. (The old per-table self-chaining loops + supervisor existed to keep
+  // the countdown-ring animation phase-aligned per table; the ring is gone.)
+  const chain = () => {
+    setTimeout(async () => {
+      try {
+        const all = await fetchActivePipelines();
+        const byTable = new Map<string, PipelineRef[]>();
+        for (const p of all) {
+          const arr = byTable.get(p.table_fqn) ?? [];
+          arr.push(p);
+          byTable.set(p.table_fqn, arr);
+        }
+        const results = await Promise.allSettled(
+          [...byTable.entries()].map(([tableFqn, cols]) =>
+            pollOneTable(cols).catch((e) => {
+              console.error(`[Poller] Table ${tableFqn}: poll cycle failed:`, e);
+            }),
+          ),
+        );
+        void results;
+      } catch (e) {
+        // Never let a failed pass tear down the scheduler.
+        console.error('[Poller] Poll pass failed:', e);
       }
-    } catch (e) {
-      // Unknown state (e.g. transient fetch failure) — keep the loop alive and retry.
-      console.error(`[Poller] Table ${tableFqn}: poll cycle failed:`, e);
-    } finally {
-      if (reschedule) {
-        tableTimers.set(tableFqn, setTimeout(() => { void pollTableLoop(tableFqn); }, POLL_INTERVAL_MS));
-      } else {
-        tableTimers.delete(tableFqn);
-      }
-    }
-  }
+      chain();
+    }, msUntilNextMinute());
+  };
 
-  // Anchor a table's ring to NOW so its countdown starts cleanly the moment its
-  // loop begins, and the first real poll (scheduled one interval later) lands at
-  // 100% rather than at a stale/random phase.
-  async function anchorTableRing(tableFqn: string): Promise<void> {
-    try {
-      await withSnowflake(async (conn) => {
-        await exec(conn,
-          `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-           SET last_polled_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-           WHERE table_fqn = ? AND status = 'active'`,
-          [tableFqn]);
-      });
-      broadcastPipelineEvent({ type: 'metrics_updated' });
-    } catch (e) {
-      console.warn(`[Poller] Could not anchor ring for table ${tableFqn}:`, e);
-    }
-  }
-
-  // Supervisor: discover active tables and start a loop for any that don't have
-  // one yet (covers boot, and pipelines activated later). Runs often enough that
-  // a newly-activated pipeline starts polling promptly.
-  let supervising = false;
-  async function superviseTables(): Promise<void> {
-    if (supervising) return; // never let two ticks run concurrently (would double-start a loop)
-    supervising = true;
-    try {
-      const pipelines = await fetchActivePipelines();
-      const activeTables = new Set(pipelines.map(p => p.table_fqn));
-      for (const tableFqn of activeTables) {
-        if (tableTimers.has(tableFqn)) continue;
-        // Reserve the slot first so a later tick can't double-start the same table.
-        tableTimers.set(tableFqn, setTimeout(() => { void pollTableLoop(tableFqn); }, POLL_INTERVAL_MS));
-        void anchorTableRing(tableFqn);
-      }
-    } catch {
-      // transient — try again next supervisor tick
-    } finally {
-      supervising = false;
-    }
-  }
-
-  // Discover tables shortly after boot, then keep picking up newly activated ones.
-  setTimeout(() => { void superviseTables(); }, 5_000);
-  setInterval(() => { void superviseTables(); }, 15_000);
-
-  // Drain any queues that were above threshold when the server last shut down.
-  // Without this, a queue that was already >threshold before a restart would
-  // never trigger the threshold-based standardization path (SYSTEM$STREAM_HAS_DATA
-  // returns false when no new inserts have arrived, so pollOnePipeline returns
-  // early on every cycle and the queue sits until the hourly processor fires).
-  setTimeout(() => {
-    runHourlyStandardization().catch(e =>
-      console.error('[Poller] Startup queue drain failed:', e)
-    );
-  }, 15_000);
-
-  console.log('[Poller] Background pipeline poller started (per-table loops, 30 s cadence)');
+  chain();
+  console.log(`[Poller] Background pipeline poller started — polling at every minute mark (first pass in ${Math.round(msUntilNextMinute() / 1000)}s)`);
 }

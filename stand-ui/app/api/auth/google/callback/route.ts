@@ -1,9 +1,11 @@
 import { NextRequest } from 'next/server';
 import { google } from 'googleapis';
 import type { Credentials } from 'google-auth-library';
-import { withSnowflake } from '@/app/api/_lib/snowflake';
+import { getDb } from '@/app/api/_lib/sqlite';
+import { withWarehouse } from '@/app/api/_lib/warehouse';
 import { buildSessionCookie, sanitizeReturnTo, type SessionPayload } from '@/app/api/_lib/session';
 import { applyGrants } from '@/app/api/_lib/grants';
+import { reportError } from '@/app/api/_lib/report-error';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -16,22 +18,27 @@ function getOAuth2Client() {
 const SHEETS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 const SHEETS_COOKIE_OPTS = `HttpOnly; Path=/; SameSite=Lax; Max-Age=${SHEETS_COOKIE_MAX_AGE}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText,
-      binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
-
-function col(r: any, key: string) {
-  return r[key.toUpperCase()] ?? r[key.toLowerCase()];
-}
-
 function safeRole(v: unknown): 'admin' | 'user' {
   return v === 'admin' ? 'admin' : 'user';
+}
+
+/**
+ * Best-effort Snowflake grant application for a brand-new account. Runs on the
+ * env-configured service connection; errors are swallowed — the user can
+ * re-apply via Settings → Snowflake connection if anything is missing.
+ */
+async function tryApplyGrants(): Promise<void> {
+  try {
+    await withWarehouse(async (conn) => {
+      await applyGrants(conn, process.env.SNOWFLAKE_USER);
+    });
+  } catch (err) {
+    // No Snowflake configured yet is fine at account-creation time, but still
+    // report it — a real customer's grants pass failing silently here would
+    // otherwise never surface until something breaks downstream with no log
+    // trail pointing back to the cause.
+    reportError(err, { phase: 'new-account-grants' });
+  }
 }
 
 export async function GET(request: NextRequest) {
@@ -70,11 +77,25 @@ export async function GET(request: NextRequest) {
   }
   oauth2Client.setCredentials(tokens);
 
-  // Always store Google Sheets tokens
+  // Store the Google Sheets tokens ONLY for the sheetsOnly flow.
+  //
+  // These cookies are the app's "can we call the Sheets API" signal — the
+  // lookup-export route gates on their presence alone. The login flow no longer
+  // requests spreadsheets/drive.file scopes (see api/auth/login/route.ts), so
+  // writing them here for a plain sign-in would store a token that CANNOT call
+  // Sheets while still looking like valid Sheets auth: the export's
+  // `!accessToken && !refreshToken` check would pass and the request would then
+  // fail deep inside the Google client with a 403, instead of cleanly
+  // triggering the consent round trip.
+  //
+  // Setting them only on the sheetsOnly branch keeps "has these cookies" and
+  // "actually holds Sheets scopes" the same statement.
   const headers = new Headers();
-  if (tokens.access_token)  headers.append('Set-Cookie', `google_access_token=${tokens.access_token}; ${SHEETS_COOKIE_OPTS}`);
-  if (tokens.refresh_token) headers.append('Set-Cookie', `google_refresh_token=${tokens.refresh_token}; ${SHEETS_COOKIE_OPTS}`);
-  if (tokens.expiry_date)   headers.append('Set-Cookie', `google_token_expiry=${tokens.expiry_date}; ${SHEETS_COOKIE_OPTS}`);
+  if (sheetsOnly) {
+    if (tokens.access_token)  headers.append('Set-Cookie', `google_access_token=${tokens.access_token}; ${SHEETS_COOKIE_OPTS}`);
+    if (tokens.refresh_token) headers.append('Set-Cookie', `google_refresh_token=${tokens.refresh_token}; ${SHEETS_COOKIE_OPTS}`);
+    if (tokens.expiry_date)   headers.append('Set-Cookie', `google_token_expiry=${tokens.expiry_date}; ${SHEETS_COOKIE_OPTS}`);
+  }
 
   // Sheets-only re-auth: the user's Prism session is already valid.
   // Just refresh the Sheets tokens and return — no account lookup needed.
@@ -104,103 +125,92 @@ export async function GET(request: NextRequest) {
   const adminEmail = (process.env.ADMIN_EMAIL ?? '').toLowerCase().trim();
 
   try {
-    const { accountId, role, isNew, sessionVersion } = await withSnowflake(async (conn) => {
+    const db = getDb();
+
+    const resolveAccount = db.transaction((): { accountId: number; role: 'admin' | 'user'; isNew: boolean; sessionVersion: number } => {
       // ── Case 1: existing account ──────────────────────────────────────────
-      const existing = await exec(
-        conn,
-        `SELECT account_id, role, session_version FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE google_id = ?`,
-        [googleId],
-      );
-      if (existing.length > 0) {
-        const id = Number(col(existing[0], 'account_id'));
-        const r  = safeRole(col(existing[0], 'role'));
-        const sv = Number(col(existing[0], 'session_version') ?? 1);
-        await exec(
-          conn,
-          `UPDATE STAND_DB.STAND_INTERNAL.ACCOUNTS
-           SET last_login_at = CURRENT_TIMESTAMP(), name = ?, picture_url = ?
+      const existing = db
+        .prepare(`SELECT account_id, role, session_version FROM accounts WHERE google_id = ?`)
+        .get(googleId) as { account_id: number; role: string; session_version: number } | undefined;
+      if (existing) {
+        db.prepare(
+          `UPDATE accounts
+           SET last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), name = ?, picture_url = ?
            WHERE google_id = ?`,
-          [name, pictureUrl, googleId],
-        );
-        return { accountId: id, role: r, isNew: false, sessionVersion: sv };
+        ).run(name, pictureUrl, googleId);
+        return {
+          accountId: Number(existing.account_id),
+          role: safeRole(existing.role),
+          isNew: false,
+          sessionVersion: Number(existing.session_version ?? 1),
+        };
       }
 
       // ── Case 2: invite flow ───────────────────────────────────────────────
       if (inviteToken) {
-        const invites = await exec(
-          conn,
-          `SELECT invitation_id, invited_email, invited_role
-           FROM STAND_DB.STAND_INTERNAL.INVITATIONS
-           WHERE token = ?
-             AND status = 'pending'
-             AND expires_at > CURRENT_TIMESTAMP()`,
-          [inviteToken],
-        );
-        if (!invites.length) {
+        const invite = db
+          .prepare(
+            `SELECT invitation_id, invited_email, invited_role
+             FROM invitations
+             WHERE token = ?
+               AND status = 'pending'
+               AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+          )
+          .get(inviteToken) as { invitation_id: number; invited_email: string; invited_role: string } | undefined;
+        if (!invite) {
           throw Object.assign(new Error('invite_invalid'), { code: 'INVITE_INVALID' });
         }
-        const invitedEmail = String(col(invites[0], 'invited_email')).toLowerCase().trim();
-        if (invitedEmail !== email) {
+        if (String(invite.invited_email).toLowerCase().trim() !== email) {
           throw Object.assign(new Error('invite_email_mismatch'), { code: 'INVITE_EMAIL_MISMATCH' });
         }
-        const invitedRole = safeRole(col(invites[0], 'invited_role'));
+        const invitedRole = safeRole(invite.invited_role);
 
         const nonce = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        await exec(
-          conn,
-          `INSERT INTO STAND_DB.STAND_INTERNAL.ACCOUNTS
-             (google_id, email, name, picture_url, role, creation_nonce)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [googleId, email, name, pictureUrl, invitedRole, nonce],
-        );
-        const created = await exec(
-          conn,
-          `SELECT account_id FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE creation_nonce = ? LIMIT 1`,
-          [nonce],
-        );
-        if (!created.length) throw new Error('Could not retrieve new account_id');
+        const res = db
+          .prepare(
+            `INSERT INTO accounts (google_id, email, name, picture_url, role, creation_nonce)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(googleId, email, name, pictureUrl, invitedRole, nonce);
 
-        await exec(
-          conn,
-          `UPDATE STAND_DB.STAND_INTERNAL.INVITATIONS
-           SET status = 'accepted', accepted_at = CURRENT_TIMESTAMP()
+        db.prepare(
+          `UPDATE invitations
+           SET status = 'accepted', accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE invitation_id = ?`,
-          [Number(col(invites[0], 'invitation_id'))],
-        );
-        // Auto-apply grants using the system Snowflake user so the service role
-        // has correct privileges from day one. Errors are swallowed — the user can
-        // re-apply via Settings → Snowflake connection if anything is missing.
-        await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
-        return { accountId: Number(col(created[0], 'account_id')), role: invitedRole, isNew: true, sessionVersion: 1 };
+        ).run(Number(invite.invitation_id));
+
+        return { accountId: Number(res.lastInsertRowid), role: invitedRole, isNew: true, sessionVersion: 1 };
       }
 
       // ── Case 3: bootstrap admin ───────────────────────────────────────────
       if (adminEmail && email === adminEmail) {
         const nonce = `boot_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        await exec(
-          conn,
-          `INSERT INTO STAND_DB.STAND_INTERNAL.ACCOUNTS
-             (google_id, email, name, picture_url, role, creation_nonce)
-           VALUES (?, ?, ?, ?, 'admin', ?)`,
-          [googleId, email, name, pictureUrl, nonce],
-        );
-        const created = await exec(
-          conn,
-          `SELECT account_id FROM STAND_DB.STAND_INTERNAL.ACCOUNTS WHERE creation_nonce = ? LIMIT 1`,
-          [nonce],
-        );
-        if (!created.length) throw new Error('Could not retrieve admin account_id');
-        await applyGrants(conn, process.env.SNOWFLAKE_USER).catch(() => {});
-        return { accountId: Number(col(created[0], 'account_id')), role: 'admin' as const, isNew: true, sessionVersion: 1 };
+        const res = db
+          .prepare(
+            `INSERT INTO accounts (google_id, email, name, picture_url, role, creation_nonce)
+             VALUES (?, ?, ?, ?, 'admin', ?)`,
+          )
+          .run(googleId, email, name, pictureUrl, nonce);
+        return { accountId: Number(res.lastInsertRowid), role: 'admin' as const, isNew: true, sessionVersion: 1 };
       }
 
       throw Object.assign(new Error('no_access'), { code: 'NO_ACCESS' });
     });
 
+    const { accountId, role, isNew, sessionVersion } = resolveAccount();
+
+    // New accounts get a best-effort grant application on the customer's
+    // Snowflake so the service role has correct privileges from day one.
+    if (isNew) await tryApplyGrants();
+
     const sessionPayload: SessionPayload = { accountId, googleId, email, name, pictureUrl, role, v: sessionVersion };
     headers.append('Set-Cookie', await buildSessionCookie(sessionPayload));
 
-    // New accounts go to /setup to optionally configure their Snowflake connection.
+    // Every new account goes through /setup once. Admins configure the
+    // workspace Snowflake connection there; regular users see an optional,
+    // skippable prompt to connect their OWN Snowflake credentials (used only
+    // for one-time standardizations of tables the service role can't see —
+    // see the personal-connection variant of the setup page).
     let redirectTo: string;
     if (isNew) {
       redirectTo = `/setup?next=${encodeURIComponent(returnTo)}`;

@@ -4,22 +4,17 @@
  */
 
 import { cookies } from 'next/headers';
-import { withSnowflake, snowflakeErrorResponse } from '@/app/api/_lib/snowflake';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
-
-async function exec(conn: any, sqlText: string, binds?: any[]): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    conn.execute({
-      sqlText, binds,
-      complete: (err: any, _s: any, rows: any[]) => (err ? reject(err) : resolve(rows || [])),
-    });
-  });
-}
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { requireValidSession } from '@/app/api/_lib/account-security';
+import { getDb } from '@/app/api/_lib/sqlite';
 
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
   if (!Number.isFinite(pid) || pid <= 0) {
@@ -27,11 +22,11 @@ export async function GET(
   }
 
   try {
-    return await withSnowflake(async (conn) => {
+    return await withWarehouse(async (conn) => {
       const rows = await exec(
         conn,
         `SELECT literal_value, detected_at
-         FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE
+         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
          WHERE pipeline_id = ?
          ORDER BY detected_at ASC`,
         [pid],
@@ -43,7 +38,7 @@ export async function GET(
       return Response.json({ items, count: items.length });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to fetch queue');
+    return warehouseErrorResponse(err, 'Failed to fetch queue');
   }
 }
 
@@ -51,9 +46,9 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ pipeline_id: string }> },
 ) {
-  const cookieStore = await cookies();
-  const session = await decodeSession(cookieStore.get(SESSION_COOKIE_NAME)?.value ?? '');
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = await requireValidSession();
+  if (auth instanceof Response) return auth;
+  const session = auth;
 
   const { pipeline_id } = await params;
   const pid = Number(pipeline_id);
@@ -62,18 +57,18 @@ export async function DELETE(
   }
 
   try {
-    return await withSnowflake(async (conn) => {
-      await exec(conn, `DELETE FROM STAND_DB.STAND_INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pid]);
-      await exec(
-        conn,
-        `UPDATE STAND_DB.STAND_INTERNAL.PIPELINES
-         SET queue_size = 0, last_queue_empty_at = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-         WHERE pipeline_id = ?`,
-        [pid],
-      );
+    return await withWarehouse(async (conn) => {
+      await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pid]);
+      getDb()
+        .prepare(
+          `UPDATE pipelines
+           SET queue_size = 0, last_queue_empty_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE pipeline_id = ?`,
+        )
+        .run(pid);
       return Response.json({ ok: true });
     });
   } catch (err) {
-    return snowflakeErrorResponse(err, 'Failed to clear queue');
+    return warehouseErrorResponse(err, 'Failed to clear queue');
   }
 }
