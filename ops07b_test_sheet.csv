@@ -1,0 +1,20 @@
+Quarterly carrier reconciliation,,
+Prepared by ops,,
+,,
+Source: billing extract,,
+account_id,carrier,country
+1001,AT&T,USA
+1002,att,U.S.A.
+1003,A T & T,united states
+1004,Verizon,USA
+1005,VZW,usa
+1006,verizon wireless,United States
+1007,T-Mobile,Canada
+1008,t mobile,CAN
+1009,Télécom,France
+1010,telecom,france
+1011,__proto__,Mexico
+1012,constructor,México
+1013,"Sprint, Inc.",MEXICO
+1014,,Germany
+1015,Mint Mobile,Deutschland
