@@ -6884,7 +6884,7 @@ NOTE ON SCOPE: this was fixed for the Sheets PIPELINE path, which has since been
 itself survives in the code that replaced it — the confirmed header row is threaded through
 sheets-io + gridToRows and is honoured by the one-time Sheets ingest (OT-SRC-02), with parity
 checks pinning it there. So the defect is closed and cannot recur in the new path.",
-SHEETS-HDR-02,File pipelines,,Mis-detected Sheets header is visible and correctable,,,The detected header row is shown for Google Sheets connections with a way to override it.,,,P2,Deferred,Recorded; needs a product decision,"OPENED 2026-08-09 - NOT FIXED, needs a product decision.
+SHEETS-HDR-02,File pipelines,,Mis-detected Sheets header is visible and correctable,,,The detected header row is shown for Google Sheets connections with a way to override it.,,,P2,Not run,,"OPENED 2026-08-09 - NOT FIXED, needs a product decision.
 CLAUDE.md stated that the detected header row ""is always shown, with an override"", citing
 HeaderPreview, and described the control as covering BOTH the CSV/Excel parser and
 /api/sheets/columns. That was never true: HeaderPreview renders only on the file-upload path.
@@ -6898,7 +6898,24 @@ exists to prevent.
 CLAUDE.md corrected to describe reality. The fix is to render HeaderPreview (or an equivalent
 row picker) in the Sheets branch of the connect form and feed the override into the same
 `bodyObj.header_row` that already exists - deliberately not done unilaterally, as it is a UI
-addition rather than a defect repair.",
+addition rather than a defect repair.
+
+=== BUILT 2026-08-09 (was Deferred pending a product decision; user chose to build) ===
+Google Sheet connections now show the header row AND let the user correct it — the control file
+uploads always had.
+SERVER: /api/sheets/columns accepts an optional headerRow override, returns detectedHeaderRow
+alongside it (so the UI can show ""reset to detected row N"" rather than pretending the user's choice
+was the guess), and returns the raw top-of-sheet rows. The override is resolved SERVER-side so the
+columns offered and the row the ingest will use come from one place and cannot disagree — the two
+disagreeing is precisely what caused SHEETS-HDR-01.
+UI: a ""Column headers are on row [N]"" field plus a preview of the sheet's first 8 rows with the
+chosen header highlighted, so the choice is visible rather than a number typed blind. Changing it
+re-reads the sheet and re-offers the columns.
+6 parity checks pin it: the override param, detectedHeaderRow, sampleRows, that columns come from
+the RESOLVED row rather than the detected one, and both UI halves.
+TO VERIFY (with OT-SRC-02, same sitting): load a sheet whose header is NOT row 1, confirm the
+detected row is highlighted, change it and confirm the offered columns change to match, then reset
+and confirm it returns to the detected row.",
 OT-SRC-01,One-time flow,,One-time standardization from a CSV / Excel upload,,,Upload parses with the detected header row shown and overridable; chosen columns group and review normally; the export reproduces every source row.,,,P0,Not run,,"NEW 2026-08-09. Files moved here from pipelines (a file is a one-shot list, not a live source).
 Library-level live coverage exists (26 assertions against the real warehouse: header detection,
 distinct values with real frequencies, unicode/comma/__proto__ round-trip, warehouse write,

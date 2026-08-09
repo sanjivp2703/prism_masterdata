@@ -631,6 +631,29 @@ console.log('\nheader-row handling:');
 
   // The one-time create route reads a Sheet server-side and must honour the
   // confirmed header row rather than assuming row 0.
+  // The detected row must be SHOWN and CORRECTABLE on every source. It always
+  // was for file uploads; Google Sheets detected silently, so a wrong guess was
+  // invisible and uncorrectable — and since the row is persisted and drives what
+  // gets read and standardized, that produced sessions which looked healthy and
+  // standardized the wrong column (SHEETS-HDR-02).
+  const sheetsCols = fs.readFileSync(
+    path.join(repoRoot, 'stand-ui/app/api/sheets/columns/route.ts'), 'utf8');
+  check('sheets/columns accepts a headerRow override',
+        String(/searchParams\.get\('headerRow'\)/.test(sheetsCols)), 'true');
+  check('sheets/columns reports what it DETECTED alongside the override',
+        String(/detectedHeaderRow/.test(sheetsCols)), 'true');
+  check('sheets/columns returns raw rows so the choice is visible',
+        String(/sampleRows/.test(sheetsCols)), 'true');
+  check('columns come from the RESOLVED row, not the detected one',
+        String(/const columns: string\[\] = \(grid\[headerRow\]/.test(sheetsCols)), 'true');
+
+  const otCard = fs.readFileSync(
+    path.join(repoRoot, 'stand-ui/app/home/OneTimeStandardizationCard.tsx'), 'utf8');
+  check('one-time card lets the user correct the Sheets header row',
+        String(/Column headers are on row/.test(otCard)), 'true');
+  check('one-time card re-reads the sheet when the row changes',
+        String(/loadSheet\(sheetUrl\.trim\(\), sheetTab, idx\)/.test(otCard)), 'true');
+
   const otCreate = fs.readFileSync(
     path.join(repoRoot, 'stand-ui/app/api/one-time/create/route.ts'), 'utf8');
   check('one-time Sheets ingest uses the confirmed header row',

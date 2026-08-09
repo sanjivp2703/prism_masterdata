@@ -61,6 +61,8 @@ export default function OneTimeStandardizationCard() {
   const [sheetTabs,  setSheetTabs]  = useState<string[]>([]);
   const [sheetTab,   setSheetTab]   = useState('');
   const [sheetHdr,   setSheetHdr]   = useState(0);
+  const [sheetDetected, setSheetDetected] = useState(0);
+  const [sheetSample,   setSheetSample]   = useState<string[][]>([]);
   const [sheetBusy,  setSheetBusy]  = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
 
@@ -198,13 +200,19 @@ export default function OneTimeStandardizationCard() {
   }
 
   /** Read a Google Sheet's tabs + columns via the existing sheets endpoints. */
-  async function loadSheet(url: string, tab?: string) {
+  async function loadSheet(url: string, tab?: string, headerRow?: number) {
     setSheetError(null); setSheetBusy(true); setFields([]); setSelected([]);
     try {
       // The endpoint takes the raw URL (or a bare id) and resolves the id
       // itself, so don't pre-parse it here — that would be a second, divergent
       // parser for the same input.
-      const qs  = new URLSearchParams({ url, ...(tab ? { tab } : {}) });
+      const qs  = new URLSearchParams({
+        url,
+        ...(tab ? { tab } : {}),
+        // Only sent when the user has overridden it — otherwise the server
+        // detects, and its answer is what the ingest will use.
+        ...(headerRow != null ? { headerRow: String(headerRow) } : {}),
+      });
       const res = await fetch(`/api/sheets/columns?${qs}`);
       const b   = await res.json().catch(() => ({}));
       if (res.status === 401 && b?.needsAuth) {
@@ -218,6 +226,8 @@ export default function OneTimeStandardizationCard() {
       // Same detected header row the server will use when it ingests, so what
       // the picker offers and what gets stored cannot disagree (SHEETS-HDR-01).
       setSheetHdr(Number(b.headerRow ?? 0) || 0);
+      setSheetDetected(Number(b.detectedHeaderRow ?? b.headerRow ?? 0) || 0);
+      setSheetSample(Array.isArray(b.sampleRows) ? b.sampleRows : []);
       setFields(((b.columns ?? []) as string[]).map(c => ({ name: c, type: 'text', isText: true })));
     } catch {
       setSheetError('Could not read that sheet.');
@@ -436,10 +446,63 @@ export default function OneTimeStandardizationCard() {
               </select>
             </div>
           )}
-          {sheetId && !sheetBusy && !sheetError && (
-            <p className="mt-2 text-[11px]" style={{ color: 'var(--text-hint)' }}>
-              Using row {sheetHdr + 1} as the column headers.
-            </p>
+          {/* THE HEADER ROW, SHOWN AND CORRECTABLE.
+              A Google Sheet frequently has a title, a "prepared by" line and a
+              blank row above the real header. Prism detects it, but the guess
+              WILL be wrong on some layout — and since this row is persisted and
+              drives which values are read and standardized, a silent wrong
+              guess yields a session that looks healthy and standardizes the
+              wrong column. File uploads have always had this control; Sheets
+              did not (SHEETS-HDR-02). */}
+          {sheetId && !sheetBusy && !sheetError && sheetSample.length > 0 && (
+            <div className="mt-3 rounded-[10px] border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 px-3 py-2" style={{ backgroundColor: 'var(--page-bg)' }}>
+                <span className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>Column headers are on row</span>
+                <input
+                  type="number" min={1} max={sheetSample.length} value={sheetHdr + 1}
+                  disabled={submitting || sheetBusy}
+                  onChange={e => {
+                    const idx = Math.max(0, Math.min(sheetSample.length - 1, Number(e.target.value) - 1));
+                    setSelected([]);
+                    loadSheet(sheetUrl.trim(), sheetTab, idx);
+                  }}
+                  className="w-16 px-2 py-1 rounded-button border-[0.5px] text-xs outline-none"
+                  style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+                />
+                {sheetHdr !== sheetDetected && (
+                  <button type="button" disabled={submitting || sheetBusy}
+                    onClick={() => { setSelected([]); loadSheet(sheetUrl.trim(), sheetTab); }}
+                    className="text-[11px] underline" style={{ color: 'var(--accent)' }}>
+                    reset to detected row {sheetDetected + 1}
+                  </button>
+                )}
+              </div>
+              {/* Show the top of the sheet so the choice is visible, not blind. */}
+              <div style={{ maxHeight: 150, overflow: 'auto' }}>
+                <table className="w-full text-[10px]" style={{ borderCollapse: 'collapse' }}>
+                  <tbody>
+                    {sheetSample.slice(0, 8).map((row, i) => {
+                      const isHeader = i === sheetHdr;
+                      return (
+                        <tr key={i} style={{
+                          backgroundColor: isHeader ? 'var(--accent-tint)' : 'transparent',
+                          borderTop: '0.5px solid var(--border-subtle)',
+                        }}>
+                          <td className="px-2 py-1 font-mono" style={{ color: 'var(--text-hint)', width: 28 }}>{i + 1}</td>
+                          {row.slice(0, 6).map((c, j) => (
+                            <td key={j} className="px-2 py-1 truncate" style={{
+                              maxWidth: 120,
+                              color: isHeader ? 'var(--accent-strong)' : 'var(--text-secondary)',
+                              fontWeight: isHeader ? 600 : 400,
+                            }}>{c}</td>
+                          ))}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           )}
           {sheetError && <p className="mt-2 text-xs" style={{ color: 'var(--confidence-low)' }}>{sheetError}</p>}
         </div>

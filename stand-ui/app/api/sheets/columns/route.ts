@@ -93,7 +93,23 @@ export async function GET(request: Request) {
     const valRes = await sheets.spreadsheets.values.get({ spreadsheetId, range });
     const grid: string[][] = (valRes.data.values ?? []).map((r) => (r ?? []).map((c) => String(c ?? '')));
     const detection = detectHeaderRow(grid);
-    const columns: string[] = (grid[detection.headerRow] ?? []).map(String).filter(Boolean);
+
+    // The caller may OVERRIDE the detected row. The heuristic is good but will
+    // be wrong on some layout, and on this path a wrong answer is not cosmetic:
+    // the chosen row is persisted and drives which values get read, what gets
+    // standardized and what the output looks like. A silent wrong guess
+    // produces a session that looks healthy and standardizes the wrong column
+    // (SHEETS-HDR-01/02).
+    //
+    // Resolved HERE rather than client-side so the columns offered and the row
+    // the ingest will use come from one place and cannot disagree.
+    const overrideRaw = searchParams.get('headerRow');
+    const overrideIdx = overrideRaw != null && overrideRaw !== '' ? Number(overrideRaw) : NaN;
+    const headerRow = Number.isInteger(overrideIdx) && overrideIdx >= 0 && overrideIdx < grid.length
+      ? overrideIdx
+      : detection.headerRow;
+
+    const columns: string[] = (grid[headerRow] ?? []).map(String).filter(Boolean);
 
     const responseHeaders = new Headers({ 'Content-Type': 'application/json' });
     if (refreshedTokens?.access_token) {
@@ -106,9 +122,16 @@ export async function GET(request: Request) {
     return new Response(JSON.stringify({
       spreadsheetId, title, sheets: sheetList, activeSheet: targetTab.name, columns,
       // 0-based. The client uses this for the preview AND to offset the data range.
-      headerRow:        detection.headerRow,
-      headerConfidence: detection.confidence,
-      previewRows:      grid.slice(detection.headerRow + 1).filter(r => r.some(c => c.trim() !== '')).slice(0, 3),
+      headerRow,
+      // What the heuristic picked, regardless of any override — so the UI can
+      // show "detected row N" next to a user's correction instead of pretending
+      // their choice was the guess.
+      detectedHeaderRow: detection.headerRow,
+      headerConfidence:  detection.confidence,
+      previewRows:       grid.slice(headerRow + 1).filter(r => r.some(c => c.trim() !== '')).slice(0, 3),
+      // The raw top-of-sheet rows, so the user can SEE which row holds their
+      // column names rather than guessing a number blind.
+      sampleRows:        grid.slice(0, 12),
     }), {
       headers: responseHeaders,
     });
