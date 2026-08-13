@@ -30,6 +30,7 @@ import { pickBestAliasName } from './namescore';
 import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
 import { internalObject, prismNormalizeFn } from './warehouse-tables';
+import { recordStandardizedUnits } from './billing-meter';
 import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
 import {
@@ -590,6 +591,18 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
+
+    // §2.8 billing: one-time sessions never touch the shared lookup, so the
+    // billable unit here is each distinct value standardized in this export
+    // (leaving them free would make the one-time flow a billing bypass).
+    // A deliberate re-export of the SAME session re-counts — accepted edge
+    // (sessions export once in practice; the archive row marks completion).
+    const standardizedDistinct = watched.reduce(
+      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
+      0,
+    );
+    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
@@ -751,6 +764,18 @@ async function exportOneTimeToPgTarget(
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
+
+    // §2.8 billing: one-time sessions never touch the shared lookup, so the
+    // billable unit here is each distinct value standardized in this export
+    // (leaving them free would make the one-time flow a billing bypass).
+    // A deliberate re-export of the SAME session re-counts — accepted edge
+    // (sessions export once in practice; the archive row marks completion).
+    const standardizedDistinct = watched.reduce(
+      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
+      0,
+    );
+    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
@@ -917,6 +942,18 @@ async function exportOneTimeToMysqlTarget(
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
+
+    // §2.8 billing: one-time sessions never touch the shared lookup, so the
+    // billable unit here is each distinct value standardized in this export
+    // (leaving them free would make the one-time flow a billing bypass).
+    // A deliberate re-export of the SAME session re-counts — accepted edge
+    // (sessions export once in practice; the archive row marks completion).
+    const standardizedDistinct = watched.reduce(
+      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
+      0,
+    );
+    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
@@ -1051,6 +1088,18 @@ async function exportOneTimeToMssqlTarget(
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
+
+    // §2.8 billing: one-time sessions never touch the shared lookup, so the
+    // billable unit here is each distinct value standardized in this export
+    // (leaving them free would make the one-time flow a billing bypass).
+    // A deliberate re-export of the SAME session re-counts — accepted edge
+    // (sessions export once in practice; the archive row marks completion).
+    const standardizedDistinct = watched.reduce(
+      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
+      0,
+    );
+    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});

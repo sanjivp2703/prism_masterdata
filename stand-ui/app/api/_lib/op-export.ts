@@ -36,6 +36,7 @@ import { upsertApprovedAliasMssql, bulkUpsertApprovedAliasesMssql, bulkUpsertLit
 import { upsertApprovedAliasPg, bulkUpsertApprovedAliasesPg, bulkUpsertLiteralMatchesPg } from './warehouse/postgres/mappings';
 import { upsertApprovedAliasMysql, bulkUpsertApprovedAliasesMysql, bulkUpsertLiteralMatchesMysql } from './warehouse/mysql/mappings';
 import { internalTable, prismNormalizeFn } from './warehouse-tables';
+import { recordStandardizedUnits } from './billing-meter';
 import { getDb } from './sqlite';
 import { normalizeLiteral } from './normalize';
 import { reportError } from './report-error';
@@ -297,8 +298,8 @@ async function bulkUpsertLiteralMatches(
   entries:    Array<{ literalValue: string; aliasId: number }>,
   domainId:   number | null,
   runId:      number,
-): Promise<void> {
-  if (entries.length === 0) return;
+): Promise<number> {
+  if (entries.length === 0) return 0;
 
   // Dedup on the NORMALIZED form before anything else — above the adapter
   // branch so both warehouses get it.
@@ -338,15 +339,18 @@ async function bulkUpsertLiteralMatches(
   }
   entries = deduped;
 
-  if (getWarehouseAdapter().kind === 'mssql') return bulkUpsertLiteralMatchesMssql(connection, entries, domainId, runId);
-  if (getWarehouseAdapter().kind === 'postgres') return bulkUpsertLiteralMatchesPg(connection, entries, domainId, runId);
-  if (getWarehouseAdapter().kind === 'mysql') return bulkUpsertLiteralMatchesMysql(connection, entries, domainId, runId);
+  // Non-Snowflake dialect writers don't report insert counts yet — §2.8 metering
+  // is Snowflake-only for now (the native edition's requirement); see billing-meter.ts.
+  if (getWarehouseAdapter().kind === 'mssql') { await bulkUpsertLiteralMatchesMssql(connection, entries, domainId, runId); return 0; }
+  if (getWarehouseAdapter().kind === 'postgres') { await bulkUpsertLiteralMatchesPg(connection, entries, domainId, runId); return 0; }
+  if (getWarehouseAdapter().kind === 'mysql') { await bulkUpsertLiteralMatchesMysql(connection, entries, domainId, runId); return 0; }
 
   const domainFilter  = domainId != null
     ? `AND t.domain_id = ${Number(domainId)}`
     : `AND t.domain_id IS NULL`;
   const domainLiteral = domainId != null ? String(Number(domainId)) : 'NULL';
 
+  let insertedTotal = 0;
   for (let i = 0; i < entries.length; i += EXPORT_MERGE_BATCH) {
     const batch = entries.slice(i, i + EXPORT_MERGE_BATCH);
     // Build (?, ?, ?) placeholders and a flat binds array.
@@ -354,7 +358,7 @@ async function bulkUpsertLiteralMatches(
     const placeholders = batch.map(() => '(?, ?, ?)').join(', ');
     const binds: any[] = batch.flatMap(e => [e.literalValue, e.aliasId, runId]);
 
-    await exec(
+    const mergeResult = await exec(
       connection,
       `MERGE INTO ${internalTable('LITERAL_ALIAS_MATCHES')} AS t
        USING (
@@ -372,7 +376,12 @@ async function bulkUpsertLiteralMatches(
          VALUES (s.literal_value, ${prismNormalizeFn()}(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
       binds,
     );
+    // §2.8 billing: MERGE-reported inserts are the billable unit — a NEW row
+    // means a value standardized for the first time in this scope. Retried
+    // idempotent batches MATCH instead of inserting and report 0.
+    insertedTotal += Number(mergeResult?.[0]?.['number of rows inserted'] ?? 0);
   }
+  return insertedTotal;
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +853,8 @@ async function writeAllDecisions(
     if (aliasId == null) continue; // should not happen
     matchEntries.push({ literalValue, aliasId });
   }
-  await bulkUpsertLiteralMatches(connection, matchEntries, domainId, runId);
+  const newlyInserted = await bulkUpsertLiteralMatches(connection, matchEntries, domainId, runId);
+  await recordStandardizedUnits(connection, newlyInserted, 'pipeline_export');
   const items_written = matchEntries.length;
 
   // ── Apply global Case B renames (touches historical rows outside this run) ─

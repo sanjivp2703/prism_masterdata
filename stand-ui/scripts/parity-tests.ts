@@ -22,6 +22,7 @@ import { asExportKind, standardizedColumnName, assertCompanionColumnSafe } from 
 import { isProbablyCatastrophicRegex } from '../app/api/_lib/convention-rules';
 import { detectHeaderRow, columnLetter } from '../app/api/_lib/table-shape';
 import { asPrismEdition } from '../app/api/_lib/edition';
+import { splitBillableUnits } from '../app/api/_lib/billing-math';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -988,6 +989,19 @@ console.log('\ninternal-schema reference guard:');
   })(apiRoot);
   check('no hardcoded internal-schema reference outside the allowlist',
     offending.join(', ') || '(none)', '(none)');
+}
+
+// ── Billing math (billing-math.ts, §2.8) ─────────────────────────────────────
+// $25 per 1,000 = $0.025/value, first 1,000 free, LINEAR after the boundary.
+{
+  console.log('\nbilling math (splitBillableUnits):');
+  check('all free under the tier', JSON.stringify(splitBillableUnits(0, 500)), JSON.stringify({ free: 500, billable: 0, chargeUsd: 0 }));
+  check('exactly filling the tier bills nothing', JSON.stringify(splitBillableUnits(0, 1000)), JSON.stringify({ free: 1000, billable: 0, chargeUsd: 0 }));
+  check('value #1001 bills immediately', JSON.stringify(splitBillableUnits(1000, 1)), JSON.stringify({ free: 0, billable: 1, chargeUsd: 0.025 }));
+  check('straddling bills only the post-free portion', JSON.stringify(splitBillableUnits(900, 300)), JSON.stringify({ free: 100, billable: 200, chargeUsd: 5 }));
+  check('deep past the tier: fully billable', JSON.stringify(splitBillableUnits(5000, 1000)), JSON.stringify({ free: 0, billable: 1000, chargeUsd: 25 }));
+  check('zero units is a no-op split', JSON.stringify(splitBillableUnits(0, 0)), JSON.stringify({ free: 0, billable: 0, chargeUsd: 0 }));
+  check('negative/fractional inputs clamp sanely', JSON.stringify(splitBillableUnits(-5, 2.9)), JSON.stringify({ free: 2, billable: 0, chargeUsd: 0 }));
 }
 
 // ── Result ───────────────────────────────────────────────────────────────────

@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS internal_state.BILLING_METER (
     event_units   INTEGER NOT NULL,           -- billable units in this emitted event
     charge_usd    NUMBER(12,4) NOT NULL,      -- event_units x 0.025 at emission time
     total_after   INTEGER NOT NULL,           -- cumulative billable+free total after this event
+    source        VARCHAR,                     -- pipeline_export | commit_standardizations | one_time_export
     emitted_at    TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
 
