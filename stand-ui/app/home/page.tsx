@@ -27,7 +27,7 @@ async function needsWorkspaceSetup(): Promise<boolean> {
   // 'spcs' = native edition's ambient token — always a real connection, never
   // subject to the fresh-setup simulation (a dev tool for the standard edition).
   const sfOk  = sf === 'spcs' || sf === 'workspace' || (!freshSim && sf === 'env');
-  const llmOk = llm === 'workspace' || (!freshSim && llm === 'env');
+  const llmOk = llm === 'cortex' || llm === 'workspace' || (!freshSim && llm === 'env');
   return !(sfOk && llmOk);
 }
 

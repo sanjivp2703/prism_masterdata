@@ -8,7 +8,7 @@ import { isFreshSetupSim } from '@/app/api/_lib/env';
 
 /** Status source with the fresh-install simulation applied: env-provided keys
  *  are hidden so the setup flow behaves like a bare deployment. */
-function effectiveSource(): 'workspace' | 'env' | 'none' {
+function effectiveSource(): 'workspace' | 'env' | 'cortex' | 'none' {
   const s = anthropicKeySource();
   return isFreshSetupSim() && s === 'env' ? 'none' : s;
 }

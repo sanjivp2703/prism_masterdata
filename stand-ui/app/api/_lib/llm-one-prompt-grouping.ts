@@ -44,6 +44,7 @@ import {
 } from './convention-rules';
 import { compileSafeRegex } from './safe-regex';
 import { appendTiming } from './timing';
+import { withWarehouse, executeQuery } from './warehouse';
 import { normalizeLiteral } from './normalize';
 import { getAnthropicApiKey, getLlmProviderConfig } from './anthropic-key';
 
@@ -576,12 +577,80 @@ function fromOpenAiBody(body: any): AnthropicApiBody {
  * always Anthropic-shaped; `apiKey` is the active provider's credential.
  * Shared by the grouping calls here and the export validation in op-export.ts.
  */
+/** Cortex-served model default (native edition — plan §2.4; spike-validated). */
+export const DEFAULT_CORTEX_MODEL = process.env.PRISM_CORTEX_MODEL || 'claude-4-sonnet';
+
+/** One SNOWFLAKE.CORTEX.COMPLETE call through the warehouse facade, translated
+ *  to/from the Anthropic body shape all downstream code expects. System blocks
+ *  are flattened (no cache_control — caching is Anthropic-API-only) and the
+ *  JSON-only reminder is appended (spike-validated to keep output fence-free). */
+async function cortexComplete(
+  payload: Record<string, unknown>,
+  model: string,
+  label: string,
+): Promise<AnthropicApiBody> {
+  const sys = Array.isArray(payload.system)
+    ? (payload.system as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n\n')
+    : typeof payload.system === 'string' ? payload.system : '';
+  const messages = [
+    ...(sys ? [{ role: 'system', content: sys }] : []),
+    ...((payload.messages as Array<{ role: string; content: unknown }>) ?? []).map((m, i, arr) => ({
+      role: m.role,
+      content: String(m.content) + (i === arr.length - 1 ? JSON_ONLY_REMINDER : ''),
+    })),
+  ];
+  const options = {
+    temperature: typeof payload.temperature === 'number' ? payload.temperature : 0,
+    max_tokens: typeof payload.max_tokens === 'number' ? payload.max_tokens : 4000,
+  };
+  const rows = await withWarehouse((conn) =>
+    executeQuery(conn, `SELECT SNOWFLAKE.CORTEX.COMPLETE(?, PARSE_JSON(?), PARSE_JSON(?)) AS R`, [
+      model, JSON.stringify(messages), JSON.stringify(options),
+    ]));
+  const raw = rows?.[0]?.R;
+  const body = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const text = body?.choices?.[0]?.messages ?? body?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string') {
+    throw new Error(`[one-prompt-grouping] Cortex returned no text (${label}): ${JSON.stringify(body).slice(0, 300)}`);
+  }
+  return {
+    content: [{ type: 'text', text }],
+    stop_reason: 'end_turn',
+    usage: {
+      input_tokens: Number(body?.usage?.prompt_tokens ?? 0),
+      output_tokens: Number(body?.usage?.completion_tokens ?? 0),
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+  } as AnthropicApiBody;
+}
+
 export async function callAnthropicWithRetry(
   apiKey:  string,
   payload: Record<string, unknown>,
   label:   string,
 ): Promise<AnthropicApiBody> {
   const cfg = getLlmProviderConfig();
+
+  // Native edition: all LLM work runs inside the warehouse via Cortex — no
+  // key, no egress. Same retry cadence as the Anthropic path; Cortex errors
+  // are treated as retryable (transient service/rate issues) since the
+  // failure mode downstream is the honest 'llm_failed' degradation anyway.
+  if (cfg.provider === 'cortex') {
+    const model = cfg.model || DEFAULT_CORTEX_MODEL;
+    const delays = [0, 1_000, 4_000];
+    let lastErr: unknown = null;
+    for (const delay of delays) {
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      try {
+        return await cortexComplete(payload, model, label);
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[one-prompt-grouping] ${label}: Cortex error (retrying): ${err instanceof Error ? err.message.slice(0, 200) : err}`);
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(`[one-prompt-grouping] ${label}: Cortex retries exhausted`);
+  }
   const style = cfg.source === 'workspace' ? OPENAI_STYLE_PROVIDERS[cfg.provider] : undefined;
 
   // Non-Anthropic providers get a longer backoff: a per-minute rate-limit quota
@@ -1442,7 +1511,7 @@ export async function runOnePromptGrouping(
   };
 
   const dispatchCfg = getLlmProviderConfig();
-  const effectiveConcurrency = dispatchCfg.source === 'workspace' && dispatchCfg.provider !== 'anthropic'
+  const effectiveConcurrency = dispatchCfg.provider === 'cortex' || (dispatchCfg.source === 'workspace' && dispatchCfg.provider !== 'anthropic')
     ? Math.min(CHUNK_CONCURRENCY, NON_ANTHROPIC_CHUNK_CONCURRENCY)
     : CHUNK_CONCURRENCY;
 

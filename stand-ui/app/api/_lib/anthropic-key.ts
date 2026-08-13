@@ -1,6 +1,7 @@
 import 'server-only';
 
 import { getDb } from './sqlite';
+import { isNativeEdition } from './edition';
 import { decryptSecret } from './crypto';
 
 /**
@@ -20,10 +21,11 @@ import { decryptSecret } from './crypto';
  * effect.
  */
 
-export type LlmProvider = 'anthropic' | 'openai' | 'gemini';
+export type LlmProvider = 'anthropic' | 'openai' | 'gemini' | 'cortex';
 
 /** Narrow an untrusted string to a provider id (anything unknown → 'anthropic'). */
 export function asLlmProvider(v: unknown): LlmProvider {
+  if (v === 'cortex') return 'cortex';
   return v === 'openai' || v === 'gemini' ? v : 'anthropic';
 }
 
@@ -35,7 +37,7 @@ export interface LlmProviderConfig {
   /** Provider-specific model override; null = the provider default (Claude:
    *  the PRISM_CHUNK_MODEL/... defaults). */
   model: string | null;
-  source: 'workspace' | 'env' | 'none';
+  source: 'workspace' | 'env' | 'cortex' | 'none';
 }
 
 const NONE: LlmProviderConfig = { provider: 'anthropic', apiKey: null, model: null, source: 'none' };
@@ -51,6 +53,19 @@ export function invalidateAnthropicKeyCache(): void {
 }
 
 function resolve(): LlmProviderConfig {
+  // Native (Marketplace) edition ships ONE LLM path: Snowflake Cortex
+  // (docs/NATIVE_APP_PLAN.md §2.4, spike-validated 2026-08-13). No key exists
+  // or is needed — calls run inside the warehouse; apiKey is a non-null
+  // sentinel so "is an LLM configured" truthiness checks pass. Model override
+  // via PRISM_CORTEX_MODEL.
+  if (isNativeEdition()) {
+    return {
+      provider: 'cortex',
+      apiKey:   'cortex',
+      model:    process.env.PRISM_CORTEX_MODEL?.trim() || null,
+      source:   'cortex',
+    };
+  }
   try {
     const r = getDb()
       .prepare(`SELECT provider, anthropic_api_key, model FROM workspace_llm_config WHERE id = 1`)
@@ -87,6 +102,6 @@ export function getAnthropicApiKey(): string | null {
 }
 
 /** Where the active AI-provider credential comes from — for setup/status surfaces. */
-export function anthropicKeySource(): 'workspace' | 'env' | 'none' {
+export function anthropicKeySource(): 'workspace' | 'env' | 'cortex' | 'none' {
   return getLlmProviderConfig().source;
 }
