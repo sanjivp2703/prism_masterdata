@@ -104,10 +104,13 @@ CREATE TABLE IF NOT EXISTS internal_state.VALIDATION_LOG (
 );
 -- §2.8 billing meter: cumulative billable-unit count + append-only emission
 -- ledger (effectively-once event emission; free tier enforced in-app).
+-- Billing is LINEAR PER VALUE after the free 1,000 — each row is one emitted
+-- aggregate event (units × $0.025), never a quantized 1,000-block.
 CREATE TABLE IF NOT EXISTS internal_state.BILLING_METER (
     id            INTEGER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY NOT NULL,
-    block_units   INTEGER NOT NULL,           -- units in this emitted block
-    total_after   INTEGER NOT NULL,           -- cumulative total after this block
+    event_units   INTEGER NOT NULL,           -- billable units in this emitted event
+    charge_usd    NUMBER(12,4) NOT NULL,      -- event_units x 0.025 at emission time
+    total_after   INTEGER NOT NULL,           -- cumulative billable+free total after this event
     emitted_at    TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
 

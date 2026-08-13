@@ -209,6 +209,16 @@ lifetime, enforced in-app (no events emitted until the meter passes 1,000).
 In-app enforcement (vs. the listing's trial feature) keeps the boundary
 exact and lets the UI show "612 of 1,000 free values used".
 
+**Billing is LINEAR PER VALUE after the free tier (owner decision
+2026-08-13)** — never quantized into 1,000-value blocks. Value #1,001 bills
+immediately at $0.025 (the per-unit form of $25/1,000); a pass that
+standardizes 250 billable values emits a $6.25 event. Snowflake billing
+events carry an explicit charge amount, so fractional-block emission is
+native to the mechanism. The marketing copy stays "$25 per 1,000 values";
+the meter charges per value. (Also noted for §N5 design-partner data: a
+monthly platform fee ALONGSIDE usage — Marketplace supports combining them —
+is the lever if per-customer revenue runs thin; revisit with real volumes.)
+
 **Metering architecture (shared core, not native-only):**
 - `_lib/billing-meter.ts` — increments on every lookup-write path
   (`writeAllDecisions`, `commit-standardizations`, `runOpExportDirect`, the
@@ -221,7 +231,10 @@ exact and lets the UI show "612 of 1,000 free values used".
   must survive container/volume loss; SQLite may mirror it for display only.
   Ledger + emission in the same transaction scope gives effectively-once
   emission; events are batched (`SYSTEM$CREATE_BILLING_EVENTS`) to respect
-  the per-minute frequency limits.
+  the per-minute frequency limits — one aggregated event per standardization
+  pass (or daily rollup), charge = billable_units × $0.025, starting from
+  the first value past the free 1,000 (a pass straddling the boundary bills
+  only its post-free portion).
 - A **usage surface in the UI** (Settings → Usage: values standardized,
   free-tier remaining, current month's billable count) — customers being
   charged per unit must be able to see the meter; this prevents disputes and
