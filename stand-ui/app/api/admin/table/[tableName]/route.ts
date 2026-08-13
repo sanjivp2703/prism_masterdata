@@ -3,6 +3,7 @@ import { warehouseErrorResponse, withWarehouse, executeQuery, getWarehouseAdapte
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireAdminSession } from '@/app/api/_lib/account-security';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import { internalObject } from '@/app/api/_lib/warehouse-tables';
 
 // Snowflake-side tables (read via the service connection)
 const SNOWFLAKE_TABLES = [
@@ -78,13 +79,13 @@ export async function GET(
     // /debug dropdown tables returned a 500 with `Msg 102 ... Incorrect syntax
     // near '1000'` instead of data (SEC-03, reproduced across three passes).
     const sqlText = getWarehouseAdapter().kind === 'mssql'
-      ? `SELECT TOP (1000) * FROM PRISM_DB.INTERNAL.${tableName}`
+      ? `SELECT TOP (1000) * FROM ${internalObject(tableName)}`
       : getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql'
       // Postgres/MySQL installs use lowercase prism_internal.* tables (a
       // schema on pg, a database on mysql); the allowlisted names are the
       // canonical uppercase forms.
       ? `SELECT * FROM prism_internal.${tableName.toLowerCase()} LIMIT 1000`
-      : `SELECT * FROM PRISM_DB.INTERNAL.${tableName} LIMIT 1000`;
+      : `SELECT * FROM ${internalObject(tableName)} LIMIT 1000`;
 
   try {
     return await withWarehouse(async (connection) => {

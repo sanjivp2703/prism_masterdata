@@ -34,7 +34,7 @@ import { pausePipelineWithMessage, NOT_BLOCKED_SQL } from './pipeline-alerts';
 import { reconcileMssqlQueue } from './pipeline-poller-mssql';
 import { reconcilePgQueue } from './pipeline-poller-postgres';
 import { reconcileMysqlQueue } from './pipeline-poller-mysql';
-import { internalTable } from './warehouse-tables';
+import { internalTable, prismNormalizeFn } from './warehouse-tables';
 import { getAnthropicApiKey } from './anthropic-key';
 import { parseStoredSchedule, isScheduleActiveNow } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
@@ -404,7 +404,7 @@ export async function reconcilePipelineQueue(
   return await withWarehouse(async (conn) => {
     const [beforeRow] = await exec(
       conn,
-      `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+      `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
       [pid],
     );
     const queueBefore = Number(beforeRow?.CNT ?? beforeRow?.cnt ?? 0);
@@ -413,31 +413,31 @@ export async function reconcilePipelineQueue(
     // ensures the LIMIT budget is spent only on genuinely-new values, so every
     // pass makes forward progress instead of re-selecting already-queued rows.
     await exec(conn, `
-      MERGE INTO PRISM_DB.INTERNAL.PIPELINE_QUEUE AS tgt
+      MERGE INTO ${internalTable('PIPELINE_QUEUE')} AS tgt
       USING (
         SELECT ANY_VALUE(TO_VARCHAR(src.${colRef})) AS literal_value,
                COUNT(*)                             AS source_frequency
         FROM ${tableRef} src
-        LEFT JOIN PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-          ON lam.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+        LEFT JOIN ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+          ON lam.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
           ${domainCond}
         WHERE src.${colRef} IS NOT NULL
           AND lam.literal_value IS NULL
           AND NOT EXISTS (
-            SELECT 1 FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE q
+            SELECT 1 FROM ${internalTable('PIPELINE_QUEUE')} q
             WHERE q.pipeline_id = ${pid}
-              AND PRISM_DB.INTERNAL.PRISM_NORMALIZE(q.literal_value) = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+              AND ${prismNormalizeFn()}(q.literal_value) = ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
           )
-        GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+        GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
         LIMIT ${RECONCILE_QUEUE_BATCH}
       ) AS recon
-        ON tgt.pipeline_id = ${pid} AND PRISM_DB.INTERNAL.PRISM_NORMALIZE(tgt.literal_value) = PRISM_DB.INTERNAL.PRISM_NORMALIZE(recon.literal_value)
+        ON tgt.pipeline_id = ${pid} AND ${prismNormalizeFn()}(tgt.literal_value) = ${prismNormalizeFn()}(recon.literal_value)
       WHEN NOT MATCHED THEN INSERT (pipeline_id, literal_value, source_frequency)
         VALUES (${pid}, recon.literal_value, recon.source_frequency)`);
 
     const [afterRow] = await exec(
       conn,
-      `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+      `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
       [pid],
     );
     const queueAfter = Number(afterRow?.CNT ?? afterRow?.cnt ?? 0);
@@ -524,7 +524,7 @@ export async function fetchQueueLiterals(
     connection,
     kind === 'mssql'
       ? `SELECT literal_value
-         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+         FROM ${internalTable('PIPELINE_QUEUE')}
          WHERE pipeline_id = ?
          ORDER BY CASE WHEN detected_at IS NULL THEN 1 ELSE 0 END, detected_at, literal_value`
       : kind === 'mysql'
@@ -534,7 +534,7 @@ export async function fetchQueueLiterals(
          WHERE pipeline_id = ?
          ORDER BY (detected_at IS NULL), detected_at, literal_value`
       : `SELECT literal_value
-         FROM ${kind === 'postgres' ? 'prism_internal.pipeline_queue' : 'PRISM_DB.INTERNAL.PIPELINE_QUEUE'}
+         FROM ${internalTable('PIPELINE_QUEUE')}
          WHERE pipeline_id = ?
          ORDER BY detected_at NULLS LAST, literal_value`,
     [pipelineId],
@@ -557,7 +557,7 @@ export async function fetchQueueLiteralsWithFreq(
     connection,
     kind === 'mssql'
       ? `SELECT TOP (5000) literal_value, source_frequency
-         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+         FROM ${internalTable('PIPELINE_QUEUE')}
          WHERE pipeline_id = ?
          ORDER BY CASE WHEN detected_at IS NULL THEN 1 ELSE 0 END, detected_at, literal_value`
       : kind === 'mysql'
@@ -567,7 +567,7 @@ export async function fetchQueueLiteralsWithFreq(
          ORDER BY (detected_at IS NULL), detected_at, literal_value
          LIMIT 5000`
       : `SELECT literal_value, source_frequency
-         FROM ${kind === 'postgres' ? 'prism_internal.pipeline_queue' : 'PRISM_DB.INTERNAL.PIPELINE_QUEUE'}
+         FROM ${internalTable('PIPELINE_QUEUE')}
          WHERE pipeline_id = ?
          ORDER BY detected_at NULLS LAST, literal_value
          LIMIT 5000`,

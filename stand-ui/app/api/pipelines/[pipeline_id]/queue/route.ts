@@ -7,6 +7,7 @@ import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 
 export async function GET(
   _request: Request,
@@ -26,7 +27,7 @@ export async function GET(
       const rows = await exec(
         conn,
         `SELECT literal_value, detected_at
-         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+         FROM ${internalTable('PIPELINE_QUEUE')}
          WHERE pipeline_id = ?
          ORDER BY detected_at ASC`,
         [pid],
@@ -58,7 +59,7 @@ export async function DELETE(
 
   try {
     return await withWarehouse(async (conn) => {
-      await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pid]);
+      await exec(conn, `DELETE FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`, [pid]);
       getDb()
         .prepare(
           `UPDATE pipelines

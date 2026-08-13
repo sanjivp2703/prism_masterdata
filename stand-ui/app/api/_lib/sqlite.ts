@@ -26,7 +26,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 const MIGRATIONS: string[] = [
-  // 001 — initial app-state tables (moved out of Snowflake PRISM_DB.INTERNAL).
+  // 001 — initial app-state tables (moved out of the Snowflake internal schema).
   // Timestamps are ISO-8601 UTC TEXT. JSON payloads are TEXT.
   `
   CREATE TABLE accounts (

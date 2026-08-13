@@ -14,6 +14,7 @@
 import 'server-only';
 
 import { normalizeLiteral } from '../../normalize';
+import { internalTable } from '../../warehouse-tables';
 import { executeQuery as exec } from './connection';
 
 // 1 bind per name → 1500 is comfortably inside the ceiling.
@@ -32,7 +33,7 @@ export async function upsertApprovedAliasMssql(
 
   await exec(
     conn,
-    `MERGE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WITH (HOLDLOCK) AS t
+    `MERGE ${internalTable('APPROVED_ALIAS_NAMES')} WITH (HOLDLOCK) AS t
      USING (SELECT ? AS alias_name) AS s
        ON t.alias_name = s.alias_name ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
@@ -45,7 +46,7 @@ export async function upsertApprovedAliasMssql(
 
   const rows = await exec(
     conn,
-    `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_name = ? ${selectFilter}`,
+    `SELECT alias_id FROM ${internalTable('APPROVED_ALIAS_NAMES')} WHERE alias_name = ? ${selectFilter}`,
     [aliasName],
   );
   const aliasId = Number(rows[0]?.alias_id ?? 0);
@@ -71,7 +72,7 @@ export async function bulkUpsertApprovedAliasesMssql(
     const valuesRows = batch.map(() => '(?)').join(', ');
     await exec(
       conn,
-      `MERGE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WITH (HOLDLOCK) AS t
+      `MERGE ${internalTable('APPROVED_ALIAS_NAMES')} WITH (HOLDLOCK) AS t
        USING (VALUES ${valuesRows}) AS s (alias_name)
          ON t.alias_name = s.alias_name ${domainFilter}
        WHEN MATCHED THEN UPDATE SET
@@ -88,7 +89,7 @@ export async function bulkUpsertApprovedAliasesMssql(
     const inPlaceholders = batch.map(() => '?').join(', ');
     const rows = await exec(
       conn,
-      `SELECT alias_name, alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+      `SELECT alias_name, alias_id FROM ${internalTable('APPROVED_ALIAS_NAMES')}
        WHERE alias_name IN (${inPlaceholders}) ${selectFilter}`,
       batch,
     );
@@ -130,7 +131,7 @@ export async function bulkUpsertLiteralMatchesMssql(
     ]);
     await exec(
       conn,
-      `MERGE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES WITH (HOLDLOCK) AS t
+      `MERGE ${internalTable('LITERAL_ALIAS_MATCHES')} WITH (HOLDLOCK) AS t
        USING (VALUES ${valuesRows}) AS s (literal_value, normalized_value, alias_id, run_id)
          ON t.normalized_value = s.normalized_value ${domainFilter}
        WHEN MATCHED THEN UPDATE SET

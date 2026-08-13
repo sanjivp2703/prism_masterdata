@@ -13,6 +13,7 @@
 import 'server-only';
 
 import { normalizeLiteral } from '../../normalize';
+import { internalTable } from '../../warehouse-tables';
 import { executeQuery as exec } from './connection';
 import { quoteIdent, parseFqn, computeScanTier } from './dialect';
 
@@ -451,7 +452,7 @@ export async function filterUnknownValues(
 
   const queuedRows = await exec(
     conn,
-    `SELECT literal_value FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+    `SELECT literal_value FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
     [pipelineId],
   );
   const queuedNorms = new Set(queuedRows.map((r: any) => normalizeLiteral(String(r.literal_value))));
@@ -472,7 +473,7 @@ export async function filterUnknownValues(
     const rows = await exec(
       conn,
       `SELECT DISTINCT normalized_value AS nv
-       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+       FROM ${internalTable('LITERAL_ALIAS_MATCHES')}
        WHERE normalized_value IN (${placeholders}) ${domainFilter}`,
       binds,
     );
@@ -535,7 +536,7 @@ export async function queueValues(
     for (const v of batch) binds.push(pipelineId, v.literal_value, v.frequency);
     await exec(
       conn,
-      `MERGE PRISM_DB.INTERNAL.PIPELINE_QUEUE WITH (HOLDLOCK) AS q
+      `MERGE ${internalTable('PIPELINE_QUEUE')} WITH (HOLDLOCK) AS q
        USING (VALUES ${rowsSql}) AS s (pipeline_id, literal_value, source_frequency)
        ON q.pipeline_id = s.pipeline_id AND q.literal_value = s.literal_value
        WHEN MATCHED THEN UPDATE SET source_frequency = s.source_frequency
@@ -549,6 +550,6 @@ export async function queueValues(
 }
 
 export async function getQueueSize(conn: any, pipelineId: number): Promise<number> {
-  const rows = await exec(conn, `SELECT COUNT(*) AS c FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pipelineId]);
+  const rows = await exec(conn, `SELECT COUNT(*) AS c FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`, [pipelineId]);
   return Number(rows[0]?.c ?? 0);
 }

@@ -17,6 +17,7 @@ import 'server-only';
 
 import { getDb } from '../../sqlite';
 import { normalizeLiteral } from '../../normalize';
+import { internalObject, internalTable } from '../../warehouse-tables';
 import { standardizedColumnName, assertCompanionColumnSafe } from '../../export-kind';
 import { executeQuery as exec, getServiceLoginName } from './connection';
 import { flagPipelineMessage } from '../../pipeline-alerts';
@@ -186,7 +187,7 @@ export async function refreshExportTableMssql(
       const w = watched[i];
       const colRef = quoteIdent(w.columnName);
       const stgName = `EXPORT_STG_${pipelineId ?? 0}_${i}_${nonce}`;
-      const stgRef = `PRISM_DB.INTERNAL.${quoteIdent(stgName)}`;
+      const stgRef = `${internalObject(quoteIdent(stgName))}`;
       stagingRefs.push(stgRef);
 
       // 1–3. Distinct read (bounded) → app-side normalize + alias resolve →
@@ -514,8 +515,8 @@ async function materializeAliasStaging(
     const rows = await exec(
       conn,
       `SELECT lam.normalized_value AS nv, aan.alias_name AS an
-       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-       JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES aan ON aan.alias_id = lam.alias_id
+       FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+       JOIN ${internalTable('APPROVED_ALIAS_NAMES')} aan ON aan.alias_id = lam.alias_id
        WHERE lam.normalized_value IN (${placeholders}) ${domainFilter}`,
       binds,
     );
@@ -693,7 +694,7 @@ export async function refreshStandardizedColumnsMssql(
       assertCompanionColumnSafe(stdName, watchedRawNames); // guardrail — write target only
       const colRef = quoteIdent(w.columnName);
       const stdRef = quoteIdent(stdName);
-      const stgRef = `PRISM_DB.INTERNAL.${quoteIdent(`COLSYNC_STG_${pipelineId ?? 0}_${i}_${nonce}`)}`;
+      const stgRef = `${internalObject(quoteIdent(`COLSYNC_STG_${pipelineId ?? 0}_${i}_${nonce}`))}`;
       stagingRefs.push(stgRef);
 
       await materializeAliasStaging(conn, sourceRef, w.columnName, w.domainId, stgRef);
@@ -832,7 +833,7 @@ export async function computeMappedCountsMssql(
     const mapped = await exec(
       conn,
       `SELECT DISTINCT normalized_value AS nv
-       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+       FROM ${internalTable('LITERAL_ALIAS_MATCHES')}
        WHERE normalized_value IN (${placeholders}) ${domainFilter}`,
       binds,
     );

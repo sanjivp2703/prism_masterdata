@@ -28,7 +28,7 @@
  *   - USAGE on the source database and schema (for INFORMATION_SCHEMA access)
  *   - CREATE TABLE on the export schema (table kind) and/or CREATE VIEW on
  *     the export schema (view kind)
- *   - USAGE on PRISM_DB.INTERNAL.PRISM_NORMALIZE (the join calls it by its
+ *   - USAGE on the internal schema's PRISM_NORMALIZE (the join calls it by its
  *     fully qualified name — see the comment on the join clause below for why
  *     it must never be written bare)
  */
@@ -65,6 +65,7 @@ import { getServiceLoginName } from './warehouse/mssql/connection';
 import { loadOpRunState } from './op-auto-group';
 import { getDb } from './sqlite';
 import { sqlStringLiteral, normalizeLiteral } from './normalize';
+import { internalTable, prismNormalizeFn } from './warehouse-tables';
 import { type ExportKind, standardizedColumnName, assertCompanionColumnSafe } from './export-kind';
 import { pausePipelineWithMessage } from './pipeline-alerts';
 
@@ -377,13 +378,13 @@ export async function refreshExportTable(
       // schema — not the schema the session had when the view was created. An
       // unqualified call therefore worked for the table build (which runs in
       // the session, schema = INTERNAL) but failed every view build whose
-      // destination lived outside PRISM_DB.INTERNAL — i.e. every realistic
+      // destination lived outside the internal schema — i.e. every realistic
       // customer destination — with "Unknown function PRISM_NORMALIZE".
       joinClauses.push(
-        `LEFT JOIN PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES ${lam}
-        ON ${lam}.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.columnName)}))
+        `LEFT JOIN ${internalTable('LITERAL_ALIAS_MATCHES')} ${lam}
+        ON ${lam}.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(src.${quoteIdent(w.columnName)}))
         ${domainFilter}
-      LEFT JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES ${aan}
+      LEFT JOIN ${internalTable('APPROVED_ALIAS_NAMES')} ${aan}
         ON ${aan}.alias_id = ${lam}.alias_id`,
       );
       // Exclude rows where this column has a non-null unmapped value.
@@ -760,16 +761,16 @@ async function refreshSnowflakeSiblingMetrics(
       : `AND lam.domain_id IS NULL`;
     const [statsRow] = await exec(conn,
       `WITH src_agg AS (
-         SELECT PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
+         SELECT ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
          FROM ${sourceRef} src
          WHERE src.${colRef} IS NOT NULL
-         GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+         GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
        )
        SELECT
          COALESCE(SUM(sa.freq), 0) AS total_source,
          COALESCE(SUM(CASE WHEN sa.nv IN (
            SELECT lam.normalized_value
-           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+           FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
            WHERE 1=1 ${domainFilter}
          ) THEN sa.freq ELSE 0 END), 0) AS total_mapped
        FROM src_agg sa`);
@@ -897,21 +898,21 @@ async function refreshStandardizedColumnsSnowflake(
          SET ${stdRef} = m.prism_alias_name
          FROM (
            SELECT lam.normalized_value AS prism_nv, MAX(aan.alias_name) AS prism_alias_name
-           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES aan ON aan.alias_id = lam.alias_id
+           FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+           JOIN ${internalTable('APPROVED_ALIAS_NAMES')} aan ON aan.alias_id = lam.alias_id
            WHERE 1=1 ${domainFilter}
            GROUP BY lam.normalized_value
          ) m
-         WHERE PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${sourceRef}.${colRef})) = m.prism_nv
+         WHERE ${prismNormalizeFn()}(TO_VARCHAR(${sourceRef}.${colRef})) = m.prism_nv
            AND NOT EQUAL_NULL(${sourceRef}.${stdRef}, m.prism_alias_name)`);
       // Rows no longer mapped (raw value changed/cleared, or mapping removed).
       await exec(conn,
         `UPDATE ${sourceRef}
          SET ${stdRef} = NULL
          WHERE ${stdRef} IS NOT NULL
-           AND (${colRef} IS NULL OR PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef})) NOT IN (
+           AND (${colRef} IS NULL OR ${prismNormalizeFn()}(TO_VARCHAR(${colRef})) NOT IN (
              SELECT lam.normalized_value
-             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+             FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
              WHERE 1=1 ${domainFilter}
            ))`);
     } catch (err) {
@@ -982,16 +983,16 @@ export async function updatePipelineMappedCount(
     const [statsRow] = await exec(
       conn,
       `WITH src_agg AS (
-         SELECT PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
+         SELECT ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
          FROM ${tableRef} src
          WHERE src.${colRef} IS NOT NULL
-         GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${colRef}))
+         GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
        )
        SELECT
          COALESCE(SUM(sa.freq), 0) AS total_source,
          COALESCE(SUM(CASE WHEN sa.nv IN (
            SELECT lam.normalized_value
-           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+           FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
            WHERE 1=1 ${domainFilter}
          ) THEN sa.freq ELSE 0 END), 0) AS total_mapped
        FROM src_agg sa`,

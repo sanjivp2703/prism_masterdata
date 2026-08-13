@@ -333,7 +333,7 @@ isolates SPCS problems from Native-App-packaging problems.
   two distinct Snowflake users seeing correct roles; service survives a
   suspend/resume with state intact.
 
-### Phase N3 — Native App packaging · ~2–3 wk (the long pole)
+### Phase N3 — Native App packaging · ~2–3 wk (the long pole) · **STARTED 2026-08-13: Cortex provider wired AND live-verified (grouping through the UI, zero egress); Anthropic key stripped from the spec, EAI detached — the interim scaffolding is retired**
 - Write `manifest.yml` + `setup.sql` + callbacks per §2.6/§2.7/§3; translate
   `01_internal_tables.sql` object-by-object (keep a checklist; every table,
   the UDF, grants → application roles).

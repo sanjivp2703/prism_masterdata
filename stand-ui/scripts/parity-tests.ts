@@ -951,6 +951,45 @@ console.log('file-inplace — XLSX patching (handcrafted fixture):');
     (() => { try { patchXlsxInPlace(fixture, 'Accounts', 2, [{ dataRow: 0, column: 'GUID', value: 'x' }]); return 'no-throw'; } catch { return 'threw'; } })(), 'no-throw');
 }
 
+// ── Internal-schema reference guard (native-edition sweep) ───────────────────
+//
+// Runtime data-plane SQL must reference the internal schema through the
+// warehouse-tables helpers (internalTable / internalObject / internalSchemaFqn
+// / prismNormalizeFn) so the native (Marketplace) edition can resolve them to
+// its own schemas. A hardcoded literal anywhere else silently breaks the
+// native edition only — the standard build keeps working, so nothing catches
+// the regression. Allowlist: warehouse-tables.ts (the resolver itself), the
+// standard-edition install/grant surfaces (they legitimately EMIT the standard
+// schema's SQL), and the lookup-export route's refusal of the internal schema
+// as a user-supplied target (a security check on user input, not a data-plane
+// reference).
+console.log('\ninternal-schema reference guard:');
+{
+  // Concatenated so this test file never matches its own needle.
+  const needle = 'PRISM_DB' + '.INTERNAL';
+  const INTERNAL_REF_ALLOWED = new Set([
+    'app/api/_lib/warehouse-tables.ts',
+    'app/api/_lib/grants.ts',
+    'app/api/accounts/install-script/route.ts',
+    'app/api/accounts/verify-install/route.ts',
+    'app/api/global-standardizations/export/route.ts',
+  ]);
+  const apiRoot = path.join(repoRoot, 'stand-ui', 'app', 'api');
+  const offending: string[] = [];
+  (function walk(dir: string) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.ts$/.test(entry.name)) continue;
+      const rel = path.relative(path.join(repoRoot, 'stand-ui'), full).split(path.sep).join('/');
+      if (INTERNAL_REF_ALLOWED.has(rel)) continue;
+      if (fs.readFileSync(full, 'utf8').includes(needle)) offending.push(rel);
+    }
+  })(apiRoot);
+  check('no hardcoded internal-schema reference outside the allowlist',
+    offending.join(', ') || '(none)', '(none)');
+}
+
 // ── Result ───────────────────────────────────────────────────────────────────
 // KEEP THIS BLOCK LAST. It used to sit above the file-inplace section, which
 // meant every check added below it ran AFTER the exit decision — failures

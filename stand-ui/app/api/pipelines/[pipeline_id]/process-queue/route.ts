@@ -23,6 +23,7 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { broadcastPipelineEvent } from '@/app/api/_lib/pipeline-broadcaster';
 import { PIPELINE_BLOCK_REASONS } from '@/app/api/_lib/pipeline-alerts';
+import { internalObject, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import {
   fetchPipelineById,
@@ -50,7 +51,7 @@ async function fetchSourceLiterals(
     SELECT ANY_VALUE(${colRef}) AS val
     FROM ${tableRef}
     WHERE ${colRef} IS NOT NULL
-    GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+    GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
   return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter(Boolean);
@@ -120,7 +121,7 @@ export async function POST(
         // Values inserted after this point  → caught by the stream on next poll.
         const parts      = pipeline.table_fqn.split('.');
         const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
-        const streamName = `PRISM_DB.INTERNAL.PIPELINE_STREAM_${pid}`;
+        const streamName = internalObject(`PIPELINE_STREAM_${pid}`);
         try {
           await exec(conn, `
             CREATE STREAM IF NOT EXISTS ${streamName}

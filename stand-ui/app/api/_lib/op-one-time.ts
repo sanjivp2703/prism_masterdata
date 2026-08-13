@@ -29,6 +29,7 @@ import { hasAnyRule } from './convention-rules';
 import { pickBestAliasName } from './namescore';
 import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
+import { internalObject, prismNormalizeFn } from './warehouse-tables';
 import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
 import {
@@ -258,7 +259,7 @@ export async function createOneTimeRun(connection: any, args: CreateOneTimeRunAr
               COUNT(*) AS source_frequency
        FROM ${tableRef}
        WHERE ${colRef} IS NOT NULL
-       GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+       GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
        ORDER BY source_frequency DESC`,
     );
   }
@@ -492,7 +493,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
     return await exportOneTimeToMssqlTarget(connection, { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched });
   }
 
-  const mapTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_MAP_${nonce}`)}`;
+  const mapTable = `${internalObject(quoteIdent(`OTS_MAP_${nonce}`))}`;
 
   try {
     // ── Build the transient mapping table ──────────────────────────────────
@@ -541,7 +542,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       joinClauses.push(
         `LEFT JOIN ${mapTable} ${alias}
            ON ${alias}.column_name = ${literal}
-          AND ${alias}.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(src.${quoteIdent(w.column_name)}))`,
+          AND ${alias}.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(src.${quoteIdent(w.column_name)}))`,
       );
     });
 
@@ -569,7 +570,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
 
         // Build staging table in INTERNAL (always writable), then
         // overwrite target rows. Target schema must match the source.
-        const stageRef = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_FALLBACK_${nonce}`)}`;
+        const stageRef = `${internalObject(quoteIdent(`OTS_FALLBACK_${nonce}`))}`;
         try {
           await exec(connection, `CREATE OR REPLACE TEMPORARY TABLE ${stageRef} AS ${selectSQL}`);
           await exec(connection, `DELETE FROM ${targetRef} WHERE TRUE`);
@@ -939,8 +940,8 @@ async function exportOneTimeToMssqlTarget(
 ): Promise<{ rows_written: number }> {
   const { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched } = args;
   const BIN2 = 'Latin1_General_100_BIN2';
-  const mapTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_MAP_${nonce}`)}`;
-  const stageTable = `PRISM_DB.INTERNAL.${quoteIdent(`OTS_STAGE_${nonce}`)}`;
+  const mapTable = `${internalObject(quoteIdent(`OTS_MAP_${nonce}`))}`;
+  const stageTable = `${internalObject(quoteIdent(`OTS_STAGE_${nonce}`))}`;
 
   try {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);

@@ -23,6 +23,7 @@ import { reconcilePipelineQueue } from './pipeline-hourly-processor';
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 import { sqlStringLiteral } from './normalize';
+import { internalObject, internalSchemaFqn, internalTable, prismNormalizeFn } from './warehouse-tables';
 import { parseStoredSchedule, isScheduleActiveNow, type UpdateSchedule } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
 import {
@@ -165,7 +166,7 @@ function touchLastPolled(pipelineId: number, opts: { claimSynced?: boolean } = {
 
 /** Fully-qualified name of the stream for a given pipeline (unquoted — safe because pipeline_id is always a positive integer). */
 function streamFqn(pipeline_id: number): string {
-  return `PRISM_DB.INTERNAL.PIPELINE_STREAM_${pipeline_id}`;
+  return internalObject(`PIPELINE_STREAM_${pipeline_id}`);
 }
 
 /**
@@ -688,7 +689,7 @@ export async function pollOnePipeline(
         let streamRows: any[] | null = null;
         try {
           streamRows = await exec(connection,
-            `SHOW STREAMS LIKE 'PIPELINE_STREAM_${pid}' IN SCHEMA PRISM_DB.INTERNAL`);
+            `SHOW STREAMS LIKE 'PIPELINE_STREAM_${pid}' IN SCHEMA ${internalSchemaFqn()}`);
         } catch (showErr: any) {
           // SHOW STREAMS failed (privileges / transient) — non-fatal; the
           // SYSTEM$STREAM_HAS_DATA check below still catches a missing stream.
@@ -853,12 +854,12 @@ export async function pollOnePipeline(
             COUNT(*)                                                        AS new_row_count,
             MAX(CASE WHEN lam.literal_value IS NOT NULL THEN 1 ELSE 0 END) AS already_mapped
           FROM ${streamRef} s
-          LEFT JOIN PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-            ON lam.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
+          LEFT JOIN ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+            ON lam.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))
             ${domainJoinCond}
           WHERE s.METADATA$ACTION = 'INSERT'
             AND TO_VARCHAR(s.${colRef}) IS NOT NULL
-          GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))`);
+          GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))`);
 
         // Step 1b: Detect removals in the SAME snapshot.  DELETE rows cover both
         // pure deletes and the delete-half of updates.  We don't touch the lookup
@@ -896,7 +897,7 @@ export async function pollOnePipeline(
         // subquery produces 0 rows so no queue rows are inserted/updated, but the
         // stream is still consumed.
         await exec(connection, `
-          MERGE INTO PRISM_DB.INTERNAL.PIPELINE_QUEUE AS tgt
+          MERGE INTO ${internalTable('PIPELINE_QUEUE')} AS tgt
           USING (
             SELECT
               ANY_VALUE(TO_VARCHAR(s.${colRef})) AS literal_value,
@@ -904,9 +905,9 @@ export async function pollOnePipeline(
             FROM ${streamRef} s
             WHERE s.METADATA$ACTION = 'INSERT'
               AND TO_VARCHAR(s.${colRef}) IS NOT NULL
-            GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(s.${colRef}))
+            GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))
           ) AS src
-            ON tgt.pipeline_id = ${pid} AND PRISM_DB.INTERNAL.PRISM_NORMALIZE(tgt.literal_value) = PRISM_DB.INTERNAL.PRISM_NORMALIZE(src.literal_value)
+            ON tgt.pipeline_id = ${pid} AND ${prismNormalizeFn()}(tgt.literal_value) = ${prismNormalizeFn()}(src.literal_value)
           WHEN MATCHED THEN UPDATE SET
             tgt.source_frequency = tgt.source_frequency + src.new_row_count
           WHEN NOT MATCHED THEN INSERT (pipeline_id, literal_value, source_frequency)
@@ -936,7 +937,7 @@ export async function pollOnePipeline(
       // ── Step 4: Get queue size + source row count after consuming ─────────
       console.log(`[Poller] Pipeline ${pid}: stream consumed (MERGE complete)`);
       const [postMergeRow] = await exec(connection,
-        `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+        `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
         [pid]);
       const queueAfter = Number(postMergeRow?.CNT ?? postMergeRow?.cnt ?? 0);
 

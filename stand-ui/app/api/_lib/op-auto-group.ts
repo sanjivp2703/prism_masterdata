@@ -87,6 +87,7 @@ export interface OpRunState {
 // ---------------------------------------------------------------------------
 
 import { withWarehouse, executeQuery, getWarehouseAdapter } from './warehouse';
+import { internalTable } from './warehouse-tables';
 
 type WarehouseConn = unknown;
 
@@ -94,7 +95,7 @@ function runStateTable(): string {
   const kind = getWarehouseAdapter().kind;
   if (kind === 'mssql') return 'INTERNAL.RUN_STATE';
   if (kind === 'postgres' || kind === 'mysql') return 'prism_internal.run_state';
-  return 'PRISM_DB.INTERNAL.RUN_STATE';
+  return internalTable('RUN_STATE');
 }
 
 function parseStateCell(raw: unknown): OpRunState | null {
@@ -188,7 +189,7 @@ export async function saveOpRunState(runId: number, state: OpRunState, conn?: Wa
       // apply to a USING (SELECT …) source.
       await executeQuery(
         c,
-        `MERGE INTO PRISM_DB.INTERNAL.RUN_STATE t
+        `MERGE INTO ${internalTable('RUN_STATE')} t
          USING (SELECT ? AS run_id, PARSE_JSON(?) AS state) s
          ON t.run_id = s.run_id
          WHEN MATCHED THEN UPDATE SET t.state = s.state, t.updated_at = CURRENT_TIMESTAMP()
@@ -252,7 +253,7 @@ export async function saveOpRunStateWithRev(
     } else {
       const rows = await executeQuery(
         c,
-        `UPDATE PRISM_DB.INTERNAL.RUN_STATE
+        `UPDATE ${internalTable('RUN_STATE')}
          SET state = PARSE_JSON(?), updated_at = CURRENT_TIMESTAMP()
          WHERE run_id = ?
            AND COALESCE(state:rev::NUMBER, 0) = ?`,

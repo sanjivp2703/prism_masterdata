@@ -23,6 +23,7 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
+import { internalObject, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
 import {
   fetchPipelineById,
   createRunFromQueue,
@@ -90,7 +91,7 @@ async function fetchSourceLiterals(
     SELECT ANY_VALUE(${colRef}) AS val, COUNT(*) AS freq
     FROM ${tableRef}
     WHERE ${colRef} IS NOT NULL
-    GROUP BY PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+    GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
   const literals: string[] = [];
@@ -208,7 +209,7 @@ export async function POST(
       const parts = pipeline.table_fqn.split('.');
       if (parts.length === 3) {
         const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
-        const streamName = `PRISM_DB.INTERNAL.PIPELINE_STREAM_${pid}`;
+        const streamName = internalObject(`PIPELINE_STREAM_${pid}`);
         const createStream = () => withWarehouse(async (conn) =>
           exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${tableRef}`));
         try {

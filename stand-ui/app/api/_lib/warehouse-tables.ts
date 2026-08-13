@@ -55,3 +55,22 @@ export function prismNormalizeFn(): string {
   if (isNativeEdition()) return `${nativeDbPrefix()}app_code.PRISM_NORMALIZE`;
   return `PRISM_DB.INTERNAL.PRISM_NORMALIZE`;
 }
+
+/** Generic internal-schema OBJECT reference for streams, staging/scratch
+ *  tables, and the debug inspector — anything that isn't one of the 7 typed
+ *  internal tables. The name is appended VERBATIM after the schema prefix
+ *  (pass it pre-quoted when it needs quoting, e.g. `"PIPELINE_STREAM_5"`).
+ *  These objects exist only on the Snowflake-family warehouses (Snowflake +
+ *  mssql — pg/mysql have no streams and their ports name their own scratch
+ *  objects), so there is no lowercase prism_internal spelling here. */
+export function internalObject(name: string): string {
+  if (isNativeEdition()) return `${nativeDbPrefix()}internal_state.${name}`;
+  return `PRISM_DB.INTERNAL.${name}`;
+}
+
+/** The internal schema itself, for schema-level SQL —
+ *  `SHOW STREAMS IN SCHEMA <x>` / `CREATE STREAM <x>."NAME"` style text. */
+export function internalSchemaFqn(): string {
+  if (isNativeEdition()) return `${nativeDbPrefix()}internal_state`;
+  return `PRISM_DB.INTERNAL`;
+}

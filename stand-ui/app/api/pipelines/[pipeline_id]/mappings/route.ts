@@ -16,7 +16,7 @@ import { quoteIdent as pgQuoteIdent } from '@/app/api/_lib/warehouse/postgres/di
 import { pgTableRef } from '@/app/api/_lib/warehouse/postgres/detection';
 import { myTableRef } from '@/app/api/_lib/warehouse/mysql/detection';
 import { quoteIdent as myQuoteIdent, binaryCompare as myBinaryCompare } from '@/app/api/_lib/warehouse/mysql/dialect';
-import { internalTable } from '@/app/api/_lib/warehouse-tables';
+import { internalTable, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
 import { upsertApprovedAlias } from '@/app/api/_lib/op-export';
 import { refreshExportTable } from '@/app/api/_lib/export-table';
 import { asExportKind } from '@/app/api/_lib/export-kind';
@@ -140,7 +140,7 @@ export async function GET(
         const tableRef = parts.map(quoteIdent).join('.');
         const colRef   = quoteIdent(column_name);
         colScopeFilter = `AND lam.normalized_value IN (
-          SELECT PRISM_DB.INTERNAL.PRISM_NORMALIZE(TO_VARCHAR(${colRef}))
+          SELECT ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
           FROM ${tableRef}
           WHERE ${colRef} IS NOT NULL
         )`;

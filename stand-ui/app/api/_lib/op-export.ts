@@ -35,7 +35,7 @@ import { withWarehouse, executeQuery as exec, getWarehouseAdapter } from './ware
 import { upsertApprovedAliasMssql, bulkUpsertApprovedAliasesMssql, bulkUpsertLiteralMatchesMssql } from './warehouse/mssql/mappings';
 import { upsertApprovedAliasPg, bulkUpsertApprovedAliasesPg, bulkUpsertLiteralMatchesPg } from './warehouse/postgres/mappings';
 import { upsertApprovedAliasMysql, bulkUpsertApprovedAliasesMysql, bulkUpsertLiteralMatchesMysql } from './warehouse/mysql/mappings';
-import { internalTable } from './warehouse-tables';
+import { internalTable, prismNormalizeFn } from './warehouse-tables';
 import { getDb } from './sqlite';
 import { normalizeLiteral } from './normalize';
 import { reportError } from './report-error';
@@ -363,13 +363,13 @@ async function bulkUpsertLiteralMatches(
                 column3 AS run_id
          FROM VALUES ${placeholders}
        ) AS s
-         ON t.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value) ${domainFilter}
+         ON t.normalized_value = ${prismNormalizeFn()}(s.literal_value) ${domainFilter}
        WHEN MATCHED THEN UPDATE SET
          t.alias_id     = s.alias_id,
          t.run_id       = s.run_id,
          t.confirmed_at = CURRENT_TIMESTAMP()
        WHEN NOT MATCHED THEN INSERT (literal_value, normalized_value, alias_id, domain_id, run_id, confirmed_at)
-         VALUES (s.literal_value, PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
+         VALUES (s.literal_value, ${prismNormalizeFn()}(s.literal_value), s.alias_id, ${domainLiteral}, s.run_id, CURRENT_TIMESTAMP())`,
       binds,
     );
   }
