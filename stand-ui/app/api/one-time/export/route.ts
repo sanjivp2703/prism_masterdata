@@ -377,6 +377,23 @@ export async function POST(request: Request) {
         // Full detail server-side ALWAYS — the install test lost hours to this
         // branch classifying and responding without logging the underlying error.
         reportError(exportErr, { where: 'one-time export', target_fqn, mode });
+        // Create-mode name collision — including a table Prism cannot even
+        // SEE (created by another role/edition; Snowflake says "already
+        // exists, but current role has no privileges on it"). This is not a
+        // missing-grant problem, and showing the grants panel for it sent the
+        // install test down a rabbit hole. Say what actually happened.
+        const rawMsg = String(exportErr?.message ?? '');
+        if (mode === 'create' && rawMsg.toLowerCase().includes('already exists')) {
+          const invisible = rawMsg.toLowerCase().includes('no privileges');
+          return Response.json(
+            {
+              error: `A table named ${target_fqn} already exists${invisible
+                ? ' (created outside Prism, so Prism cannot see or replace it)'
+                : ''}. Choose a different name, or drop the existing table and retry.`,
+            },
+            { status: 409 },
+          );
+        }
         const isMssql = getWarehouseAdapter().kind === 'mssql';
         const isPg = getWarehouseAdapter().kind === 'postgres';
         const isMy = getWarehouseAdapter().kind === 'mysql';

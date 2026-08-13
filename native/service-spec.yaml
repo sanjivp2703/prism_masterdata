@@ -16,13 +16,9 @@ spec:
         # file) is injected by the platform — do NOT set credentials here.
         SNOWFLAKE_WAREHOUSE: PRISM_APP_WH
         PRISM_SQLITE_PATH: /data/prism.db
-        # Server-side secrets that are NOT Snowflake credentials still need a
-        # home in N2; set real values via ALTER SERVICE ... SET or a
-        # Snowflake SECRET in N3. SESSION_SECRET/PRISM_ENCRYPTION_KEY are
-        # per-installation (see deploy/DEPLOY.md).
-        SESSION_SECRET: change-me-openssl-rand-hex-32
-        PRISM_ENCRYPTION_KEY: change-me-openssl-rand-hex-32
-        ANTHROPIC_API_KEY: change-me-until-cortex
+        # No secrets here — the native edition self-provisions
+        # SESSION_SECRET / PRISM_ENCRYPTION_KEY at first boot and persists
+        # them on the block volume (instrumentation.ts ensureNativeSecrets).
       volumeMounts:
         - name: data
           mountPath: /data
