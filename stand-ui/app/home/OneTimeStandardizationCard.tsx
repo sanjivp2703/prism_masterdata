@@ -8,6 +8,7 @@ import ConventionEditor, {
 } from '@/app/components/ConventionEditor';
 import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import NativeTablePicker from '@/app/components/NativeTablePicker';
 import { detectHeaderRow, gridToRows } from '@/app/api/_lib/table-shape';
 
 interface TableColumn { name: string; type: string; isText: boolean }
@@ -382,6 +383,9 @@ export default function OneTimeStandardizationCard() {
       {sourceKind === 'warehouse' && (
         <div className="mb-4">
           <label htmlFor="ot-table-fqn" className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>Source table</label>
+          {isNativeEdition() ? (
+            <NativeTablePicker inputId="ot-table-fqn" value={tableFqn} onChange={setTableFqn} />
+          ) : (
           <input
             id="ot-table-fqn" type="text" value={tableFqn}
             onChange={e => setTableFqn(e.target.value)}
@@ -393,6 +397,7 @@ export default function OneTimeStandardizationCard() {
             onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
             onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
           />
+          )}
         </div>
       )}
 

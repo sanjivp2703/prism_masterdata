@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import NativeTablePicker from '@/app/components/NativeTablePicker';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -1311,6 +1312,9 @@ export default function AutoExportHome() {
                         <label htmlFor="ae-table-fqn" className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>
                           Source table
                         </label>
+                        {isNativeEdition() ? (
+                          <NativeTablePicker inputId="ae-table-fqn" value={tableFqn} onChange={setTableFqn} />
+                        ) : (
                         <input
                           id="ae-table-fqn" type="text" value={tableFqn}
                           onChange={e => setTableFqn(e.target.value)}
@@ -1322,6 +1326,7 @@ export default function AutoExportHome() {
                           onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
                           onBlur={e  => { e.currentTarget.style.borderColor = 'var(--border)'; }}
                         />
+                        )}
                         <p className="mt-1 text-xs" style={{ color: 'var(--text-hint)' }}>Full path to the source table whose column values you want to standardize</p>
                       </div>
 
