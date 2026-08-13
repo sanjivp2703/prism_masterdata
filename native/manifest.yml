@@ -12,7 +12,7 @@ artifacts:
   setup_script: setup.sql
   readme: README.md
   default_web_endpoint:
-    service: app_code.prism_app
+    service: services.prism_app
     endpoint: app
   container_services:
     images:

@@ -28,6 +28,9 @@ CREATE APPLICATION ROLE IF NOT EXISTS app_data_admin;  -- human lookup maintenan
 -- internal_state: UNVERSIONED — the data plane; survives upgrades.
 CREATE OR ALTER VERSIONED SCHEMA app_code;
 CREATE SCHEMA IF NOT EXISTS internal_state;
+-- services: UNVERSIONED — SPCS services are not supported in versioned schemas
+-- (install-test finding 2026-08-13).
+CREATE SCHEMA IF NOT EXISTS services;
 
 -- ── PRISM_NORMALIZE (stateless; body mirrored by normalizeLiteral — keep in sync)
 CREATE OR REPLACE FUNCTION app_code.PRISM_NORMALIZE(V STRING)
@@ -143,17 +146,21 @@ CREATE OR REPLACE PROCEDURE app_code.start_app()
 RETURNS STRING LANGUAGE SQL AS
 $$
 BEGIN
-  CREATE COMPUTE POOL IF NOT EXISTS prism_pool
+  CREATE COMPUTE POOL IF NOT EXISTS prism_app_pool  -- app-namespaced: pool names are ACCOUNT-global (collided with the N2 dev pool, 2026-08-13)
     MIN_NODES = 1 MAX_NODES = 1 INSTANCE_FAMILY = CPU_X64_XS AUTO_RESUME = TRUE;
-  CREATE WAREHOUSE IF NOT EXISTS PRISM_WH
+  CREATE WAREHOUSE IF NOT EXISTS PRISM_APP_WH  -- app-namespaced (warehouse names are account-global; PRISM_WH collides with a standard install)
     WAREHOUSE_SIZE = XSMALL AUTO_SUSPEND = 60 AUTO_RESUME = TRUE
     INITIALLY_SUSPENDED = TRUE STATEMENT_TIMEOUT_IN_SECONDS = 600
     COMMENT = 'Dedicated warehouse for the Prism standardization service';
-  CREATE SERVICE IF NOT EXISTS app_code.prism_app
-    IN COMPUTE POOL prism_pool
+  CREATE SERVICE IF NOT EXISTS services.prism_app
+    IN COMPUTE POOL prism_app_pool
     FROM SPECIFICATION_FILE = '/service-spec.yaml'   -- packaged path finalized at packaging
     MIN_INSTANCES = 1 MAX_INSTANCES = 1;             -- single-node BY DESIGN (in-process poller/locks/SSE)
-  GRANT SERVICE ROLE app_code.prism_app!ALL_ENDPOINTS_USAGE TO APPLICATION ROLE app_user;
+  GRANT SERVICE ROLE services.prism_app!ALL_ENDPOINTS_USAGE TO APPLICATION ROLE app_user;
+  -- Visibility for consumer admins (and provider dev tooling): without these,
+  -- SHOW ENDPOINTS/SERVICE CONTAINERS is impossible outside the app.
+  GRANT USAGE ON SCHEMA services TO APPLICATION ROLE app_user;
+  GRANT MONITOR ON SERVICE services.prism_app TO APPLICATION ROLE app_user;
   RETURN 'Prism started';
 END;
 $$;
@@ -163,9 +170,12 @@ CREATE OR REPLACE PROCEDURE app_code.upgrade_app()
 RETURNS STRING LANGUAGE SQL AS
 $$
 BEGIN
-  ALTER SERVICE IF EXISTS app_code.prism_app FROM SPECIFICATION_FILE = '/service-spec.yaml';
+  ALTER SERVICE IF EXISTS services.prism_app FROM SPECIFICATION_FILE = '/service-spec.yaml';
   RETURN 'Prism service upgraded';
 END;
 $$;
 
 GRANT USAGE ON PROCEDURE app_code.start_app() TO APPLICATION ROLE app_user;
+-- The reference callback must be callable by the consumer's Security UI
+-- (install warning 2026-08-13 when this grant was missing).
+GRANT USAGE ON PROCEDURE app_code.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_user;

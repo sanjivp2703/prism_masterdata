@@ -14,7 +14,7 @@ spec:
       env:
         # Ambient SPCS auth (SNOWFLAKE_HOST / SNOWFLAKE_ACCOUNT / the token
         # file) is injected by the platform — do NOT set credentials here.
-        SNOWFLAKE_WAREHOUSE: PRISM_WH
+        SNOWFLAKE_WAREHOUSE: PRISM_APP_WH
         PRISM_SQLITE_PATH: /data/prism.db
         # Server-side secrets that are NOT Snowflake credentials still need a
         # home in N2; set real values via ALTER SERVICE ... SET or a
