@@ -2,11 +2,14 @@ import { NextRequest } from 'next/server';
 import { randomBytes } from 'crypto';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireAdminSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 import { sendInviteEmail } from '@/app/api/_lib/email';
 
 export async function POST(request: NextRequest) {
   const auth = await requireAdminSession();
   if (auth instanceof Response) return auth;
+  // Native edition: Snowflake owns identity/membership — no email invitations.
+  if (isNativeEdition()) return nativeEditionUnavailable('Email invitations');
   const session = auth;
 
   let body: any;

@@ -12,6 +12,7 @@ import snowflake from 'snowflake-sdk';
 import { getDb } from '../../sqlite';
 import { decryptSecret } from '../../crypto';
 import { getOptionalEnv } from '../../env';
+import { isNativeEdition } from '../../edition';
 import { NoUserWarehouseConfig, type WarehouseAdapter } from '../types';
 
 type SnowflakeConnection = ReturnType<typeof snowflake.createConnection>;
@@ -56,9 +57,51 @@ function getPrivateKeyFromPath(): string | undefined {
   }
 }
 
+// ── SPCS ambient auth (native edition only — docs/NATIVE_APP_PLAN.md N2) ─────
+//
+// Inside a Snowpark Container Services container, Snowflake mounts a rotating
+// OAuth token at /snowflake/session/token and sets SNOWFLAKE_HOST /
+// SNOWFLAKE_ACCOUNT. No credentials are configured anywhere — the container
+// IS the identity. The token rotates, so it is read fresh for every
+// connection (which fits the no-pool, fresh-connection-per-call design).
+// Gated on the native edition so the standard edition's resolution is
+// byte-identical even if its image ever runs inside SPCS.
+
+const SPCS_TOKEN_PATH = '/snowflake/session/token';
+
+/** True when running inside SPCS with the ambient token available. */
+export function spcsAmbientAvailable(): boolean {
+  if (!isNativeEdition()) return false;
+  if (!getOptionalEnv('SNOWFLAKE_HOST') || !getOptionalEnv('SNOWFLAKE_ACCOUNT')) return false;
+  try { return fs.statSync(SPCS_TOKEN_PATH).isFile(); } catch { return false; }
+}
+
+function createSpcsSnowflakeConnection(): SnowflakeConnection {
+  const host    = getRequiredEnv('SNOWFLAKE_HOST');
+  const account = getRequiredEnv('SNOWFLAKE_ACCOUNT');
+  // Fresh read every connection — the platform rotates the token in place.
+  const token = fs.readFileSync(SPCS_TOKEN_PATH, 'utf8').trim();
+  const port  = getOptionalEnv('SNOWFLAKE_PORT') ?? '443';
+
+  const database  = getOptionalEnv('SNOWFLAKE_DATABASE')  ?? 'PRISM_DB';
+  const schema    = getOptionalEnv('SNOWFLAKE_SCHEMA')    ?? 'INTERNAL';
+  const warehouse = getOptionalEnv('SNOWFLAKE_WAREHOUSE') ?? 'PRISM_WH';
+
+  return snowflake.createConnection({
+    accessUrl: `https://${host}:${port}`,
+    account,
+    token,
+    authenticator: 'OAUTH',
+    warehouse,
+    database,
+    schema,
+  } as any);
+}
+
 // ── Workspace-level service credentials (saved from /setup onboarding) ───────
 //
-// The service connection resolves in two tiers:
+// The service connection resolves in tiers:
+//   0. SPCS ambient token (native edition inside a container — see above)
 //   1. workspace_config (SQLite, saved by an admin on the /setup flow — secrets
 //      encrypted at rest, decrypted only here)
 //   2. SNOWFLAKE_* env vars (the operator fallback / escape hatch)
@@ -130,7 +173,8 @@ export function getEnvSnowflakeSecrets(): { password?: string; privateKey?: stri
 }
 
 /** Where the service connection's credentials come from right now. */
-export function serviceConnectionSource(): 'workspace' | 'env' | 'none' {
+export function serviceConnectionSource(): 'spcs' | 'workspace' | 'env' | 'none' {
+  if (spcsAmbientAvailable()) return 'spcs';
   if (getWorkspaceSfConfig()) return 'workspace';
   if (
     getOptionalEnv('SNOWFLAKE_ACCOUNT') &&
@@ -166,6 +210,7 @@ function createWorkspaceSnowflakeConnection(ws: WorkspaceSfConfig): SnowflakeCon
 }
 
 export function createSnowflakeConnection(): SnowflakeConnection {
+  if (spcsAmbientAvailable()) return createSpcsSnowflakeConnection();
   const ws = getWorkspaceSfConfig();
   if (ws) return createWorkspaceSnowflakeConnection(ws);
 

@@ -1,0 +1,15 @@
+# Build context hygiene for native/Dockerfile (context = stand-ui/).
+# Nothing secret or stateful may reach the image (docs/NATIVE_APP_PLAN.md N5:
+# the security scan examines the image; .env files and the SQLite DB are
+# per-installation state, never build inputs).
+node_modules
+.next
+data
+*.db
+*.db-wal
+*.db-shm
+.env*
+snowflake.log
+*.log
+tsconfig.tsbuildinfo
+tsconfig.scripts.tsbuildinfo

@@ -2,6 +2,7 @@ import { cookies } from 'next/headers';
 import { detectHeaderRow } from '@/app/api/_lib/table-shape';
 import { google } from 'googleapis';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(
@@ -28,6 +29,7 @@ function extractSpreadsheetId(urlOrId: string): string | null {
 export async function GET(request: Request) {
   const authz = await requireValidSession();
   if (authz instanceof Response) return authz;
+  if (isNativeEdition()) return nativeEditionUnavailable('Google Sheets');
   const { searchParams } = new URL(request.url);
   const input = searchParams.get('url') ?? '';
   const tab   = searchParams.get('tab') ?? '';

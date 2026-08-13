@@ -1,0 +1,45 @@
+# SPCS service specification for the Prism native edition (Phase N2 — bare
+# service in the dev account, NOT yet a Native App package; N3 moves this into
+# the application package).
+#
+# Upload to the stage referenced by native/spcs-dev-setup.sql, then:
+#   CREATE SERVICE ... FROM @PRISM_DB.INTERNAL.NATIVE_ARTIFACTS SPECIFICATION_FILE='service-spec.yaml'
+#
+# The image path must match your account's image repository — see
+# native/push.sh (SPCS pulls from the repo created in spcs-dev-setup.sql).
+spec:
+  containers:
+    - name: prism
+      image: /prism_db/internal/prism_images/prism-native:latest
+      env:
+        # Ambient SPCS auth (SNOWFLAKE_HOST / SNOWFLAKE_ACCOUNT / the token
+        # file) is injected by the platform — do NOT set credentials here.
+        SNOWFLAKE_WAREHOUSE: PRISM_WH
+        PRISM_SQLITE_PATH: /data/prism.db
+        # Server-side secrets that are NOT Snowflake credentials still need a
+        # home in N2; set real values via ALTER SERVICE ... SET or a
+        # Snowflake SECRET in N3. SESSION_SECRET/PRISM_ENCRYPTION_KEY are
+        # per-installation (see deploy/DEPLOY.md).
+        SESSION_SECRET: change-me-openssl-rand-hex-32
+        PRISM_ENCRYPTION_KEY: change-me-openssl-rand-hex-32
+        ANTHROPIC_API_KEY: change-me-until-cortex
+      volumeMounts:
+        - name: data
+          mountPath: /data
+      resources:
+        requests:
+          cpu: 1
+          memory: 2Gi
+        limits:
+          cpu: 2
+          memory: 4Gi
+  volumes:
+    # Block volume: durable across restarts — holds the SQLite app state
+    # (docs/NATIVE_APP_PLAN.md §2.5). The N0 spike validates this mechanism.
+    - name: data
+      source: block
+      size: 10Gi
+  endpoints:
+    - name: app
+      port: 8000
+      public: true
