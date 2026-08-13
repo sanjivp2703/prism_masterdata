@@ -1,6 +1,7 @@
 // PLACEHOLDER LEGAL TEXT — have counsel review/replace before selling. Generated 2026-07-02.
 
 import { getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 /**
  * The warehouse this installation is actually configured for.
@@ -52,6 +53,7 @@ const listStyle: React.CSSProperties = {
 
 export default function PrivacyPage() {
   const warehouse = warehouseName();
+  const native = isNativeEdition();
   return (
     <div style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh', padding: '48px 24px' }}>
       <div style={{ maxWidth: 720, margin: '0 auto' }}>
@@ -85,23 +87,34 @@ export default function PrivacyPage() {
 
           <p style={bodyText}>
             This privacy policy explains what information Prism collects, how it is used, and the
-            choices you have. Prism is a data standardization platform that connects to data
-            sources you designate — your {warehouse} data warehouse and Google Sheets — and helps
+            choices you have. Prism is a data standardization platform that {native
+            ? 'runs inside your Snowflake account and connects to the tables your administrator grants it'
+            : <>connects to data sources you designate — your {warehouse} data warehouse and Google Sheets</>} — and helps
             you map inconsistent text values to canonical names. It applies alongside our{' '}
             <a href="/terms" style={{ color: 'var(--accent)', textDecoration: 'none' }}>terms of service</a>.
           </p>
 
           <h2 style={sectionTitle}>1. Data we collect</h2>
           <ul style={listStyle}>
-            <li>
-              <strong>Account information</strong> — your name, email address, and profile picture
-              from Google sign-in, plus your workspace role and invitation history.
-            </li>
-            <li>
-              <strong>Connection credentials</strong> — {warehouse} credentials (password or private
-              key) and Google OAuth tokens (including refresh tokens for connected Sheets
-              pipelines) that you provide to connect your data sources.
-            </li>
+            {native ? (
+              <li>
+                <strong>Account information</strong> — your Snowflake username (provided by
+                Snowflake when you open the app) and your workspace role. No credentials are
+                collected: authentication is handled entirely by Snowflake.
+              </li>
+            ) : (
+              <>
+                <li>
+                  <strong>Account information</strong> — your name, email address, and profile picture
+                  from Google sign-in, plus your workspace role and invitation history.
+                </li>
+                <li>
+                  <strong>Connection credentials</strong> — {warehouse} credentials (password or private
+                  key) and Google OAuth tokens (including refresh tokens for connected Sheets
+                  pipelines) that you provide to connect your data sources.
+                </li>
+              </>
+            )}
             <li>
               <strong>Customer data values</strong> — the distinct text values from the columns
               and sheets you choose to standardize, and the confirmed mappings between raw values
@@ -118,8 +131,9 @@ export default function PrivacyPage() {
             <li>To authenticate you and manage workspace access and invitations;</li>
             <li>To connect to and read from the data sources you configure;</li>
             <li>
-              To propose groupings and canonical names for your data values, including by sending
-              those values to our language model provider for classification;
+              {native
+                ? 'To propose groupings and canonical names for your data values, using Snowflake Cortex AI models running inside your Snowflake account (values are not sent to us or to any external AI provider);'
+                : 'To propose groupings and canonical names for your data values, including by sending those values to our language model provider for classification;'}
             </li>
             <li>To store confirmed mappings and write standardized output where you direct it;</li>
             <li>To operate, secure, troubleshoot, and improve the Service.</li>
@@ -131,27 +145,38 @@ export default function PrivacyPage() {
 
           <h2 style={sectionTitle}>3. Subprocessors</h2>
           <ul style={listStyle}>
-            <li>
-              <strong>{warehouse}</strong> — mappings, run state, and pipeline configuration are
-              stored in your connected {warehouse} account, under your agreement with {warehouse}.
-            </li>
-            <li>
-              <strong>AI provider (Anthropic by default; OpenAI or Google if your
-              workspace configures one)</strong> — distinct data values (never your credentials) are
-              sent to the configured provider&rsquo;s API to propose groupings and canonical names.
-            </li>
-            <li>
-              <strong>Google</strong> — used for sign-in and, when you connect them, for reading
-              and writing the Google Sheets you authorize.
-            </li>
+            {native ? (
+              <li>
+                <strong>Snowflake</strong> — hosts the application, stores all data, and provides
+                the AI models (Snowflake Cortex) used for classification, all inside your
+                Snowflake account under your agreement with Snowflake. No other party receives
+                your data.
+              </li>
+            ) : (
+              <>
+                <li>
+                  <strong>{warehouse}</strong> — mappings, run state, and pipeline configuration are
+                  stored in your connected {warehouse} account, under your agreement with {warehouse}.
+                </li>
+                <li>
+                  <strong>AI provider (Anthropic by default; OpenAI or Google if your
+                  workspace configures one)</strong> — distinct data values (never your credentials) are
+                  sent to the configured provider&rsquo;s API to propose groupings and canonical names.
+                </li>
+                <li>
+                  <strong>Google</strong> — used for sign-in and, when you connect them, for reading
+                  and writing the Google Sheets you authorize.
+                </li>
+              </>
+            )}
           </ul>
 
           <h2 style={sectionTitle}>4. Retention</h2>
           <p style={bodyText}>
             Confirmed mappings, run history, and pipeline configuration are retained for as long
             as your workspace remains active, since accumulated mappings are the core value of
-            the Service. Stored credentials are retained until you replace or remove them, or
-            until the associated connection is deleted. Account information is retained while your
+            the Service. {native ? '' : <>Stored credentials are retained until you replace or remove them, or
+            until the associated connection is deleted. </>}Account information is retained while your
             account exists and is removed when a user is removed from the workspace, except where
             retention is required for audit or legal purposes.
           </p>

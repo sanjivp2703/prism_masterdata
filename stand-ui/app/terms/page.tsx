@@ -1,6 +1,7 @@
 // PLACEHOLDER LEGAL TEXT — have counsel review/replace before selling. Generated 2026-07-02.
 
 import { getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 /**
  * The warehouse this installation is actually configured for.
@@ -51,6 +52,7 @@ const listStyle: React.CSSProperties = {
 
 export default function TermsPage() {
   const warehouse = warehouseName();
+  const native = isNativeEdition();
   return (
     <div style={{ backgroundColor: 'var(--page-bg)', minHeight: '100vh', padding: '48px 24px' }}>
       <div style={{ maxWidth: 720, margin: '0 auto' }}>
@@ -100,14 +102,25 @@ export default function TermsPage() {
 
           <h2 style={sectionTitle}>2. Description of the service</h2>
           <p style={bodyText}>
-            Prism connects to data sources you designate — including your {warehouse} data warehouse
-            and Google Sheets — using credentials you provide, and helps you standardize
-            inconsistent text values into canonical names. Confirmed mappings are stored in a
-            lookup table within your connected {warehouse} environment and, depending on your
-            configuration, may be written back to export tables or spreadsheets you control. The
-            Service uses a third-party large language model provider — Anthropic by default, or
-            OpenAI or Google if your workspace admin configures one — to propose
-            groupings and canonical names for the data values you submit for standardization.
+            {native ? (
+              <>Prism runs entirely inside your Snowflake account as a Snowflake Native App. It
+              connects only to the tables your administrator grants it access to, and helps you
+              standardize inconsistent text values into canonical names. Confirmed mappings,
+              run state, and standardized outputs are stored within your Snowflake account.
+              Groupings and canonical names are proposed using Snowflake Cortex — AI models
+              hosted inside Snowflake — so the values being standardized are processed within
+              your Snowflake account and are not transmitted to us or to any external AI
+              provider.</>
+            ) : (
+              <>Prism connects to data sources you designate — including your {warehouse} data warehouse
+              and Google Sheets — using credentials you provide, and helps you standardize
+              inconsistent text values into canonical names. Confirmed mappings are stored in a
+              lookup table within your connected {warehouse} environment and, depending on your
+              configuration, may be written back to export tables or spreadsheets you control. The
+              Service uses a third-party large language model provider — Anthropic by default, or
+              OpenAI or Google if your workspace admin configures one — to propose
+              groupings and canonical names for the data values you submit for standardization.</>
+            )}
           </p>
 
           <h2 style={sectionTitle}>3. Customer data and credentials</h2>
@@ -117,16 +130,26 @@ export default function TermsPage() {
             process, and store Customer Data solely to provide and improve the Service for you.
           </p>
           <ul style={listStyle}>
-            <li>
-              You are responsible for the credentials you provide ({warehouse} credentials, Google
-              account authorization) and for ensuring you are authorized to connect the data
-              sources you configure.
-            </li>
-            <li>
-              Stored credentials are encrypted at rest by the application. Data values sent for
-              classification are transmitted to our subprocessors as described below; your
-              credentials are never sent to the language model provider.
-            </li>
+            {native ? (
+              <li>
+                The Service collects no connection credentials: sign-in and access control are
+                handled by Snowflake, and the application operates only with the privileges and
+                table references your administrator grants it.
+              </li>
+            ) : (
+              <>
+                <li>
+                  You are responsible for the credentials you provide ({warehouse} credentials, Google
+                  account authorization) and for ensuring you are authorized to connect the data
+                  sources you configure.
+                </li>
+                <li>
+                  Stored credentials are encrypted at rest by the application. Data values sent for
+                  classification are transmitted to our subprocessors as described below; your
+                  credentials are never sent to the language model provider.
+                </li>
+              </>
+            )}
             <li>
               You are responsible for the accuracy and lawfulness of Customer Data, including
               ensuring it does not contain data you are not permitted to process.
@@ -138,21 +161,32 @@ export default function TermsPage() {
             We use the following third-party subprocessors to provide the Service:
           </p>
           <ul style={listStyle}>
-            <li>
-              <strong>{warehouse}</strong> — your connected warehouse stores mappings, run state, and
-              pipeline configuration. Data resides in your {warehouse} account, under your
-              agreement with {warehouse}.
-            </li>
-            <li>
-              <strong>AI provider (Anthropic by default; OpenAI or Google if your
-              workspace configures one)</strong> — distinct data values (not credentials, and not full
-              source rows beyond the values being standardized) are sent to the configured
-              provider&rsquo;s API to propose groupings and canonical names.
-            </li>
-            <li>
-              <strong>Google</strong> — used for sign-in (OAuth) and, when you connect them, for
-              reading and writing Google Sheets you authorize.
-            </li>
+            {native ? (
+              <li>
+                <strong>Snowflake</strong> — the Service runs inside your Snowflake account, which
+                hosts the application, stores all data (mappings, run state, configuration), and
+                provides the AI models (Snowflake Cortex) used for classification — all under
+                your agreement with Snowflake. No other subprocessor receives your data.
+              </li>
+            ) : (
+              <>
+                <li>
+                  <strong>{warehouse}</strong> — your connected warehouse stores mappings, run state, and
+                  pipeline configuration. Data resides in your {warehouse} account, under your
+                  agreement with {warehouse}.
+                </li>
+                <li>
+                  <strong>AI provider (Anthropic by default; OpenAI or Google if your
+                  workspace configures one)</strong> — distinct data values (not credentials, and not full
+                  source rows beyond the values being standardized) are sent to the configured
+                  provider&rsquo;s API to propose groupings and canonical names.
+                </li>
+                <li>
+                  <strong>Google</strong> — used for sign-in (OAuth) and, when you connect them, for
+                  reading and writing Google Sheets you authorize.
+                </li>
+              </>
+            )}
           </ul>
           <p style={bodyText}>
             We may update this list from time to time; material changes will be reflected in these

@@ -233,3 +233,26 @@ VIEW DEFINITION + CONTROL) before the swap and flags the pipeline with the exact
 fix statement when it is absent, so a skipped onboarding step surfaces instead
 of silently losing grants. Snowflake is unaffected — `COPY GRANTS` preserves
 privileges natively and it has no column-level GRANT.
+
+## Native (Snowflake Marketplace) edition — data-flow summary (2026-08-13)
+
+The native edition inverts the standard deployment model, and its disclosures
+differ accordingly (the /terms and /privacy pages render edition-aware
+variants; the setup footer likewise):
+
+- **Nothing is stored or processed outside the customer's Snowflake account.**
+  The app runs as a Snowpark Container Services service in their account; app
+  state (SQLite) lives on a block volume in their account; all values and
+  mappings are warehouse tables in their account.
+- **No credentials are collected.** Snowflake authenticates users at the
+  ingress; the app operates via its granted privileges and table references.
+- **AI = Snowflake Cortex, in-account.** No external LLM provider, no vendor
+  key, no egress (the container has no external access integration).
+- **No Google, no SMTP, no Sentry** in this edition (all gated off).
+- What the provider (we) receive: Marketplace billing events (counts only)
+  and Snowflake's aggregate provider reporting. Never values, never metadata.
+
+Any future feature that transmits anything off-account must update the
+edition-aware /terms + /privacy variants AND pass Snowflake's security
+review disclosure requirements. Full N5 review of this document happens
+before listing (docs/NATIVE_APP_PLAN.md).

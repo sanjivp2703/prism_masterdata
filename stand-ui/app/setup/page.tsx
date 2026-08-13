@@ -2794,7 +2794,7 @@ function SetupForm() {
 
         <p className="text-xs text-center mt-4" style={{ color: 'var(--text-hint)' }}>
           {role === 'admin'
-            ? 'Prism only ever stores the low-privilege service credentials and your AI provider key, encrypted. Admin credentials are never saved.'
+            ? (isNativeEdition() ? 'This edition of Prism runs inside your Snowflake account and stores no credentials at all — access is granted through Snowflake, and AI runs on Snowflake Cortex.' : 'Prism only ever stores the low-privilege service credentials and your AI provider key, encrypted. Admin credentials are never saved.')
             : `Credentials are stored encrypted in your account and used only to connect to ${PLATFORM_LABELS[platform]} on your behalf.`}
         </p>
       </div>
