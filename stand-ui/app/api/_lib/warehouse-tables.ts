@@ -6,9 +6,17 @@
 // at all (docs/POSTGRES_PORT_PLAN.md §2.1): its install creates lowercase
 // `prism_internal.*` tables in the connected database, so shared SQL resolves
 // table names through here instead of hardcoding the 3-part form.
+// NATIVE (Marketplace) edition: inside a Native App the database is the
+// APPLICATION itself (whatever the consumer named it) and the schemas are
+// setup.sql's `internal_state` (data) + `app_code` (UDF). PRISM_INTERNAL_DB
+// carries the app database name into the container (service spec / resolved
+// at boot); when unset, references stay database-relative — correct for all
+// in-session SQL, and view bodies must resolve the app name explicitly.
 import 'server-only';
 
 import { getWarehouseAdapter } from './warehouse';
+import { isNativeEdition } from './edition';
+import { getOptionalEnv } from './env';
 
 type InternalTable =
   | 'LITERAL_ALIAS_MATCHES'
@@ -19,7 +27,14 @@ type InternalTable =
   | 'RUN_STATE'
   | 'VALIDATION_LOG';
 
+/** The app database prefix in native mode ('"MY_PRISM".' or '' when relative). */
+function nativeDbPrefix(): string {
+  const db = getOptionalEnv('PRISM_INTERNAL_DB');
+  return db ? `"${db.replace(/"/g, '""')}".` : '';
+}
+
 export function internalTable(name: InternalTable): string {
+  if (isNativeEdition()) return `${nativeDbPrefix()}internal_state.${name}`;
   const kind = getWarehouseAdapter().kind;
   // Postgres: prism_internal is a SCHEMA in the connected database.
   // MySQL: prism_internal is a DATABASE (no schema level) — same spelling,
@@ -28,4 +43,15 @@ export function internalTable(name: InternalTable): string {
     return `prism_internal.${name.toLowerCase()}`;
   }
   return `PRISM_DB.INTERNAL.${name}`;
+}
+
+/** The PRISM_NORMALIZE UDF's qualified name for SQL text. ⚠ KI-149: view
+ *  bodies resolve names against the VIEW's own schema, so generated view SQL
+ *  must use this (never a bare call) — in native mode with PRISM_INTERNAL_DB
+ *  unset, view-creating paths must resolve the app database name first.
+ *  Snowflake-family only (pg/mysql normalize app-side). The 99 hardcoded
+ *  `PRISM_DB.INTERNAL.PRISM_NORMALIZE` sites converge here (N3 sweep). */
+export function prismNormalizeFn(): string {
+  if (isNativeEdition()) return `${nativeDbPrefix()}app_code.PRISM_NORMALIZE`;
+  return `PRISM_DB.INTERNAL.PRISM_NORMALIZE`;
 }
