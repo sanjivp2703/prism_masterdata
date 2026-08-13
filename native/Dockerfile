@@ -35,11 +35,18 @@ COPY . .
 # bundle; the bare var covers server reads. PRISM_BUILD_STANDALONE turns on
 # Next's standalone output (see next.config.ts) without touching the standard
 # edition's build.
+# PRISM_SKIP_BUILD_TYPECHECK: the deploy-server pattern (see next.config.ts) —
+# the in-build tsc pass is the memory hog that OOM-kills constrained VMs
+# (Docker Desktop included). Only safe because `npx tsc --noEmit` gates every
+# image build on the operator machine first.
 ENV PRISM_EDITION=native \
     NEXT_PUBLIC_PRISM_EDITION=native \
     PRISM_BUILD_STANDALONE=true \
+    PRISM_SKIP_BUILD_TYPECHECK=true \
     NEXT_TELEMETRY_DISABLED=1
-RUN npm run build
+# Heap cap keeps the build inside constrained Docker VMs (the 2 GB droplet
+# proves this is enough once the tsc pass is skipped).
+RUN NODE_OPTIONS=--max-old-space-size=2048 npm run build
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM node:22-bookworm-slim
