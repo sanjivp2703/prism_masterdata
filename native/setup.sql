@@ -156,6 +156,7 @@ BEGIN
     IN COMPUTE POOL prism_app_pool
     FROM SPECIFICATION_FILE = '/service-spec.yaml'   -- packaged path finalized at packaging
     MIN_INSTANCES = 1 MAX_INSTANCES = 1;             -- single-node BY DESIGN (in-process poller/locks/SSE)
+  ALTER SERVICE IF EXISTS services.prism_app RESUME;  -- start = resume when suspended (stop_app pairs with this)
   GRANT SERVICE ROLE services.prism_app!ALL_ENDPOINTS_USAGE TO APPLICATION ROLE app_user;
   -- Visibility for consumer admins (and provider dev tooling): without these,
   -- SHOW ENDPOINTS/SERVICE CONTAINERS is impossible outside the app.
