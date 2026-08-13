@@ -202,7 +202,11 @@ app-state lives in a local SQLite file.*
   residency); `runs`/`pipelines` are migration 002; migration
   006 adds `pipelines.update_schedule` (backfilling old `mode` rows: manual →
   manual-only, auto → 24/7) — the legacy `mode` column physically remains but
-  is no longer read or written. Booleans are INTEGER 0/1
+  is no longer read or written; migration 016 dropped the file-pipeline
+  columns (warehouse-only pipelines — files/Sheets moved to the one-time
+  flow); 017 added terms clickwrap (`terms_accepted_version`/`_at`); 018/019
+  added the pg_*/my_* credential columns (Postgres/MySQL ports); 020 added
+  `accounts.sf_username` (native-edition SPCS identity). Booleans are INTEGER 0/1
   (`export_unmapped_rows`); JSON columns are TEXT (`runs.state`,
   `stats_snapshot`, `file_source_meta`, `file_export_meta`,
   `update_schedule`); timestamps are ISO-8601 UTC TEXT.
@@ -1097,6 +1101,7 @@ How warehouse billing actually works, and the rules it imposes on this codebase:
 | `grouping-types.ts` | Shared grouping types (`RunItemForPairing`, `FinalGroup`, …) — the only survivors of the deleted deterministic pipeline. |
 | `op-export.ts` | User-first fail-open export: reads state blob, detects Case A/B/C, runs the validation referee (spec-context prompt, extreme-confidence bar, retries; failure → proceed with user's decisions + `validation_status: 'failed'`), then **writes everything in one pass** (batched idempotent MERGEs at `EXPORT_MERGE_BATCH=5000`, deduped on `normalizeLiteral`, sets `normalized_value`), marks run `'completed'`. |
 | `op-one-time.ts` | One-time standardization engine: lookup-free LLM grouping, optional naming convention, export to a standalone table, archive to `ONE_TIME_STANDARDIZATIONS`. |
+| `file-inplace.ts` | Edit-in-place file patcher for one-time CSV/XLSX exports (pure, parity-tested): byte-span CSV tokenizer + zip-level XLSX surgery (fflate) that replaces ONLY the standardized cells, leaving every other byte of the customer's original file intact (hidden columns, styles, column order). ANY patch failure falls back to the legacy regenerated `{headers, rows}` export — never a corrupted "original". |
 | `convention-rules.ts` | Structured naming-convention rules for a column spec — prompt instructions + deterministic normalization of LLM output. Pure module shared by UI and server. |
 | `namescore.ts` | NameScore — deterministic "most representative literal" scoring, used as the fallback group namer. Derives cleaned value + token arrays from the raw literal when callers pass empties (live callers no longer carry the deleted pipeline's precomputed fields). |
 | `export-table.ts` | Rebuilds the pipeline's optional export Snowflake table/view (`CREATE OR REPLACE … COPY GRANTS AS SELECT`). Joins stored `normalized_value` vs `PRISM_NORMALIZE(source)`. Table builds are physically sorted to mirror the source when it has a PK / unique key / clustering key (`resolveSourceOrdering`); otherwise unordered — no synthetic order column. Also hosts `refreshStandardizedColumnsSnowflake` (export_kind `'column'` — guarded UPDATEs onto the source table, see Standardized-Column Output) and dispatches all kinds (incl. the mssql implementations) from `refreshExportTable`. Refuses a table/view destination equal to the source table. |
@@ -1204,6 +1209,15 @@ Sentry is wired via `instrumentation.ts` (server), `instrumentation-client.ts` (
 
 ## Deployment Model
 
+- **Production instance:** prismmasterdata.com on a DigitalOcean droplet
+  (167.99.235.20). Update with `deploy/deploy.sh <ip>` (rsync → `npm ci` →
+  build → systemd restart; see `deploy/DEPLOY.md`). The script typechecks on
+  the operator machine first and sets `PRISM_SKIP_BUILD_TYPECHECK` server-side
+  (the 2 GB droplet OOM-kills the build's TS pass). The prod env carries NO
+  warehouse or AI credentials — both are wizard-configured (workspace rows).
+  Cloudflare DNS must stay **DNS-only, never proxied** (proxying breaks SSE
+  and Caddy's TLS issuance). The Google OAuth app is published but unverified
+  (consent screen shows the warning until verification).
 - **The SQLite file (`PRISM_SQLITE_PATH`) must live on persistent storage** — losing it loses accounts, column specs, and run/pipeline metadata (never customer values: confirmed mappings, run state blobs, and the validation log are all in the customer's warehouse).
 - **One long-lived Node process per installation is REQUIRED.** The poller loops, per-pipeline locks, and the SSE broadcaster are all in-process — serverless/multi-instance deployments break them. Deploy as a single persistent `next start` (or equivalent) process.
 - **Single-tenant:** one deployment + one customer Snowflake account per company. There is no cross-tenant isolation inside the app.
