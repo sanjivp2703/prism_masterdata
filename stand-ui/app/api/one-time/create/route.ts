@@ -17,11 +17,13 @@ import {
 } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { createOneTimeRun, isSimpleIdent, parseFqn, quoteIdent, OneTimeTooLargeError } from '@/app/api/_lib/op-one-time';
+import { pgTableRef } from '@/app/api/_lib/warehouse/postgres/detection';
+import { myTableRef } from '@/app/api/_lib/warehouse/mysql/detection';
 import { sanitizeConventionRules, hasAnyRule } from '@/app/api/_lib/convention-rules';
 import { validateStandardizationRules, validateConventionValue } from '@/app/api/_lib/column-specs';
 import type { NamingConvention } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
-import { insertOneTimeFileRows, deleteOneTimeFileRows } from '@/app/api/_lib/op-one-time-file';
+import { insertOneTimeFileRows, deleteOneTimeFileRows, storeOneTimeFileBlob } from '@/app/api/_lib/op-one-time-file';
 import { google } from 'googleapis';
 import { readAllSheetRows, SheetTooLargeError } from '@/app/api/_lib/sheets-io';
 import { gridToRows } from '@/app/api/_lib/table-shape';
@@ -118,6 +120,23 @@ export async function POST(request: Request) {
         { error: 'File too large (max 200,000 rows). Load the data into a warehouse table and standardize that instead.' },
         { status: 400 },
       );
+    }
+  } else if (getWarehouseAdapter().kind === 'postgres') {
+    // Warehouse source, Postgres: 2-part (schema.table) or 3-part FQNs are
+    // valid; pgTableRef rejects cross-database references and unquotable names
+    // with its own actionable message.
+    try {
+      pgTableRef(source_relation);
+    } catch (e) {
+      return Response.json({ error: String((e as Error)?.message ?? `Invalid source table: ${source_relation}`) }, { status: 400 });
+    }
+  } else if (getWarehouseAdapter().kind === 'mysql') {
+    // Warehouse source, MySQL: FQNs ARE 2-part (database.table — no schema
+    // level); myTableRef rejects 3-part shapes and unquotable names.
+    try {
+      myTableRef(source_relation);
+    } catch (e) {
+      return Response.json({ error: String((e as Error)?.message ?? `Invalid source table: ${source_relation}`) }, { status: 400 });
     }
   } else {
     // Warehouse source: source_relation must be a real, safely-quotable FQN.
@@ -219,8 +238,38 @@ export async function POST(request: Request) {
         }
       }
 
+      // Original-file bytes for the edit-in-place round trip (CSV/XLSX
+      // uploads only — Sheets are read server-side and pasted lists have no
+      // file). Optional and best-effort: a session without a blob simply
+      // falls back to the regenerated-file export.
+      const of = (body as any)?.original_file;
+      const originalFile =
+        of && typeof of.data_b64 === 'string' && (of.kind === 'csv' || of.kind === 'xlsx')
+          ? {
+              file_name:  String(of.name ?? 'upload').slice(0, 400),
+              file_kind:  of.kind as 'csv' | 'xlsx',
+              sheet_name: of.sheet_name != null ? String(of.sheet_name).slice(0, 400) : null,
+              header_row: Math.max(0, Number(of.header_row ?? 0) || 0),
+              data_b64:   String(of.data_b64),
+            }
+          : null;
+      // Same 20 MB ceiling as the upload itself (base64 is 4/3 the bytes).
+      if (originalFile && originalFile.data_b64.length > 28 * 1024 * 1024) {
+        return Response.json({ error: 'Original file too large to keep for in-place export (max 20 MB).' }, { status: 400 });
+      }
+
       return await withWarehouse(async (conn) => {
         await insertOneTimeFileRows(conn, sessionNonce, rowsToStore);
+        if (originalFile) {
+          const { data_b64, ...meta } = originalFile;
+          try {
+            await storeOneTimeFileBlob(conn, sessionNonce, meta, data_b64);
+          } catch (blobErr) {
+            // Never fail session creation over the nice-to-have blob — the
+            // export falls back to the regenerated file.
+            console.warn('[one-time] original-file blob store failed (falling back to regenerated exports):', (blobErr as any)?.message ?? blobErr);
+          }
+        }
 
         const created: { run_id: number; column_name: string }[] = [];
         for (const c of columns) {
@@ -259,11 +308,21 @@ export async function POST(request: Request) {
     }
   }
 
-  const { db, schema, table } = parseFqn(source_relation);
   // Dialect-branched read probe through the facade's executeQuery — a raw
   // snowflake-sdk conn.execute() here broke every mssql one-time create with
   // "Failed to read the source table" (TypeError, not access-classified).
-  const probeFqn = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+  // Postgres FQNs may be 2-part (schema.table), which the strict 3-part
+  // parseFqn rejects — pgTableRef parses/validates them (incl. cross-database
+  // rejection) and quotes the reference itself.
+  let probeFqn: string;
+  if (getWarehouseAdapter().kind === 'postgres') {
+    probeFqn = pgTableRef(source_relation).ref;
+  } else if (getWarehouseAdapter().kind === 'mysql') {
+    probeFqn = myTableRef(source_relation).ref;
+  } else {
+    const { db, schema, table } = parseFqn(source_relation);
+    probeFqn = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+  }
   const probeSql = getWarehouseAdapter().kind === 'mssql'
     ? `SELECT TOP (1) 1 AS one FROM ${probeFqn}`
     : `SELECT 1 FROM ${probeFqn} LIMIT 1`;

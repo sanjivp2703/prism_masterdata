@@ -15,6 +15,8 @@
 
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { pollOneMssqlPipeline } from './pipeline-poller-mssql';
+import { pollOnePgPipeline } from './pipeline-poller-postgres';
+import { pollOneMysqlPipeline } from './pipeline-poller-mysql';
 import { getDb } from './sqlite';
 import { isPipelineStandardizing } from './pipeline-coordination';
 import { reconcilePipelineQueue } from './pipeline-hourly-processor';
@@ -1149,11 +1151,17 @@ async function pollOneTable(cols: PipelineRef[]): Promise<void> {
     const verifiedIds: number[] = [];
     // Live-table pipelines poll through the active warehouse adapter:
     // Snowflake → streams (pollOnePipeline); SQL Server → Change Tracking /
-    // tiered diff scans (pollOneMssqlPipeline). Same result contract.
-    const isMssql = getWarehouseAdapter().kind === 'mssql';
+    // tiered diff scans (pollOneMssqlPipeline); Postgres → pg_stat-gated
+    // tiered diff scans (pollOnePgPipeline); MySQL → UPDATE_TIME-gated tiered
+    // diff scans (pollOneMysqlPipeline). Same result contract.
+    const whKind = getWarehouseAdapter().kind;
     for (const col of sfCols) {
-      const res = isMssql
+      const res = whKind === 'mssql'
         ? await pollOneMssqlPipeline(col)
+        : whKind === 'postgres'
+        ? await pollOnePgPipeline(col)
+        : whKind === 'mysql'
+        ? await pollOneMysqlPipeline(col)
         : await pollOnePipeline(col, { deferStandardization: true });
       if (res.checked) verifiedIds.push(col.pipeline_id);
       if (res.needsExportRefresh && col.export_table_fqn && !exportRefreshes.has(col.export_table_fqn)) {

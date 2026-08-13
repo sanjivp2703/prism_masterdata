@@ -163,3 +163,19 @@ export function gridToRows(grid: unknown[][], headerIdx: number): GridRows {
 
   return { headers, rows, collisions: [...new Set(collisions)] };
 }
+
+/**
+ * The ORIGINAL grid indices of the rows gridToRows keeps, in output order.
+ * Exists for the edit-in-place file patcher (file-inplace.ts): stored data
+ * row i lives at grid row gridDataRowIndices(...)[i], so the two can never
+ * disagree about which physical row a value came from — the filter predicate
+ * here MUST stay identical to gridToRows's.
+ */
+export function gridDataRowIndices(grid: unknown[][], headerIdx: number): number[] {
+  const out: number[] = [];
+  for (let i = headerIdx + 1; i < grid.length; i++) {
+    const row = (grid[i] as unknown[]) ?? [];
+    if (row.some((c) => String(c ?? '').trim() !== '')) out.push(i);
+  }
+  return out;
+}

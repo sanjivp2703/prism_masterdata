@@ -60,7 +60,7 @@ export class NoUserWarehouseConfig extends Error {
 
 export interface WarehouseAdapter {
   /** Which warehouse this adapter drives. */
-  readonly kind: 'snowflake' | 'mssql';
+  readonly kind: 'snowflake' | 'mssql' | 'postgres' | 'mysql';
 
   /** Safe bind-parameter budget per statement (Snowflake ~65k → 60000;
    *  SQL Server ~2100 → 2000). Callers building IN-lists or VALUES batches
@@ -99,5 +99,7 @@ export interface WarehouseAdapter {
   errorResponse(error: unknown, fallbackPublicMessage: string): Response;
 
   /** Where the service connection's credentials come from right now. */
-  serviceConnectionSource(): 'workspace' | 'env' | 'none';
+  // 'spcs' = the native edition's ambient SPCS token (Snowflake adapter only,
+  // inside a Snowpark Container Services container — docs/NATIVE_APP_PLAN.md N2).
+  serviceConnectionSource(): 'spcs' | 'workspace' | 'env' | 'none';
 }

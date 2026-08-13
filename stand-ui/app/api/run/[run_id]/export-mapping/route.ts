@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { warehouseErrorResponse, withWarehouse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 
@@ -37,8 +38,8 @@ export async function GET(
       const mappingRows = await exec(
         connection,
         `SELECT lam.literal_value AS original_value, aan.alias_name AS standardized_value
-         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+         FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+         JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
            ON lam.alias_id = aan.alias_id
          WHERE lam.run_id = ?
          ORDER BY aan.alias_name, lam.literal_value`,

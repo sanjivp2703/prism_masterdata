@@ -24,7 +24,7 @@ import { useEffect, useState } from 'react';
  * (`getWarehouseAdapter()`), so a slow or failed fetch degrades to today's
  * behavior rather than to blank or wrong copy.
  */
-export type WarehouseKind = 'snowflake' | 'mssql';
+export type WarehouseKind = 'snowflake' | 'mssql' | 'postgres' | 'mysql';
 
 let cachedKind: WarehouseKind | null = null;
 let inFlight: Promise<WarehouseKind> | null = null;
@@ -41,7 +41,7 @@ function loadKind(): Promise<WarehouseKind> {
       // "snowflake" and caching it would pin an mssql install to the wrong
       // vendor name for the rest of the page's life, off one transient failure.
       // Return the default UNCACHED instead, so the next caller retries.
-      if (d?.kind === 'mssql' || d?.kind === 'snowflake') {
+      if (d?.kind === 'mssql' || d?.kind === 'snowflake' || d?.kind === 'postgres' || d?.kind === 'mysql') {
         cachedKind = d.kind as WarehouseKind;
         return cachedKind;
       }
@@ -66,5 +66,6 @@ export function useWarehouseKind(): WarehouseKind {
 
 /** The display name for the active warehouse — use this in user-facing copy. */
 export function useWarehouseLabel(): string {
-  return useWarehouseKind() === 'mssql' ? 'SQL Server' : 'Snowflake';
+  const kind = useWarehouseKind();
+  return kind === 'mssql' ? 'SQL Server' : kind === 'postgres' ? 'PostgreSQL' : kind === 'mysql' ? 'MySQL' : 'Snowflake';
 }

@@ -21,6 +21,7 @@ import { normalizeLiteral, sqlStringLiteral } from '../app/api/_lib/normalize';
 import { asExportKind, standardizedColumnName, assertCompanionColumnSafe } from '../app/api/_lib/export-kind';
 import { isProbablyCatastrophicRegex } from '../app/api/_lib/convention-rules';
 import { detectHeaderRow, columnLetter } from '../app/api/_lib/table-shape';
+import { asPrismEdition } from '../app/api/_lib/edition';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -168,6 +169,134 @@ check('HS_S serverless', isServerlessAzureTier('HS_S_Gen5_4'), true);
 check('GP provisioned', isServerlessAzureTier('GP_Gen5_2'), false);
 check('DTU tier', isServerlessAzureTier('S0'), false);
 check('null (on-prem)', isServerlessAzureTier(null), false);
+
+// ── PostgreSQL dialect helpers ───────────────────────────────────────────────
+import {
+  quoteIdent as pgQuote, parseFqn as pgParseFqn, assertFqnInDatabase,
+  translateBinds as pgTranslateBinds, classifyPgPollError, isPgAccessErrorShape,
+  isScaleToZeroHost,
+} from '../app/api/_lib/warehouse/postgres/dialect';
+
+console.log('postgres dialect — quoteIdent:');
+check('plain name', pgQuote('Company Name'), '"Company Name"');
+check('embedded quote doubled', pgQuote('weird"name'), '"weird""name"');
+check('control char rejected', (() => { try { pgQuote('a' + String.fromCharCode(1) + 'b'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+
+console.log('postgres dialect — parseFqn (2- and 3-part; cross-db rejection):');
+check('three parts', JSON.stringify(pgParseFqn('prism_dev.prism_internal.pipeline_queue')), JSON.stringify({ db: 'prism_dev', schema: 'prism_internal', table: 'pipeline_queue' }));
+check('two parts → null db', JSON.stringify(pgParseFqn('public.orders')), JSON.stringify({ db: null, schema: 'public', table: 'orders' }));
+check('one part rejected', (() => { try { pgParseFqn('orders'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+check('empty part rejected', (() => { try { pgParseFqn('a..b'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+check('same db passes (case-insensitive)', (() => { try { assertFqnInDatabase(pgParseFqn('Prism_Dev.public.t'), 'prism_dev'); return 'ok'; } catch { return 'threw'; } })(), 'ok');
+check('2-part passes any db', (() => { try { assertFqnInDatabase(pgParseFqn('public.t'), 'prism_dev'); return 'ok'; } catch { return 'threw'; } })(), 'ok');
+check('cross-database rejected', (() => { try { assertFqnInDatabase(pgParseFqn('other_db.public.t'), 'prism_dev'); return 'no-throw'; } catch (e) { return String((e as Error).message).includes('cannot query across databases') ? 'threw-right' : 'threw-wrong'; } })(), 'threw-right');
+
+console.log('postgres dialect — translateBinds (? -> $n, quote/comment/dollar-aware):');
+{
+  const r = pgTranslateBinds('SELECT * FROM t WHERE a = ? AND b = ?');
+  check('two binds text', r.text, 'SELECT * FROM t WHERE a = $1 AND b = $2');
+  check('two binds count', r.count, 2);
+}
+{
+  const r = pgTranslateBinds("SELECT 'lit?eral', c FROM t WHERE d = ?");
+  check('? inside string untouched', r.text, "SELECT 'lit?eral', c FROM t WHERE d = $1");
+}
+{
+  const r = pgTranslateBinds("SELECT 'it''s ?', ? FROM t");
+  check('escaped quote handled', r.text, "SELECT 'it''s ?', $1 FROM t");
+}
+{
+  const r = pgTranslateBinds('SELECT "odd?col" FROM t WHERE x = ? -- trailing ? comment');
+  check('quoted ident + line comment untouched', r.text, 'SELECT "odd?col" FROM t WHERE x = $1 -- trailing ? comment');
+}
+{
+  const r = pgTranslateBinds('/* block ? comment */ SELECT ?');
+  check('block comment untouched', r.text, '/* block ? comment */ SELECT $1');
+}
+{
+  const r = pgTranslateBinds('DO $$ BEGIN PERFORM 1 WHERE ,? > 0; END $$; SELECT ?');
+  check('dollar-quoted body untouched', r.text, 'DO $$ BEGIN PERFORM 1 WHERE ,? > 0; END $$; SELECT $1');
+}
+{
+  const r = pgTranslateBinds("SELECT $tag$has ? mark$tag$, ?");
+  check('tagged dollar quote untouched', r.text, "SELECT $tag$has ? mark$tag$, $1");
+}
+{
+  const r = pgTranslateBinds("SELECT E'esc\\'aped ?', ?");
+  check('E-string backslash escape handled', r.text, "SELECT E'esc\\'aped ?', $1");
+}
+
+console.log('postgres dialect — classifyPgPollError / isPgAccessErrorShape:');
+check('bad password → global', classifyPgPollError({ code: '28P01' }), 'global');
+check('db missing → global', classifyPgPollError({ code: '3D000' }), 'global');
+check('undefined table → table', classifyPgPollError({ code: '42P01' }), 'table');
+check('permission denied → table', classifyPgPollError({ code: '42501' }), 'table');
+check('watched column dropped → table', classifyPgPollError({ code: '42703' }), 'table');
+check('deadlock → transient', classifyPgPollError({ code: '40P01' }), 'transient');
+check('conn refused → transient', classifyPgPollError({ code: 'ECONNREFUSED' }), 'transient');
+check('unknown → transient', classifyPgPollError(new Error('weird')), 'transient');
+check('42501 is access error', isPgAccessErrorShape({ code: '42501' }), true);
+check('relation-missing message is access error', isPgAccessErrorShape(new Error('relation "public.foo" does not exist')), true);
+check('syntax error is not access error', isPgAccessErrorShape({ code: '42601', message: 'syntax error at or near' }), false);
+
+console.log('postgres dialect — isScaleToZeroHost:');
+check('neon host detected', isScaleToZeroHost('ep-cool-cloud-123.us-east-2.aws.neon.tech'), true);
+check('rds host not flagged', isScaleToZeroHost('mydb.abc.us-east-1.rds.amazonaws.com'), false);
+check('localhost not flagged', isScaleToZeroHost('localhost'), false);
+check('null not flagged', isScaleToZeroHost(null), false);
+
+// ── MySQL dialect helpers ────────────────────────────────────────────────────
+import {
+  quoteIdent as myQuote, parseFqn as myParseFqn, translateBinds as myTranslateBinds,
+  binaryCompare, classifyMysqlPollError, isMysqlAccessErrorShape,
+  isScaleToZeroHost as myScaleToZero,
+} from '../app/api/_lib/warehouse/mysql/dialect';
+
+console.log('mysql dialect — quoteIdent:');
+check('plain name', myQuote('Company Name'), '`Company Name`');
+check('embedded backtick doubled', myQuote('weird`name'), '`weird``name`');
+check('control char rejected', (() => { try { myQuote('a' + String.fromCharCode(1) + 'b'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+
+console.log('mysql dialect — parseFqn (2-part only; no schema level):');
+check('two parts', JSON.stringify(myParseFqn('prism_internal.pipeline_queue')), JSON.stringify({ db: 'prism_internal', table: 'pipeline_queue' }));
+check('three parts rejected (unconverted snowflake FQN)', (() => { try { myParseFqn('A.B.C'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+check('one part rejected', (() => { try { myParseFqn('orders'); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+
+console.log('mysql dialect — translateBinds (native ?, count-only, quote/comment-aware):');
+{
+  const r = myTranslateBinds('SELECT * FROM t WHERE a = ? AND b = ?');
+  check('text unchanged', r.text, 'SELECT * FROM t WHERE a = ? AND b = ?');
+  check('two binds counted', r.count, 2);
+}
+check('? inside string not counted', myTranslateBinds("SELECT 'lit?eral' FROM t WHERE d = ?").count, 1);
+check('backslash-escaped quote handled', myTranslateBinds("SELECT 'it\\'s ?', ? FROM t").count, 1);
+check('doubled quote handled', myTranslateBinds("SELECT 'it''s ?', ? FROM t").count, 1);
+check('backtick ident not counted', myTranslateBinds('SELECT `odd?col` FROM t WHERE x = ?').count, 1);
+check('# comment not counted', myTranslateBinds('SELECT ? # trailing ? comment').count, 1);
+check('-- comment not counted', myTranslateBinds('SELECT ? -- trailing ? comment').count, 1);
+check('block comment not counted', myTranslateBinds('/* block ? */ SELECT ?').count, 1);
+check('double-quoted string not counted', myTranslateBinds('SELECT "who?dis", ?').count, 1);
+
+console.log('mysql dialect — binaryCompare (charset coercion, not bare COLLATE):');
+check('wraps with CONVERT + utf8mb4_bin', binaryCompare('src.`carrier`'), 'CONVERT(src.`carrier` USING utf8mb4) COLLATE utf8mb4_bin');
+
+console.log('mysql dialect — classifyMysqlPollError / isMysqlAccessErrorShape:');
+check('auth failed → global', classifyMysqlPollError({ errno: 1045 }), 'global');
+check('unknown database → global', classifyMysqlPollError({ errno: 1049 }), 'global');
+check('table missing → table', classifyMysqlPollError({ errno: 1146 }), 'table');
+check('command denied → table', classifyMysqlPollError({ errno: 1142 }), 'table');
+check('watched column dropped → table', classifyMysqlPollError({ errno: 1054 }), 'table');
+check('deadlock → transient', classifyMysqlPollError({ errno: 1213 }), 'transient');
+check('conn refused → transient', classifyMysqlPollError({ code: 'ECONNREFUSED' }), 'transient');
+check('unknown → transient', classifyMysqlPollError(new Error('weird')), 'transient');
+check('1142 is access error', isMysqlAccessErrorShape({ errno: 1142 }), true);
+check("table-missing message is access error", isMysqlAccessErrorShape(new Error("Table 'x.y' doesn't exist")), true);
+check('syntax error is not access error', isMysqlAccessErrorShape({ errno: 1064, message: 'You have an error in your SQL syntax' }), false);
+
+console.log('mysql dialect — isScaleToZeroHost:');
+check('planetscale host detected', myScaleToZero('aws.connect.psdb.cloud'), true);
+check('rds host not flagged', myScaleToZero('mydb.abc.us-east-1.rds.amazonaws.com'), false);
+check('localhost not flagged', myScaleToZero('localhost'), false);
 
 console.log('export-kind — asExportKind / standardizedColumnName:');
 check('view preserved', asExportKind('view'), 'view');
@@ -740,7 +869,92 @@ console.log('\ncolumn-mode failures are diagnosed by cause:');
   check('unknown errors default to the privilege remedy', classify('something unexpected'), 'privilege');
 }
 
+// ── Edition switch (edition.ts) ──────────────────────────────────────────────
+// The native (Marketplace) edition rides on this predicate; the ABSENT flag
+// must resolve to 'standard' so the standard edition stays byte-identical
+// (docs/NATIVE_APP_PLAN.md, Phase N1).
+{
+  console.log('\nedition switch (edition.ts):');
+  check('absent → standard', asPrismEdition(undefined), 'standard');
+  check('empty → standard', asPrismEdition(''), 'standard');
+  check('junk → standard', asPrismEdition('nativ'), 'standard');
+  check("'native' recognized", asPrismEdition('native'), 'native');
+  check('case/whitespace tolerated', asPrismEdition('  Native '), 'native');
+  check("'standard' explicit", asPrismEdition('standard'), 'standard');
+
+  // edition.ts must stay importable from CLIENT components (it hides cut
+  // surfaces in the UI), so it may never grow a 'server-only' import.
+  const editionSrc = fs.readFileSync(path.join(here, '..', 'app', 'api', '_lib', 'edition.ts'), 'utf8');
+  check("edition.ts has no 'server-only' import", editionSrc.includes("'server-only'"), false);
+}
+
+// ── Edit-in-place file patching (file-inplace.ts) ────────────────────────────
+import { zipSync as fZip, unzipSync as fUnzip, strToU8 as fS2U, strFromU8 as fU2S } from 'fflate';
+import { patchCsvInPlace, patchXlsxInPlace, extractCsvGrid, extractXlsxGrid } from '../app/api/_lib/file-inplace';
+
+console.log('file-inplace — CSV patching:');
+{
+  // BOM + CRLF + quoted commas + quoted newline + blank row + title row above header.
+  const csv = '﻿Customer Export\r\n\r\nName,Carrier,City\r\n"Acme, Inc",att,"Bos\nton"\r\n\r\nBeta,VZW,Erie\r\n';
+  const out = patchCsvInPlace(csv, 2, [
+    { dataRow: 0, column: 'Carrier', value: 'AT&T' },
+    { dataRow: 1, column: 'Carrier', value: 'Verizon' },
+  ]);
+  check('quoted fields + blank rows addressed correctly', out,
+    '﻿Customer Export\r\n\r\nName,Carrier,City\r\n"Acme, Inc",AT&T,"Bos\nton"\r\n\r\nBeta,Verizon,Erie\r\n');
+  const out2 = patchCsvInPlace(csv, 2, [{ dataRow: 0, column: 'Name', value: 'Needs, quoting' }]);
+  check('replacement needing quotes gets quoted', out2.includes('"Needs, quoting",att'), true);
+  check('unrelated bytes untouched (BOM, CRLF, title, quoted newline)',
+    out2.startsWith('﻿Customer Export\r\n\r\n') && out2.includes('"Bos\nton"'), true);
+  check('unknown column throws (caller falls back)',
+    (() => { try { patchCsvInPlace(csv, 2, [{ dataRow: 0, column: 'Nope', value: 'x' }]); return 'no-throw'; } catch { return 'threw'; } })(), 'threw');
+  check('grid extraction matches parse', JSON.stringify(extractCsvGrid('a,b\n"x,y",z')[1]), JSON.stringify(['x,y', 'z']));
+}
+
+console.log('file-inplace — XLSX patching (handcrafted fixture):');
+{
+  const CT = `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>`;
+  const wbRels = `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>`;
+  const workbook = `<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Accounts" sheetId="1" r:id="rId1"/></sheets></workbook>`;
+  const shared = `<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="5" uniqueCount="5"><si><t>GUID</t></si><si><t>Name</t></si><si><t>Carrier</t></si><si><t>att</t></si><si><t>Title Row</t></si></sst>`;
+  const styles = `<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="2"><xf/><xf applyFill="1"/></cellXfs></styleSheet>`;
+  const sheet = `<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" hidden="1"/></cols><sheetData><row r="1"><c r="A1" t="s"><v>4</v></c></row><row r="3"><c r="A3" t="s"><v>0</v></c><c r="B3" t="s"><v>1</v></c><c r="C3" t="s"><v>2</v></c></row><row r="4"><c r="A4" t="str"><v>guid-1</v></c><c r="B4" t="inlineStr"><is><t>Acme &amp; Co</t></is></c><c r="C4" s="1" t="s"><v>3</v></c></row><row r="6"><c r="A6" t="str"><v>guid-2</v></c><c r="B6" t="str"><v>Beta</v></c><c r="C6" t="str"><v>VZW</v></c></row></sheetData></worksheet>`;
+  const fixture = fZip({
+    '[Content_Types].xml': fS2U(CT),
+    'xl/workbook.xml': fS2U(workbook),
+    'xl/_rels/workbook.xml.rels': fS2U(wbRels),
+    'xl/sharedStrings.xml': fS2U(shared),
+    'xl/styles.xml': fS2U(styles),
+    'xl/worksheets/sheet1.xml': fS2U(sheet),
+  });
+
+  const grid = extractXlsxGrid(fixture, 'Accounts');
+  check('fixture grid extracted (shared strings resolved)', grid[2]?.[2] === 'Carrier' && grid[3]?.[2] === 'att', true);
+
+  const patched = patchXlsxInPlace(fixture, 'Accounts', 2, [
+    { dataRow: 0, column: 'Carrier', value: 'AT&T' },
+    { dataRow: 1, column: 'Carrier', value: 'Verizon' },
+  ]);
+  const outFiles = fUnzip(patched);
+  const outSheet = fU2S(outFiles['xl/worksheets/sheet1.xml']);
+  check('cell C4 patched to style-preserving inline string',
+    outSheet.includes('<c r="C4" s="1" t="inlineStr"><is><t xml:space="preserve">AT&amp;T</t></is></c>'), true);
+  check('cell C6 patched', outSheet.includes('<c r="C6" t="inlineStr"><is><t xml:space="preserve">Verizon</t></is></c>'), true);
+  check('hidden-column definition untouched', outSheet.includes('<col min="1" max="1" hidden="1"/>'), true);
+  check('GUID cells untouched', outSheet.includes('<c r="A4" t="str"><v>guid-1</v></c>') && outSheet.includes('<c r="A6" t="str"><v>guid-2</v></c>'), true);
+  check('inline-string name cell untouched', outSheet.includes('<c r="B4" t="inlineStr"><is><t>Acme &amp; Co</t></is></c>'), true);
+  check('styles.xml byte-identical', fU2S(outFiles['xl/styles.xml']), styles);
+  check('sharedStrings byte-identical', fU2S(outFiles['xl/sharedStrings.xml']), shared);
+  const reGrid = extractXlsxGrid(patched, 'Accounts');
+  check('patched file re-extracts with new values (blank-row mapping held)', reGrid[3]?.[2] === 'AT&T' && reGrid[5]?.[2] === 'Verizon', true);
+  check('GUID column edit resolves to a real cell (no-throw)',
+    (() => { try { patchXlsxInPlace(fixture, 'Accounts', 2, [{ dataRow: 0, column: 'GUID', value: 'x' }]); return 'no-throw'; } catch { return 'threw'; } })(), 'no-throw');
+}
+
 // ── Result ───────────────────────────────────────────────────────────────────
+// KEEP THIS BLOCK LAST. It used to sit above the file-inplace section, which
+// meant every check added below it ran AFTER the exit decision — failures
+// printed but could never fail the process (found 2026-08-12).
 if (failures > 0) {
   console.error(`\n${failures} parity check(s) FAILED`);
   process.exit(1);

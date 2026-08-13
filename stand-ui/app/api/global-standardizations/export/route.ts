@@ -4,7 +4,12 @@ import { cookies } from 'next/headers';
 import { google } from 'googleapis';
 import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { parseFqn, quoteIdent, isSimpleIdent } from '@/app/api/_lib/op-one-time';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
+import { parseFqn as pgParseFqn, quoteIdent as pgQuoteIdent, assertFqnInDatabase } from '@/app/api/_lib/warehouse/postgres/dialect';
+import { getConnectedPgDatabase } from '@/app/api/_lib/warehouse/postgres/connection';
+import { parseFqn as myParseFqn, quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 
 /**
  * Validate and quote a user-supplied DB.SCHEMA.TABLE target so it can be
@@ -52,6 +57,68 @@ function buildSafeTargetFqn(rawFqn: string): { fqn: string } | { error: string }
   return { fqn: resolved.map(quoteIdent).join('.') };
 }
 
+/**
+ * Postgres variant: accepts SCHEMA.TABLE or DB.SCHEMA.TABLE (the DB part must
+ * match the connected database — Postgres cannot write across databases),
+ * folds unquoted parts to LOWERCASE (Postgres's resolution rule, the opposite
+ * of Snowflake's), and refuses Prism's internal schema.
+ */
+function buildSafeTargetFqnPg(rawFqn: string): { fqn: string } | { error: string } {
+  let parsed: { db: string | null; schema: string; table: string };
+  try {
+    parsed = pgParseFqn(rawFqn);
+    const connected = getConnectedPgDatabase();
+    if (connected) assertFqnInDatabase(parsed, connected);
+  } catch (e) {
+    const msg = String((e as Error)?.message ?? '');
+    return {
+      error: msg.includes('cannot query across databases')
+        ? msg
+        : 'Target table must be a SCHEMA.TABLE (or DB.SCHEMA.TABLE) name.',
+    };
+  }
+
+  const resolved = [parsed.schema, parsed.table].map((p) => {
+    const m = /^"(.*)"$/.exec(p);
+    return m ? m[1].replace(/""/g, '"') : p.toLowerCase();
+  });
+  if (resolved.some((p) => !isSimpleIdent(p))) {
+    return { error: 'Target table name contains unsupported characters.' };
+  }
+  // Same over-strict spirit as the Snowflake guard: nothing that reads as the
+  // internal schema is writable, regardless of quoting or case.
+  if (resolved[0].trim().toLowerCase() === 'prism_internal') {
+    return { error: 'Cannot export into the prism_internal schema.' };
+  }
+  return { fqn: resolved.map(pgQuoteIdent).join('.') };
+}
+
+/**
+ * MySQL analog of buildSafeTargetFqnPg: DATABASE.TABLE only (MySQL has no
+ * schema level), lowercase folding for unquoted parts (install convention;
+ * table-name case sensitivity is OS-dependent), backtick quoting, and refuses
+ * Prism's internal database.
+ */
+function buildSafeTargetFqnMysql(rawFqn: string): { fqn: string } | { error: string } {
+  let parsed: { db: string; table: string };
+  try {
+    parsed = myParseFqn(rawFqn);
+  } catch {
+    return { error: 'Target table must be a DATABASE.TABLE name (MySQL has no schema level).' };
+  }
+  const resolved = [parsed.db, parsed.table].map((p) => {
+    const m = /^`(.*)`$/.exec(p);
+    return m ? m[1].replace(/``/g, '`') : p.toLowerCase();
+  });
+  if (resolved.some((p) => !isSimpleIdent(p))) {
+    return { error: 'Target table name contains unsupported characters.' };
+  }
+  if (resolved[0].trim().toLowerCase() === 'prism_internal') {
+    return { error: 'Cannot export into the prism_internal database.' };
+  }
+  return { fqn: resolved.map(myQuoteIdent).join('.') };
+}
+
 function getOAuth2Client() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID!,
@@ -82,6 +149,9 @@ export async function POST(request: NextRequest) {
   if (!format || !['sheets', 'snowflake'].includes(format)) {
     return Response.json({ error: 'Invalid format. Use "sheets" or "snowflake".' }, { status: 400 });
   }
+  if (format === 'sheets' && isNativeEdition()) {
+    return nativeEditionUnavailable('Google Sheets export');
+  }
 
   // Validate rather than passing NaN straight through to a bind, which the
   // warehouse rejected with a driver error surfaced as a 500 on what is plainly
@@ -106,8 +176,8 @@ export async function POST(request: NextRequest) {
       const sfRows = await exec(
         connection,
         `SELECT aan.alias_name AS canonical_name, lam.literal_value AS raw_value
-         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+         FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+         JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
            ON lam.alias_id = aan.alias_id
          ${domainFilter}
          ORDER BY aan.alias_name, lam.literal_value`,
@@ -237,12 +307,21 @@ export async function POST(request: NextRequest) {
   // ── Warehouse table (Snowflake or SQL Server) ───────────────────────────────
   if (format === 'snowflake') {
     const isMssql = getWarehouseAdapter().kind === 'mssql';
+    const isPg    = getWarehouseAdapter().kind === 'postgres';
+    const isMy    = getWarehouseAdapter().kind === 'mysql';
     // SQL Server installs default lookup exports into EXPORTS ("PUBLIC"
-    // collides with the built-in database role there).
+    // collides with the built-in database role there). Postgres installs are
+    // single-database (no PRISM_DB) — the default is the 2-part
+    // prism_exports.<name>_lookup, lowercase per Postgres folding.
     const defaultSchema = isMssql ? 'EXPORTS' : 'PUBLIC';
-    const defaultFqn = domainName
-      ? `PRISM_DB.${defaultSchema}.${domainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
-      : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`;
+    const defaultFqn = isPg || isMy
+      // MySQL shares the pg spelling: prism_exports is a DATABASE there.
+      ? (domainName
+          ? `prism_exports.${domainName.toLowerCase().replace(/[^a-z0-9_]/g, '_')}_lookup`
+          : `prism_exports.global_canonical_mappings`)
+      : (domainName
+          ? `PRISM_DB.${defaultSchema}.${domainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+          : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`);
     const targetFqn = snowflakeTableFqn?.trim() || defaultFqn;
 
     // Never interpolate the raw string: parse, validate, and fully quote each
@@ -258,11 +337,11 @@ export async function POST(request: NextRequest) {
     // fully quote every part.
     let safeFqn: string;
     if (snowflakeTableFqn?.trim()) {
-      const built = buildSafeTargetFqn(targetFqn);
+      const built = isPg ? buildSafeTargetFqnPg(targetFqn) : isMy ? buildSafeTargetFqnMysql(targetFqn) : buildSafeTargetFqn(targetFqn);
       if ('error' in built) return Response.json({ error: built.error }, { status: 400 });
       safeFqn = built.fqn;
     } else {
-      safeFqn = targetFqn.split('.').map(quoteIdent).join('.');
+      safeFqn = targetFqn.split('.').map(isPg ? pgQuoteIdent : isMy ? myQuoteIdent : quoteIdent).join('.');
     }
 
     try {
@@ -286,8 +365,8 @@ export async function POST(request: NextRequest) {
         const exportFilter = domainId != null ? 'WHERE lam.domain_id = ?' : '';
         const exportBinds  = domainId != null ? [domainId] : [];
         const fromBody =
-          `FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+          `FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+           JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
              ON lam.alias_id = aan.alias_id
            ${exportFilter}`;
         if (isMssql) {
@@ -295,6 +374,16 @@ export async function POST(request: NextRequest) {
           // a heap insert is not a durable order; consumers sort themselves.)
           await exec(connection, `DROP TABLE IF EXISTS ${safeFqn}`);
           await exec(connection, `${selectBody}\n           INTO ${safeFqn}\n           ${fromBody}`, exportBinds);
+        } else if (isPg || isMy) {
+          // Neither Postgres nor MySQL has CREATE OR REPLACE TABLE — drop + CTAS.
+          // (CTAS honours ORDER BY for the physical write; as everywhere,
+          // consumers who need guaranteed order still sort themselves.)
+          await exec(connection, `DROP TABLE IF EXISTS ${safeFqn}`);
+          await exec(
+            connection,
+            `CREATE TABLE ${safeFqn} AS\n           ${selectBody}\n           ${fromBody}\n           ORDER BY canonical_name, raw_value`,
+            exportBinds,
+          );
         } else {
           await exec(
             connection,

@@ -12,7 +12,10 @@ import 'server-only';
 import type { WarehouseAdapter, WarehouseConnection } from './types';
 import { snowflakeAdapter } from './snowflake/connection';
 import { mssqlAdapter } from './mssql/connection';
+import { postgresAdapter } from './postgres/connection';
+import { mysqlAdapter } from './mysql/connection';
 import { getOptionalEnv } from '../env';
+import { isNativeEdition } from '../edition';
 import { getDb } from '../sqlite';
 
 export { NoUserWarehouseConfig } from './types';
@@ -40,7 +43,7 @@ function workspaceWarehouseType(): string | null {
   try {
     const r = getDb().prepare(`SELECT warehouse_type FROM workspace_config WHERE id = 1`).get() as any;
     const t = String(r?.warehouse_type ?? '').toLowerCase();
-    value = t === 'mssql' || t === 'snowflake' ? t : null;
+    value = t === 'mssql' || t === 'snowflake' || t === 'postgres' || t === 'mysql' ? t : null;
   } catch {
     value = null; // table missing / fresh install — fall through to env
   }
@@ -49,9 +52,15 @@ function workspaceWarehouseType(): string | null {
 }
 
 export function getWarehouseAdapter(): WarehouseAdapter {
+  // The Marketplace (native) edition runs inside the consumer's Snowflake
+  // account and is Snowflake-only by definition — stored/env warehouse types
+  // are ignored outright (docs/NATIVE_APP_PLAN.md §1).
+  if (isNativeEdition()) return snowflakeAdapter;
   const kind = workspaceWarehouseType()
     ?? (getOptionalEnv('PRISM_WAREHOUSE_TYPE') ?? 'snowflake').toLowerCase();
   if (kind === 'mssql') return mssqlAdapter;
+  if (kind === 'postgres') return postgresAdapter;
+  if (kind === 'mysql') return mysqlAdapter;
   return snowflakeAdapter;
 }
 
@@ -100,7 +109,8 @@ export function warehouseErrorResponse(
   return getWarehouseAdapter().errorResponse(error, fallbackPublicMessage);
 }
 
-/** Where the service connection's credentials come from right now. */
-export function serviceConnectionSource(): 'workspace' | 'env' | 'none' {
+/** Where the service connection's credentials come from right now.
+ *  'spcs' = native edition running inside SPCS (ambient token). */
+export function serviceConnectionSource(): 'spcs' | 'workspace' | 'env' | 'none' {
   return getWarehouseAdapter().serviceConnectionSource();
 }

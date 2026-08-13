@@ -164,6 +164,42 @@ because its provisioning path grants to a login rather than a role.
 No data leaves the customer's SQL Server except the same distinct-value
 prompts to the AI provider documented above.
 
+## PostgreSQL installs (port, 2026-08)
+
+Credential inventory on Postgres installs mirrors the other two:
+
+| Credential | Where stored | Encrypted | Used for |
+|---|---|---|---|
+| Workspace service role (`workspace_config.pg_*` — host, port, database, user, password, sslmode; migration 018) | SQLite | AES-256-GCM (`enc:v1:`) | Everything automatic: poller, standardization, exports (via `/setup` step 3 or `PG_*` env fallback) |
+| Personal role (`accounts.pg_*`) | SQLite | AES-256-GCM | ONLY the one-time flow's access fallback (`/api/accounts/pg-config`, member-savable) and Column-mode consent provisioning (`GRANT UPDATE` + `ADD COLUMN`, consent-gated). **There is NO Change-Tracking analog on Postgres** — detection needs no DDL and no personal-credential ladder, so that entire use category does not exist here. |
+| Warehouse platform choice (`workspace_config.warehouse_type`) | SQLite | — (not a secret) | Adapter selection; admin-only writes (`/api/accounts/warehouse-type`, `workspace-postgres`) |
+
+Scope disclosures specific to Postgres: one installation reaches ONE database
+(pg cannot query across databases — stated in the wizard); detection reads
+only built-in statistics counters plus the granted source schemas; the kill
+switch is `ALTER ROLE prism_svc NOLOGIN`. TLS: managed providers use
+`sslmode=require`/`verify-full`; the sslmode is part of the stored workspace
+config. No data leaves the customer's Postgres except the same distinct-value
+prompts to the AI provider documented above.
+
+## MySQL installs (port, 2026-08)
+
+Credential inventory on MySQL installs mirrors the others:
+
+| Credential | Where stored | Encrypted | Used for |
+|---|---|---|---|
+| Workspace service account (`workspace_config.my_*` — host, port, database, user, password, ssl; migration 019) | SQLite | AES-256-GCM (`enc:v1:`) | Everything automatic: poller, standardization, exports (via `/setup` step 3 or `MYSQL_*` env fallback) |
+| Personal account (`accounts.my_*`) | SQLite | AES-256-GCM | ONLY the one-time flow's access fallback (`/api/accounts/mysql-config`, member-savable) and Column-mode consent provisioning (`GRANT UPDATE` + `ADD COLUMN`, consent-gated). No Change-Tracking analog exists on MySQL — that use category does not apply. |
+| Warehouse platform choice (`workspace_config.warehouse_type`) | SQLite | — (not a secret) | Adapter selection; admin-only writes (`/api/accounts/warehouse-type`, `workspace-mysql`) |
+
+Scope disclosures specific to MySQL: the service account reaches any DATABASE
+it is granted (cross-database joins work — per-database `GRANT SELECT ON
+<db>.*`); detection reads only InnoDB last-write metadata plus the granted
+sources; no binlog/replication access is ever requested; kill switch is
+`ALTER USER 'prism_svc'@'%' ACCOUNT LOCK`. TLS setting is part of the stored
+workspace config. No data leaves the customer's MySQL except the same
+distinct-value prompts to the AI provider documented above.
+
 
 ---
 

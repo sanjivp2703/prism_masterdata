@@ -31,6 +31,18 @@ import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
 import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
+import {
+  diffScan as pgDiffScan,
+  DIFF_SCAN_MAX_DISTINCT as PG_DIFF_SCAN_MAX_DISTINCT,
+  pgTableRef,
+} from './warehouse/postgres/detection';
+import { quoteIdent as pgQuoteIdent } from './warehouse/postgres/dialect';
+import {
+  diffScan as myDiffScan,
+  DIFF_SCAN_MAX_DISTINCT as MY_DIFF_SCAN_MAX_DISTINCT,
+  myTableRef,
+} from './warehouse/mysql/detection';
+import { quoteIdent as myQuoteIdent, binaryCompare } from './warehouse/mysql/dialect';
 import { readOneTimeDistinctValues } from './op-one-time-file';
 
 // ---------------------------------------------------------------------------
@@ -191,12 +203,23 @@ export async function createOneTimeRun(connection: any, args: CreateOneTimeRunAr
   // unquoted three-part name, so it needs the parts too.
   let parts: { db: string; schema: string; table: string } = { db: '', schema: '', table: '' };
   if (!isFileSession) {
-    parts = parseFqn(source_relation);
-    if (![parts.db, parts.schema, parts.table, column_name].every(isSimpleIdent)) {
-      throw new Error('Table or column name contains unsupported characters.');
+    if (getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
+      // Postgres FQNs may be 2-part (schema.table) and MySQL FQNs ARE 2-part
+      // (database.table — no schema level) — the strict 3-part parse below
+      // would reject them. pgTableRef/myTableRef inside each scan parse,
+      // validate and quote the table name themselves; only the column name
+      // needs the character check here.
+      if (!isSimpleIdent(column_name)) {
+        throw new Error('Table or column name contains unsupported characters.');
+      }
+    } else {
+      parts = parseFqn(source_relation);
+      if (![parts.db, parts.schema, parts.table, column_name].every(isSimpleIdent)) {
+        throw new Error('Table or column name contains unsupported characters.');
+      }
+      tableRef = `${quoteIdent(parts.db)}.${quoteIdent(parts.schema)}.${quoteIdent(parts.table)}`;
+      colRef   = quoteIdent(column_name);
     }
-    tableRef = `${quoteIdent(parts.db)}.${quoteIdent(parts.schema)}.${quoteIdent(parts.table)}`;
-    colRef   = quoteIdent(column_name);
   }
 
   // Dedupe by the normalized form (a representative original kept via ANY_VALUE)
@@ -213,6 +236,20 @@ export async function createOneTimeRun(connection: any, args: CreateOneTimeRunAr
   } else if (getWarehouseAdapter().kind === 'mssql') {
     const scan = await diffScan(connection, `${parts.db}.${parts.schema}.${parts.table}`, column_name);
     if (scan.truncated) throw new OneTimeTooLargeError(column_name, DIFF_SCAN_MAX_DISTINCT + 1);
+    valueRows = scan.values.map(v => ({ literal_value: v.literal_value, source_frequency: v.frequency }));
+  } else if (getWarehouseAdapter().kind === 'postgres') {
+    // Same shape as the mssql branch: the pg diff scan dedupes app-side on
+    // normalizeLiteral (no SQL normalize on this warehouse either), and its
+    // 20k cap equals ONE_TIME_MAX_DISTINCT, so truncation ⇒ over the cap.
+    const scan = await pgDiffScan(connection, source_relation, column_name);
+    if (scan.truncated) throw new OneTimeTooLargeError(column_name, PG_DIFF_SCAN_MAX_DISTINCT + 1);
+    valueRows = scan.values.map(v => ({ literal_value: v.literal_value, source_frequency: v.frequency }));
+  } else if (getWarehouseAdapter().kind === 'mysql') {
+    // Same shape again: the mysql diff scan dedupes app-side (binaryCompare
+    // grouping — byte-distinct even on legacy-charset columns) and shares the
+    // 20k cap, so truncation ⇒ over the cap.
+    const scan = await myDiffScan(connection, source_relation, column_name);
+    if (scan.truncated) throw new OneTimeTooLargeError(column_name, MY_DIFF_SCAN_MAX_DISTINCT + 1);
     valueRows = scan.values.map(v => ({ literal_value: v.literal_value, source_frequency: v.frequency }));
   } else {
     valueRows = await exec(
@@ -408,6 +445,18 @@ export interface ExportOneTimeArgs {
 export async function exportOneTimeToSnowflake(connection: any, args: ExportOneTimeArgs): Promise<{ rows_written: number }> {
   const { source_relation, target_fqn, mode, columns, nonce } = args;
 
+  // Postgres branches at the top: its FQNs may be 2-part, and the
+  // INFORMATION_SCHEMA discovery below addresses another database (invalid on
+  // pg, which cannot query across databases).
+  if (getWarehouseAdapter().kind === 'postgres') {
+    return await exportOneTimeToPgTarget(connection, args);
+  }
+  // MySQL too: its FQNs ARE 2-part (database.table — no schema level), so the
+  // strict 3-part parse below would reject every valid mysql name.
+  if (getWarehouseAdapter().kind === 'mysql') {
+    return await exportOneTimeToMysqlTarget(connection, args);
+  }
+
   const src = parseFqn(source_relation);
   const tgt = parseFqn(target_fqn);
   for (const p of [src.db, src.schema, src.table, tgt.db, tgt.schema, tgt.table]) {
@@ -543,6 +592,334 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
+  }
+}
+
+// ── PostgreSQL one-time export (port Phase P3) ───────────────────────────────
+// Same raw-keyed mapping-table design as the mssql writer below: no SQL-side
+// normalize exists on this warehouse, so each watched column's distinct raw
+// values are read under COLLATE "C" (byte-distinct variants each keep their own
+// row), normalized app-side, resolved from the run's mappings, and joined on
+// raw equality. Same fall-through semantics: unmapped/NULL values keep their
+// raw value.
+async function exportOneTimeToPgTarget(
+  connection: any,
+  args: ExportOneTimeArgs,
+): Promise<{ rows_written: number }> {
+  const { source_relation, target_fqn, mode, columns, nonce } = args;
+
+  // pgTableRef parses 2- or 3-part FQNs, rejects cross-database references and
+  // control characters (via quoteIdent); the column/nonce checks mirror the
+  // other writers.
+  const src = pgTableRef(source_relation);
+  const tgt = pgTableRef(target_fqn);
+  for (const c of columns) {
+    if (!isSimpleIdent(c.column_name)) throw new Error('Column name contains unsupported characters.');
+  }
+  if (!isSimpleIdent(nonce)) throw new Error('Invalid session identifier.');
+  const sourceRef = src.ref;
+  const targetRef = tgt.ref;
+
+  // ── Discover source columns (export mirrors source column names/order) ─────
+  const colRows = await exec(
+    connection,
+    `SELECT column_name AS col
+     FROM information_schema.columns
+     WHERE table_schema = ? AND table_name = ?
+     ORDER BY ordinal_position`,
+    [src.schema, src.table],
+  );
+  if (!colRows.length) {
+    throw new Error(`No columns found for ${source_relation}. Verify it exists and the service role has USAGE on its schema.`);
+  }
+  const sourceCols = colRows.map((r: any) => String(r.col ?? ''));
+  const sourceColsUpper = new Set(sourceCols.map((c) => c.toUpperCase()));
+  const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
+
+  const mapTable = `prism_internal.${pgQuoteIdent(`ots_map_${nonce}`)}`;
+  const stageTable = `prism_internal.${pgQuoteIdent(`ots_stage_${nonce}`)}`;
+
+  try {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
+    await exec(
+      connection,
+      `CREATE TABLE ${mapTable} (
+         column_name        VARCHAR(200) COLLATE "C" NOT NULL,
+         raw_value          VARCHAR(800) COLLATE "C" NOT NULL,
+         standardized_value VARCHAR(800) NOT NULL,
+         PRIMARY KEY (column_name, raw_value)
+       )`,
+    );
+
+    for (const w of watched) {
+      const stdByNorm = new Map<string, string>();
+      for (const m of w.mappings) {
+        if (m.raw != null && m.standardized != null && m.standardized !== '') {
+          stdByNorm.set(normalizeLiteral(m.raw), m.standardized);
+        }
+      }
+      if (stdByNorm.size === 0) continue;
+
+      const colRef = pgQuoteIdent(w.column_name);
+      // COLLATE "C" on the DISTINCT is load-bearing for the same reason as the
+      // mssql BIN2 (KI-82 there): the join below compares byte-exact, so the
+      // distinct pass must keep byte-distinct variants distinct too — a
+      // nondeterministic database collation would otherwise collapse them to
+      // one representative and every other spelling would export raw.
+      const distinctRows = await exec(
+        connection,
+        `SELECT DISTINCT ${colRef} COLLATE "C" AS v FROM ${sourceRef} WHERE ${colRef} IS NOT NULL`,
+      );
+      const stagingRows: Array<[string, string, string]> = [];
+      const seenRaw = new Set<string>();
+      for (const r of distinctRows) {
+        const raw = String((r as any).v);
+        if (raw.length > 800 || seenRaw.has(raw)) continue;
+        const std = stdByNorm.get(normalizeLiteral(raw));
+        if (std == null) continue;
+        seenRaw.add(raw);
+        stagingRows.push([w.column_name, raw, std]);
+      }
+      const BATCH = 5_000; // 3 binds/row → 15k, well inside pg's ~65k ceiling
+      for (let i = 0; i < stagingRows.length; i += BATCH) {
+        const slice = stagingRows.slice(i, i + BATCH);
+        const valuesSql = slice.map(() => '(?, ?, ?)').join(', ');
+        await exec(
+          connection,
+          `INSERT INTO ${mapTable} (column_name, raw_value, standardized_value) VALUES ${valuesSql}`,
+          slice.flat(),
+        );
+      }
+    }
+
+    const replaceMap = new Map<string, string>();
+    const joinClauses: string[] = [];
+    watched.forEach((w, i) => {
+      const alias = `m_${i}`;
+      const literal = `'${w.column_name}'`; // isSimpleIdent-validated upstream
+      replaceMap.set(
+        w.column_name.toUpperCase(),
+        // No collation overrides needed on the COALESCE arms: the staging
+        // columns carry the explicit collation; the result is just selected.
+        `COALESCE(${alias}.standardized_value, src.${pgQuoteIdent(w.column_name)}::text) AS ${pgQuoteIdent(w.column_name)}`,
+      );
+      joinClauses.push(
+        `LEFT JOIN ${mapTable} ${alias}
+           ON ${alias}.column_name = ${literal}
+          AND ${alias}.raw_value = src.${pgQuoteIdent(w.column_name)} COLLATE "C"`,
+      );
+    });
+
+    const selectList = sourceCols
+      .map((c) => replaceMap.get(c.toUpperCase()) ?? `src.${pgQuoteIdent(c)}`)
+      .join(',\n      ');
+    const selectSQL =
+      `SELECT\n         ${selectList}\n       FROM ${sourceRef} src\n       ${joinClauses.join('\n       ')}`;
+
+    if (mode === 'overwrite') {
+      const existsRows = await exec(connection, `SELECT to_regclass(?) AS oid`, [targetRef]);
+      if ((existsRows[0] as any)?.oid != null) {
+        // Preserve the target's identity/permissions: stage the result, then
+        // DELETE + INSERT inside one transaction (needs only DELETE/INSERT on
+        // the target — the same privilege bar as the other writers). The
+        // transaction is what guarantees a mid-write failure never leaves the
+        // target emptied — Postgres DDL/DML is fully transactional.
+        await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`);
+        await exec(connection, `CREATE TABLE ${stageTable} AS ${selectSQL}`);
+        await exec(connection, `BEGIN`);
+        try {
+          await exec(connection, `DELETE FROM ${targetRef}`);
+          await exec(connection, `INSERT INTO ${targetRef} SELECT * FROM ${stageTable}`);
+          await exec(connection, `COMMIT`);
+        } catch (err) {
+          await exec(connection, `ROLLBACK`).catch(() => {});
+          throw err;
+        }
+      } else {
+        await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
+      }
+    } else {
+      // 'create' must FAIL on an existing table (that is what distinguishes it
+      // from overwrite) — plain CREATE TABLE does exactly that.
+      await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
+    }
+
+    const cntRows = await exec(connection, `SELECT COUNT(*) AS cnt FROM ${targetRef}`);
+    const rows_written = Number((cntRows[0] as any)?.cnt ?? 0);
+    console.log(
+      `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
+      `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
+    );
+    return { rows_written };
+  } finally {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
+    await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`).catch(() => {});
+  }
+}
+
+// ── MySQL one-time export (port Phase M3) ────────────────────────────────────
+// Mirrors the pg writer: raw-keyed map table (utf8mb4_bin — byte-exact),
+// app-side normalization, per-column LEFT JOINs, CTAS create / staged
+// transactional DELETE+INSERT overwrite. MySQL specifics: 2-part FQNs
+// (database.table), binaryCompare on the source side of every byte-exact
+// join/distinct (legacy-charset columns cannot take a bare COLLATE — M1
+// live-proven), CONVERT on both COALESCE arms (mixing utf8mb4_bin with a
+// source column's collation raises "illegal mix of collations"), and NO
+// primary key on the map table — a (200+800)-char utf8mb4 composite key
+// exceeds InnoDB's 3072-byte limit, so dedup stays app-side (seenRaw) with a
+// prefix KEY for join speed.
+async function exportOneTimeToMysqlTarget(
+  connection: any,
+  args: ExportOneTimeArgs,
+): Promise<{ rows_written: number }> {
+  const { source_relation, target_fqn, mode, columns, nonce } = args;
+
+  const src = myTableRef(source_relation);
+  const tgt = myTableRef(target_fqn);
+  for (const c of columns) {
+    if (!isSimpleIdent(c.column_name)) throw new Error('Column name contains unsupported characters.');
+  }
+  if (!isSimpleIdent(nonce)) throw new Error('Invalid session identifier.');
+  const sourceRef = src.ref;
+  const targetRef = tgt.ref;
+
+  // ── Discover source columns (export mirrors source column names/order) ─────
+  const colRows = await exec(
+    connection,
+    `SELECT column_name AS col
+     FROM information_schema.columns
+     WHERE table_schema = ? AND table_name = ?
+     ORDER BY ordinal_position`,
+    [src.db, src.table],
+  );
+  if (!colRows.length) {
+    throw new Error(`No columns found for ${source_relation}. Verify it exists and the service account can read its database.`);
+  }
+  const sourceCols = colRows.map((r: any) => String(r.col ?? ''));
+  const sourceColsUpper = new Set(sourceCols.map((c) => c.toUpperCase()));
+  const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
+
+  const mapTable = `prism_internal.${myQuoteIdent(`ots_map_${nonce}`)}`;
+  const stageTable = `prism_internal.${myQuoteIdent(`ots_stage_${nonce}`)}`;
+
+  try {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
+    await exec(
+      connection,
+      `CREATE TABLE ${mapTable} (
+         column_name        VARCHAR(200) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+         raw_value          VARCHAR(800) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+         standardized_value VARCHAR(800) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+         KEY ix_map (column_name, raw_value(191))
+       ) ENGINE=InnoDB`,
+    );
+
+    for (const w of watched) {
+      const stdByNorm = new Map<string, string>();
+      for (const m of w.mappings) {
+        if (m.raw != null && m.standardized != null && m.standardized !== '') {
+          stdByNorm.set(normalizeLiteral(m.raw), m.standardized);
+        }
+      }
+      if (stdByNorm.size === 0) continue;
+
+      const colRef = myQuoteIdent(w.column_name);
+      // binaryCompare on the DISTINCT is load-bearing for the same reason as
+      // the mssql BIN2 / pg COLLATE "C" reads: the join below compares
+      // byte-exact, so the distinct pass must keep byte-distinct variants
+      // distinct too.
+      const distinctRows = await exec(
+        connection,
+        `SELECT DISTINCT ${binaryCompare(colRef)} AS v FROM ${sourceRef} WHERE ${colRef} IS NOT NULL`,
+      );
+      const stagingRows: Array<[string, string, string]> = [];
+      const seenRaw = new Set<string>();
+      for (const r of distinctRows) {
+        const raw = String((r as any).v);
+        if (raw.length > 800 || seenRaw.has(raw)) continue;
+        const std = stdByNorm.get(normalizeLiteral(raw));
+        if (std == null) continue;
+        seenRaw.add(raw);
+        stagingRows.push([w.column_name, raw, std]);
+      }
+      const BATCH = 5_000;
+      for (let i = 0; i < stagingRows.length; i += BATCH) {
+        const slice = stagingRows.slice(i, i + BATCH);
+        const valuesSql = slice.map(() => '(?, ?, ?)').join(', ');
+        await exec(
+          connection,
+          `INSERT INTO ${mapTable} (column_name, raw_value, standardized_value) VALUES ${valuesSql}`,
+          slice.flat(),
+        );
+      }
+    }
+
+    const replaceMap = new Map<string, string>();
+    const joinClauses: string[] = [];
+    watched.forEach((w, i) => {
+      const alias = `m_${i}`;
+      const literal = `'${w.column_name}'`; // isSimpleIdent-validated upstream
+      const colRef = myQuoteIdent(w.column_name);
+      replaceMap.set(
+        w.column_name.toUpperCase(),
+        // CONVERT on BOTH arms: the staging column is utf8mb4_bin and the
+        // source column carries its own collation — COALESCE across them
+        // raises "illegal mix of collations" without the normalization.
+        `COALESCE(CONVERT(${alias}.standardized_value USING utf8mb4), CONVERT(src.${colRef} USING utf8mb4)) AS ${colRef}`,
+      );
+      joinClauses.push(
+        `LEFT JOIN ${mapTable} ${alias}
+           ON ${alias}.column_name = ${literal}
+          AND ${alias}.raw_value = ${binaryCompare(`src.${colRef}`)}`,
+      );
+    });
+
+    const selectList = sourceCols
+      .map((c) => replaceMap.get(c.toUpperCase()) ?? `src.${myQuoteIdent(c)}`)
+      .join(',\n      ');
+    const selectSQL =
+      `SELECT\n         ${selectList}\n       FROM ${sourceRef} src\n       ${joinClauses.join('\n       ')}`;
+
+    if (mode === 'overwrite') {
+      const existsRows = await exec(
+        connection,
+        `SELECT COUNT(*) AS c FROM information_schema.tables WHERE table_schema = ? AND table_name = ?`,
+        [tgt.db, tgt.table],
+      );
+      if (Number((existsRows[0] as any)?.c ?? 0) > 0) {
+        // Preserve the target's identity/permissions: stage the result (DDL —
+        // auto-commits, deliberately OUTSIDE the transaction), then DELETE +
+        // INSERT inside one InnoDB transaction so a mid-write failure never
+        // leaves the target emptied.
+        await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`);
+        await exec(connection, `CREATE TABLE ${stageTable} AS ${selectSQL}`);
+        await exec(connection, `BEGIN`);
+        try {
+          await exec(connection, `DELETE FROM ${targetRef}`);
+          await exec(connection, `INSERT INTO ${targetRef} SELECT * FROM ${stageTable}`);
+          await exec(connection, `COMMIT`);
+        } catch (err) {
+          await exec(connection, `ROLLBACK`).catch(() => {});
+          throw err;
+        }
+      } else {
+        await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
+      }
+    } else {
+      // 'create' must FAIL on an existing table — plain CREATE TABLE does.
+      await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
+    }
+
+    const cntRows = await exec(connection, `SELECT COUNT(*) AS cnt FROM ${targetRef}`);
+    const rows_written = Number((cntRows[0] as any)?.cnt ?? 0);
+    console.log(
+      `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
+      `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
+    );
+    return { rows_written };
+  } finally {
+    await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
+    await exec(connection, `DROP TABLE IF EXISTS ${stageTable}`).catch(() => {});
   }
 }
 

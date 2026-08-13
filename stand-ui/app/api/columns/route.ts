@@ -16,6 +16,9 @@
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getPrimaryKeyColumns, isCtEnabled } from '@/app/api/_lib/warehouse/mssql/detection';
+import { parseFqn as pgParseFqn, assertFqnInDatabase } from '@/app/api/_lib/warehouse/postgres/dialect';
+import { getConnectedPgDatabase } from '@/app/api/_lib/warehouse/postgres/connection';
+import { parseFqn as myParseFqn } from '@/app/api/_lib/warehouse/mysql/dialect';
 
 // This response depends on which account/connection is calling — never let
 // the browser (or an intermediary) reuse a cached response across accounts.
@@ -26,13 +29,36 @@ function json(body: any, status = 200) {
 }
 
 async function fetchColumns(conn: any, db: string, schema: string, table: string) {
-  const rows = await exec(conn,
-    `SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
-     FROM ${db}.INFORMATION_SCHEMA.COLUMNS
-     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-     ORDER BY ORDINAL_POSITION`,
-    [schema, table],
-  );
+  // Postgres: a connection is bound to one database, so information_schema is
+  // referenced bare (the db part was already validated against the connected
+  // database by the caller). data_type comes back lowercase ('character
+  // varying') — uppercased below for the shared type sets.
+  const rows = getWarehouseAdapter().kind === 'postgres'
+    ? await exec(conn,
+        `SELECT column_name, ordinal_position, data_type
+         FROM information_schema.columns
+         WHERE table_schema = ? AND table_name = ?
+         ORDER BY ordinal_position`,
+        [schema, table],
+      )
+    : getWarehouseAdapter().kind === 'mysql'
+    // MySQL: database IS the schema level (information_schema.table_schema
+    // holds the database name; the `schema` argument carries it — see the
+    // 2-part parse below).
+    ? await exec(conn,
+        `SELECT column_name, ordinal_position, data_type
+         FROM information_schema.columns
+         WHERE table_schema = ? AND table_name = ?
+         ORDER BY ordinal_position`,
+        [schema, table],
+      )
+    : await exec(conn,
+        `SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
+         FROM ${db}.INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+         ORDER BY ORDINAL_POSITION`,
+        [schema, table],
+      );
   // `columns` (name → ordinal) is kept for existing callers; `fields` carries
   // the type info the pipeline-creation column picker needs. Snowflake reports
   // VARCHAR/CHAR/STRING all as 'TEXT'; SQL Server reports the concrete type
@@ -52,15 +78,31 @@ async function fetchColumns(conn: any, db: string, schema: string, table: string
   // failure.
   const MSSQL_TEXT = new Set(['VARCHAR', 'NVARCHAR', 'CHAR', 'NCHAR']);
   const MSSQL_UNSUPPORTED_TEXT = new Set(['TEXT', 'NTEXT']);
+  const PG_TEXT = new Set(['TEXT', 'CHARACTER VARYING', 'VARCHAR', 'CHARACTER', 'CHAR', 'BPCHAR', 'CITEXT']);
+  // ENUM included deliberately (it holds exactly the categorical strings Prism
+  // standardizes); SET excluded (comma-joined multi-values are not one value).
+  const MYSQL_TEXT = new Set(['CHAR', 'VARCHAR', 'TEXT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM']);
   const isTextType = (t: string) =>
-    getWarehouseAdapter().kind === 'mssql' ? MSSQL_TEXT.has(t) : t === 'TEXT';
+    getWarehouseAdapter().kind === 'mssql' ? MSSQL_TEXT.has(t)
+    : getWarehouseAdapter().kind === 'postgres' ? PG_TEXT.has(t)
+    : getWarehouseAdapter().kind === 'mysql' ? MYSQL_TEXT.has(t)
+    : t === 'TEXT';
   // Object.create(null) — keyed by column names read from the customer's
   // catalog. A source column literally named __proto__ is legal in both
   // warehouses and would otherwise be silently dropped from the picker.
   const columns: Record<string, number> = Object.create(null);
   const fields: { name: string; type: string; isText: boolean; unsupportedReason?: string }[] = [];
   for (const row of rows) {
-    const name = String(row.COLUMN_NAME ?? row.column_name ?? '').toUpperCase();
+    // Postgres preserves the column name AS-WRITTEN (typically lowercase), and
+    // that exact string is later re-quoted as an identifier by every scan and
+    // export — upper-casing it here would make `"CARRIER"` out of a column
+    // physically named `carrier` and break every downstream reference. The
+    // other warehouses fold/compare case-insensitively, so their uppercase
+    // normalization is safe (and long-standing).
+    const rawName = String(row.COLUMN_NAME ?? row.column_name ?? '');
+    const name = getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql'
+      ? rawName
+      : rawName.toUpperCase();
     const pos  = Number(row.ORDINAL_POSITION ?? row.ordinal_position ?? 0);
     const type = String(row.DATA_TYPE ?? row.data_type ?? '').toUpperCase();
     if (name) {
@@ -109,14 +151,58 @@ export async function GET(request: Request) {
     return json({ error: 'table_fqn is required' }, 400);
   }
 
-  const parts = table_fqn.split('.');
-  if (parts.length !== 3) {
-    return json({ error: 'table_fqn must be DATABASE.SCHEMA.TABLE' }, 400);
-  }
-
-  const [db, schema, table] = parts.map(p => p.trim().replace(/^"|"$/g, '').toUpperCase());
-
   const isMssql = getWarehouseAdapter().kind === 'mssql';
+  const isPg    = getWarehouseAdapter().kind === 'postgres';
+  const isMy    = getWarehouseAdapter().kind === 'mysql';
+
+  let db: string, schema: string, table: string;
+  if (isPg) {
+    // Postgres: SCHEMA.TABLE or DB.SCHEMA.TABLE (the db part must be the
+    // connected database — cross-database queries are impossible). Unquoted
+    // identifiers fold to LOWERCASE, the opposite of the other warehouses.
+    try {
+      const parsed = pgParseFqn(table_fqn);
+      const connected = getConnectedPgDatabase();
+      if (connected) assertFqnInDatabase(parsed, connected);
+      const fold = (p: string) => {
+        const m = /^"(.*)"$/.exec(p.trim());
+        return m ? m[1].replace(/""/g, '"') : p.trim().toLowerCase();
+      };
+      db     = parsed.db != null ? fold(parsed.db) : (getConnectedPgDatabase() ?? '');
+      schema = fold(parsed.schema);
+      table  = fold(parsed.table);
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? '');
+      return json({
+        error: msg.includes('cannot query across databases')
+          ? msg
+          : 'table_fqn must be SCHEMA.TABLE (or DATABASE.SCHEMA.TABLE)',
+      }, 400);
+    }
+  } else if (isMy) {
+    // MySQL: DATABASE.TABLE (no schema level). The database name doubles as
+    // information_schema's table_schema, so it rides in the `schema` slot for
+    // fetchColumns. Unquoted names fold to lowercase (install convention;
+    // table-name case sensitivity is OS-dependent on MySQL).
+    try {
+      const parsed = myParseFqn(table_fqn);
+      const fold = (p: string) => {
+        const m = /^`(.*)`$/.exec(p.trim());
+        return m ? m[1].replace(/``/g, '`') : p.trim().toLowerCase();
+      };
+      db     = fold(parsed.db);
+      schema = fold(parsed.db);
+      table  = fold(parsed.table);
+    } catch {
+      return json({ error: 'table_fqn must be DATABASE.TABLE (MySQL has no schema level)' }, 400);
+    }
+  } else {
+    const parts = table_fqn.split('.');
+    if (parts.length !== 3) {
+      return json({ error: 'table_fqn must be DATABASE.SCHEMA.TABLE' }, 400);
+    }
+    [db, schema, table] = parts.map(p => p.trim().replace(/^"|"$/g, '').toUpperCase());
+  }
 
   try {
     // 1. Service connection (covers everything granted to PRISM_SERVICE).

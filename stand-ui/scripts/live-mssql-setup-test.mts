@@ -26,7 +26,8 @@ const { encryptSecret } = await import('../app/api/_lib/crypto');
 const { getWarehouseAdapter, invalidateWarehouseTypeCache, withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery: exec } = await import('../app/api/_lib/warehouse');
 const { invalidateWorkspaceMsConfig, mssqlServiceConnectionSource } = await import('../app/api/_lib/warehouse/mssql/connection');
 const { exportOneTimeToSnowflake } = await import('../app/api/_lib/op-one-time');
-const { insertFileRows, readFileDistinctValues, mssqlFileColumnMetrics } = await import('../app/api/_lib/op-file-pipeline');
+const { insertOneTimeFileRows, readOneTimeDistinctValues, deleteOneTimeFileRows } = await import('../app/api/_lib/op-one-time-file');
+const { normalizeLiteral } = await import('../app/api/_lib/normalize');
 
 let failures = 0;
 function check(name: string, ok: boolean, detail?: unknown): void {
@@ -102,26 +103,25 @@ await withWarehouse(async (conn) => {
   await exec(conn, `DROP TABLE IF EXISTS TEST_DB.dbo.OT_TARGET`);
 });
 
-// ── File pipelines (JSON rows) ────────────────────────────────────────────────
-console.log('File pipelines:');
-db.prepare(
-  `INSERT INTO pipelines (pipeline_id, table_fqn, column_name, domain_id, name, status, update_schedule, source_type)
-   VALUES (9201, 'FILE:setup-test', 'Carrier', 1, 'file-test', 'active', '{"type":"manual"}', 'csv')`,
-).run();
+// ── One-time file rows (JSON rows) ────────────────────────────────────────────
+// File PIPELINES were removed on the warehouse-only-pipelines branch — files
+// and Google Sheets are one-time sources now. Same coverage intent (JSON row
+// insert + normalized-dedup distinct read), against ONE_TIME_FILE_ROWS.
+console.log('One-time file rows:');
 await withWarehouse(async (conn) => {
-  await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_FILE_ROWS WHERE pipeline_id = ?`, [9201]);
-  await insertFileRows(conn, 9201, [
+  const nonce = 'setup-test-nonce';
+  await deleteOneTimeFileRows(conn, nonce);
+  await insertOneTimeFileRows(conn, nonce, [
     { Carrier: 'ATT', Company: "O'Brien & Sons" },
     { Carrier: 'AT&T', Company: 'Acme' },
     { Carrier: 'T Mobile', Company: 'Beta LLC' },
     { Carrier: 'att', Company: 'Gamma' },
   ]);
-  const distinct = await readFileDistinctValues(conn, 9201, 'Carrier');
-  check('file rows insert + distinct read (normalized dedup: att≡ATT)', distinct.length === 3, distinct);
-
-  const metrics = await mssqlFileColumnMetrics(conn, 9201, 'Carrier', 1);
-  check('file metrics computed (nothing mapped yet)', metrics.total === 3 && metrics.mapped === 0, metrics);
-  await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_FILE_ROWS WHERE pipeline_id = ?`, [9201]);
+  const distinct = await readOneTimeDistinctValues(conn, nonce, 'Carrier');
+  check('one-time file rows insert + distinct read (normalized dedup: att≡ATT)', distinct.length === 3, distinct);
+  const att = distinct.find(d => normalizeLiteral(d.literal_value) === 'att');
+  check('frequency summed across normalized dupes', (att?.source_frequency ?? 0) === 2, distinct);
+  await deleteOneTimeFileRows(conn, nonce);
 });
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────

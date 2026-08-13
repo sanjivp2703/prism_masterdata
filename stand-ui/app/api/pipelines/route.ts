@@ -5,6 +5,7 @@
 
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import {
@@ -284,7 +285,7 @@ export async function POST(request: Request) {
         if (existingRow) {
           const pid = Number(existingRow.pipeline_id);
           const oldSpecId = existingRow.domain_id != null ? Number(existingRow.domain_id) : null;
-          await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`, [pid]);
+          await exec(conn, `DELETE FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`, [pid]);
           db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
           if (oldSpecId != null) deleteColumnSpec(oldSpecId);
         }

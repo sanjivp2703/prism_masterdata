@@ -1,5 +1,8 @@
 import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { upsertApprovedAliasMssql, bulkUpsertLiteralMatchesMssql } from '@/app/api/_lib/warehouse/mssql/mappings';
+import { upsertApprovedAliasPg, bulkUpsertLiteralMatchesPg } from '@/app/api/_lib/warehouse/postgres/mappings';
+import { upsertApprovedAliasMysql, bulkUpsertLiteralMatchesMysql } from '@/app/api/_lib/warehouse/mysql/mappings';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 
@@ -20,14 +23,14 @@ export async function GET(request: Request) {
         connection,
         domainId != null
           ? `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
-             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-             JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+             FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+             JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
                ON lam.alias_id = aan.alias_id
              WHERE lam.domain_id = ?
              ORDER BY aan.alias_name, lam.literal_value`
           : `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
-             FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-             JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+             FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+             JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
                ON lam.alias_id = aan.alias_id
              ORDER BY aan.alias_name, lam.literal_value`,
         domainId != null ? [domainId] : undefined,
@@ -106,6 +109,8 @@ export async function POST(request: Request) {
         : `AND t.domain_id IS NULL`;
 
       const isMssql = getWarehouseAdapter().kind === 'mssql';
+      const isPg    = getWarehouseAdapter().kind === 'postgres';
+      const isMy    = getWarehouseAdapter().kind === 'mysql';
 
       for (const [aliasName, literals] of Object.entries(new_items)) {
         if (!literals.length) continue;
@@ -119,11 +124,31 @@ export async function POST(request: Request) {
           );
           continue;
         }
+        if (isPg) {
+          // App-side normalization path (no SQL-side normalize on Postgres).
+          const aliasId = await upsertApprovedAliasPg(connection, aliasName, domainId);
+          await bulkUpsertLiteralMatchesPg(
+            connection,
+            literals.map(lv => ({ literalValue: lv, aliasId })),
+            domainId, 0,
+          );
+          continue;
+        }
+        if (isMy) {
+          // Same app-side path (no SQL-side normalize on MySQL either).
+          const aliasId = await upsertApprovedAliasMysql(connection, aliasName, domainId);
+          await bulkUpsertLiteralMatchesMysql(
+            connection,
+            literals.map(lv => ({ literalValue: lv, aliasId })),
+            domainId, 0,
+          );
+          continue;
+        }
 
         // Upsert alias
         await exec(
           connection,
-          `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES t
+          `MERGE INTO ${internalTable('APPROVED_ALIAS_NAMES')} t
            USING (SELECT ? AS alias_name) s
              ON t.alias_name = s.alias_name ${domainFilter}
            WHEN MATCHED THEN UPDATE SET
@@ -136,7 +161,7 @@ export async function POST(request: Request) {
 
         const aliasRows = await exec(
           connection,
-          `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+          `SELECT alias_id FROM ${internalTable('APPROVED_ALIAS_NAMES')}
            WHERE alias_name = ? ${domainFilter} LIMIT 1`,
           [aliasName],
         );
@@ -147,7 +172,7 @@ export async function POST(request: Request) {
         for (const litVal of literals) {
           await exec(
             connection,
-            `MERGE INTO PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES t
+            `MERGE INTO ${internalTable('LITERAL_ALIAS_MATCHES')} t
              USING (SELECT ? AS literal_value) s
                ON t.normalized_value = PRISM_DB.INTERNAL.PRISM_NORMALIZE(s.literal_value)
                   ${domainFilter}
@@ -168,9 +193,19 @@ export async function POST(request: Request) {
           await bulkUpsertLiteralMatchesMssql(connection, [{ literalValue: litVal, aliasId }], domainId, 0);
           continue;
         }
+        if (isPg) {
+          const aliasId = await upsertApprovedAliasPg(connection, newAlias, domainId);
+          await bulkUpsertLiteralMatchesPg(connection, [{ literalValue: litVal, aliasId }], domainId, 0);
+          continue;
+        }
+        if (isMy) {
+          const aliasId = await upsertApprovedAliasMysql(connection, newAlias, domainId);
+          await bulkUpsertLiteralMatchesMysql(connection, [{ literalValue: litVal, aliasId }], domainId, 0);
+          continue;
+        }
         await exec(
           connection,
-          `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES t
+          `MERGE INTO ${internalTable('APPROVED_ALIAS_NAMES')} t
            USING (SELECT ? AS alias_name) s
              ON t.alias_name = s.alias_name AND t.domain_id IS NULL
            WHEN MATCHED THEN UPDATE SET
@@ -182,7 +217,7 @@ export async function POST(request: Request) {
         );
         const aliasRows = await exec(
           connection,
-          `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+          `SELECT alias_id FROM ${internalTable('APPROVED_ALIAS_NAMES')}
            WHERE alias_name = ? AND domain_id IS NULL`,
           [newAlias],
         );
@@ -190,7 +225,7 @@ export async function POST(request: Request) {
         const aliasId = Number((aliasRows[0] as any).ALIAS_ID ?? (aliasRows[0] as any).alias_id);
         await exec(
           connection,
-          `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+          `UPDATE ${internalTable('LITERAL_ALIAS_MATCHES')}
            SET alias_id = ?
            WHERE literal_value = ?`,
           [aliasId, litVal],
@@ -201,7 +236,7 @@ export async function POST(request: Request) {
       for (const litVal of deleted_literals) {
         await exec(
           connection,
-          `DELETE FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+          `DELETE FROM ${internalTable('LITERAL_ALIAS_MATCHES')}
            WHERE literal_value = ?`,
           [litVal],
         );
@@ -214,7 +249,7 @@ export async function POST(request: Request) {
         const litPh  = allNewLiterals.map(() => '?').join(', ');
         await exec(
           connection,
-          `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+          `DELETE FROM ${internalTable('PIPELINE_QUEUE')}
            WHERE pipeline_id IN (${pidPh}) AND literal_value IN (${litPh})`,
           [...pipeline_ids_to_dequeue, ...allNewLiterals],
         );
@@ -222,7 +257,7 @@ export async function POST(request: Request) {
         for (const pid of pipeline_ids_to_dequeue) {
           const cntRows = await exec(
             connection,
-            `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+            `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
             [pid],
           );
           const queueSize = Number((cntRows[0] as any).CNT ?? (cntRows[0] as any).cnt ?? 0);

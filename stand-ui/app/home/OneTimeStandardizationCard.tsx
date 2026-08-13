@@ -7,6 +7,7 @@ import ConventionEditor, {
   type ConventionDraft,
 } from '@/app/components/ConventionEditor';
 import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { detectHeaderRow, gridToRows } from '@/app/api/_lib/table-shape';
 
 interface TableColumn { name: string; type: string; isText: boolean }
@@ -51,6 +52,7 @@ export default function OneTimeStandardizationCard() {
   const [fileTabs,    setFileTabs]    = useState<string[]>([]);
   const [fileTab,     setFileTab]     = useState('');
   const [headerIdx,   setHeaderIdx]   = useState(0);
+  const [fileB64,     setFileB64]     = useState<string | null>(null);
   const [tabGrids,    setTabGrids]    = useState<Record<string, unknown[][]>>({});
   const [fileWarning, setFileWarning] = useState<string | null>(null);
   const [fileError,   setFileError]   = useState<string | null>(null);
@@ -170,6 +172,7 @@ export default function OneTimeStandardizationCard() {
 
   async function handleFile(file: File) {
     setFileError(null); setFileWarning(null); setSelected([]); setFields([]); setFileRows([]);
+    setFileB64(null);
     setFileName(file.name);
     if (!/\.(csv|xlsx|xls)$/i.test(file.name)) {
       setFileError('Only .csv, .xlsx and .xls files are supported.');
@@ -182,12 +185,33 @@ export default function OneTimeStandardizationCard() {
     try {
       const XLSX = await import('xlsx');
       const buf  = await file.arrayBuffer();
+      // Keep the ORIGINAL bytes (base64) so the export can hand back the same
+      // file edited in place — hidden columns, styles and column order intact
+      // (what a Dynamics/SAP reimport needs). Legacy .xls is excluded: only
+      // the zip-based .xlsx format can be surgically patched.
+      if (/\.(csv|xlsx)$/i.test(file.name)) {
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        }
+        setFileB64(btoa(bin));
+      }
       const wb   = XLSX.read(buf, { type: 'array' });
       // Convert every tab up front so switching tabs needs no re-parse and the
       // workbook object never has to live in React state.
       const grids: Record<string, unknown[][]> = Object.create(null);
       for (const name of wb.SheetNames) {
-        grids[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: false, defval: '' }) as unknown[][];
+        // blankrows: TRUE deliberately. Dropping blank rows shifts every index
+        // up, so a file whose header sits on row 5 in Excel (under a title, a
+        // subtitle and a blank line) parses to index 3 and the control below
+        // would tell the user "headers are on row 4" — a number that matches
+        // nothing they can see in their own spreadsheet. Keeping the blanks
+        // makes the displayed row number the REAL one.
+        //
+        // Safe on both readers: detectHeaderRow skips blank/narrow rows by
+        // width, and gridToRows already filters all-blank rows out of the data.
+        grids[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: true, defval: '' }) as unknown[][];
       }
       setTabGrids(grids);
       setFileTabs(wb.SheetNames);
@@ -283,6 +307,18 @@ export default function OneTimeStandardizationCard() {
           ...(sourceKind === 'sheets'
             ? { spreadsheet_id: sheetId, sheet_tab_name: sheetTab, header_row: sheetHdr }
             : sourceKind === 'warehouse' ? {} : { rows: effectiveRows() }),
+          // Original bytes for the edit-in-place export (file uploads only).
+          ...(sourceKind === 'file' && fileB64
+            ? {
+                original_file: {
+                  name: fileName,
+                  kind: /\.csv$/i.test(fileName) ? 'csv' : 'xlsx',
+                  sheet_name: /\.csv$/i.test(fileName) ? null : fileTab || null,
+                  header_row: headerIdx,
+                  data_b64: fileB64,
+                },
+              }
+            : {}),
           columns: selected.map(s => ({
             column_name: s.column_name,
             description: s.description.trim() || null,
@@ -324,7 +360,10 @@ export default function OneTimeStandardizationCard() {
             { id: 'file',      label: 'CSV / Excel' },
             { id: 'sheets',    label: 'Google Sheet' },
             { id: 'paste',     label: 'Paste values' },
-          ] as const).map(({ id, label }, i, arr) => (
+          ] as const)
+            // Native (Marketplace) edition has no Google integration.
+            .filter(({ id }) => id !== 'sheets' || !isNativeEdition())
+            .map(({ id, label }, i, arr) => (
             <button
               key={id} type="button" disabled={submitting}
               onClick={() => { setSourceKind(id); setSelected([]); setFields([]); setColumnsError(null); setFileError(null); }}

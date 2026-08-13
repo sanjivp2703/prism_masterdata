@@ -395,14 +395,14 @@ export default function AutoExportHome() {
   // ── Warehouse platform — drives copy that must name the right platform
   // ("Snowflake" vs "SQL Server") instead of assuming Snowflake. Defaults to
   // 'snowflake' (this app's historical default) until the fetch resolves.
-  const [warehouseKind, setWarehouseKind] = useState<'snowflake' | 'mssql'>('snowflake');
+  const [warehouseKind, setWarehouseKind] = useState<'snowflake' | 'mssql' | 'postgres' | 'mysql'>('snowflake');
   useEffect(() => {
     fetch('/api/accounts/warehouse-kind')
       .then(r => r.json())
-      .then(d => { if (d?.kind === 'mssql' || d?.kind === 'snowflake') setWarehouseKind(d.kind); })
+      .then(d => { if (d?.kind === 'mssql' || d?.kind === 'snowflake' || d?.kind === 'postgres' || d?.kind === 'mysql') setWarehouseKind(d.kind); })
       .catch(() => {});
   }, []);
-  const warehouseLabel = warehouseKind === 'mssql' ? 'SQL Server' : 'Snowflake';
+  const warehouseLabel = warehouseKind === 'mssql' ? 'SQL Server' : warehouseKind === 'postgres' ? 'PostgreSQL' : warehouseKind === 'mysql' ? 'MySQL' : 'Snowflake';
 
   // Copy for the Connect tab's "Output types" explainer grid.
   //
@@ -605,7 +605,14 @@ export default function AutoExportHome() {
 
   useEffect(() => {
     const t = tableFqn.trim();
-    if (t.split('.').filter(Boolean).length !== 3) {
+    // Postgres accepts the 2-part schema.table form too — a connection is
+    // bound to one database, so the database part is implied. MySQL is
+    // EXACTLY 2-part (database.table — no schema level).
+    const partCount = t.split('.').filter(Boolean).length;
+    const validFqn = warehouseKind === 'mysql'
+      ? partCount === 2
+      : partCount === 3 || (warehouseKind === 'postgres' && partCount === 2);
+    if (!validFqn) {
       setTableColumns([]); setColumnsError(null); setColumnsLoading(false); setCtStatus(null);
       return;
     }
@@ -657,7 +664,7 @@ export default function AutoExportHome() {
       }
     }, 400);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [tableFqn]);
+  }, [tableFqn, warehouseKind]);
 
   // Columns of the current table that already have a live pipeline (uppercased).
   // pending_baseline pipelines are incomplete setups and should not block.
@@ -1305,7 +1312,7 @@ export default function AutoExportHome() {
                         <input
                           id="ae-table-fqn" type="text" value={tableFqn}
                           onChange={e => setTableFqn(e.target.value)}
-                          placeholder="DATABASE.SCHEMA.TABLE_NAME"
+                          placeholder={warehouseKind === 'postgres' ? 'schema.table_name' : warehouseKind === 'mysql' ? 'database.table_name' : 'DATABASE.SCHEMA.TABLE_NAME'}
                           autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
                           disabled={loading}
                           className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"
@@ -1422,7 +1429,9 @@ export default function AutoExportHome() {
                         <input
                           id="ae-export-fqn" type="text" value={exportTableFqn}
                           onChange={e => setExportTableFqn(e.target.value)}
-                          placeholder={copyMode === 'view' ? 'DATABASE.SCHEMA.TABLE_STANDARDIZED_VIEW' : 'DATABASE.SCHEMA.TABLE_STANDARDIZED'}
+                          placeholder={warehouseKind === 'postgres' || warehouseKind === 'mysql'
+                            ? (copyMode === 'view' ? 'prism_exports.table_standardized_view' : 'prism_exports.table_standardized')
+                            : (copyMode === 'view' ? 'DATABASE.SCHEMA.TABLE_STANDARDIZED_VIEW' : 'DATABASE.SCHEMA.TABLE_STANDARDIZED')}
                           autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
                           disabled={loading}
                           className="w-full px-3.5 py-3 rounded-button border-[0.5px] text-sm outline-none transition-colors disabled:opacity-50"

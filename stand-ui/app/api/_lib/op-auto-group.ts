@@ -91,9 +91,10 @@ import { withWarehouse, executeQuery, getWarehouseAdapter } from './warehouse';
 type WarehouseConn = unknown;
 
 function runStateTable(): string {
-  return getWarehouseAdapter().kind === 'mssql'
-    ? 'INTERNAL.RUN_STATE'
-    : 'PRISM_DB.INTERNAL.RUN_STATE';
+  const kind = getWarehouseAdapter().kind;
+  if (kind === 'mssql') return 'INTERNAL.RUN_STATE';
+  if (kind === 'postgres' || kind === 'mysql') return 'prism_internal.run_state';
+  return 'PRISM_DB.INTERNAL.RUN_STATE';
 }
 
 function parseStateCell(raw: unknown): OpRunState | null {
@@ -164,6 +165,24 @@ export async function saveOpRunState(runId: number, state: OpRunState, conn?: Wa
            VALUES (s.run_id, s.state, SYSUTCDATETIME());`,
         [runId, json],
       );
+    } else if (getWarehouseAdapter().kind === 'postgres') {
+      await executeQuery(
+        c,
+        `INSERT INTO prism_internal.run_state (run_id, state, updated_at)
+         VALUES (?, ?::jsonb, now())
+         ON CONFLICT (run_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now()`,
+        [runId, json],
+      );
+    } else if (getWarehouseAdapter().kind === 'mysql') {
+      // Row-alias upsert (VALUES() is removed in MySQL 8.4); native JSON
+      // column takes the string bind directly.
+      await executeQuery(
+        c,
+        `INSERT INTO prism_internal.run_state (run_id, state, updated_at)
+         VALUES (?, ?, NOW(3)) AS new_rows
+         ON DUPLICATE KEY UPDATE state = new_rows.state, updated_at = NOW(3)`,
+        [runId, json],
+      );
     } else {
       // PARSE_JSON(?) is fine here — the VALUES-clause restriction doesn't
       // apply to a USING (SELECT …) source.
@@ -207,6 +226,29 @@ export async function saveOpRunStateWithRev(
         [json, runId, expectedRev],
       ) as unknown[];
       if ((rows?.length ?? 0) > 0) return true;
+    } else if (getWarehouseAdapter().kind === 'postgres') {
+      const rows = await executeQuery(
+        c,
+        `UPDATE prism_internal.run_state
+         SET state = ?::jsonb, updated_at = now()
+         WHERE run_id = ?
+           AND COALESCE((state->>'rev')::int, 0) = ?
+         RETURNING run_id`,
+        [json, runId, expectedRev],
+      ) as unknown[];
+      if ((rows?.length ?? 0) > 0) return true;
+    } else if (getWarehouseAdapter().kind === 'mysql') {
+      // No RETURNING on MySQL — the driver's OkPacket (affectedRows) is the
+      // landed-detection, returned by executeQuery as a one-element array.
+      const rows = await executeQuery(
+        c,
+        `UPDATE prism_internal.run_state
+         SET state = ?, updated_at = NOW(3)
+         WHERE run_id = ?
+           AND COALESCE(CAST(state->>'$.rev' AS SIGNED), 0) = ?`,
+        [json, runId, expectedRev],
+      ) as Array<Record<string, unknown>>;
+      if (Number(rows?.[0]?.affectedRows ?? 0) > 0) return true;
     } else {
       const rows = await executeQuery(
         c,

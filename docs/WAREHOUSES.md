@@ -14,6 +14,18 @@ does another is worse than no row at all.
 
 ---
 
+> **Edition note (2026-08-12):** the native (Snowflake Marketplace) edition
+> pins the adapter factory to Snowflake — `getWarehouseAdapter()` returns the
+> Snowflake adapter unconditionally when `PRISM_EDITION=native`, ignoring
+> `workspace_config.warehouse_type` and `PRISM_WAREHOUSE_TYPE`, and the
+> warehouse-type API refuses non-Snowflake saves. The other adapters remain
+> compiled in (standard edition unaffected); see `docs/NATIVE_APP_PLAN.md`.
+> The Snowflake service connection also has a **tier 0 (N2)**: inside SPCS,
+> the ambient platform token (`/snowflake/session/token` + `SNOWFLAKE_HOST`,
+> `authenticator: OAUTH`, token read fresh per connection — it rotates) takes
+> precedence over workspace/env credentials; `serviceConnectionSource()`
+> reports `'spcs'`. Native-edition-gated, so standard resolution is untouched.
+
 ## Connection & errors
 
 | Operation | Snowflake | SQL Server (planned) |
@@ -91,6 +103,60 @@ a test line proving the code handles it.
 | Spec-value seeding / mapping edits | ✅ Snowflake MERGEs in the column-specs + global-standardizations routes (domains removed 2026-07-15 — `domain_id` params/columns carry a `column_specs.spec_id`) | ✅ P7 — routed through the mssql mappings writers (HOLDLOCK MERGEs). |
 | Pipeline creation (baseline + detection setup) | ✅ stream pre-create + CT auto-fix ladder; `GROUP BY PRISM_NORMALIZE` baseline (5k) | ✅ P6 — `initDetection` w/ CT-enable ladder (service → creator's personal creds → diff fallback, never blocks); baseline via capped diff scan. |
 | Setup wizard | ✅ 5-step Snowflake flow | ✅ P6 — platform picker persists `warehouse_type`; mssql install-script step (login + CT templates), credential form (test/save, blank-keeps-secret), verify checklist; non-admin personal mssql variant. |
+
+## PostgreSQL adapter (2026-08-11 — docs/POSTGRES_PORT_PLAN.md)
+
+Third warehouse. One compact matrix here rather than a third column above —
+same operations, pg-specific facts only. Everything below is **live-tested**
+via `npm run test:pg-live` / `test:pg-detection` / `test:pg-lifecycle` (Docker
+postgres:16) unless marked otherwise.
+
+| Operation | PostgreSQL (`warehouse/postgres/`) |
+|---|---|
+| Install scope | ⚠️ ONE DATABASE, not a server — pg cannot query across databases. `01_internal_tables.postgres.sql` creates `prism_internal` + `prism_exports` SCHEMAS in the customer's database (lowercase snake_case — unquoted pg identifiers fold to lowercase, the opposite of Snowflake). `npm run pg:install` dev runner; `docs/DEV_POSTGRES.md` container recipe. |
+| Service/personal/ad-hoc connection | `connection.ts` (`pg` driver, lint-guarded): env tier `PG_HOST/PORT/DATABASE/USER/PASSWORD/SSLMODE[/SSL_CA_PATH]` → workspace tier `workspace_config.pg_*` (migration 018, encrypted, 10 s cache); personal `accounts.pg_*`; `withAdHocPostgres` for setup. Fresh Client per call, `SET statement_timeout = 600000` (PRISM_WH parity). int8 parsed to Number. |
+| Query execution | `?`→`$n` scanner (quote/dollar-quote/E-string/comment-aware, parity-tested). Bind ceiling 65,535 → `bindLimit 60_000`; Snowflake-sized 5k batches fit. Bind-free calls use the simple protocol → multi-statement `BEGIN; …; COMMIT` works. |
+| Errors | SQLSTATE-based: access = 42501/42P01/3F000/3D000/28P01/28000 (+message fallbacks); poll triage global/table/transient in `classifyPgPollError` (42703 = watched column dropped → table). Sanitized responses; 28P01 → 401. |
+| Change detection | **Diff-scan only** (`detection.ts` + `pipeline-poller-postgres.ts`): no stream/CT analog usable under a plain service role (logical replication needs elevated setup; triggers need customer-table DDL — deferred, not rejected). `detection_mode='diff'`, `diff_reason='pg_diff'` (own UI tooltip, no upgrade nudge). |
+| Cheap "anything new?" | `pg_stat_user_tables` write counters (`n_tup_ins/upd/del`) — NO special grant needed (beats mssql's VIEW SERVER STATE ask). Counter-reset tolerated (fail-open scan). **Delete detection is FREE**: the del-counter delta flags the hygiene export rebuild the same cycle — mssql diff mode can't see deletes at all. Idle poll = zero table reads (live-proven via seq/idx-scan counters). |
+| Source health | `pg_class`/`information_schema.columns` (cheap catalog); masking analog = **Row-Level Security** (`relrowsecurity`) → flag `policy_blocked` + skip + auto-recover (live-tested). |
+| Normalization | App-side only, mssql rule. pg 13+ HAS `normalize()` — deliberately unused (a third implementation would have to agree with `normalizeLiteral` forever). Staging joins use `COLLATE "C"` (byte-wise; guards nondeterministic ICU database collations). |
+| Bulk upserts | `INSERT … ON CONFLICT` (MERGE needs pg 15; floor is 13) against unique indexes the install creates — which also mechanically ENFORCE the one-row-per-(normalized_value, spec) invariant other warehouses keep only by convention. NULL-scope (domain_id IS NULL) conflicts target partial unique indexes (pg unique treats NULLs as distinct). `RETURNING` collapses the upsert-then-select round trip. In-batch normalized dupes raise "cannot affect row a second time" — caller dedupe contract unchanged. |
+| Export rebuild | `export.ts`: staging join → `CREATE TABLE _new AS … ORDER BY` (CTAS honours ORDER BY; no TOP trick needed) → **transactional swap** (`BEGIN; DROP; ALTER RENAME; COMMIT` — pg DDL is transactional) → ACL capture/re-apply from `information_schema.role_table_grants` + `column_privileges` (no COPY GRANTS; no DENY concept; table-level grants deduped out of the per-column expansion). Order tiers: PK → unique index (no clustering keys — two tiers). Grant survival live-tested. |
+| `export_kind 'view'` | ✅ SUPPORTED (refused on mssql): view reads source LEFT JOIN **persistent** per-column mapping tables (`prism_internal.viewmap_<md5>`), whose content refreshes transactionally each rebuild — the view object is stable, and new rows of already-mapped values appear through it IMMEDIATELY, no rebuild (live-tested). Offboarding materialize-before-drop caveat applies (CLIENT_ONBOARDING §12). |
+| Column mode | `refreshStandardizedColumnsPg`: `ADD COLUMN IF NOT EXISTS` (needs table OWNERSHIP; consent SQL via `columnModeSetupSqlPg` — one generator) + guarded UPDATEs (steady-state touches 0 rows — live-proven via `n_tup_upd` delta). ⚠️ Companion column is a QUOTED case-sensitive identifier on pg (`"carrier_STANDARDIZED"`) — a hand-created companion with different case will not match. Same PRELAUNCH §1 bar as the other warehouses before customer use. |
+| Run state / validation log | `prism_internal.run_state` JSONB (`ON CONFLICT` save; rev check `COALESCE((state->>'rev')::int,0)` + `RETURNING` landed-detection); `validation_log` same insert contract. Shared SQL resolves table names via `_lib/warehouse-tables.ts` `internalTable()` — snowflake AND mssql keep `PRISM_DB.INTERNAL.*`, pg gets `prism_internal.*`. |
+| One-time / file rows / lookup export | Ported P3 (mirroring the mssql P7 shapes): pg map table `COLLATE "C"`, overwrite = staged `BEGIN; DELETE; INSERT; COMMIT`; `one_time_file_rows` JSONB via `?::jsonb` binds + `->>` reads; lookup export default `prism_exports.<name>_lookup`; `prism_internal` targets refused. Code-verified + covered by the setup suite. |
+| Setup / grants | No programmatic grants pass (mssql rule — the service role can't grant): install script + role templates run by the customer's admin; Part-D analog emits per-schema `GRANT USAGE/SELECT` + `ALTER DEFAULT PRIVILEGES` (⚠️ footgun: default privileges only cover tables created by the role that ran the statement — run FOR ROLE per owning role). Kill switch: `ALTER ROLE prism_svc NOLOGIN`. |
+| Cost model | Provisioned capacity — protect load (heartbeat-gated tiered scans). ⚠️ Scale-to-zero providers (Neon; Aurora Serverless): steady polling holds them awake — best-effort host detection (`isScaleToZeroHost`, Neon only) warns once per process + cadence stretch ×10; disclose in onboarding regardless. |
+| Version floor | PostgreSQL 13+ (ON CONFLICT/partial indexes/JSONB all present; MERGE and NULLS NOT DISTINCT deliberately avoided). Managed flavors (RDS, Cloud SQL, Azure, Supabase, Neon) are the same wire protocol — no per-cloud variants. |
+
+## MySQL adapter (2026-08-12 — docs/MYSQL_PORT_PLAN.md)
+
+Fourth warehouse. Same compact-matrix treatment as the PostgreSQL section.
+Everything below is **live-tested** via `npm run test:mysql-live` /
+`test:mysql-detection` / `test:mysql-lifecycle` / `test:mysql-setup` (Docker
+mysql:8.0) unless marked otherwise.
+
+| Operation | MySQL (`warehouse/mysql/`) |
+|---|---|
+| Install scope | Databases ARE schemas (no schema level; `CREATE SCHEMA` = `CREATE DATABASE`) and **cross-database joins work** — Prism gets sibling DATABASES `prism_internal` + `prism_exports`; sources may live in ANY database granted to the service account (no pg-style one-database limit). FQNs are TWO-part `database.table`; 3-part rejects loudly. `internalTable()` needs no new arm — the pg spelling `prism_internal.<table>` means database.table here. Lowercase names throughout (`lower_case_table_names` is OS-dependent). |
+| Connection | `connection.ts` (`mysql2` driver, lint-guarded): env tier `MYSQL_HOST/PORT/DATABASE/USER/PASSWORD/SSL` → workspace `workspace_config.my_*` (migration 019, encrypted, 10 s cache); personal `accounts.my_*`; ad-hoc for setup. Per-connection session: `MAX_EXECUTION_TIME=600000` (⚠️ SELECT-only — writes are bounded by innodb_lock_wait_timeout, documented not pretended) **and `information_schema_stats_expiry = 0` — LOAD-BEARING**: the 24h default caches UPDATE_TIME/TABLE_ROWS and would blind the detection heartbeat for a day (live-proven fresh: writes detected the same minute). |
+| Query execution | Placeholders are NATIVE `?` — translateBinds validates/counts only (quote/backtick/#-comment-aware, parity-tested). `bindLimit 60_000` for batching consistency (client-side interpolation has no protocol ceiling). DML resolves to `[OkPacket]` — `affectedRows` is the RETURNING/OUTPUT analog. |
+| Errors | errno-based: access = 1044/1142/1143/1146/1045/1049; poll triage global (1045/1049) / table (1044/1142/1143/1146/1054) / transient (1213/1205/1040 + socket codes). 28P01-style login → 401. ⚠️ `READS` is a reserved word (stored-routine characteristics) — never use it as an alias. |
+| Change detection | **Diff-scan only** (`detection.ts` + `pipeline-poller-mysql.ts`); binlog/CDC rejected (REPLICATION privileges + server config), triggers rejected (customer-table DDL). `diff_reason='mysql_diff'` (own nudge-free tooltip). Heartbeat = `information_schema.TABLES.UPDATE_TIME` (fresh via stats_expiry=0): second-granularity (fine at minute cadence), NULL after ANY server restart → fail-open scan, and ⚠️ **delete-blind** — unlike pg's counter heartbeat there is NO same-cycle delete flag; deletes surface via the hourly safety rebuild (the mssql diff-mode story). Idle poll = zero table reads (live-proven via performance_schema I/O counters). |
+| Uniqueness / InnoDB key limits | **No partial indexes** + UNIQUE treats NULLs as always-distinct → functional key parts with a `COALESCE(domain_id,-1)` sentinel. **InnoDB caps index keys at 3072 bytes** (800-char utf8mb4 = 3200), so the queue/lookup unique keys are functional **SHA2-hash keys** (`(pipeline_id, SHA2(literal_value,256))`, `(COALESCE(domain_id,-1), SHA2(normalized_value,256))`) with a 191-prefix secondary index for lookups — collision-safe for dedup, serves ON DUPLICATE KEY, and mechanically ENFORCES the one-row-per-(normalized,scope) invariant (live-tested). This is why the **version floor is 8.0.13 → raised to 8.0.19**: the row-alias upsert form (`VALUES … AS new ON DUPLICATE KEY UPDATE col = new.col`) is the only spelling valid across the range — `VALUES()` is deprecated 8.0.20 and REMOVED in 8.4. |
+| Normalization / byte-exact joins | App-side only (the standing rule). Staging columns `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`; **source side must go through `binaryCompare(expr)` = `CONVERT(expr USING utf8mb4) COLLATE utf8mb4_bin`** — a bare COLLATE on a legacy latin1 column is error 1253 (live-proven both ways with the latin1 demo fixture). Distinct scans GROUP BY binaryCompare (the KI-138 rule); COALESCE arms in exports CONVERT both sides (illegal-mix-of-collations otherwise). Legacy charsets are mainline at target customers, not an edge case. |
+| Bulk upserts | Row-alias ON DUPLICATE KEY (mappings.ts); alias-id maps via upsert-then-SELECT (no RETURNING). 5k batches. |
+| Export rebuild | `export.ts`: staging join → ordered CTAS → **ATOMIC multi-`RENAME TABLE cur→old, new→cur`** (DDL is non-transactional but multi-RENAME is atomic) → DROP old; stale `__prism_old_*`/`__prism_new_*` swept at each rebuild start (crash-safety). ACLs from information_schema.TABLE_/COLUMN_PRIVILEGES (column grants deduped against table-level), grantees replayed **verbatim as `'user'@'host'`** — a bare-name re-grant implicitly means @'%' and can address a different account. No DENY concept. Order tiers: PK → unique key. Grant survival live-tested. |
+| `export_kind 'view'` | ✅ SUPPORTED (pg design): `CREATE OR REPLACE VIEW` over persistent `prism_internal.viewmap_<md5>` mapping tables refreshed inside DML transactions — new rows of known values appear through the view with no rebuild (live-tested). Offboarding materialize-before-drop caveat applies. |
+| Column mode | `refreshStandardizedColumnsMysql`: privilege-based (no ownership concept — ALTER + UPDATE per table); **no ADD COLUMN IF NOT EXISTS on MySQL 8.0** — catalog check first, errno 1060 (duplicate column) = already-provisioned. Guarded UPDATEs; steady-state 0 writes live-proven via performance_schema COUNT_WRITE. Same PRELAUNCH §1 bar before customer use. |
+| Run state / validation log | `prism_internal.run_state` native JSON (row-alias upsert; rev check `COALESCE(CAST(state->>'$.rev' AS SIGNED),0)`; landed-detection via `affectedRows`); validation_log via `internalTable()`. |
+| One-time / file rows / lookup export | M3 fork sweep: map table WITHOUT a PK (200+800 utf8mb4 composite exceeds the key limit — app-side dedup + 191-prefix KEY); JSON reads `column_data->>'$."…"'` (reuses the mssql JSON-path escaper — valid MySQL escaping, one helper no drift); lookup export default `prism_exports.<name>_lookup`; `prism_internal` targets refused. Live-tested via the setup suite. |
+| Detection/ordering dialect | No `NULLS LAST` — order with `(col IS NULL), col`; no `SPLIT_PART` — `SUBSTRING_INDEX(x,' ',1)`; ENUM counts as a text type (categorical strings — Prism's domain), SET excluded. |
+| Setup / grants | No programmatic grants pass (the mssql/pg rule); source grants are per-DATABASE `GRANT SELECT ON <db>.* TO 'prism_svc'@'%'` — covers future tables automatically (**no pg default-privileges footgun**). Kill switch: `ALTER USER 'prism_svc'@'%' ACCOUNT LOCK`. |
+| Cost model | Provisioned capacity — protect load via heartbeat-gated tiers. ⚠️ Sleep-on-idle: PlanetScale (`*.psdb.cloud` host sniff, once-per-process warning) and Aurora Serverless v2 (not host-detectable) — onboarding disclosure required. |
+| Version floor | **MySQL 8.0.19+** (row-alias upserts; functional key parts landed 8.0.13). Validate 8.4 LTS before a real customer. **MariaDB explicitly deferred** — no functional key parts; the follow-on design is generated columns + unique indexes. |
 
 ## SQL Server index-key limits in the export staging table (2026-08-07)
 

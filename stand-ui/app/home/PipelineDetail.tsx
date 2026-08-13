@@ -118,7 +118,11 @@ function ActivityTab({ group, isStandardizing = false, specsById }: { group: Pip
       // that would actually fix it — making the misconfiguration effectively
       // undiscoverable (INS-M09).
       const tooltip =
-        reason === 'no_pk'
+        reason === 'pg_diff'
+          ? 'New values are found by periodically scanning the column, with a free write-activity check each minute so an unchanged table is never read. This is how detection works on PostgreSQL.'
+        : reason === 'mysql_diff'
+          ? 'New values are found by periodically scanning the column, with a free last-write check each minute so an unchanged table is never read. This is how detection works on MySQL.'
+        : reason === 'no_pk'
           ? 'New values are found by periodically scanning the column — the table has no primary key, which Change Tracking requires. Adding one enables the fastest detection.'
         : reason === 'ct_no_grant'
           ? 'Change Tracking is already enabled on this table, but Prism has not been given permission to read it. Ask your database admin to run: GRANT VIEW CHANGE TRACKING ON <schema>.<table> TO <the Prism login>; — then this switches to the fastest detection automatically.'

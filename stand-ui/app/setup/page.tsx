@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 function PrismLogo() {
   return (
@@ -131,9 +132,23 @@ function StepHeader({ step, title }: { step: number; title: string }) {
 
 // ── Step 1: choose the data warehouse platform ───────────────────────────────
 
+type Platform = 'snowflake' | 'mssql' | 'postgres' | 'mysql';
+
+/** Narrow an untrusted string to a Platform ('snowflake' fallback). */
+function asPlatform(v: unknown): Platform {
+  return v === 'mssql' || v === 'postgres' || v === 'mysql' ? v : 'snowflake';
+}
+
+const PLATFORM_LABELS: Record<Platform, string> = {
+  snowflake: 'Snowflake',
+  mssql:     'SQL Server',
+  postgres:  'PostgreSQL',
+  mysql:     'MySQL',
+};
+
 function StepPlatform({ platform, onSelect, onNext }: {
-  platform: 'snowflake' | 'mssql';
-  onSelect: (p: 'snowflake' | 'mssql') => void;
+  platform: Platform;
+  onSelect: (p: Platform) => void;
   onNext: () => void;
 }) {
   const [saving, setSaving] = useState(false);
@@ -154,7 +169,7 @@ function StepPlatform({ platform, onSelect, onNext }: {
     onNext();
   }
 
-  const card = (key: 'snowflake' | 'mssql', title: string, blurb: string) => (
+  const card = (key: Platform, title: string, blurb: string) => (
     <button type="button" onClick={() => onSelect(key)}
       className="flex-1 rounded-card border-[0.5px] p-4 text-left"
       style={{
@@ -180,16 +195,19 @@ function StepPlatform({ platform, onSelect, onNext }: {
         Pick the platform your company uses. Prism runs entirely against it — your data never
         moves to another warehouse.
       </p>
-      <div className="flex gap-3 mb-5">
+      <div className="grid grid-cols-2 gap-3 mb-5">
         {card('snowflake', 'Snowflake', 'Cloud data warehouse. Prism watches tables through streams on a dedicated warehouse.')}
-        {card('mssql', 'Microsoft SQL Server', 'On-prem, VM, or Azure SQL. Prism watches tables through Change Tracking or scheduled scans.')}
+        {/* Native (Marketplace) edition is Snowflake-only — hide the other platforms. */}
+        {!isNativeEdition() && card('mssql', 'Microsoft SQL Server', 'On-prem, VM, or Azure SQL. Prism watches tables through Change Tracking or scheduled scans.')}
+        {!isNativeEdition() && card('postgres', 'PostgreSQL', 'Open-source database — self-hosted or managed (RDS, Cloud SQL, Supabase, Neon). Prism watches tables through scheduled scans.')}
+        {!isNativeEdition() && card('mysql', 'MySQL', 'Open-source database — self-hosted or managed (RDS/Aurora, Cloud SQL, PlanetScale). Prism watches tables through scheduled scans. Requires MySQL 8.0.19+.')}
       </div>
       <button
         type="button" onClick={handleNext} disabled={saving}
         className="w-full flex items-center justify-center gap-2 text-sm font-medium rounded-button"
         style={{ height: 36, backgroundColor: saving ? 'var(--accent-border)' : 'var(--accent)', color: '#fff', cursor: saving ? 'not-allowed' : 'pointer' }}
       >
-        {saving ? <><Spinner /> Saving…</> : (platform === 'mssql' ? 'Continue with SQL Server' : 'Continue with Snowflake')}
+        {saving ? <><Spinner /> Saving…</> : `Continue with ${PLATFORM_LABELS[platform]}`}
       </button>
     </div>
   );
@@ -1265,7 +1283,7 @@ function StepVerify({ onBack, onFinish }: { onBack: () => void; onFinish: () => 
   const [checks,  setChecks]  = useState<CheckItem[]>([]);
   const [allOk,   setAllOk]   = useState(false);
   const [error,   setError]   = useState<string | null>(null);
-  const [platform, setPlatform] = useState<'snowflake' | 'mssql'>('snowflake');
+  const [platform, setPlatform] = useState<Platform>('snowflake');
   // Bumped by the re-run button; the effect owns the fetch for both the
   // initial run and re-runs.
   const [runToken, setRunToken] = useState(0);
@@ -1278,7 +1296,7 @@ function StepVerify({ onBack, onFinish }: { onBack: () => void; onFinish: () => 
         if (cancelled) return;
         setChecks(Array.isArray(b?.checks) ? b.checks : []);
         setAllOk(Boolean(b?.ok));
-        if (b?.warehouse_type === 'mssql') setPlatform('mssql');
+        setPlatform(asPlatform(b?.warehouse_type));
         if (b?.connected === false) setError(String(b?.error ?? 'Could not connect.'));
       })
       .catch(() => { if (!cancelled) setError('Network error — could not reach server'); })
@@ -1306,7 +1324,7 @@ function StepVerify({ onBack, onFinish }: { onBack: () => void; onFinish: () => 
 
       {running && (
         <div className="flex items-center gap-2 text-sm py-6 justify-center" style={{ color: 'var(--text-muted)' }}>
-          <Spinner dark /> Checking your {platform === 'mssql' ? 'SQL Server' : 'Snowflake'}…
+          <Spinner dark /> Checking your {PLATFORM_LABELS[platform]}…
         </div>
       )}
 
@@ -1384,7 +1402,7 @@ function StepVerify({ onBack, onFinish }: { onBack: () => void; onFinish: () => 
       </div>
       {!allOk && !running && (
         <p className="text-[11px] mt-2 text-center" style={{ color: 'var(--text-hint)' }}>
-          You can finish now and fix the remaining items later from Settings → {platform === 'mssql' ? 'SQL Server' : 'Snowflake'} connection.
+          You can finish now and fix the remaining items later from Settings → {PLATFORM_LABELS[platform]} connection.
         </p>
       )}
     </div>
@@ -1396,18 +1414,24 @@ function StepVerify({ onBack, onFinish }: { onBack: () => void; onFinish: () => 
 function AdminOnboarding({ nextUrl }: { nextUrl: string }) {
   const router = useRouter();
   const [step, setStep] = useState<0 | 1 | 2 | 3 | 4 | 5>(0); // 0 = deciding fast path vs flow
-  const [platform, setPlatform] = useState<'snowflake' | 'mssql'>('snowflake');
+  const [platform, setPlatform] = useState<Platform>('snowflake');
   useEffect(() => {
     let cancelled = false;
     fetch('/api/accounts/warehouse-type', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
-      .then(b => { if (!cancelled && (b?.saved === 'mssql' || b?.resolved === 'mssql')) setPlatform('mssql'); })
+      .then(b => {
+        const t = b?.saved ?? b?.resolved;
+        if (!cancelled && (t === 'mssql' || t === 'postgres' || t === 'mysql')) setPlatform(t);
+      })
       .catch(() => {});
     // Non-admins can't read warehouse-type (admin-only); the connection status
     // route reports the resolved platform for everyone.
     fetch('/api/accounts/test-snowflake', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
-      .then(b => { if (!cancelled && b?.warehouse_type === 'mssql') setPlatform('mssql'); })
+      .then(b => {
+        const t = b?.warehouse_type;
+        if (!cancelled && (t === 'mssql' || t === 'postgres' || t === 'mysql')) setPlatform(t);
+      })
       .catch(() => {});
     return () => { cancelled = true; };
   }, []);
@@ -1470,11 +1494,11 @@ function AdminOnboarding({ nextUrl }: { nextUrl: string }) {
     return (
       <div>
         <h1 className="text-[18px] font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
-          {platform === 'mssql' ? 'Connect your SQL Server account' : 'Connect your Snowflake account'}
+          {platform === 'postgres' ? 'Connect your Postgres database' : platform === 'mysql' ? 'Connect your MySQL database' : `Connect your ${PLATFORM_LABELS[platform]} account`}
         </h1>
         <div className="mt-4 rounded-button border-[0.5px] p-3" style={{ borderColor: '#BFE3D6', backgroundColor: '#F2FAF7' }}>
           <p className="text-xs font-medium" style={{ color: '#065F46' }}>
-            ✓ This workspace already has a working {platform === 'mssql' ? 'SQL Server' : 'Snowflake'} connection
+            ✓ This workspace already has a working {PLATFORM_LABELS[platform]} connection
             {connWarehouse ? ` (warehouse ${connWarehouse})` : ''}
             {connRole ? `, running as role ${connRole}` : ''}.
           </p>
@@ -1534,12 +1558,21 @@ function AdminOnboarding({ nextUrl }: { nextUrl: string }) {
   }
 
   if (step === 1) return <StepPlatform platform={platform} onSelect={setPlatform} onNext={() => setStep(2)} />;
-  if (step === 2) return platform === 'mssql'
-    ? <StepInstallScriptMssql onBack={() => setStep(1)} onNext={() => setStep(3)} />
-    : <StepInstallScript onBack={() => setStep(1)} onNext={() => setStep(3)} />;
+  if (step === 2) {
+    if (platform === 'mssql')    return <StepInstallScriptMssql onBack={() => setStep(1)} onNext={() => setStep(3)} />;
+    if (platform === 'postgres') return <StepInstallScriptPostgres onBack={() => setStep(1)} onNext={() => setStep(3)} />;
+    if (platform === 'mysql')    return <StepInstallScriptMysql onBack={() => setStep(1)} onNext={() => setStep(3)} />;
+    return <StepInstallScript onBack={() => setStep(1)} onNext={() => setStep(3)} />;
+  }
   if (step === 3) {
     if (platform === 'mssql') {
       return <StepCredentialsMssql onBack={() => setStep(2)} onSaved={() => setStep(4)} />;
+    }
+    if (platform === 'postgres') {
+      return <StepCredentialsPostgres onBack={() => setStep(2)} onSaved={() => setStep(4)} />;
+    }
+    if (platform === 'mysql') {
+      return <StepCredentialsMysql onBack={() => setStep(2)} onSaved={() => setStep(4)} />;
     }
     return (
       <StepCredentials
@@ -1551,6 +1584,626 @@ function AdminOnboarding({ nextUrl }: { nextUrl: string }) {
   }
   if (step === 4) return <StepLlmProvider onBack={() => setStep(3)} onSaved={() => setStep(5)} />;
   return <StepVerify onBack={() => setStep(4)} onFinish={() => router.push(nextUrl)} />;
+}
+
+// ── Step 2 (PostgreSQL): run the install script ──────────────────────────────
+
+const PG_SERVICE_LOGIN_SQL = `CREATE ROLE prism_svc LOGIN PASSWORD '<strong generated password>';
+GRANT prism_service TO prism_svc;
+ALTER ROLE prism_svc SET statement_timeout = '600s';`;
+
+function StepInstallScriptPostgres({ onBack, onNext }: { onBack: () => void; onNext: () => void }) {
+  const [script, setScript] = useState<string | null>(null);
+  const [scriptError, setScriptError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkFailures, setCheckFailures] = useState<CheckItem[] | null>(null);
+  // Source-schema grants generator (the Part D analog — schemas, not
+  // DB.SCHEMA: one Prism installation covers ONE Postgres database).
+  const [grantSchemas, setGrantSchemas] = useState('');
+  const INSTALL_CHECK_KEYS = ['database', 'schemas', 'tables', 'roles'];
+
+  async function handleContinue() {
+    if (checking) return;
+    setChecking(true);
+    setCheckFailures(null);
+    try {
+      const r = await fetch('/api/accounts/verify-install?scope=install', { cache: 'no-store' });
+      const b = await r.json();
+      if (!b?.connected) { onNext(); return; }
+      // Same platform-mismatch guard as the SQL Server step: the route picks
+      // its branch from the ACTIVE adapter — refuse to interpret another
+      // platform's checks as green.
+      if (b?.warehouse_type && b.warehouse_type !== 'postgres') {
+        setCheckFailures([{
+          key: 'platform',
+          label: 'Prism is still configured for a different platform, not PostgreSQL',
+          ok: false,
+          detail: 'The PostgreSQL platform choice from step 1 did not save, so these install checks could not be run. Go back one step and pick PostgreSQL again.',
+        }]);
+        return;
+      }
+      const bad = (Array.isArray(b.checks) ? b.checks : [])
+        .filter((c: CheckItem) => INSTALL_CHECK_KEYS.includes(c.key) && !c.ok);
+      if (bad.length === 0) { onNext(); return; }
+      setCheckFailures(bad);
+    } catch {
+      onNext();
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/install-script?warehouse=postgres', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled) return;
+        if (b?.ok) setScript(String(b.script));
+        else setScriptError(String(b?.error ?? 'Install script unavailable.'));
+      })
+      .catch(() => { if (!cancelled) setScriptError('Could not load the install script.'); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const schemaList = grantSchemas.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  const grantsSql = schemaList.map(s =>
+    `GRANT USAGE ON SCHEMA ${s} TO prism_service;\n` +
+    `GRANT SELECT ON ALL TABLES IN SCHEMA ${s} TO prism_service;\n` +
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA ${s} GRANT SELECT ON TABLES TO prism_service;`,
+  ).join('\n\n');
+
+  return (
+    <div>
+      <StepHeader step={2} title="Set up Prism inside your Postgres database" />
+      <p className="text-sm mb-1" style={{ color: 'var(--text-muted)' }}>
+        This step runs in your own database, so you stay in control — Prism never asks for your
+        admin credentials. Three short parts, about five minutes.
+      </p>
+      <p className="text-xs mb-1 mt-2 rounded-button p-2.5" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)', lineHeight: 1.55 }}>
+        Postgres cannot query across databases — this installation standardizes tables in this
+        one database. Run everything below connected to the database that holds your source tables.
+      </p>
+
+      <SectionTitle>Part A — Run the install script</SectionTitle>
+      <Steps items={[
+        <>Connect to your database as a <strong>superuser</strong> (or the database owner), with
+          psql, pgAdmin, or your usual SQL client:{' '}
+          <span style={{ fontFamily: 'monospace' }}>psql -h &lt;host&gt; -U postgres -d &lt;database&gt; -f 01_internal_tables.postgres.sql</span></>,
+        <>Or copy the script below into a query window and run it. Re-running it is safe.</>,
+      ]} />
+      {script && <CodeBlock code={script} maxHeight={240} />}
+      {!script && !scriptError && (
+        <div className="flex items-center gap-2 text-sm py-6 justify-center" style={{ color: 'var(--text-muted)' }}>
+          <Spinner dark /> Loading install script…
+        </div>
+      )}
+      {scriptError && (
+        <p className="text-xs rounded-button p-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {scriptError}
+        </p>
+      )}
+
+      <SectionTitle>Part B — Create Prism&apos;s service login</SectionTitle>
+      <p className="text-xs mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        Prism signs in as a machine identity, never as a person. Replace the placeholder with a
+        strong generated password and keep it for the next step. To cut Prism off at any time:
+        {' '}<span style={{ fontFamily: 'monospace' }}>ALTER ROLE prism_svc NOLOGIN;</span>
+      </p>
+      <CodeBlock code={PG_SERVICE_LOGIN_SQL} maxHeight={120} />
+
+      <SectionTitle>Part C — Grant read access to your source schemas</SectionTitle>
+      <p className="text-xs mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        Type the schema name(s) that hold the tables you want to standardize (comma or space
+        separated) and run the generated grants. This is your control surface — schemas you never
+        grant stay invisible to Prism.
+      </p>
+      <Input id="pg-grant-schemas" value={grantSchemas} onChange={setGrantSchemas} placeholder="public, sales" />
+      {schemaList.length > 0 && (
+        <div className="mt-2">
+          <CodeBlock code={grantsSql} maxHeight={170} />
+          <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-hint)', lineHeight: 1.5 }}>
+            Note: ALTER DEFAULT PRIVILEGES only covers tables created by the role that runs it —
+            if several roles create tables in a schema, run it once per owning role
+            (…&nbsp;<span style={{ fontFamily: 'monospace' }}>FOR ROLE &lt;owner&gt;</span>&nbsp;…).
+          </p>
+        </div>
+      )}
+
+      {checkFailures && (
+        <div className="mt-5 rounded-card border-[0.5px] p-3" style={{ borderColor: '#FCA5A5', backgroundColor: '#FFF5F5' }}>
+          <p className="text-xs font-medium mb-2" style={{ color: '#991B1B' }}>
+            Prism connected to your Postgres and couldn&apos;t find everything the script creates:
+          </p>
+          {checkFailures.map(c => (
+            <div key={c.key} className="mb-1.5">
+              <p className="text-xs font-medium" style={{ color: '#991B1B' }}>✕ {c.label}</p>
+              {c.detail && <p className="text-[11px]" style={{ color: '#B91C1C' }}>{c.detail}</p>}
+            </div>
+          ))}
+          <p className="text-[11px] mt-2" style={{ color: '#B91C1C' }}>
+            Usually this means the script hasn&apos;t been run yet, only partially ran, or ran against
+            a different database. Run it as a superuser in the right database and try again.
+          </p>
+        </div>
+      )}
+
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={onBack}
+          className="text-sm font-medium rounded-button px-4"
+          style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)', cursor: 'pointer' }}
+        >
+          Back
+        </button>
+        <button
+          type="button" onClick={handleContinue} disabled={checking}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: checking ? 'var(--accent-border)' : 'var(--accent)', color: '#fff', cursor: checking ? 'not-allowed' : 'pointer' }}
+        >
+          {checking
+            ? <><Spinner /> Checking your Postgres…</>
+            : (checkFailures ? 'I’ve re-run it — check again' : 'I’ve run the script — continue')}
+        </button>
+        {checkFailures && (
+          <button type="button" onClick={onNext} className="text-sm"
+            style={{ color: 'var(--text-muted)', background: 'none', cursor: 'pointer' }}>
+            Continue anyway
+          </button>
+        )}
+      </div>
+      <p className="text-[11px] mt-2 text-center" style={{ color: 'var(--text-hint)' }}>
+        Everything is verified again in the last step, so nothing breaks if something was missed.
+      </p>
+    </div>
+  );
+}
+
+// ── Step 3 (PostgreSQL): service credentials ─────────────────────────────────
+
+function StepCredentialsPostgres({ onBack, onSaved }: { onBack: () => void; onSaved: () => void }) {
+  const [host, setHost]         = useState('');
+  const [port, setPort]         = useState('5432');
+  const [database, setDatabase] = useState('');
+  const [user, setUser]         = useState('prism_svc');
+  const [password, setPassword] = useState('');
+  const [sslmode, setSslmode]   = useState<'disable' | 'require' | 'verify-full'>('require');
+  const [hasSavedSecret, setHasSavedSecret] = useState(false);
+  const [busy, setBusy]         = useState<'test' | 'save' | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [tested, setTested]     = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/workspace-postgres', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled || !b) return;
+        if (b.host)     setHost(String(b.host));
+        if (b.port)     setPort(String(b.port));
+        if (b.database) setDatabase(String(b.database));
+        if (b.user)     setUser(String(b.user));
+        if (b.sslmode === 'disable' || b.sslmode === 'require' || b.sslmode === 'verify-full') setSslmode(b.sslmode);
+        setHasSavedSecret(Boolean(b.has_secret));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const canAct = Boolean(host.trim() && database.trim() && user.trim() && (password.trim() || hasSavedSecret));
+
+  async function submit(testOnly: boolean) {
+    if (busy || !canAct) return;
+    setBusy(testOnly ? 'test' : 'save');
+    setError(null);
+    try {
+      const r = await fetch('/api/accounts/workspace-postgres', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          test_only: testOnly || undefined,
+          host: host.trim(),
+          port: Number(port) || 5432,
+          database: database.trim(),
+          user: user.trim(),
+          password: password,
+          sslmode,
+        }),
+      });
+      const b = await r.json();
+      if (!r.ok || b?.error) { setError(String(b?.error ?? 'Request failed.')); return; }
+      if (testOnly) setTested(true);
+      else onSaved();
+    } catch {
+      setError('Could not reach the server.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div>
+      <StepHeader step={3} title="Connect Prism to your Postgres" />
+      <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+        Enter the service login from the previous step. The password is stored encrypted and never
+        shown again.
+      </p>
+
+      <div className="flex flex-col gap-3">
+        <div>
+          <Label htmlFor="pg-host">Host</Label>
+          <Input id="pg-host" value={host} onChange={setHost} placeholder="db.yourcompany.com or mydb.abc.us-east-1.rds.amazonaws.com" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <Label htmlFor="pg-port">Port</Label>
+            <Input id="pg-port" value={port} onChange={setPort} placeholder="5432" />
+          </div>
+          <div className="flex-1">
+            <Label htmlFor="pg-database">Database</Label>
+            <Input id="pg-database" value={database} onChange={setDatabase} placeholder="the database holding your source tables" />
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="pg-user">Login role</Label>
+          <Input id="pg-user" value={user} onChange={setUser} placeholder="prism_svc" />
+        </div>
+        <div>
+          <Label htmlFor="pg-password">Password{hasSavedSecret ? ' (blank keeps the saved one)' : ''}</Label>
+          <Input id="pg-password" type="password" value={password} onChange={setPassword} placeholder={hasSavedSecret ? '••••••••' : ''} />
+        </div>
+        <div>
+          <Label htmlFor="pg-sslmode">TLS</Label>
+          <select
+            id="pg-sslmode" value={sslmode}
+            onChange={e => setSslmode(e.target.value as 'disable' | 'require' | 'verify-full')}
+            className="w-full text-sm rounded-button px-2.5"
+            style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+          >
+            <option value="require">Require (managed providers — RDS, Cloud SQL, Supabase, Neon)</option>
+            <option value="verify-full">Verify full (TLS with certificate verification)</option>
+            <option value="disable">Disable (only for servers without TLS)</option>
+          </select>
+        </div>
+      </div>
+
+      {error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {error}
+        </p>
+      )}
+      {tested && !error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#0F6E56', backgroundColor: '#F0FDF9', border: '0.5px solid #99E5CF' }}>
+          Connection works.
+        </p>
+      )}
+
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={onBack}
+          className="text-sm font-medium rounded-button px-4"
+          style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)', cursor: 'pointer' }}>
+          Back
+        </button>
+        <button type="button" onClick={() => submit(true)} disabled={!canAct || busy !== null}
+          className="text-sm font-medium rounded-button px-4 flex items-center gap-2"
+          style={{ height: 36, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', color: 'var(--accent-strong)', cursor: canAct && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy === 'test' ? <><Spinner dark /> Testing…</> : 'Test connection'}
+        </button>
+        <button type="button" onClick={() => submit(false)} disabled={!canAct || busy !== null}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: canAct && !busy ? 'var(--accent)' : 'var(--accent-border)', color: '#fff', cursor: canAct && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy === 'save' ? <><Spinner /> Saving…</> : 'Save and continue'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Step 2 (MySQL): run the install script ───────────────────────────────────
+
+const MY_SERVICE_LOGIN_SQL = `CREATE USER 'prism_svc'@'%' IDENTIFIED BY '<strong generated password>';
+GRANT 'prism_service' TO 'prism_svc'@'%';
+SET DEFAULT ROLE 'prism_service' TO 'prism_svc'@'%';`;
+
+function StepInstallScriptMysql({ onBack, onNext }: { onBack: () => void; onNext: () => void }) {
+  const [script, setScript] = useState<string | null>(null);
+  const [scriptError, setScriptError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkFailures, setCheckFailures] = useState<CheckItem[] | null>(null);
+  // Source-grants generator (the Part D analog — DATABASES, not schemas:
+  // MySQL has no schema level, and database-wide SELECT covers future tables).
+  const [grantDbs, setGrantDbs] = useState('');
+  const INSTALL_CHECK_KEYS = ['database', 'schemas', 'tables', 'roles'];
+
+  async function handleContinue() {
+    if (checking) return;
+    setChecking(true);
+    setCheckFailures(null);
+    try {
+      const r = await fetch('/api/accounts/verify-install?scope=install', { cache: 'no-store' });
+      const b = await r.json();
+      if (!b?.connected) { onNext(); return; }
+      // Same platform-mismatch guard as the other steps: the route picks its
+      // branch from the ACTIVE adapter — refuse to interpret another
+      // platform's checks as green.
+      if (b?.warehouse_type && b.warehouse_type !== 'mysql') {
+        setCheckFailures([{
+          key: 'platform',
+          label: 'Prism is still configured for a different platform, not MySQL',
+          ok: false,
+          detail: 'The MySQL platform choice from step 1 did not save, so these install checks could not be run. Go back one step and pick MySQL again.',
+        }]);
+        return;
+      }
+      const bad = (Array.isArray(b.checks) ? b.checks : [])
+        .filter((c: CheckItem) => INSTALL_CHECK_KEYS.includes(c.key) && !c.ok);
+      if (bad.length === 0) { onNext(); return; }
+      setCheckFailures(bad);
+    } catch {
+      onNext();
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/install-script?warehouse=mysql', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled) return;
+        if (b?.ok) setScript(String(b.script));
+        else setScriptError(String(b?.error ?? 'Install script unavailable.'));
+      })
+      .catch(() => { if (!cancelled) setScriptError('Could not load the install script.'); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const dbList = grantDbs.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  const grantsSql = dbList.map(d =>
+    `GRANT SELECT ON \`${d}\`.* TO 'prism_svc'@'%';`,
+  ).join('\n');
+
+  return (
+    <div>
+      <StepHeader step={2} title="Set up Prism on your MySQL server" />
+      <p className="text-sm mb-1" style={{ color: 'var(--text-muted)' }}>
+        This step runs on your own server, so you stay in control — Prism never asks for your
+        admin credentials. Three short parts, about five minutes.
+      </p>
+      <p className="text-xs mb-1 mt-2 rounded-button p-2.5" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--page-bg)', border: '0.5px solid var(--border)', lineHeight: 1.55 }}>
+        MySQL joins across databases on one server — connect tables from any database Prism is
+        granted. Requires MySQL 8.0.19 or newer.
+      </p>
+
+      <SectionTitle>Part A — Run the install script</SectionTitle>
+      <Steps items={[
+        <>Connect to your server as <strong>root</strong> (or an admin account), with the mysql
+          client, MySQL Workbench, or your usual SQL client:{' '}
+          <span style={{ fontFamily: 'monospace' }}>mysql -h &lt;host&gt; -u root -p &lt; 01_internal_tables.mysql.sql</span></>,
+        <>Or copy the script below into a query window and run it. Re-running it is safe.</>,
+      ]} />
+      {script && <CodeBlock code={script} maxHeight={240} />}
+      {!script && !scriptError && (
+        <div className="flex items-center gap-2 text-sm py-6 justify-center" style={{ color: 'var(--text-muted)' }}>
+          <Spinner dark /> Loading install script…
+        </div>
+      )}
+      {scriptError && (
+        <p className="text-xs rounded-button p-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {scriptError}
+        </p>
+      )}
+
+      <SectionTitle>Part B — Create Prism&apos;s service account</SectionTitle>
+      <p className="text-xs mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        Prism signs in as a machine identity, never as a person. Replace the placeholder with a
+        strong generated password and keep it for the next step. To cut Prism off at any time:
+        {' '}<span style={{ fontFamily: 'monospace' }}>ALTER USER &apos;prism_svc&apos;@&apos;%&apos; ACCOUNT LOCK;</span>
+      </p>
+      <CodeBlock code={MY_SERVICE_LOGIN_SQL} maxHeight={120} />
+
+      <SectionTitle>Part C — Grant read access to your source databases</SectionTitle>
+      <p className="text-xs mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        Type the database name(s) that hold the tables you want to standardize (comma or space
+        separated) and run the generated grants. Database-wide SELECT automatically covers tables
+        created later. This is your control surface — databases you never grant stay invisible
+        to Prism.
+      </p>
+      <Input id="my-grant-dbs" value={grantDbs} onChange={setGrantDbs} placeholder="erp, sales" />
+      {dbList.length > 0 && (
+        <div className="mt-2">
+          <CodeBlock code={grantsSql} maxHeight={170} />
+        </div>
+      )}
+
+      {checkFailures && (
+        <div className="mt-5 rounded-card border-[0.5px] p-3" style={{ borderColor: '#FCA5A5', backgroundColor: '#FFF5F5' }}>
+          <p className="text-xs font-medium mb-2" style={{ color: '#991B1B' }}>
+            Prism connected to your MySQL and couldn&apos;t find everything the script creates:
+          </p>
+          {checkFailures.map(c => (
+            <div key={c.key} className="mb-1.5">
+              <p className="text-xs font-medium" style={{ color: '#991B1B' }}>✕ {c.label}</p>
+              {c.detail && <p className="text-[11px]" style={{ color: '#B91C1C' }}>{c.detail}</p>}
+            </div>
+          ))}
+          <p className="text-[11px] mt-2" style={{ color: '#B91C1C' }}>
+            Usually this means the script hasn&apos;t been run yet, only partially ran, or ran against
+            a different server. Run it as an admin on the right server and try again.
+          </p>
+        </div>
+      )}
+
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={onBack}
+          className="text-sm font-medium rounded-button px-4"
+          style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)', cursor: 'pointer' }}
+        >
+          Back
+        </button>
+        <button
+          type="button" onClick={handleContinue} disabled={checking}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: checking ? 'var(--accent-border)' : 'var(--accent)', color: '#fff', cursor: checking ? 'not-allowed' : 'pointer' }}
+        >
+          {checking
+            ? <><Spinner /> Checking your MySQL…</>
+            : (checkFailures ? 'I’ve re-run it — check again' : 'I’ve run the script — continue')}
+        </button>
+        {checkFailures && (
+          <button type="button" onClick={onNext} className="text-sm"
+            style={{ color: 'var(--text-muted)', background: 'none', cursor: 'pointer' }}>
+            Continue anyway
+          </button>
+        )}
+      </div>
+      <p className="text-[11px] mt-2 text-center" style={{ color: 'var(--text-hint)' }}>
+        Everything is verified again in the last step, so nothing breaks if something was missed.
+      </p>
+    </div>
+  );
+}
+
+// ── Step 3 (MySQL): service credentials ──────────────────────────────────────
+
+function StepCredentialsMysql({ onBack, onSaved }: { onBack: () => void; onSaved: () => void }) {
+  const [host, setHost]         = useState('');
+  const [port, setPort]         = useState('3306');
+  const [database, setDatabase] = useState('');
+  const [user, setUser]         = useState('prism_svc');
+  const [password, setPassword] = useState('');
+  const [ssl, setSsl]           = useState<'false' | 'true' | 'strict'>('true');
+  const [hasSavedSecret, setHasSavedSecret] = useState(false);
+  const [busy, setBusy]         = useState<'test' | 'save' | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [tested, setTested]     = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/workspace-mysql', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled || !b) return;
+        if (b.host)     setHost(String(b.host));
+        if (b.port)     setPort(String(b.port));
+        if (b.database) setDatabase(String(b.database));
+        if (b.user)     setUser(String(b.user));
+        if (b.ssl === 'false' || b.ssl === 'true' || b.ssl === 'strict') setSsl(b.ssl);
+        setHasSavedSecret(Boolean(b.has_secret));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Unlike Postgres, database is OPTIONAL here — it is only the session
+  // default (MySQL joins across databases), so host + user + secret suffice.
+  const canAct = Boolean(host.trim() && user.trim() && (password.trim() || hasSavedSecret));
+
+  async function submit(testOnly: boolean) {
+    if (busy || !canAct) return;
+    setBusy(testOnly ? 'test' : 'save');
+    setError(null);
+    try {
+      const r = await fetch('/api/accounts/workspace-mysql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          test_only: testOnly || undefined,
+          host: host.trim(),
+          port: Number(port) || 3306,
+          database: database.trim() || undefined,
+          user: user.trim(),
+          password: password,
+          ssl,
+        }),
+      });
+      const b = await r.json();
+      if (!r.ok || b?.error) { setError(String(b?.error ?? 'Request failed.')); return; }
+      if (testOnly) setTested(true);
+      else onSaved();
+    } catch {
+      setError('Could not reach the server.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div>
+      <StepHeader step={3} title="Connect Prism to your MySQL" />
+      <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+        Enter the service account from the previous step. The password is stored encrypted and
+        never shown again.
+      </p>
+
+      <div className="flex flex-col gap-3">
+        <div>
+          <Label htmlFor="my-host">Host</Label>
+          <Input id="my-host" value={host} onChange={setHost} placeholder="db.yourcompany.com or mydb.abc.us-east-1.rds.amazonaws.com" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <Label htmlFor="my-port">Port</Label>
+            <Input id="my-port" value={port} onChange={setPort} placeholder="3306" />
+          </div>
+          <div className="flex-1">
+            <Label htmlFor="my-database">Database (optional — session default only)</Label>
+            <Input id="my-database" value={database} onChange={setDatabase} placeholder="prism_internal" />
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="my-user">Service account</Label>
+          <Input id="my-user" value={user} onChange={setUser} placeholder="prism_svc" />
+        </div>
+        <div>
+          <Label htmlFor="my-password">Password{hasSavedSecret ? ' (blank keeps the saved one)' : ''}</Label>
+          <Input id="my-password" type="password" value={password} onChange={setPassword} placeholder={hasSavedSecret ? '••••••••' : ''} />
+        </div>
+        <div>
+          <Label htmlFor="my-ssl">TLS</Label>
+          <select
+            id="my-ssl" value={ssl}
+            onChange={e => setSsl(e.target.value as 'false' | 'true' | 'strict')}
+            className="w-full text-sm rounded-button px-2.5"
+            style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+          >
+            <option value="true">Require (managed providers — RDS/Aurora, Cloud SQL, PlanetScale)</option>
+            <option value="strict">Strict (TLS with certificate verification)</option>
+            <option value="false">Disable (only for servers without TLS)</option>
+          </select>
+        </div>
+      </div>
+
+      {error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {error}
+        </p>
+      )}
+      {tested && !error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#0F6E56', backgroundColor: '#F0FDF9', border: '0.5px solid #99E5CF' }}>
+          Connection works.
+        </p>
+      )}
+
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={onBack}
+          className="text-sm font-medium rounded-button px-4"
+          style={{ height: 36, border: '0.5px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)', cursor: 'pointer' }}>
+          Back
+        </button>
+        <button type="button" onClick={() => submit(true)} disabled={!canAct || busy !== null}
+          className="text-sm font-medium rounded-button px-4 flex items-center gap-2"
+          style={{ height: 36, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', color: 'var(--accent-strong)', cursor: canAct && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy === 'test' ? <><Spinner dark /> Testing…</> : 'Test connection'}
+        </button>
+        <button type="button" onClick={() => submit(false)} disabled={!canAct || busy !== null}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: canAct && !busy ? 'var(--accent)' : 'var(--accent-border)', color: '#fff', cursor: canAct && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy === 'save' ? <><Spinner /> Saving…</> : 'Save and continue'}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ── Personal (non-admin) variant — unchanged behavior ────────────────────────
@@ -1641,6 +2294,216 @@ function PersonalSetupFormMssql({ nextUrl }: { nextUrl: string }) {
         <div>
           <Label htmlFor="pms-password">Password{hasSavedSecret ? ' (blank keeps the saved one)' : ''}</Label>
           <Input id="pms-password" type="password" value={password} onChange={setPassword} placeholder={hasSavedSecret ? '••••••••' : ''} />
+        </div>
+      </div>
+      {error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={handleSave} disabled={!canSave || busy}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: canSave && !busy ? 'var(--accent)' : 'var(--accent-border)', color: '#fff', cursor: canSave && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy ? <><Spinner /> Saving…</> : 'Save and continue'}
+        </button>
+        <button type="button" onClick={() => router.push(nextUrl)}
+          className="text-sm" style={{ color: 'var(--text-muted)', background: 'none', cursor: 'pointer' }}>
+          Skip for now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PersonalSetupFormPg({ nextUrl }: { nextUrl: string }) {
+  const router = useRouter();
+  const [host, setHost]         = useState('');
+  const [port, setPort]         = useState('5432');
+  const [database, setDatabase] = useState('');
+  const [user, setUser]         = useState('');
+  const [password, setPassword] = useState('');
+  const [hasSavedSecret, setHasSavedSecret] = useState(false);
+  const [busy, setBusy]         = useState(false);
+  const [error, setError]       = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/pg-config', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled || !b) return;
+        if (b.host)     setHost(String(b.host));
+        if (b.port)     setPort(String(b.port));
+        if (b.database) setDatabase(String(b.database));
+        if (b.user)     setUser(String(b.user));
+        setHasSavedSecret(Boolean(b.has_secret));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const canSave = Boolean(host.trim() && user.trim() && (password.trim() || hasSavedSecret));
+
+  async function handleSave() {
+    if (!canSave || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch('/api/accounts/pg-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: host.trim(), port: Number(port) || 5432, database: database.trim(), user: user.trim(), password }),
+      });
+      const b = await r.json();
+      if (!r.ok || b?.error) { setError(String(b?.error ?? 'Save failed.')); return; }
+      router.push(nextUrl);
+    } catch {
+      setError('Could not reach the server.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <h1 className="text-lg font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
+        Connect your own Postgres login{' '}
+        <span className="text-sm font-normal" style={{ color: 'var(--text-hint)' }}>(optional)</span>
+      </h1>
+      <p className="text-sm mb-4" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        You don&apos;t need this to use Prism. It&apos;s used for one-time standardizations on a
+        table Prism&apos;s service role can&apos;t see, and for granting the service role access to
+        one table when you enable an output mode that writes to it. Credentials are stored
+        encrypted. You can always come back to this from Settings.
+      </p>
+      <div className="flex flex-col gap-3">
+        <div>
+          <Label htmlFor="ppg-host">Host</Label>
+          <Input id="ppg-host" value={host} onChange={setHost} placeholder="db.yourcompany.com" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <Label htmlFor="ppg-port">Port</Label>
+            <Input id="ppg-port" value={port} onChange={setPort} placeholder="5432" />
+          </div>
+          <div className="flex-1">
+            <Label htmlFor="ppg-database">Database</Label>
+            <Input id="ppg-database" value={database} onChange={setDatabase} placeholder="same database as the workspace" />
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="ppg-user">Your login role</Label>
+          <Input id="ppg-user" value={user} onChange={setUser} placeholder="" />
+        </div>
+        <div>
+          <Label htmlFor="ppg-password">Password{hasSavedSecret ? ' (blank keeps the saved one)' : ''}</Label>
+          <Input id="ppg-password" type="password" value={password} onChange={setPassword} placeholder={hasSavedSecret ? '••••••••' : ''} />
+        </div>
+      </div>
+      {error && (
+        <p className="text-xs rounded-button p-3 mt-3" style={{ color: '#991B1B', backgroundColor: '#FFF5F5', border: '0.5px solid #FCA5A5' }}>
+          {error}
+        </p>
+      )}
+      <div className="mt-5 flex items-center gap-3">
+        <button type="button" onClick={handleSave} disabled={!canSave || busy}
+          className="flex-1 flex items-center justify-center gap-2 text-sm font-medium rounded-button"
+          style={{ height: 36, backgroundColor: canSave && !busy ? 'var(--accent)' : 'var(--accent-border)', color: '#fff', cursor: canSave && !busy ? 'pointer' : 'not-allowed' }}>
+          {busy ? <><Spinner /> Saving…</> : 'Save and continue'}
+        </button>
+        <button type="button" onClick={() => router.push(nextUrl)}
+          className="text-sm" style={{ color: 'var(--text-muted)', background: 'none', cursor: 'pointer' }}>
+          Skip for now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PersonalSetupFormMysql({ nextUrl }: { nextUrl: string }) {
+  const router = useRouter();
+  const [host, setHost]         = useState('');
+  const [port, setPort]         = useState('3306');
+  const [database, setDatabase] = useState('');
+  const [user, setUser]         = useState('');
+  const [password, setPassword] = useState('');
+  const [hasSavedSecret, setHasSavedSecret] = useState(false);
+  const [busy, setBusy]         = useState(false);
+  const [error, setError]       = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/mysql-config', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(b => {
+        if (cancelled || !b) return;
+        if (b.host)     setHost(String(b.host));
+        if (b.port)     setPort(String(b.port));
+        if (b.database) setDatabase(String(b.database));
+        if (b.user)     setUser(String(b.user));
+        setHasSavedSecret(Boolean(b.has_secret));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const canSave = Boolean(host.trim() && user.trim() && (password.trim() || hasSavedSecret));
+
+  async function handleSave() {
+    if (!canSave || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch('/api/accounts/mysql-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: host.trim(), port: Number(port) || 3306, database: database.trim(), user: user.trim(), password }),
+      });
+      const b = await r.json();
+      if (!r.ok || b?.error) { setError(String(b?.error ?? 'Save failed.')); return; }
+      router.push(nextUrl);
+    } catch {
+      setError('Could not reach the server.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <h1 className="text-lg font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
+        Connect your own MySQL account{' '}
+        <span className="text-sm font-normal" style={{ color: 'var(--text-hint)' }}>(optional)</span>
+      </h1>
+      <p className="text-sm mb-4" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
+        You don&apos;t need this to use Prism. It&apos;s used for one-time standardizations on a
+        table Prism&apos;s service account can&apos;t see, and for granting the service account
+        access to one table when you enable an output mode that writes to it. Credentials are
+        stored encrypted. You can always come back to this from Settings.
+      </p>
+      <div className="flex flex-col gap-3">
+        <div>
+          <Label htmlFor="pmy-host">Host</Label>
+          <Input id="pmy-host" value={host} onChange={setHost} placeholder="db.yourcompany.com" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <Label htmlFor="pmy-port">Port</Label>
+            <Input id="pmy-port" value={port} onChange={setPort} placeholder="3306" />
+          </div>
+          <div className="flex-1">
+            <Label htmlFor="pmy-database">Database (optional)</Label>
+            <Input id="pmy-database" value={database} onChange={setDatabase} placeholder="session default only" />
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="pmy-user">Your account</Label>
+          <Input id="pmy-user" value={user} onChange={setUser} placeholder="" />
+        </div>
+        <div>
+          <Label htmlFor="pmy-password">Password{hasSavedSecret ? ' (blank keeps the saved one)' : ''}</Label>
+          <Input id="pmy-password" type="password" value={password} onChange={setPassword} placeholder={hasSavedSecret ? '••••••••' : ''} />
         </div>
       </div>
       {error && (
@@ -1882,7 +2745,7 @@ function SetupForm() {
   // The installation's warehouse platform — decides which personal-credentials
   // form regular users see. test-snowflake GET is member-readable and reports
   // warehouse_type on SQL Server installs.
-  const [platform, setPlatform] = useState<'snowflake' | 'mssql'>('snowflake');
+  const [platform, setPlatform] = useState<Platform>('snowflake');
   useEffect(() => {
     let cancelled = false;
     fetch('/api/auth/session', { cache: 'no-store' })
@@ -1893,7 +2756,10 @@ function SetupForm() {
       .catch(() => {});
     fetch('/api/accounts/test-snowflake', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
-      .then(b => { if (!cancelled && b?.warehouse_type === 'mssql') setPlatform('mssql'); })
+      .then(b => {
+        const t = b?.warehouse_type;
+        if (!cancelled && (t === 'mssql' || t === 'postgres' || t === 'mysql')) setPlatform(t);
+      })
       .catch(() => {});
     return () => { cancelled = true; };
   }, []);
@@ -1920,13 +2786,16 @@ function SetupForm() {
         <div className="rounded-card border-[0.5px]" style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: '32px 28px' }}>
           {role === 'admin'
             ? <AdminOnboarding nextUrl={nextUrl} />
-            : (platform === 'mssql' ? <PersonalSetupFormMssql nextUrl={nextUrl} /> : <PersonalSetupForm nextUrl={nextUrl} />)}
+            : platform === 'mssql'    ? <PersonalSetupFormMssql nextUrl={nextUrl} />
+            : platform === 'postgres' ? <PersonalSetupFormPg nextUrl={nextUrl} />
+            : platform === 'mysql'    ? <PersonalSetupFormMysql nextUrl={nextUrl} />
+            : <PersonalSetupForm nextUrl={nextUrl} />}
         </div>
 
         <p className="text-xs text-center mt-4" style={{ color: 'var(--text-hint)' }}>
           {role === 'admin'
             ? 'Prism only ever stores the low-privilege service credentials and your AI provider key, encrypted. Admin credentials are never saved.'
-            : 'Credentials are stored encrypted in your account and used only to connect to Snowflake on your behalf.'}
+            : `Credentials are stored encrypted in your account and used only to connect to ${PLATFORM_LABELS[platform]} on your behalf.`}
         </p>
       </div>
     </div>

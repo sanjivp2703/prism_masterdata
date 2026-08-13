@@ -382,6 +382,73 @@ const MIGRATIONS: string[] = [
   ALTER TABLE pipelines DROP COLUMN file_source_meta;
   ALTER TABLE pipelines DROP COLUMN file_export_meta;
   `,
+
+  // 017 — recorded terms-of-service acceptance (clickwrap).
+  //
+  // The login page's "by signing in you agree" line is browsewrap: nothing
+  // proves the user saw it, and nothing is stored. Every account must now
+  // explicitly accept the current terms once (the /accept-terms interstitial)
+  // before reaching the app; the accepted version + timestamp are the durable
+  // record. CURRENT_TERMS_VERSION (terms-version.ts) is bumped when the terms
+  // materially change, which re-prompts everyone on their next login.
+  // NULL = never accepted (all pre-existing accounts — they get the
+  // interstitial on their next visit to /home or their next sign-in).
+  `
+  ALTER TABLE accounts ADD COLUMN terms_accepted_version INTEGER;
+  ALTER TABLE accounts ADD COLUMN terms_accepted_at TEXT;
+  `,
+
+  // 018 — PostgreSQL warehouse credentials (docs/POSTGRES_PORT_PLAN.md Phase
+  // P4, mirroring migration 010's ms_* pattern). workspace_config gains the
+  // workspace service-connection fields (secrets enc:v1: encrypted; sslmode is
+  // a first-class field — managed pg providers require TLS, the dev container
+  // has none); accounts gains the personal-credential variant used by the
+  // one-time flow's access fallback. warehouse_type is already free-text and
+  // the factory accepts 'postgres'.
+  `
+  ALTER TABLE workspace_config ADD COLUMN pg_host TEXT;
+  ALTER TABLE workspace_config ADD COLUMN pg_port INTEGER;
+  ALTER TABLE workspace_config ADD COLUMN pg_database TEXT;
+  ALTER TABLE workspace_config ADD COLUMN pg_user TEXT;
+  ALTER TABLE workspace_config ADD COLUMN pg_password TEXT;
+  ALTER TABLE workspace_config ADD COLUMN pg_sslmode TEXT;
+  ALTER TABLE accounts ADD COLUMN pg_host TEXT;
+  ALTER TABLE accounts ADD COLUMN pg_port INTEGER;
+  ALTER TABLE accounts ADD COLUMN pg_database TEXT;
+  ALTER TABLE accounts ADD COLUMN pg_user TEXT;
+  ALTER TABLE accounts ADD COLUMN pg_password TEXT;
+  `,
+
+  // 019 — MySQL warehouse credentials (docs/MYSQL_PORT_PLAN.md Phase M4,
+  // mirroring migrations 010/018). my_ssl is 'false' | 'true' | 'strict'
+  // (managed providers require TLS; the dev container has none). my_database
+  // is only the SESSION DEFAULT — MySQL joins across databases freely, so it
+  // is not a scope the way pg_database is.
+  `
+  ALTER TABLE workspace_config ADD COLUMN my_host TEXT;
+  ALTER TABLE workspace_config ADD COLUMN my_port INTEGER;
+  ALTER TABLE workspace_config ADD COLUMN my_database TEXT;
+  ALTER TABLE workspace_config ADD COLUMN my_user TEXT;
+  ALTER TABLE workspace_config ADD COLUMN my_password TEXT;
+  ALTER TABLE workspace_config ADD COLUMN my_ssl TEXT;
+  ALTER TABLE accounts ADD COLUMN my_host TEXT;
+  ALTER TABLE accounts ADD COLUMN my_port INTEGER;
+  ALTER TABLE accounts ADD COLUMN my_database TEXT;
+  ALTER TABLE accounts ADD COLUMN my_user TEXT;
+  ALTER TABLE accounts ADD COLUMN my_password TEXT;
+  `,
+
+  // 020 — native (Marketplace) edition identity (docs/NATIVE_APP_PLAN.md N2).
+  // Inside SPCS the ingress authenticates the browser user against Snowflake
+  // and injects Sf-Context-Current-User; /api/auth/spcs provisions an account
+  // per Snowflake username and issues the normal session cookie. sf_username
+  // is that identity key (uppercase-normalized). Partial unique index because
+  // the column is NULL for every Google-auth account.
+  `
+  ALTER TABLE accounts ADD COLUMN sf_username TEXT;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_sf_username
+    ON accounts(sf_username) WHERE sf_username IS NOT NULL;
+  `,
 ];
 
 let _db: Database.Database | null = null;

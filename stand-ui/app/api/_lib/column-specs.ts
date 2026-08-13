@@ -23,9 +23,12 @@ import { getDb, sqliteNow } from './sqlite';
 import {
   withWarehouse, executeQuery as exec, getWarehouseAdapter,
 } from './warehouse';
+import { internalTable } from './warehouse-tables';
 import {
   bulkUpsertApprovedAliasesMssql, bulkUpsertLiteralMatchesMssql,
 } from './warehouse/mssql/mappings';
+import { bulkUpsertApprovedAliasesPg, bulkUpsertLiteralMatchesPg } from './warehouse/postgres/mappings';
+import { bulkUpsertApprovedAliasesMysql, bulkUpsertLiteralMatchesMysql } from './warehouse/mysql/mappings';
 import { sanitizeConventionRules, hasAnyRule, isProbablyCatastrophicRegex } from './convention-rules';
 import { safeRegexError } from './safe-regex';
 import { normalizeLiteral } from './normalize';
@@ -360,6 +363,27 @@ export async function seedSpecValuesOnConn(conn: any, specId: number, valuesToSe
       );
       return;
     }
+    // Postgres: same shape via the ON CONFLICT writers (app-side
+    // normalized_value; upsert-on-match is a superset of the NOT EXISTS guard).
+    if (getWarehouseAdapter().kind === 'postgres') {
+      const aliasIds = await bulkUpsertApprovedAliasesPg(conn, seeded, did);
+      await bulkUpsertLiteralMatchesPg(
+        conn,
+        seeded.filter(v => aliasIds.has(v)).map(v => ({ literalValue: v, aliasId: aliasIds.get(v)! })),
+        did, 0,
+      );
+      return;
+    }
+    // MySQL: same shape via the row-alias ON DUPLICATE KEY writers.
+    if (getWarehouseAdapter().kind === 'mysql') {
+      const aliasIds = await bulkUpsertApprovedAliasesMysql(conn, seeded, did);
+      await bulkUpsertLiteralMatchesMysql(
+        conn,
+        seeded.filter(v => aliasIds.has(v)).map(v => ({ literalValue: v, aliasId: aliasIds.get(v)! })),
+        did, 0,
+      );
+      return;
+    }
 
     const BATCH = 200;
     for (let i = 0; i < seeded.length; i += BATCH) {
@@ -368,7 +392,7 @@ export async function seedSpecValuesOnConn(conn: any, specId: number, valuesToSe
       // 1. Ensure an alias row exists for every value (MERGE dedups).
       const namesSql = batch.map(() => '(?)').join(', ');
       await exec(conn,
-        `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES AS t
+        `MERGE INTO ${internalTable('APPROVED_ALIAS_NAMES')} AS t
          USING (SELECT DISTINCT column1 AS alias_name FROM VALUES ${namesSql}) AS s
            ON t.alias_name = s.alias_name AND t.domain_id = ?
          WHEN NOT MATCHED THEN INSERT (alias_name, domain_id)
@@ -382,14 +406,14 @@ export async function seedSpecValuesOnConn(conn: any, specId: number, valuesToSe
       const rowBinds: any[] = [];
       for (const v of batch) rowBinds.push(v, normalizeLiteral(v));
       await exec(conn,
-        `INSERT INTO PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+        `INSERT INTO ${internalTable('LITERAL_ALIAS_MATCHES')}
            (literal_value, normalized_value, alias_id, domain_id, run_id)
          SELECT v.column1, v.column2, a.alias_id, ?, 0
          FROM (SELECT DISTINCT column1, column2 FROM VALUES ${rowsSql}) v
-         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES a
+         JOIN ${internalTable('APPROVED_ALIAS_NAMES')} a
            ON a.alias_name = v.column1 AND a.domain_id = ?
          WHERE NOT EXISTS (
-           SELECT 1 FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES m
+           SELECT 1 FROM ${internalTable('LITERAL_ALIAS_MATCHES')} m
            WHERE m.normalized_value = v.column2 AND m.domain_id = ?
          )`,
         [did, ...rowBinds, did, did]);

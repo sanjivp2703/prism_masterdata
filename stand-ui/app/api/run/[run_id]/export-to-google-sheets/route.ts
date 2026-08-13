@@ -3,7 +3,9 @@ import { NextRequest } from 'next/server';
 import { cookies } from 'next/headers';
 import { google } from 'googleapis';
 import { warehouseErrorResponse, withWarehouse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 import { getDb } from '@/app/api/_lib/sqlite';
 
 // ── Snowflake helpers ─────────────────────────────────────────────────────────
@@ -29,6 +31,7 @@ export async function POST(
 ) {
   const authz = await requireValidSession();
   if (authz instanceof Response) return authz;
+  if (isNativeEdition()) return nativeEditionUnavailable('Google Sheets export');
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REDIRECT_URI) {
     return Response.json(
       { error: 'Google Sheets export is not configured on this server.' },
@@ -92,8 +95,8 @@ export async function POST(
       const mappingRows = await exec(
         connection,
         `SELECT lam.literal_value AS original_value, aan.alias_name AS standardized_value
-         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+         FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+         JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
            ON lam.alias_id = aan.alias_id
          WHERE lam.run_id = ?
          ORDER BY aan.alias_name, lam.literal_value`,

@@ -217,6 +217,27 @@ CREATE OR REPLACE TABLE ONE_TIME_FILE_ROWS (
 );
 
 -- ----------------------------------------------------------------------------
+-- ONE_TIME_FILE_BLOBS — the ORIGINAL uploaded file's bytes (base64, chunked),
+-- for the edit-in-place round trip: the cleaned download is the customer's
+-- own workbook with only the standardized cells changed (hidden columns,
+-- styles, column order intact — what a Dynamics/SAP reimport wizard needs).
+-- Customer VALUES → warehouse-side (data residency), same lifecycle as
+-- ONE_TIME_FILE_ROWS. Chunked because a 20 MB file is ~27 MB of base64 and
+-- Snowflake caps a VARCHAR value at 16 MB. Meta columns repeat per chunk.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE ONE_TIME_FILE_BLOBS (
+    session_nonce VARCHAR         NOT NULL,
+    chunk_num     INTEGER         NOT NULL,
+    file_name     VARCHAR         NOT NULL,
+    file_kind     VARCHAR(10)     NOT NULL,   -- 'csv' | 'xlsx'
+    sheet_name    VARCHAR,                    -- xlsx tab (NULL for csv)
+    header_row    INTEGER         NOT NULL,   -- 0-based grid index the user confirmed
+    data          VARCHAR         NOT NULL,   -- base64 chunk (≤ 6 MB each)
+    created_at    TIMESTAMP_NTZ   NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (session_nonce, chunk_num)
+);
+
+-- ----------------------------------------------------------------------------
 -- RUN_STATE — the run review state blob (data residency).
 -- One row per run: the full grouping/review JSON for that run. The blob
 -- contains the customer's distinct column values under review, so it lives in
@@ -314,6 +335,7 @@ GRANT ALL PRIVILEGES ON SCHEMA   PRISM_DB.INTERNAL      TO ROLE PRISM_SERVICE;
 -- FUTURE TABLES below only covers tables created AFTER this script runs).
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.PIPELINE_QUEUE             TO ROLE PRISM_SERVICE;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS        TO ROLE PRISM_SERVICE;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.ONE_TIME_FILE_BLOBS       TO ROLE PRISM_SERVICE;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES       TO ROLE PRISM_SERVICE;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES      TO ROLE PRISM_SERVICE;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE PRISM_DB.INTERNAL.RUN_STATE                  TO ROLE PRISM_SERVICE;

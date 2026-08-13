@@ -207,19 +207,27 @@ export async function PATCH(
         // likely fix, never raw driver text.
         const curated = err instanceof Error && err.message.startsWith('Prism ') ? err.message : null;
         // Name the exact schema in the fix SQL so the admin can copy-paste it.
-        const isMssql   = getWarehouseAdapter().kind === 'mssql';
+        const whKind    = getWarehouseAdapter().kind;
+        const isMssql   = whKind === 'mssql';
+        const isPg      = whKind === 'postgres';
         const expParts  = String(exportRef.export_table_fqn ?? '').split('.');
-        const [expDb, expSch] = expParts.length === 3 ? [expParts[0], expParts[1]] : ['<database>', '<schema>'];
-        const expSchema = isMssql ? expSch : `${expDb}.${expSch}`;
+        const [expDb, expSch] = expParts.length === 3 ? [expParts[0], expParts[1]]
+                              : expParts.length === 2 ? ['<database>', expParts[0]]
+                              : ['<database>', '<schema>'];
+        const expSchema = isMssql || isPg ? expSch : `${expDb}.${expSch}`;
         const fallback = exportRef.export_kind === 'view'
           ? (isMssql
               // Views are refused on the mssql adapter — this branch shouldn't
               // fire in practice, but keep a sane message rather than none.
               ? `The export view ${exportRef.export_table_fqn} could not be created. SQL Server exports don't support the View output — switch this pipeline to Table or Column in the card's Settings tab.`
+            : isPg
+              ? `The export view ${exportRef.export_table_fqn} could not be created. Run in Postgres: GRANT USAGE, CREATE ON SCHEMA ${expSchema} TO prism_service; then use "Recreate view now" in the card's Settings tab.`
               : `The export view ${exportRef.export_table_fqn} could not be created. Run in Snowflake: GRANT CREATE VIEW ON SCHEMA ${expSchema} TO ROLE PRISM_SERVICE; then use "Recreate view now" in the card's Settings tab.`)
           : exportRef.export_kind === 'column'
           ? (isMssql
               ? `The standardized column(s) on ${exportRef.table_fqn} could not be updated. Run against the SQL Server as a sysadmin: ${columnModeSetupSql(exportRef.table_fqn, exportRef.column_name)} then use "Sync standardized columns now" in the card's Settings tab.`
+            : isPg
+              ? `The standardized column(s) on ${exportRef.table_fqn} could not be updated. Run as a Postgres admin: ${columnModeSetupSql(exportRef.table_fqn, exportRef.column_name)} then use "Sync standardized columns now" in the card's Settings tab.`
               : `The standardized column(s) on ${exportRef.table_fqn} could not be updated. Run in Snowflake: GRANT UPDATE ON TABLE ${exportRef.table_fqn} TO ROLE PRISM_SERVICE; then use "Sync standardized columns now" in the card's Settings tab.`)
           : (isMssql
               // Grant to the prism_svc LOGIN directly, not the PRISM_SERVICE
@@ -232,6 +240,8 @@ export async function PATCH(
               // admin is told to run verbatim must name the login that actually
               // needs the permission.
               ? `The export table ${exportRef.export_table_fqn} could not be built. Run against the SQL Server as a sysadmin: ${tableModeSetupSql(exportRef.export_table_fqn!)} then use "Rebuild export table now" in the card's Settings tab.`
+            : isPg
+              ? `The export table ${exportRef.export_table_fqn} could not be built. Run in Postgres: GRANT USAGE, CREATE ON SCHEMA ${expSchema} TO prism_service; then use "Rebuild export table now" in the card's Settings tab.`
               : `The export table ${exportRef.export_table_fqn} could not be built. Run in Snowflake: GRANT CREATE TABLE ON SCHEMA ${expSchema} TO ROLE PRISM_SERVICE; then use "Rebuild export table now" in the card's Settings tab.`);
         flagPipelineMessage(pid, curated ?? fallback, 'error').catch(() => {});
       });

@@ -24,6 +24,37 @@ export async function GET() {
   const auth = await requireValidSession();
   if (auth instanceof Response) return auth;
 
+  // Postgres installs: the setup entry check tests the pg service connection
+  // instead (Postgres port Phase P4). Same shape: ok + identifiers ("role" is
+  // the connected pg role; no warehouse concept).
+  if (getWarehouseAdapter().kind === 'postgres') {
+    try {
+      const info = await withWarehouse(async (conn) => {
+        const rows = await exec(conn, `SELECT current_database() AS d, current_user AS u`);
+        const r = rows[0] ?? {};
+        return { database: String(r.d ?? ''), role: String(r.u ?? ''), warehouse: '' };
+      });
+      return Response.json({ ok: true, warehouse_type: 'postgres', account: '', ...info });
+    } catch {
+      return Response.json({ ok: false, warehouse_type: 'postgres', account: '' });
+    }
+  }
+
+  // MySQL installs: same shape — "role" is the connected account; DATABASE()
+  // is only the session default (not a scope) and may be NULL.
+  if (getWarehouseAdapter().kind === 'mysql') {
+    try {
+      const info = await withWarehouse(async (conn) => {
+        const rows = await exec(conn, `SELECT DATABASE() AS d, CURRENT_USER() AS u`);
+        const r = rows[0] ?? {};
+        return { database: String(r.d ?? ''), role: String(r.u ?? ''), warehouse: '' };
+      });
+      return Response.json({ ok: true, warehouse_type: 'mysql', account: '', ...info });
+    } catch {
+      return Response.json({ ok: false, warehouse_type: 'mysql', account: '' });
+    }
+  }
+
   // SQL Server installs: the setup entry check tests the mssql service
   // connection instead (SQL Server port Phase 6). Same shape: ok + identifiers.
   if (getWarehouseAdapter().kind === 'mssql') {

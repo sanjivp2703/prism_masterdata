@@ -43,6 +43,23 @@ import {
   hasTableModePermissions, grantTableModePermissions, tableModeSetupSql,
   columnModeSetupSqlMssql,
 } from './warehouse/mssql/export';
+import {
+  refreshExportTablePg, refreshStandardizedColumnsPg, computeMappedCountsPg, listSourceColumnsPg,
+  columnModeSetupSqlPg,
+} from './warehouse/postgres/export';
+import { quoteIdent as pgQuoteIdent } from './warehouse/postgres/dialect';
+import { getServiceRoleName } from './warehouse/postgres/connection';
+import { pgTableRef } from './warehouse/postgres/detection';
+import {
+  refreshExportTableMysql, refreshStandardizedColumnsMysql, computeMappedCountsMysql, listSourceColumnsMysql,
+  columnModeSetupSqlMysql,
+} from './warehouse/mysql/export';
+import { quoteIdent as myQuoteIdent } from './warehouse/mysql/dialect';
+import { getServiceAccountName as myServiceAccount } from './warehouse/mysql/connection';
+import { myTableRef } from './warehouse/mysql/detection';
+
+/** schema-qualified pg reference (cross-database FQNs rejected inside). */
+const pgRefOf = (fqn: string): string => pgTableRef(fqn).ref;
 import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from './warehouse/mssql/dialect';
 import { getServiceLoginName } from './warehouse/mssql/connection';
 import { loadOpRunState } from './op-auto-group';
@@ -203,6 +220,28 @@ export async function refreshExportTable(
         }
         throw err;
       }
+    }
+    if (getWarehouseAdapter().kind === 'postgres') {
+      if (exportKind === 'column') {
+        return await withColumnModeFailureSurfaced(
+          pipelineId, source_fqn, column_name,
+          () => refreshStandardizedColumnsPg(conn, source_fqn, column_name, domain_id, pipelineId),
+        );
+      }
+      // Table AND view kinds — the pg builder handles both (views are live
+      // over persistent mapping tables; see warehouse/postgres/export.ts).
+      return await refreshExportTablePg(conn, source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind === 'view' ? 'view' : 'table');
+    }
+    if (getWarehouseAdapter().kind === 'mysql') {
+      if (exportKind === 'column') {
+        return await withColumnModeFailureSurfaced(
+          pipelineId, source_fqn, column_name,
+          () => refreshStandardizedColumnsMysql(conn, source_fqn, column_name, domain_id, pipelineId),
+        );
+      }
+      // Table AND view kinds — the mysql builder handles both (views are live
+      // over persistent mapping tables; see warehouse/mysql/export.ts).
+      return await refreshExportTableMysql(conn, source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind === 'view' ? 'view' : 'table');
     }
     if (exportKind === 'column') {
       return await withColumnModeFailureSurfaced(
@@ -442,6 +481,10 @@ export async function assertCompanionColumnAvailable(
   let cols: string[];
   if (getWarehouseAdapter().kind === 'mssql') {
     cols = await listSourceColumnsMssql(conn, table_fqn);
+  } else if (getWarehouseAdapter().kind === 'postgres') {
+    cols = await listSourceColumnsPg(conn, table_fqn);
+  } else if (getWarehouseAdapter().kind === 'mysql') {
+    cols = await listSourceColumnsMysql(conn, table_fqn);
   } else {
     const src = parseFqn(table_fqn);
     const ref = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
@@ -555,6 +598,14 @@ export function columnModeSetupSql(table_fqn: string, column_name: string): stri
     // the same failure produced correct SQL elsewhere (PIPE-09 / OUT-15).
     return columnModeSetupSqlMssql(table_fqn, column_name);
   }
+  if (getWarehouseAdapter().kind === 'postgres') {
+    // Same one-generator rule as mssql — defined in warehouse/postgres/export.ts.
+    return columnModeSetupSqlPg(table_fqn, column_name);
+  }
+  if (getWarehouseAdapter().kind === 'mysql') {
+    // Same one-generator rule — defined in warehouse/mysql/export.ts.
+    return columnModeSetupSqlMysql(table_fqn, column_name);
+  }
 
   // Same ordering rule as the mssql branch above — see that comment.
   return (
@@ -605,6 +656,22 @@ export async function provisionColumnModeAccess(
           `USE ${msQuoteIdent(p.db)}; IF COL_LENGTH('${p.schema}.${p.table}', '${companion.replace(/'/g, "''")}') IS NULL ` +
           `ALTER TABLE ${obj} ADD ${msQuoteIdent(companion)} NVARCHAR(450) NULL;`,
         );
+      } else if (getWarehouseAdapter().kind === 'postgres') {
+        const ref = pgRefOf(table_fqn);
+        // GRANT first — same ordering rule as the other warehouses: a failed
+        // GRANT must not leave an orphan companion column behind.
+        await exec(conn, `GRANT UPDATE ON ${ref} TO ${pgQuoteIdent(getServiceRoleName())}`);
+        await exec(conn, `ALTER TABLE ${ref} ADD COLUMN IF NOT EXISTS ${pgQuoteIdent(companion)} VARCHAR(450)`);
+      } else if (getWarehouseAdapter().kind === 'mysql') {
+        const { ref } = myTableRef(table_fqn);
+        // GRANT first (same ordering rule); no ADD COLUMN IF NOT EXISTS on
+        // MySQL — duplicate-column (errno 1060) reads as already-provisioned.
+        await exec(conn, `GRANT UPDATE ON ${ref} TO '${myServiceAccount().replace(/'/g, "''")}'@'%'`);
+        try {
+          await exec(conn, `ALTER TABLE ${ref} ADD COLUMN ${myQuoteIdent(companion)} VARCHAR(450) NULL`);
+        } catch (e) {
+          if (Number((e as { errno?: number } | null)?.errno) !== 1060) throw e;
+        }
       } else {
         const src = parseFqn(table_fqn);
         const ref = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
@@ -889,8 +956,10 @@ export async function updatePipelineMappedCount(
   pipelineId:  number,
 ): Promise<void> {
   return await withWarehouse(async (conn) => {
-    if (getWarehouseAdapter().kind === 'mssql') {
-      const { totalSource, totalMapped } = await computeMappedCountsMssql(conn, source_fqn, column_name, domain_id);
+    if (getWarehouseAdapter().kind === 'mssql' || getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
+      const kind = getWarehouseAdapter().kind;
+      const compute = kind === 'mssql' ? computeMappedCountsMssql : kind === 'mysql' ? computeMappedCountsMysql : computeMappedCountsPg;
+      const { totalSource, totalMapped } = await compute(conn, source_fqn, column_name, domain_id);
       getDb()
         .prepare(
           `UPDATE pipelines

@@ -56,6 +56,7 @@ DROP TABLE IF EXISTS INTERNAL.LITERAL_ALIAS_MATCHES;
 DROP TABLE IF EXISTS INTERNAL.APPROVED_ALIAS_NAMES;
 DROP TABLE IF EXISTS INTERNAL.PIPELINE_QUEUE;
 DROP TABLE IF EXISTS INTERNAL.ONE_TIME_FILE_ROWS;
+DROP TABLE IF EXISTS INTERNAL.ONE_TIME_FILE_BLOBS;
 DROP TABLE IF EXISTS INTERNAL.RUN_STATE;
 DROP TABLE IF EXISTS INTERNAL.VALIDATION_LOG;
 GO
@@ -145,6 +146,23 @@ GO
 -- ($.rev; missing = 0) — the app's rev-checked save compares it via
 -- JSON_VALUE. run_id is a cross-store ref to SQLite runs.
 -- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+-- ONE_TIME_FILE_BLOBS — original uploaded file bytes (base64, chunked) for
+-- the edit-in-place round trip (see the Snowflake script's comment).
+-- ----------------------------------------------------------------------------
+CREATE TABLE INTERNAL.ONE_TIME_FILE_BLOBS (
+    session_nonce NVARCHAR(100)  NOT NULL,
+    chunk_num     INT            NOT NULL,
+    file_name     NVARCHAR(400)  NOT NULL,
+    file_kind     NVARCHAR(10)   NOT NULL,
+    sheet_name    NVARCHAR(400)  NULL,
+    header_row    INT            NOT NULL,
+    data          NVARCHAR(MAX)  NOT NULL,
+    created_at    DATETIME2(3)   NOT NULL CONSTRAINT DF_OTFB_at DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_OTFB PRIMARY KEY (session_nonce, chunk_num)
+);
+GO
+
 CREATE TABLE INTERNAL.RUN_STATE (
     run_id      INT               NOT NULL PRIMARY KEY,
     state       NVARCHAR(MAX)     NULL CONSTRAINT CK_RS_json CHECK (state IS NULL OR ISJSON(state) = 1),

@@ -27,6 +27,7 @@ import { pickBestAliasName } from './namescore';
 import { normalizeLiteral } from './normalize';
 import type { RunItemForPairing } from './grouping-types';
 import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { internalTable } from './warehouse-tables';
 
 /**
  * Backfill missing run_item_ids with sequential unique ids so legacy blobs
@@ -219,8 +220,8 @@ export async function runAutoGroupForRun(
         const lookupRows = await exec(
           connection,
           `SELECT lam.normalized_value AS norm_key, aan.alias_name
-           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+           FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+           JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
              ON lam.alias_id = aan.alias_id
            WHERE lam.normalized_value IN (${placeholders})
              ${domainFilter}`,
@@ -316,10 +317,16 @@ export async function runAutoGroupForRun(
     const existingAliasRows = await exec(
       connection,
       getWarehouseAdapter().kind === 'mssql'
-        ? `SELECT TOP (200) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+        ? `SELECT TOP (200) alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
            ${aliasFilter}
            ORDER BY usage_count DESC, last_used_at DESC`
-        : `SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+        : getWarehouseAdapter().kind === 'mysql'
+        // MySQL has no NULLS LAST; DESC already sorts NULLs last there.
+        ? `SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
+           ${aliasFilter}
+           ORDER BY usage_count DESC, last_used_at DESC
+           LIMIT 200`
+        : `SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
            ${aliasFilter}
            ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
            LIMIT 200`,
@@ -348,11 +355,18 @@ export async function runAutoGroupForRun(
           const relatedRows = await exec(
             connection,
             getWarehouseAdapter().kind === 'mssql'
-              ? `SELECT TOP (100) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+              ? `SELECT TOP (100) alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
                  ${aliasFilter}
                    AND LOWER(LEFT(LTRIM(RTRIM(alias_name)), CHARINDEX(' ', LTRIM(RTRIM(alias_name)) + ' ') - 1)) IN (${tokenPlaceholders})
                  ORDER BY usage_count DESC`
-              : `SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+              : getWarehouseAdapter().kind === 'mysql'
+              // First-word extraction: SUBSTRING_INDEX is the MySQL SPLIT_PART.
+              ? `SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
+                 ${aliasFilter}
+                   AND LOWER(SUBSTRING_INDEX(TRIM(alias_name), ' ', 1)) IN (${tokenPlaceholders})
+                 ORDER BY usage_count DESC
+                 LIMIT 100`
+              : `SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
                  ${aliasFilter}
                    AND LOWER(SPLIT_PART(TRIM(alias_name), ' ', 1)) IN (${tokenPlaceholders})
                  ORDER BY usage_count DESC NULLS LAST

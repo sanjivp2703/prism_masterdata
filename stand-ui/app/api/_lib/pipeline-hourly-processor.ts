@@ -32,6 +32,9 @@ import { beginStandardization, endStandardization, isPipelineStandardizing } fro
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { pausePipelineWithMessage, NOT_BLOCKED_SQL } from './pipeline-alerts';
 import { reconcileMssqlQueue } from './pipeline-poller-mssql';
+import { reconcilePgQueue } from './pipeline-poller-postgres';
+import { reconcileMysqlQueue } from './pipeline-poller-mysql';
+import { internalTable } from './warehouse-tables';
 import { getAnthropicApiKey } from './anthropic-key';
 import { parseStoredSchedule, isScheduleActiveNow } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
@@ -270,7 +273,7 @@ async function fetchPipelinesWithQueue(): Promise<PipelineForProcessing[]> {
     const sumRows = await exec(
       conn,
       `SELECT pipeline_id, COALESCE(SUM(source_frequency), 0) AS freq_sum
-       FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+       FROM ${internalTable('PIPELINE_QUEUE')}
        GROUP BY pipeline_id`,
     );
     const overThreshold = new Set(
@@ -373,11 +376,17 @@ export async function reconcilePipelineQueue(
   // queue and LITERAL_ALIAS_MATCHES, so a concurrent scan would race.
   if (isPipelineStandardizing(pid)) return 0;
 
-  // SQL Server: the reconcile is a diff scan (distinct values → app-side
-  // normalize → filter already-queued/mapped → queue), reusing the Phase 4
-  // detection engine. No SQL-side normalize exists on this warehouse.
+  // SQL Server / Postgres: the reconcile is a diff scan (distinct values →
+  // app-side normalize → filter already-queued/mapped → queue), reusing each
+  // port's detection engine. No SQL-side normalize exists on these warehouses.
   if (getWarehouseAdapter().kind === 'mssql') {
     return await reconcileMssqlQueue(pipeline);
+  }
+  if (getWarehouseAdapter().kind === 'postgres') {
+    return await reconcilePgQueue(pipeline);
+  }
+  if (getWarehouseAdapter().kind === 'mysql') {
+    return await reconcileMysqlQueue(pipeline);
   }
 
   const parts = String(table_fqn).split('.').map((p) => p.trim());
@@ -510,15 +519,22 @@ export async function fetchQueueLiterals(
   connection: any,
   pipelineId: number,
 ): Promise<string[]> {
+  const kind = getWarehouseAdapter().kind;
   const rows = await exec(
     connection,
-    getWarehouseAdapter().kind === 'mssql'
+    kind === 'mssql'
       ? `SELECT literal_value
          FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
          WHERE pipeline_id = ?
          ORDER BY CASE WHEN detected_at IS NULL THEN 1 ELSE 0 END, detected_at, literal_value`
+      : kind === 'mysql'
+      // MySQL has no NULLS LAST — the IS NULL sort key is the standard form.
+      ? `SELECT literal_value
+         FROM prism_internal.pipeline_queue
+         WHERE pipeline_id = ?
+         ORDER BY (detected_at IS NULL), detected_at, literal_value`
       : `SELECT literal_value
-         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+         FROM ${kind === 'postgres' ? 'prism_internal.pipeline_queue' : 'PRISM_DB.INTERNAL.PIPELINE_QUEUE'}
          WHERE pipeline_id = ?
          ORDER BY detected_at NULLS LAST, literal_value`,
     [pipelineId],
@@ -536,15 +552,22 @@ export async function fetchQueueLiteralsWithFreq(
   // once via the stream, and an uncapped drain would build one monster run
   // (context-busting merge pass, unreviewable output). FIFO order + the queue's
   // persistence mean the tail simply processes on subsequent passes.
+  const kind = getWarehouseAdapter().kind;
   const rows = await exec(
     connection,
-    getWarehouseAdapter().kind === 'mssql'
+    kind === 'mssql'
       ? `SELECT TOP (5000) literal_value, source_frequency
          FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
          WHERE pipeline_id = ?
          ORDER BY CASE WHEN detected_at IS NULL THEN 1 ELSE 0 END, detected_at, literal_value`
+      : kind === 'mysql'
+      ? `SELECT literal_value, source_frequency
+         FROM prism_internal.pipeline_queue
+         WHERE pipeline_id = ?
+         ORDER BY (detected_at IS NULL), detected_at, literal_value
+         LIMIT 5000`
       : `SELECT literal_value, source_frequency
-         FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+         FROM ${kind === 'postgres' ? 'prism_internal.pipeline_queue' : 'PRISM_DB.INTERNAL.PIPELINE_QUEUE'}
          WHERE pipeline_id = ?
          ORDER BY detected_at NULLS LAST, literal_value
          LIMIT 5000`,
@@ -693,7 +716,7 @@ async function removeExportedFromQueue(
     const placeholders = batch.map(() => '?').join(', ');
     await exec(
       connection,
-      `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+      `DELETE FROM ${internalTable('PIPELINE_QUEUE')}
        WHERE pipeline_id = ? AND literal_value IN (${placeholders})`,
       [pipelineId, ...batch],
     );
@@ -701,7 +724,7 @@ async function removeExportedFromQueue(
 
   const countRows = await exec(
     connection,
-    `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+    `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
     [pipelineId],
   );
   const queueSize = Number(countRows[0]?.CNT ?? countRows[0]?.cnt ?? 0);

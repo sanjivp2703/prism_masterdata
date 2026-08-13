@@ -19,6 +19,45 @@ export async function GET(request: Request) {
   const warehouse = new URL(request.url).searchParams.get('warehouse') ?? 'snowflake';
   const candidates = [path.join(process.cwd(), '..'), process.cwd()];
 
+  if (warehouse === 'postgres') {
+    for (const dir of candidates) {
+      try {
+        // No truncation marker in the pg script — serve it whole (a file
+        // without the marker is always served whole; see the Snowflake branch).
+        const script = fs.readFileSync(path.join(dir, '01_internal_tables.postgres.sql'), 'utf8');
+        return Response.json({
+          ok: true,
+          script:
+            `-- Prism PostgreSQL install\n-- Run with psql against the database that holds your source tables, as a superuser:\n--   psql -h <host> -U postgres -d <database> -f 01_internal_tables.postgres.sql\n\n` +
+            `${script.trim()}\n`,
+        });
+      } catch { /* try next candidate */ }
+    }
+    return Response.json({
+      ok: false,
+      error: 'Install script not found on this server. Use 01_internal_tables.postgres.sql from the Prism repository.',
+    });
+  }
+
+  if (warehouse === 'mysql') {
+    for (const dir of candidates) {
+      try {
+        // No truncation marker in the mysql script — serve it whole.
+        const script = fs.readFileSync(path.join(dir, '01_internal_tables.mysql.sql'), 'utf8');
+        return Response.json({
+          ok: true,
+          script:
+            `-- Prism MySQL install\n-- Run with the mysql client as an admin account (root or equivalent):\n--   mysql -h <host> -u root -p < 01_internal_tables.mysql.sql\n\n` +
+            `${script.trim()}\n`,
+        });
+      } catch { /* try next candidate */ }
+    }
+    return Response.json({
+      ok: false,
+      error: 'Install script not found on this server. Use 01_internal_tables.mysql.sql from the Prism repository.',
+    });
+  }
+
   if (warehouse === 'mssql') {
     for (const dir of candidates) {
       try {

@@ -1,4 +1,5 @@
 import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
 import { clearBaseline } from '@/app/api/_lib/auto-export-seen';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 
@@ -43,8 +44,19 @@ export async function GET(request: Request) {
 
   let db: string, schema: string, table: string;
   try {
-    const fqn = parseFqn(table_fqn);
-    db = fqn.db; schema = fqn.schema; table = fqn.table;
+    // Postgres accepts the 2-part SCHEMA.TABLE form (the db part is implied by
+    // the connection and never emitted in the reference below).
+    const parts = String(table_fqn).split('.').map(p => p.trim());
+    if (getWarehouseAdapter().kind === 'postgres' && parts.length === 2 && parts.every(Boolean)) {
+      db = ''; schema = parts[0]; table = parts[1];
+    } else if (getWarehouseAdapter().kind === 'mysql' && parts.length === 2 && parts.every(Boolean)) {
+      // MySQL: DATABASE.TABLE — the db part IS emitted (cross-database reads
+      // work there); the schema slot stays empty (no schema level).
+      db = parts[0]; schema = ''; table = parts[1];
+    } else {
+      const fqn = parseFqn(table_fqn);
+      db = fqn.db; schema = fqn.schema; table = fqn.table;
+    }
   } catch {
     return Response.json(
       { error: `Invalid table_fqn format. Expected DB.SCHEMA.TABLE, got: ${table_fqn}` },
@@ -52,7 +64,7 @@ export async function GET(request: Request) {
     );
   }
 
-  if (!isSimpleIdent(db) || !isSimpleIdent(schema) || !isSimpleIdent(table) || !isSimpleIdent(column_name)) {
+  if ((db !== '' && !isSimpleIdent(db)) || (schema !== '' && !isSimpleIdent(schema)) || !isSimpleIdent(table) || !isSimpleIdent(column_name)) {
     return Response.json(
       { error: 'Table or column name contains unsupported characters.' },
       { status: 400 }
@@ -61,16 +73,25 @@ export async function GET(request: Request) {
 
   try {
     return await withWarehouse(async (connection) => {
-      const tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
-      const colRef   = quoteIdent(column_name);
+      // Postgres: 2-part reference — a connection is bound to one database,
+      // and a 3-part form naming another database can't be honored anyway
+      // (pgTableRef validates that upstream surfaces; here the db part is
+      // simply not emitted).
+      const tableRef = getWarehouseAdapter().kind === 'postgres'
+        ? `${quoteIdent(schema)}.${quoteIdent(table)}`
+        : getWarehouseAdapter().kind === 'mysql'
+        // Backticks — double quotes are STRING literals on MySQL.
+        ? `${myQuoteIdent(db)}.${myQuoteIdent(table)}`
+        : `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+      const colRef   = getWarehouseAdapter().kind === 'mysql' ? myQuoteIdent(column_name) : quoteIdent(column_name);
 
       let rows: any[];
       try {
-        // SQL Server: columns are already text-typed (the picker gates on
-        // that) and TO_VARCHAR doesn't exist — select the column directly.
+        // SQL Server / Postgres: columns are already text-typed (the picker
+        // gates on that) and TO_VARCHAR doesn't exist — select directly.
         rows = await exec(
           connection,
-          getWarehouseAdapter().kind === 'mssql'
+          getWarehouseAdapter().kind !== 'snowflake'
             ? `SELECT DISTINCT ${colRef} AS literal_value
                FROM ${tableRef}
                WHERE ${colRef} IS NOT NULL

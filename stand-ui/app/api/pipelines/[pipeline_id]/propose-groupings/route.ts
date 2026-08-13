@@ -10,6 +10,7 @@
 
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
@@ -75,8 +76,8 @@ export async function POST(
           : `AND lam.domain_id IS NULL`;
         const lookupRows = await exec(conn, `
           SELECT lam.normalized_value AS norm_key, aan.alias_name
-          FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES  lam
-          JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES   aan
+          FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
+          JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
             ON lam.alias_id = aan.alias_id
           WHERE lam.normalized_value IN (${ph})
             ${domainFilter}
@@ -109,11 +110,18 @@ export async function POST(
           ? `WHERE domain_id = ${Number(domainId)}`
           : `WHERE domain_id IS NULL`;
         const aliasRows = await exec(conn, getWarehouseAdapter().kind === 'mssql'
-          ? `SELECT TOP (200) alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+          ? `SELECT TOP (200) alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
              ${aliasFilter}
              ORDER BY usage_count DESC, last_used_at DESC`
+          : getWarehouseAdapter().kind === 'mysql'
+          // MySQL has no NULLS LAST — the IS NULL sort key is the standard form
+          // (usage_count is NOT NULL; last_used_at is the nullable one).
+          ? `SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
+             ${aliasFilter}
+             ORDER BY usage_count DESC, (last_used_at IS NULL), last_used_at DESC
+             LIMIT 200`
           : `
-          SELECT alias_name FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+          SELECT alias_name FROM ${internalTable('APPROVED_ALIAS_NAMES')}
           ${aliasFilter}
           ORDER BY usage_count DESC NULLS LAST, last_used_at DESC NULLS LAST
           LIMIT 200

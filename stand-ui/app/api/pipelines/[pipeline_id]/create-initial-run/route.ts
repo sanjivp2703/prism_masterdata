@@ -16,6 +16,8 @@
 import { cookies } from 'next/headers';
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { diffScan, initDetection, enableCt, grantViewChangeTracking} from '@/app/api/_lib/warehouse/mssql/detection';
+import { diffScan as pgDiffScan, initDetection as pgInitDetection } from '@/app/api/_lib/warehouse/postgres/detection';
+import { diffScan as myDiffScan, initDetection as myInitDetection } from '@/app/api/_lib/warehouse/mysql/detection';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
@@ -58,15 +60,16 @@ async function fetchSourceLiterals(
   conn: any,
   pipeline: PipelineForProcessing,
 ): Promise<{ literals: string[]; frequencies: Map<string, number> }> {
-  const parts = pipeline.table_fqn.split('.');
-  if (parts.length !== 3) return { literals: [], frequencies: new Map() };
-  const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
-  const colRef   = quoteIdent(pipeline.column_name);
-
-  // SQL Server: no SQL-side normalize — the detection engine's diff scan
-  // reads distincts and dedups on normalizeLiteral app-side. Same 5k cap.
-  if (getWarehouseAdapter().kind === 'mssql') {
-    const scan = await diffScan(conn, pipeline.table_fqn, pipeline.column_name);
+  // SQL Server / Postgres / MySQL: no SQL-side normalize — the detection
+  // engines' diff scans read distincts and dedup on normalizeLiteral
+  // app-side. Same 5k cap. This branch runs BEFORE the 3-part gate below:
+  // the scan functions parse/validate FQNs themselves, and MySQL FQNs are
+  // legitimately TWO-part (no schema level) — the old gate order returned an
+  // empty baseline for them.
+  if (getWarehouseAdapter().kind === 'mssql' || getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
+    const kind = getWarehouseAdapter().kind;
+    const scanFn = kind === 'mssql' ? diffScan : kind === 'mysql' ? myDiffScan : pgDiffScan;
+    const scan = await scanFn(conn, pipeline.table_fqn, pipeline.column_name);
     const values = scan.values.slice(0, 5000);
     const frequencies = new Map<string, number>();
     for (const v of values) {
@@ -75,6 +78,11 @@ async function fetchSourceLiterals(
     }
     return { literals: values.map(v => v.literal_value), frequencies };
   }
+
+  const parts = pipeline.table_fqn.split('.');
+  if (parts.length !== 3) return { literals: [], frequencies: new Map() };
+  const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
+  const colRef   = quoteIdent(pipeline.column_name);
 
   // Dedup by the normalized form; ANY_VALUE keeps a representative original,
   // COUNT(*) is how many source rows collapsed into it.
@@ -178,6 +186,21 @@ export async function POST(
           .prepare(`UPDATE pipelines SET detection_mode = ?, detection_state = ? WHERE pipeline_id = ?`)
           .run(state.mode, JSON.stringify(state), pid);
         console.log(`[InitialRun] Pipeline ${pid}: detection initialized — mode=${state.mode}${state.diff_reason ? ` (${state.diff_reason})` : ''}`);
+      } catch (detErr: any) {
+        console.warn(`[InitialRun] Pipeline ${pid}: detection init failed (poller will retry):`, detErr?.message ?? detErr);
+      }
+    } else if (getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
+      // Postgres/MySQL: every pipeline runs diff mode (no CT analog, no
+      // consent ladder — detection needs no DDL at all). Pure status/state
+      // init; never blocks setup.
+      const isMy = getWarehouseAdapter().kind === 'mysql';
+      try {
+        const state = await withWarehouse(async (conn) =>
+          isMy ? myInitDetection(conn, pipeline.table_fqn) : pgInitDetection(conn, pipeline.table_fqn));
+        getDb()
+          .prepare(`UPDATE pipelines SET detection_mode = ?, detection_state = ? WHERE pipeline_id = ?`)
+          .run(state.mode, JSON.stringify(state), pid);
+        console.log(`[InitialRun] Pipeline ${pid}: detection initialized — mode=diff (${isMy ? 'mysql_diff' : 'pg_diff'})`);
       } catch (detErr: any) {
         console.warn(`[InitialRun] Pipeline ${pid}: detection init failed (poller will retry):`, detErr?.message ?? detErr);
       }

@@ -726,6 +726,20 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
       // CSV/Excel come back as DATA, not a file — built client-side, the same
       // way the lookup export does it, so the server never holds a whole
       // workbook in memory.
+      if ((format === 'csv' || format === 'excel') && b.in_place && b.file_b64) {
+        // Edit-in-place export: the server returns the ORIGINAL file with only
+        // the standardized cells changed — download it verbatim.
+        const bin = atob(String(b.file_b64));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const mime = format === 'csv'
+          ? 'text/csv'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        triggerDownload(new Blob([bytes], { type: mime }), String(b.file_name || 'standardized'));
+        setShowExport(false); setExportGrants(null);
+        setDone({ target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx', rows: b.rows_written ?? 0 });
+        return;
+      }
       if (format === 'csv' || format === 'excel') {
         const headers: string[] = b.headers ?? [];
         const rows: string[][]  = b.rows ?? [];

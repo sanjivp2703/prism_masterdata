@@ -18,7 +18,8 @@ import { getWarehouseAdapter } from '@/app/api/_lib/warehouse';
  */
 function warehouseName(): string {
   try {
-    return getWarehouseAdapter().kind === 'mssql' ? 'SQL Server' : 'Snowflake';
+    const kind = getWarehouseAdapter().kind;
+    return kind === 'mssql' ? 'SQL Server' : kind === 'postgres' ? 'PostgreSQL' : kind === 'mysql' ? 'MySQL' : 'Snowflake';
   } catch {
     return 'your data warehouse';
   }

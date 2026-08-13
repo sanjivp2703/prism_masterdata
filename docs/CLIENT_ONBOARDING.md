@@ -500,3 +500,148 @@ is not available on SQL Server (table exports only).
 throwaway login with no grants, confirm it CANNOT read a source table, drop
 it. SQL Server is default-deny by design, but verify on their instance.
 
+---
+
+## Appendix C — PostgreSQL installs (differences from the Snowflake playbook)
+
+Prism supports PostgreSQL as the warehouse (chosen in the setup wizard's first
+step). Covers self-hosted Postgres and every managed flavor — AWS RDS, Google
+Cloud SQL, Azure Database for PostgreSQL, Supabase, Neon — they are all the
+same thing to connect to. The playbook above applies with these substitutions:
+
+**⚠️ Scope: ONE DATABASE per installation.** Postgres cannot query across
+databases, so — unlike Snowflake/SQL Server, which get a separate `PRISM_DB` —
+the install creates `prism_internal` + `prism_exports` SCHEMAS inside the one
+database that holds the source tables. A customer with several databases needs
+their sources consolidated, or one Prism installation per database. Say this
+out loud during scoping, before anything is provisioned.
+
+**§3 Snowflake setup → Postgres setup (client DBA, ~15 min):**
+- Run `01_internal_tables.postgres.sql` as a superuser, **connected to the
+  source database**: `psql -h <host> -U postgres -d <database> -f
+  01_internal_tables.postgres.sql`. Creates the two schemas, the six
+  data-plane tables, and the `prism_*` roles. No warehouse, no UDF —
+  normalization runs app-side.
+- Service identity:
+  ```sql
+  CREATE ROLE prism_svc LOGIN PASSWORD '<strong generated password>';
+  GRANT prism_service TO prism_svc;
+  ALTER ROLE prism_svc SET statement_timeout = '600s';
+  ```
+- Source schema grants (one block per schema, same database):
+  ```sql
+  GRANT USAGE ON SCHEMA <schema> TO prism_service;
+  GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO prism_service;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT SELECT ON TABLES TO prism_service;
+  ```
+  ⚠️ **Default-privileges footgun:** that last statement only covers tables
+  created by the role that RAN it. If several roles create tables in the
+  schema, run it once per owning role: `ALTER DEFAULT PRIVILEGES FOR ROLE
+  <owner> IN SCHEMA <schema> GRANT SELECT ON TABLES TO prism_service;`
+- **Change detection needs NO setup and no extra grants** — Prism uses tiered
+  scans gated by Postgres's built-in write counters (readable by any role).
+  Detection latency is ~1–5 minutes by table size. There is no Change
+  Tracking analog to enable and no DDL on customer tables.
+- **TLS:** managed providers require it — the credentials step's `sslmode`
+  should be `require` (or `verify-full` with the provider CA). `disable` is
+  only for servers without TLS (dev containers).
+- **Kill switch:** `ALTER ROLE prism_svc NOLOGIN;` — instant, no cooperation
+  needed. Audit surface: their `log_statement` / pgAudit setup.
+
+**§9 Cost model:** Postgres bills provisioned capacity — no warehouse line
+item; Prism's load is a per-minute free counter check plus size-tiered
+distinct scans on tables that actually changed. ⚠️ **Scale-to-zero providers**
+(Neon, Aurora Serverless): an always-on poller keeps the database from
+suspending — Prism detects Neon hostnames and stretches its polling ×10, but
+recommend an always-on tier for watched databases, same reasoning as Azure SQL
+serverless.
+
+**Version floor:** PostgreSQL 13+. Known differences from the other
+warehouses: `View` export output IS supported (and is live — new rows of
+already-standardized values appear through it immediately); the offboarding
+materialize-before-drop caveat (§12) applies to Postgres views identically —
+they reference `prism_internal` tables, so materialize before dropping the
+schemas.
+
+**Pre-onboarding check (analog of the Appendix A RBAC test):** Postgres is
+default-deny for tables, but its classic hole is the `public` schema:
+historically `PUBLIC` (every role) holds CREATE there, and pre-existing
+blanket grants defeat default-deny. Check:
+```sql
+CREATE ROLE zg_test NOLOGIN;
+SET ROLE zg_test;                       -- requires a superuser session
+SELECT * FROM <some_source_table> LIMIT 1;   -- MUST fail with permission denied
+RESET ROLE; DROP ROLE zg_test;
+-- And look for blanket PUBLIC grants on their source schemas:
+SELECT grantee, table_schema, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'PUBLIC' AND table_schema NOT IN ('information_schema', 'pg_catalog');
+```
+
+---
+
+## Appendix D — MySQL installs (differences from the Snowflake playbook)
+
+Prism supports MySQL as the warehouse (chosen in the setup wizard's first
+step). Covers self-hosted MySQL 8.0.19+ and managed flavors — AWS RDS/Aurora
+MySQL, Google Cloud SQL, Azure Database for MySQL, PlanetScale. **MariaDB is
+NOT supported** (deliberately deferred — different uniqueness machinery).
+The playbook above applies with these substitutions:
+
+**Scope — better than Postgres here:** MySQL joins across databases on one
+server, so Prism gets its own `prism_internal` + `prism_exports` databases
+and can standardize tables from ANY database the service account is granted.
+No one-database-per-install limit.
+
+**§3 Snowflake setup → MySQL setup (client DBA, ~15 min):**
+- Run `01_internal_tables.mysql.sql` as root/admin:
+  `mysql -h <host> -u root -p < 01_internal_tables.mysql.sql`. Creates the two
+  Prism databases, six data-plane tables, and the `prism_*` roles. No
+  warehouse, no UDF — normalization runs app-side.
+- Service identity:
+  ```sql
+  CREATE USER 'prism_svc'@'%' IDENTIFIED BY '<strong generated password>';
+  GRANT 'prism_service' TO 'prism_svc'@'%';
+  SET DEFAULT ROLE 'prism_service' TO 'prism_svc'@'%';
+  ```
+- Source grants (one line per source DATABASE — database-wide SELECT covers
+  future tables automatically; there is no pg-style default-privileges
+  footgun):
+  ```sql
+  GRANT SELECT ON `<source_db>`.* TO 'prism_svc'@'%';
+  ```
+- **Change detection needs NO setup and no extra grants** — scheduled scans
+  gated by InnoDB's last-write metadata. Detection latency ~1–5 min by table
+  size. No binlog/CDC access is ever requested.
+- **TLS:** managed providers require it — the credentials step's SSL setting
+  should be `true` (or `strict`); `false` only for servers without TLS.
+- **Kill switch:** `ALTER USER 'prism_svc'@'%' ACCOUNT LOCK;` — instant.
+  Audit surface: their general/audit log setup.
+
+**§9 Cost model:** provisioned capacity — Prism's load is a per-minute free
+metadata check plus size-tiered distinct scans on tables that actually
+changed. ⚠️ **Sleep-on-idle providers** (PlanetScale, Aurora Serverless v2):
+an always-on poller keeps the database awake — Prism detects PlanetScale
+hostnames and stretches its polling ×10, but recommend an always-on tier for
+watched databases.
+
+**Version floor:** MySQL 8.0.19+ (validate on 8.4 LTS too). `View` export
+output IS supported and is live (new rows of already-standardized values
+appear immediately); the offboarding materialize-before-drop caveat (§12)
+applies — views reference the `prism_internal` database, so materialize
+before dropping it. ⚠️ Legacy-charset sources (latin1 etc.) are fully
+supported — Prism converts at the join — but tell the customer their
+mixed-charset columns are exactly why the byte-exact matching matters.
+
+**Pre-onboarding check (Appendix A analog):** MySQL is default-deny, but
+check for legacy blanket grants:
+```sql
+CREATE USER 'zg_test'@'localhost' IDENTIFIED BY 'temp';  -- no grants
+-- connect as zg_test:
+SELECT * FROM <source_db>.<table> LIMIT 1;   -- MUST fail (1142/1044)
+DROP USER 'zg_test'@'localhost';
+-- And look for broad grants that defeat default-deny:
+SELECT * FROM information_schema.SCHEMA_PRIVILEGES WHERE grantee LIKE '%''%''%';
+SHOW GRANTS FOR 'some_app_user'@'%';   -- look for GRANT ... ON *.*
+```
+

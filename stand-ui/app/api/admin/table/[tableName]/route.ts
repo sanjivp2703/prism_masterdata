@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { warehouseErrorResponse, withWarehouse, executeQuery, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireAdminSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 // Snowflake-side tables (read via the service connection)
 const SNOWFLAKE_TABLES = [
@@ -29,8 +30,9 @@ export async function GET(
   { params }: { params: Promise<{ tableName: string }> }
 ) {
   // Operator-only debug tooling — the route does not exist in customer
-  // deployments unless PRISM_DEBUG_TOOLS is explicitly enabled.
-  if (process.env.PRISM_DEBUG_TOOLS !== 'true') {
+  // deployments unless PRISM_DEBUG_TOOLS is explicitly enabled. Hard-off in
+  // the native (Marketplace) edition regardless of env.
+  if (isNativeEdition() || process.env.PRISM_DEBUG_TOOLS !== 'true') {
     return Response.json({ error: 'Not found' }, { status: 404 });
   }
 
@@ -77,6 +79,11 @@ export async function GET(
     // near '1000'` instead of data (SEC-03, reproduced across three passes).
     const sqlText = getWarehouseAdapter().kind === 'mssql'
       ? `SELECT TOP (1000) * FROM PRISM_DB.INTERNAL.${tableName}`
+      : getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql'
+      // Postgres/MySQL installs use lowercase prism_internal.* tables (a
+      // schema on pg, a database on mysql); the allowlisted names are the
+      // canonical uppercase forms.
+      ? `SELECT * FROM prism_internal.${tableName.toLowerCase()} LIMIT 1000`
       : `SELECT * FROM PRISM_DB.INTERNAL.${tableName} LIMIT 1000`;
 
   try {

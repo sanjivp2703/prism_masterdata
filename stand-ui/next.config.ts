@@ -1,6 +1,17 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Set ONLY by the native-edition Docker build (native/Dockerfile):
+  // 'standalone' emits .next/standalone (traced server + node_modules) for the
+  // container image. Deliberately conditional so the standard edition's
+  // `next build` + `next start` deploy path (deploy/deploy.sh) is untouched.
+  // outputFileTracingRoot pins the trace to this app dir — otherwise Next
+  // infers the "workspace root" from any stray parent-directory lockfile and
+  // nests the standalone output under the inferred relative path.
+  ...(process.env.PRISM_BUILD_STANDALONE === 'true'
+    ? { output: 'standalone' as const, outputFileTracingRoot: process.cwd() }
+    : {}),
+
   // Native module — must stay external to the server bundle.
   // Both of these must stay OUT of the bundle and be required at runtime.
   //
@@ -8,6 +19,14 @@ const nextConfig: NextConfig = {
   // path relative to its own package, so bundling it rewrites that path and the
   // build fails with ENOENT on re2.wasm while collecting page data.
   serverExternalPackages: ['better-sqlite3', 're2-wasm'],
+
+  // Deploy-server escape hatch ONLY (deploy/deploy.sh): the 2 GB droplet
+  // OOM-kills the build's TypeScript pass, so deploy.sh type-checks on the
+  // operator machine first and sets this to skip the server-side re-check.
+  // Never set it anywhere a local `tsc --noEmit` hasn't already passed.
+  typescript: {
+    ignoreBuildErrors: process.env.PRISM_SKIP_BUILD_TYPECHECK === 'true',
+  },
 
   experimental: {
     // MUST comfortably exceed the documented 20 MB CSV/Excel upload limit.

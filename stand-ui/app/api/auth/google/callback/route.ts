@@ -4,6 +4,7 @@ import type { Credentials } from 'google-auth-library';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { withWarehouse } from '@/app/api/_lib/warehouse';
 import { buildSessionCookie, sanitizeReturnTo, type SessionPayload } from '@/app/api/_lib/session';
+import { CURRENT_TERMS_VERSION } from '@/app/api/_lib/terms-version';
 import { applyGrants } from '@/app/api/_lib/grants';
 import { reportError } from '@/app/api/_lib/report-error';
 
@@ -219,6 +220,18 @@ export async function GET(request: NextRequest) {
     } else {
       redirectTo = `${returnTo}${returnTo.includes('?') ? '&' : '?'}gauth=success`;
     }
+
+    // Terms gate (clickwrap): every sign-in whose account hasn't accepted the
+    // CURRENT terms version detours through the /accept-terms interstitial,
+    // which then forwards to the original destination. New accounts always
+    // detour (their version is NULL) — terms come before the setup wizard.
+    const termsRow = db
+      .prepare(`SELECT terms_accepted_version FROM accounts WHERE account_id = ?`)
+      .get(accountId) as { terms_accepted_version: number | null } | undefined;
+    if (Number(termsRow?.terms_accepted_version ?? 0) < CURRENT_TERMS_VERSION) {
+      redirectTo = `/accept-terms?next=${encodeURIComponent(redirectTo)}`;
+    }
+
     headers.set('Location', redirectTo);
     return new Response(null, { status: 302, headers });
 

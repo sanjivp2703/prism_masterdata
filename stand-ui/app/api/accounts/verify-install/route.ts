@@ -169,6 +169,231 @@ export async function GET(request: Request) {
   // the result rows instead of trusting the pattern.
   const likePattern = (s: string) => s.replace(/'/g, "''");
 
+  // ── Postgres installs: catalog probes (port Phase P4) ─────────────────────
+  if (getWarehouseAdapter().kind === 'postgres') {
+    const PG_FIX = 'Run 01_internal_tables.postgres.sql with psql against the database, as a superuser, then verify again.';
+    try {
+      await withWarehouse(async (conn) => {
+        try {
+          // EXISTS over pg_auth_members instead of pg_has_role(): the scalar
+          // function throws when the role doesn't exist, which would turn
+          // "install script not run yet" into a failed identity probe.
+          const rows = await exec(
+            conn,
+            `SELECT current_user AS login_name, current_database() AS db,
+                    EXISTS (
+                      SELECT 1 FROM pg_auth_members m
+                      JOIN pg_roles r ON r.oid = m.roleid
+                      JOIN pg_roles g ON g.oid = m.member
+                      WHERE r.rolname = 'prism_service' AND g.rolname = current_user
+                    ) AS is_member`,
+          );
+          const login = String(field(rows[0] ?? {}, 'login_name') ?? '');
+          const isMember = Boolean(field(rows[0] ?? {}, 'is_member'));
+          checks.push({
+            key: 'role',
+            label: 'Connection runs as the service identity',
+            ok: Boolean(login),
+            ...(login && !isMember
+              ? { warning: `Role ${login} is not a member of prism_service. That can work (e.g. a superuser in dev), but prism_service is the audited least-privilege identity.` }
+              : {}),
+            detail: login ? `Connected as: ${login}` : 'Could not read the session role.',
+            fix: login ? undefined : 'Check the saved credentials.',
+          });
+        } catch (err) {
+          checks.push({ key: 'role', label: 'Connection runs as the service identity', ok: false, detail: checkDetail(err), fix: 'Check the saved credentials.' });
+        }
+
+        try {
+          // One-database scope is the pg install model — surface WHICH database
+          // this installation standardizes (docs/POSTGRES_PORT_PLAN.md §2.1).
+          const rows = await exec(conn, `SELECT current_database() AS db`);
+          const dbName = String(field(rows[0] ?? {}, 'db') ?? '');
+          checks.push({
+            key: 'database',
+            label: 'Connected to the installation database',
+            ok: Boolean(dbName),
+            detail: dbName ? `Database: ${dbName} — one Prism installation standardizes one Postgres database.` : undefined,
+            fix: dbName ? undefined : 'Check the saved credentials.',
+          });
+        } catch (err) {
+          checks.push({ key: 'database', label: 'Connected to the installation database', ok: false, detail: checkDetail(err), fix: 'Check the saved credentials.' });
+        }
+
+        try {
+          // pg_namespace, not information_schema.schemata — the latter only
+          // lists schemas the current role owns or can use, so a permission
+          // problem would masquerade as "schema missing".
+          const rows = await exec(conn, `SELECT nspname AS name FROM pg_catalog.pg_namespace WHERE nspname IN ('prism_internal', 'prism_exports')`);
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const ok = have.has('prism_internal') && have.has('prism_exports');
+          checks.push({
+            key: 'schemas', label: 'Schemas prism_internal and prism_exports exist', ok,
+            detail: ok ? undefined : `Visible schemas: ${[...have].join(', ') || 'none'}`,
+            fix: ok ? undefined : PG_FIX,
+          });
+        } catch (err) {
+          checks.push({ key: 'schemas', label: 'Schemas prism_internal and prism_exports exist', ok: false, detail: checkDetail(err), fix: PG_FIX });
+        }
+
+        const EXPECTED_TABLES = ['pipeline_queue', 'approved_alias_names', 'literal_alias_matches', 'one_time_file_rows', 'run_state', 'validation_log'];
+        try {
+          const rows = await exec(
+            conn,
+            `SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'prism_internal'`,
+          );
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const missing = EXPECTED_TABLES.filter((t) => !have.has(t));
+          checks.push({
+            key: 'tables', label: 'Internal tables exist (6 expected)', ok: missing.length === 0,
+            detail: missing.length ? `Missing: ${missing.join(', ')}` : undefined,
+            fix: missing.length ? PG_FIX : undefined,
+          });
+        } catch (err) {
+          checks.push({ key: 'tables', label: 'Internal tables exist (6 expected)', ok: false, detail: checkDetail(err), fix: PG_FIX });
+        }
+
+        try {
+          const EXPECTED_ROLES = ['prism_service', 'prism_data_admin', 'prism_readonly'];
+          // pg_roles is world-readable — no metadata-visibility trap here.
+          const rows = await exec(conn, `SELECT rolname AS name FROM pg_roles WHERE rolname IN ('prism_service', 'prism_data_admin', 'prism_readonly')`);
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const found = EXPECTED_ROLES.filter((r) => have.has(r));
+          const ok = found.length === EXPECTED_ROLES.length;
+          checks.push({
+            key: 'roles', label: 'Prism roles exist', ok,
+            detail: `Found: ${found.join(', ') || 'none'}`,
+            fix: ok ? undefined : PG_FIX,
+          });
+        } catch (err) {
+          checks.push({ key: 'roles', label: 'Prism roles exist', ok: false, detail: checkDetail(err), fix: PG_FIX });
+        }
+
+        // Normalization is app-side on Postgres — nothing to verify in-database.
+        checks.push({
+          key: 'normalize',
+          label: 'Value normalization (app-side on PostgreSQL)',
+          ok: true,
+          detail: 'Postgres installs normalize values in the app — no database function is required.',
+        });
+      });
+    } catch (err) {
+      return Response.json({
+        ok: false, source, connected: false,
+        error: 'Could not connect to PostgreSQL with the saved service credentials.',
+        detail: checkDetail(err),
+        checks,
+      });
+    }
+
+    if (!skipAiProbe) checks.push(await checkAnthropicKey());
+    const allOk = checks.every((c) => c.ok);
+    return Response.json({ ok: allOk, source, connected: true, warehouse_type: 'postgres', checks });
+  }
+
+  // ── MySQL installs: catalog probes (port Phase M4) ────────────────────────
+  if (getWarehouseAdapter().kind === 'mysql') {
+    const MY_FIX = 'Run 01_internal_tables.mysql.sql with the mysql client as an admin account, then verify again.';
+    try {
+      await withWarehouse(async (conn) => {
+        try {
+          const rows = await exec(conn, `SELECT CURRENT_USER() AS login_name`);
+          const login = String(field(rows[0] ?? {}, 'login_name') ?? '');
+          checks.push({
+            key: 'role',
+            label: 'Connection runs as the service identity',
+            ok: Boolean(login),
+            detail: login ? `Connected as: ${login}` : 'Could not read the session account.',
+            fix: login ? undefined : 'Check the saved credentials.',
+          });
+        } catch (err) {
+          checks.push({ key: 'role', label: 'Connection runs as the service identity', ok: false, detail: checkDetail(err), fix: 'Check the saved credentials.' });
+        }
+
+        try {
+          // On MySQL these are DATABASES (no schema level) — and NOT a scope:
+          // sources may live in any database on the server the service
+          // account can read (docs/MYSQL_PORT_PLAN.md §2.1).
+          const rows = await exec(
+            conn,
+            `SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN ('prism_internal', 'prism_exports')`,
+          );
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const ok = have.has('prism_internal') && have.has('prism_exports');
+          checks.push({
+            key: 'schemas', label: 'Databases prism_internal and prism_exports exist', ok,
+            detail: ok ? undefined : `Visible: ${[...have].join(', ') || 'none'}`,
+            fix: ok ? undefined : MY_FIX,
+          });
+        } catch (err) {
+          checks.push({ key: 'schemas', label: 'Databases prism_internal and prism_exports exist', ok: false, detail: checkDetail(err), fix: MY_FIX });
+        }
+
+        const EXPECTED_TABLES = ['pipeline_queue', 'approved_alias_names', 'literal_alias_matches', 'one_time_file_rows', 'run_state', 'validation_log'];
+        try {
+          const rows = await exec(
+            conn,
+            `SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'prism_internal'`,
+          );
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const missing = EXPECTED_TABLES.filter((t) => !have.has(t));
+          checks.push({
+            key: 'tables', label: 'Internal tables exist (6 expected)', ok: missing.length === 0,
+            detail: missing.length ? `Missing: ${missing.join(', ')}` : undefined,
+            fix: missing.length ? MY_FIX : undefined,
+          });
+        } catch (err) {
+          checks.push({ key: 'tables', label: 'Internal tables exist (6 expected)', ok: false, detail: checkDetail(err), fix: MY_FIX });
+        }
+
+        try {
+          // mysql.role_edges needs SELECT on the mysql system database, which
+          // the least-privilege service account typically lacks. A denied read
+          // is a WARNING, never red: role membership is already proven
+          // operationally — this session's grants come from prism_service.
+          const EXPECTED_ROLES = ['prism_service', 'prism_data_admin', 'prism_readonly'];
+          const rows = await exec(
+            conn,
+            `SELECT DISTINCT from_user AS name FROM mysql.role_edges WHERE from_user IN ('prism_service', 'prism_data_admin', 'prism_readonly')`,
+          );
+          const have = new Set(rows.map((r) => String(field(r, 'name')).toLowerCase()));
+          const found = EXPECTED_ROLES.filter((r) => have.has(r));
+          const ok = found.length === EXPECTED_ROLES.length;
+          checks.push({
+            key: 'roles', label: 'Prism roles exist', ok,
+            detail: `Found: ${found.join(', ') || 'none'}`,
+            fix: ok ? undefined : MY_FIX,
+          });
+        } catch (err) {
+          checks.push({
+            key: 'roles', label: 'Prism roles exist', ok: true,
+            warning: 'Could not read the role catalog (needs SELECT on mysql.*). Membership is implied by this connection working under prism_service grants.',
+            detail: checkDetail(err),
+          });
+        }
+
+        // Normalization is app-side on MySQL — nothing to verify in-database.
+        checks.push({
+          key: 'normalize',
+          label: 'Value normalization (app-side on MySQL)',
+          ok: true,
+          detail: 'MySQL installs normalize values in the app — no database function is required.',
+        });
+      });
+    } catch (err) {
+      return Response.json({
+        ok: false, source, connected: false,
+        error: 'Could not connect to MySQL with the saved service credentials.',
+        detail: checkDetail(err),
+        checks,
+      });
+    }
+
+    if (!skipAiProbe) checks.push(await checkAnthropicKey());
+    const allOk = checks.every((c) => c.ok);
+    return Response.json({ ok: allOk, source, connected: true, warehouse_type: 'mysql', checks });
+  }
+
   // ── SQL Server installs: catalog-view probes (port Phase 6) ────────────────
   if (getWarehouseAdapter().kind === 'mssql') {
     try {

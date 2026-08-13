@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useWarehouseKind } from '@/app/components/use-warehouse-label';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -98,8 +99,8 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
   // placeholder — reintroducing, briefly, the exact wrong-schema string this
   // fix exists to remove — and issued a duplicate request to boot.
   const warehouseKind   = useWarehouseKind();
-  const warehouseLabel  = warehouseKind === 'mssql' ? 'SQL Server' : 'Snowflake';
-  const defaultSchema   = warehouseKind === 'mssql' ? 'EXPORTS' : 'PUBLIC';
+  const warehouseLabel  = warehouseKind === 'mssql' ? 'SQL Server' : warehouseKind === 'postgres' ? 'PostgreSQL' : warehouseKind === 'mysql' ? 'MySQL' : 'Snowflake';
+  const defaultSchema   = warehouseKind === 'mssql' ? 'EXPORTS' : (warehouseKind === 'postgres' || warehouseKind === 'mysql') ? 'prism_exports' : 'PUBLIC';
 
   async function handleExport() {
     if (resolvedDomainId == null) { setError('No column selected.'); return; }
@@ -165,12 +166,14 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
     }
   }
 
-  const FORMATS: Array<{ key: Format; label: string; desc: string }> = [
+  const ALL_FORMATS: Array<{ key: Format; label: string; desc: string }> = [
     { key: 'csv',       label: 'CSV',            desc: 'Download as .csv file' },
     { key: 'excel',     label: 'Excel',          desc: 'Download as .xlsx file' },
     { key: 'sheets',    label: 'Google Sheets',  desc: 'Create a new Google Sheet' },
     { key: 'snowflake', label: warehouseLabel,   desc: `Create a ${warehouseLabel} table` },
   ];
+  // Native (Marketplace) edition has no Google integration.
+  const FORMATS = ALL_FORMATS.filter(f => f.key !== 'sheets' || !isNativeEdition());
 
   return createPortal(
     <div

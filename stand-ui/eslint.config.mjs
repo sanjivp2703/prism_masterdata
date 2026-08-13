@@ -21,6 +21,26 @@ const eslintConfig = defineConfig([
               message:
                 "Driver imports are only allowed inside app/api/_lib/warehouse/. Use the warehouse facade (@/app/api/_lib/warehouse) instead.",
             },
+            {
+              name: "mssql",
+              message:
+                "Driver imports are only allowed inside app/api/_lib/warehouse/. Use the warehouse facade (@/app/api/_lib/warehouse) instead.",
+            },
+            {
+              name: "pg",
+              message:
+                "Driver imports are only allowed inside app/api/_lib/warehouse/. Use the warehouse facade (@/app/api/_lib/warehouse) instead.",
+            },
+            {
+              name: "mysql2",
+              message:
+                "Driver imports are only allowed inside app/api/_lib/warehouse/. Use the warehouse facade (@/app/api/_lib/warehouse) instead.",
+            },
+            {
+              name: "mysql2/promise",
+              message:
+                "Driver imports are only allowed inside app/api/_lib/warehouse/. Use the warehouse facade (@/app/api/_lib/warehouse) instead.",
+            },
           ],
         },
       ],

@@ -4,12 +4,15 @@
 // Phase 6). Single-tenant: one warehouse type per installation.
 //
 // GET  — { resolved, saved } (resolved includes the env/dev-switch fallback).
-// POST — { type: 'snowflake' | 'mssql' } persists the choice. Saving SQL
-//        Server credentials (workspace-mssql POST) also sets it implicitly.
+// POST — { type: 'snowflake' | 'mssql' | 'postgres' | 'mysql' } persists the
+//        choice. Saving SQL Server / Postgres / MySQL credentials
+//        (workspace-mssql / workspace-postgres / workspace-mysql POST) also
+//        sets it implicitly.
 import 'server-only';
 import { requireAdminSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { getWarehouseAdapter, invalidateWarehouseTypeCache } from '@/app/api/_lib/warehouse';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 export async function GET() {
   const auth = await requireAdminSession();
@@ -24,8 +27,11 @@ export async function POST(request: Request) {
   let body: any = {};
   try { body = await request.json(); } catch { /* empty */ }
   const type = String(body?.type ?? '').toLowerCase();
-  if (type !== 'snowflake' && type !== 'mssql') {
-    return Response.json({ error: "type must be 'snowflake' or 'mssql'" }, { status: 400 });
+  if (type !== 'snowflake' && type !== 'mssql' && type !== 'postgres' && type !== 'mysql') {
+    return Response.json({ error: "type must be 'snowflake', 'mssql', 'postgres', or 'mysql'" }, { status: 400 });
+  }
+  if (isNativeEdition() && type !== 'snowflake') {
+    return Response.json({ error: 'This edition of Prism runs on Snowflake only.' }, { status: 400 });
   }
   const db = getDb();
   db.prepare(`INSERT OR IGNORE INTO workspace_config (id, sf_account, sf_user, sf_warehouse) VALUES (1, '', '', '')`).run();

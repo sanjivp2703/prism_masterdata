@@ -29,6 +29,7 @@ import 'server-only';
 
 import { executeQuery as execSql, getWarehouseAdapter } from './warehouse';
 import { normalizeLiteral, sqlStringLiteral } from './normalize';
+import { internalTable } from './warehouse-tables';
 
 /** Matches the pipeline-side batch size — 200 keeps each statement well under
  *  Snowflake's ~65k bind ceiling while staying a single round trip per batch. */
@@ -46,19 +47,24 @@ export async function insertOneTimeFileRows(
   sessionNonce: string,
   rows: Record<string, unknown>[],
 ): Promise<void> {
-  const isMssql = getWarehouseAdapter().kind === 'mssql';
+  const kind = getWarehouseAdapter().kind;
   for (let b = 0; b < rows.length; b += INSERT_BATCH) {
     const chunk = rows.slice(b, b + INSERT_BATCH);
-    const vals  = chunk.map((_, i) => `(?, ${b + i}, ?)`).join(', ');
+    // Postgres: column_data is JSONB — the bound JSON string needs an explicit
+    // cast (`?::jsonb`; the bind translator rewrites ? to $n, so the cast
+    // survives). Plain VALUES is fine there — the PARSE_JSON restriction is
+    // Snowflake-only.
+    const tuple = kind === 'postgres' ? `(?, %ROW%, ?::jsonb)` : `(?, %ROW%, ?)`;
+    const vals  = chunk.map((_, i) => tuple.replace('%ROW%', String(b + i))).join(', ');
     const binds: unknown[] = [];
     for (const r of chunk) { binds.push(sessionNonce, JSON.stringify(r)); }
     await execSql(
       conn,
-      isMssql
-        ? `INSERT INTO PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS (session_nonce, row_num, column_data)
-           VALUES ${vals}`
-        : `INSERT INTO PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS (session_nonce, row_num, column_data)
-           SELECT column1, column2, PARSE_JSON(column3) FROM VALUES ${vals}`,
+      kind === 'snowflake'
+        ? `INSERT INTO ${internalTable('ONE_TIME_FILE_ROWS')} (session_nonce, row_num, column_data)
+           SELECT column1, column2, PARSE_JSON(column3) FROM VALUES ${vals}`
+        : `INSERT INTO ${internalTable('ONE_TIME_FILE_ROWS')} (session_nonce, row_num, column_data)
+           VALUES ${vals}`,
       binds,
     );
   }
@@ -69,6 +75,13 @@ export async function insertOneTimeFileRows(
 function mssqlJsonPath(columnName: string): string {
   const jsonEscaped = columnName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return sqlStringLiteral(`$."${jsonEscaped}"`);
+}
+
+/** Postgres string-literal content escaping. NOT sqlStringLiteral: that also
+ *  doubles backslashes, which is right for Snowflake but corrupts the value on
+ *  Postgres (standard_conforming_strings treats backslashes literally). */
+function pgStringLiteral(s: string): string {
+  return String(s).replace(/'/g, "''");
 }
 
 /**
@@ -89,20 +102,32 @@ export async function readOneTimeDistinctValues(
   sessionNonce: string,
   columnName: string,
 ): Promise<{ literal_value: string; source_frequency: number }[]> {
-  const isMssql = getWarehouseAdapter().kind === 'mssql';
+  const kind = getWarehouseAdapter().kind;
   const rows = await execSql(
     conn,
-    isMssql
-      // NOTE the quotes around both interpolations. sqlStringLiteral (and
-      // mssqlJsonPath, which wraps it) returns ESCAPED CONTENT, not a quoted
-      // literal — every existing caller supplies the quotes itself. Without
-      // them Snowflake parses the column name as an identifier and fails with
-      // "invalid identifier 'CARRIER'". Caught by the live test, not by tsc.
+    // NOTE the quotes around every interpolation. sqlStringLiteral (and
+    // mssqlJsonPath, which wraps it) returns ESCAPED CONTENT, not a quoted
+    // literal — every existing caller supplies the quotes itself. Without
+    // them Snowflake parses the column name as an identifier and fails with
+    // "invalid identifier 'CARRIER'". Caught by the live test, not by tsc.
+    kind === 'mssql'
       ? `SELECT JSON_VALUE(column_data, '${mssqlJsonPath(columnName)}') AS v
-         FROM PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS
+         FROM ${internalTable('ONE_TIME_FILE_ROWS')}
+         WHERE session_nonce = ?`
+      : kind === 'mysql'
+      // Same $."…" JSON-path shape as mssql, read via ->>. mssqlJsonPath's
+      // escaping (JSON-escape, then backslash-doubling + quote-escaping) is
+      // valid MySQL string-literal escaping too (backslash IS an escape in
+      // MySQL strings, unlike Postgres) — one helper, not a drifting copy.
+      ? `SELECT column_data->>'${mssqlJsonPath(columnName)}' AS v
+         FROM ${internalTable('ONE_TIME_FILE_ROWS')}
+         WHERE session_nonce = ?`
+      : kind === 'postgres'
+      ? `SELECT column_data->>'${pgStringLiteral(columnName)}' AS v
+         FROM ${internalTable('ONE_TIME_FILE_ROWS')}
          WHERE session_nonce = ?`
       : `SELECT column_data['${sqlStringLiteral(columnName)}']::STRING AS v
-         FROM PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS
+         FROM ${internalTable('ONE_TIME_FILE_ROWS')}
          WHERE session_nonce = ?`,
     [sessionNonce],
   );
@@ -128,7 +153,7 @@ export async function readOneTimeFileRows(
 ): Promise<Record<string, string>[]> {
   const rows = await execSql(
     conn,
-    `SELECT column_data FROM PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS
+    `SELECT column_data FROM ${internalTable('ONE_TIME_FILE_ROWS')}
      WHERE session_nonce = ? ORDER BY row_num`,
     [sessionNonce],
   );
@@ -154,16 +179,82 @@ export async function readOneTimeFileColumns(conn: any, sessionNonce: string): P
 export async function deleteOneTimeFileRows(conn: any, sessionNonce: string): Promise<void> {
   await execSql(
     conn,
-    `DELETE FROM PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS WHERE session_nonce = ?`,
+    `DELETE FROM ${internalTable('ONE_TIME_FILE_ROWS')} WHERE session_nonce = ?`,
     [sessionNonce],
   );
+  // The original-file blob shares the rows' lifecycle exactly.
+  await execSql(
+    conn,
+    `DELETE FROM ${internalTable('ONE_TIME_FILE_BLOBS')} WHERE session_nonce = ?`,
+    [sessionNonce],
+  ).catch(() => { /* table absent on a pre-blob install — rows cleanup still succeeded */ });
+}
+
+// ── Original-file blob (edit-in-place round trip; see _lib/file-inplace.ts) ──
+//
+// The ORIGINAL uploaded file's bytes, base64-chunked: Snowflake caps a VARCHAR
+// value at 16 MB and a 20 MB upload is ~27 MB of base64, so chunks keep every
+// warehouse inside one uniform shape. Customer values → warehouse-side (data
+// residency), same lifecycle as the row snapshot above.
+
+const BLOB_CHUNK_CHARS = 6 * 1024 * 1024; // 6 MB of base64 per chunk
+
+export interface OneTimeFileBlobMeta {
+  file_name:  string;
+  file_kind:  'csv' | 'xlsx';
+  sheet_name: string | null;
+  header_row: number;
+}
+
+export async function storeOneTimeFileBlob(
+  conn: any,
+  sessionNonce: string,
+  meta: OneTimeFileBlobMeta,
+  dataB64: string,
+): Promise<void> {
+  await execSql(conn, `DELETE FROM ${internalTable('ONE_TIME_FILE_BLOBS')} WHERE session_nonce = ?`, [sessionNonce]);
+  for (let i = 0, chunk = 0; i < dataB64.length; i += BLOB_CHUNK_CHARS, chunk++) {
+    await execSql(
+      conn,
+      `INSERT INTO ${internalTable('ONE_TIME_FILE_BLOBS')}
+         (session_nonce, chunk_num, file_name, file_kind, sheet_name, header_row, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [sessionNonce, chunk, meta.file_name, meta.file_kind, meta.sheet_name, meta.header_row, dataB64.slice(i, i + BLOB_CHUNK_CHARS)],
+    );
+  }
+}
+
+export async function loadOneTimeFileBlob(
+  conn: any,
+  sessionNonce: string,
+): Promise<(OneTimeFileBlobMeta & { dataB64: string }) | null> {
+  let rows: any[];
+  try {
+    rows = await execSql(
+      conn,
+      `SELECT chunk_num, file_name, file_kind, sheet_name, header_row, data
+       FROM ${internalTable('ONE_TIME_FILE_BLOBS')}
+       WHERE session_nonce = ?
+       ORDER BY chunk_num`,
+      [sessionNonce],
+    );
+  } catch { return null; } // table absent on a pre-blob install
+  if (!rows?.length) return null;
+  const first = rows[0] as any;
+  return {
+    file_name:  String(first.FILE_NAME ?? first.file_name ?? ''),
+    file_kind:  (String(first.FILE_KIND ?? first.file_kind ?? 'csv') === 'xlsx' ? 'xlsx' : 'csv'),
+    sheet_name: (first.SHEET_NAME ?? first.sheet_name) != null ? String(first.SHEET_NAME ?? first.sheet_name) : null,
+    header_row: Number(first.HEADER_ROW ?? first.header_row ?? 0),
+    dataB64:    rows.map((r: any) => String(r.DATA ?? r.data ?? '')).join(''),
+  };
 }
 
 /** Row count for a session — used by the create route's size guard. */
 export async function countOneTimeFileRows(conn: any, sessionNonce: string): Promise<number> {
   const rows = await execSql(
     conn,
-    `SELECT COUNT(*) AS n FROM PRISM_DB.INTERNAL.ONE_TIME_FILE_ROWS WHERE session_nonce = ?`,
+    `SELECT COUNT(*) AS n FROM ${internalTable('ONE_TIME_FILE_ROWS')} WHERE session_nonce = ?`,
     [sessionNonce],
   );
   return Number((rows[0] as any)?.N ?? (rows[0] as any)?.n ?? 0);
@@ -218,14 +309,21 @@ export async function writeGridToWarehouseTable(
   args: { targetFqn: string; mode: 'create' | 'overwrite'; headers: string[]; grid: string[][] },
 ): Promise<number> {
   const { targetFqn, mode, headers, grid } = args;
-  const isMssql = getWarehouseAdapter().kind === 'mssql';
-  const colType = isMssql ? 'NVARCHAR(MAX)' : 'VARCHAR';
-  const quoted  = headers.map(h => `"${String(h).replace(/"/g, '""')}"`);
+  const kind = getWarehouseAdapter().kind;
+  const isMssql = kind === 'mssql';
+  const colType = isMssql ? 'NVARCHAR(MAX)' : kind === 'postgres' || kind === 'mysql' ? 'TEXT' : 'VARCHAR';
+  // MySQL quotes identifiers with backticks — double quotes are STRING
+  // literals there (without ANSI_QUOTES), so the "…" form would create a
+  // table of string-named nonsense columns.
+  const quoted  = kind === 'mysql'
+    ? headers.map(h => `\`${String(h).replace(/`/g, '``')}\``)
+    : headers.map(h => `"${String(h).replace(/"/g, '""')}"`);
   const colDefs = quoted.map(q => `${q} ${colType}`).join(', ');
 
-  if (isMssql) {
-    // T-SQL has no CREATE OR REPLACE. 'create' must FAIL on an existing table
-    // (that is what distinguishes it from overwrite), so only overwrite drops.
+  if (isMssql || kind === 'postgres' || kind === 'mysql') {
+    // None of T-SQL, Postgres or MySQL has CREATE OR REPLACE TABLE. 'create'
+    // must FAIL on an existing table (that is what distinguishes it from
+    // overwrite), so only overwrite drops.
     if (mode === 'overwrite') await execSql(conn, `DROP TABLE IF EXISTS ${targetFqn}`);
     await execSql(conn, `CREATE TABLE ${targetFqn} (${colDefs})`);
   } else {

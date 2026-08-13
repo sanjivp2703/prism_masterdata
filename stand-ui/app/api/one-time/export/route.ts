@@ -13,6 +13,12 @@ import { cookies } from 'next/headers';
 import { withWarehouse, withUserWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { isMssqlAccessError, getServiceLoginName } from '@/app/api/_lib/warehouse/mssql/connection';
 import { quoteIdent as msQuoteIdent } from '@/app/api/_lib/warehouse/mssql/dialect';
+import { isPgAccessError, getServiceRoleName } from '@/app/api/_lib/warehouse/postgres/connection';
+import { quoteIdent as pgQuoteIdent, parseFqn as pgParseFqn } from '@/app/api/_lib/warehouse/postgres/dialect';
+import { pgTableRef } from '@/app/api/_lib/warehouse/postgres/detection';
+import { isMysqlAccessError, getServiceAccountName } from '@/app/api/_lib/warehouse/mysql/connection';
+import { quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
+import { myTableRef } from '@/app/api/_lib/warehouse/mysql/detection';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { loadOpRunState } from '@/app/api/_lib/op-auto-group';
@@ -25,6 +31,7 @@ import { google } from 'googleapis';
 import {
   readOneTimeFileRows, applyMappingsToRows, writeGridToWarehouseTable,
   countOneTimeFileRows,
+  loadOneTimeFileBlob,
 } from '@/app/api/_lib/op-one-time-file';
 
 function safeJson(s: unknown): any {
@@ -100,13 +107,39 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Invalid session.' }, { status: 400 });
   }
   if (!target_fqn) return Response.json({ error: 'A destination table is required.' }, { status: 400 });
-  try {
-    const { db, schema, table } = parseFqn(target_fqn);
-    if (![db, schema, table].every(isSimpleIdent)) {
-      return Response.json({ error: 'Destination table name contains unsupported characters.' }, { status: 400 });
+  if (getWarehouseAdapter().kind === 'postgres') {
+    // Postgres destinations may be 2-part (schema.table); pgTableRef rejects
+    // cross-database references and unquotable names. Users can never write
+    // into Prism's own schema — same rule as the lookup export's
+    // refuse-internal-targets check.
+    try {
+      const parsed = pgTableRef(target_fqn);
+      if (parsed.schema.toLowerCase() === 'prism_internal') {
+        return Response.json({ error: 'Destination cannot be inside prism_internal — that schema belongs to Prism.' }, { status: 400 });
+      }
+    } catch (e) {
+      return Response.json({ error: String((e as Error)?.message ?? `Invalid destination: ${target_fqn}`) }, { status: 400 });
     }
-  } catch {
-    return Response.json({ error: `Invalid destination. Expected DB.SCHEMA.TABLE, got: ${target_fqn}` }, { status: 400 });
+  } else if (getWarehouseAdapter().kind === 'mysql') {
+    // MySQL destinations ARE 2-part (database.table); myTableRef rejects
+    // 3-part shapes and unquotable names. Same refuse-internal-targets rule.
+    try {
+      const parsed = myTableRef(target_fqn);
+      if (parsed.db.toLowerCase() === 'prism_internal') {
+        return Response.json({ error: 'Destination cannot be inside prism_internal — that database belongs to Prism.' }, { status: 400 });
+      }
+    } catch (e) {
+      return Response.json({ error: String((e as Error)?.message ?? `Invalid destination: ${target_fqn}`) }, { status: 400 });
+    }
+  } else {
+    try {
+      const { db, schema, table } = parseFqn(target_fqn);
+      if (![db, schema, table].every(isSimpleIdent)) {
+        return Response.json({ error: 'Destination table name contains unsupported characters.' }, { status: 400 });
+      }
+    } catch {
+      return Response.json({ error: `Invalid destination. Expected DB.SCHEMA.TABLE, got: ${target_fqn}` }, { status: 400 });
+    }
   }
 
   try {
@@ -235,6 +268,70 @@ export async function POST(request: Request) {
         const grid    = applyMappingsToRows(fileRows, headers, mappingsByCol);
 
         if (format === 'csv' || format === 'excel') {
+          // ── Edit-in-place: hand back the ORIGINAL file with only the
+          // standardized cells changed (hidden columns/styles/order intact —
+          // what a Dynamics/SAP reimport wizard needs). Falls back to the
+          // regenerated {headers, rows} path on any mismatch or failure —
+          // never a corrupted "original". See _lib/file-inplace.ts.
+          try {
+            const blob = await loadOneTimeFileBlob(conn, sessionNonce);
+            const kindMatches =
+              blob != null &&
+              ((format === 'csv' && blob.file_kind === 'csv') ||
+               (format === 'excel' && blob.file_kind === 'xlsx'));
+            if (blob && kindMatches) {
+              const { patchCsvInPlace, patchXlsxInPlace, extractCsvGrid, extractXlsxGrid } = await import('@/app/api/_lib/file-inplace');
+              const { gridToRows: shapeRows, gridDataRowIndices } = await import('@/app/api/_lib/table-shape');
+              const { normalizeLiteral } = await import('@/app/api/_lib/normalize');
+              const bytes = Buffer.from(blob.dataB64, 'base64');
+
+              // Build edits from the ORIGINAL file's own grid (one addressing
+              // source of truth — never the stored rows).
+              const originalGrid = blob.file_kind === 'csv'
+                ? extractCsvGrid(bytes.toString('utf8'))
+                : extractXlsxGrid(new Uint8Array(bytes), blob.sheet_name);
+              const shaped = shapeRows(originalGrid, blob.header_row);
+              const dataCount = gridDataRowIndices(originalGrid, blob.header_row).length;
+              const lookup: Record<string, Record<string, string>> = Object.create(null);
+              for (const [col, maps] of Object.entries(mappingsByCol)) {
+                const m: Record<string, string> = Object.create(null);
+                for (const { raw, standardized } of maps) m[normalizeLiteral(raw)] = standardized;
+                lookup[col] = m;
+              }
+              const edits: { dataRow: number; column: string; value: string }[] = [];
+              for (let i = 0; i < shaped.rows.length; i++) {
+                for (const col of Object.keys(lookup)) {
+                  const raw = String(shaped.rows[i][col] ?? '');
+                  if (!raw) continue;
+                  const std = lookup[col][normalizeLiteral(raw)];
+                  if (std != null && std !== raw) edits.push({ dataRow: i, column: col, value: std });
+                }
+              }
+
+              const patched = blob.file_kind === 'csv'
+                ? Buffer.from(patchCsvInPlace(bytes.toString('utf8'), blob.header_row, edits), 'utf8')
+                : Buffer.from(patchXlsxInPlace(new Uint8Array(bytes), blob.sheet_name, blob.header_row, edits));
+
+              const dot = blob.file_name.lastIndexOf('.');
+              const outName = dot > 0
+                ? `${blob.file_name.slice(0, dot)} (standardized)${blob.file_name.slice(dot)}`
+                : `${blob.file_name} (standardized)`;
+              await finishOneTimeSession({
+                target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx',
+                runRows,
+              });
+              return Response.json({
+                file_b64: patched.toString('base64'),
+                file_name: outName,
+                format,
+                rows_written: dataCount,
+                cells_changed: edits.length,
+                in_place: true,
+              });
+            }
+          } catch (patchErr) {
+            console.warn('[one-time] in-place patch failed — falling back to regenerated file:', (patchErr as any)?.message ?? patchErr);
+          }
           await finishOneTimeSession({
             target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx',
             runRows,
@@ -267,6 +364,8 @@ export async function POST(request: Request) {
         });
       } catch (exportErr: any) {
         const isMssql = getWarehouseAdapter().kind === 'mssql';
+        const isPg = getWarehouseAdapter().kind === 'postgres';
+        const isMy = getWarehouseAdapter().kind === 'mysql';
         const msg = String(exportErr?.message ?? '').toLowerCase();
         // Classify per WAREHOUSE. The substring list below is Snowflake's
         // vocabulary; SQL Server says "CREATE TABLE permission denied in
@@ -274,13 +373,18 @@ export async function POST(request: Request) {
         // failure fell through to a generic error and the user never reached
         // the needs_grants / grants_sql / retry flow that exists for exactly
         // this case. Reuse the adapter's own classifier there rather than
-        // bolting T-SQL phrases onto a Snowflake list. See KI-209.
+        // bolting T-SQL phrases onto a Snowflake list. See KI-209. Postgres
+        // gets the same treatment (SQLSTATE-based classifier).
         //
         // This route is where permission errors are MOST expected: the one-time
         // flow deliberately falls back to the creator's personal credentials
         // against tables the service role cannot see.
         const isPermission = isMssql
           ? isMssqlAccessError(exportErr)
+          : isPg
+          ? isPgAccessError(exportErr)
+          : isMy
+          ? isMysqlAccessError(exportErr)
           : (
             msg.includes('insufficient privileges') || msg.includes('insufficient privilege') ||
             msg.includes('not authorized') || msg.includes('does not exist or not authorized') ||
@@ -290,13 +394,68 @@ export async function POST(request: Request) {
         if (isPermission && useUserConnection) {
           // Personal-connection run: the fix is the USER's own warehouse
           // access, not Prism grants.
-          const { db, schema } = parseFqn(target_fqn);
-          const warehouseName = isMssql ? 'SQL Server login' : 'Snowflake user';
+          const schemaLabel = isPg
+            ? (() => { const p = pgParseFqn(target_fqn); return `${p.db != null ? `${p.db}.` : ''}${p.schema}`; })()
+            : isMy
+            ? myTableRef(target_fqn).db
+            : (() => { const { db, schema } = parseFqn(target_fqn); return `${db}.${schema}`; })();
+          const warehouseName = isMssql ? 'SQL Server login' : isPg ? 'Postgres role' : isMy ? 'MySQL account' : 'Snowflake user';
           return Response.json({
             error: mode === 'overwrite'
               ? `Your ${warehouseName} doesn't have write access to ${target_fqn}. Overwriting requires ownership of the table (or SELECT, INSERT, and DELETE on it).`
-              : `Your ${warehouseName} can't create tables in ${db}.${schema}. Ask your administrator for CREATE TABLE on that schema, or pick a schema you can write to.`,
+              : `Your ${warehouseName} can't create tables in ${schemaLabel}. Ask your administrator for CREATE on that schema, or pick a schema you can write to.`,
           }, { status: 403 });
+        }
+        if (isPermission && isPg) {
+          // Postgres remediation. The Snowflake block below emits
+          // `GRANT … TO ROLE PRISM_SERVICE` with a USAGE-on-DATABASE line —
+          // neither is valid Postgres. Grant to the CONFIGURED service role
+          // (see getServiceRoleName — never a hardcoded name).
+          const p = pgParseFqn(target_fqn);
+          const grantee = pgQuoteIdent(getServiceRoleName());
+          const schemaRef = pgQuoteIdent(p.schema);
+          const tableRef = `${schemaRef}.${pgQuoteIdent(p.table)}`;
+          const lines = [
+            `-- Run against the database as a superuser (or the schema owner)`,
+            `GRANT USAGE, CREATE ON SCHEMA ${schemaRef} TO ${grantee};`,
+          ];
+          if (mode === 'overwrite') {
+            lines.push(
+              ``,
+              `-- Target table already exists — Prism also needs to replace its contents:`,
+              `GRANT SELECT, INSERT, DELETE ON ${tableRef} TO ${grantee};`,
+            );
+          }
+          return Response.json(
+            { error: 'Prism needs write access to this location.', needs_grants: true, grants_sql: lines.join('\n'), grants_run_as: 'a Postgres superuser (or the owner of that schema)' },
+            { status: 403 },
+          );
+        }
+        if (isPermission && isMy) {
+          // MySQL remediation. Grants address 'user'@'host' ACCOUNTS (not
+          // roles), and the grantee is the CONFIGURED service account (see
+          // getServiceAccountName — never a hardcoded name). Database-wide
+          // grants are the norm on MySQL; the stage table lives in
+          // prism_internal (already granted), so only the target database
+          // needs new privileges.
+          const t = myTableRef(target_fqn);
+          const grantee = `'${getServiceAccountName().replace(/'/g, "''")}'@'%'`;
+          const dbRef = myQuoteIdent(t.db);
+          const lines = [
+            `-- Run against the MySQL server as an administrator`,
+            `GRANT CREATE, SELECT, INSERT ON ${dbRef}.* TO ${grantee};`,
+          ];
+          if (mode === 'overwrite') {
+            lines.push(
+              ``,
+              `-- Target table already exists — Prism also needs to replace its contents:`,
+              `GRANT DELETE ON ${dbRef}.* TO ${grantee};`,
+            );
+          }
+          return Response.json(
+            { error: 'Prism needs write access to this location.', needs_grants: true, grants_sql: lines.join('\n'), grants_run_as: 'a MySQL administrator (root, or an account with GRANT OPTION)' },
+            { status: 403 },
+          );
         }
         if (isPermission && isMssql) {
           // T-SQL remediation. The Snowflake block below emits

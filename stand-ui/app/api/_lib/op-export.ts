@@ -33,6 +33,9 @@ import path from 'node:path';
 
 import { withWarehouse, executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { upsertApprovedAliasMssql, bulkUpsertApprovedAliasesMssql, bulkUpsertLiteralMatchesMssql } from './warehouse/mssql/mappings';
+import { upsertApprovedAliasPg, bulkUpsertApprovedAliasesPg, bulkUpsertLiteralMatchesPg } from './warehouse/postgres/mappings';
+import { upsertApprovedAliasMysql, bulkUpsertApprovedAliasesMysql, bulkUpsertLiteralMatchesMysql } from './warehouse/mysql/mappings';
+import { internalTable } from './warehouse-tables';
 import { getDb } from './sqlite';
 import { normalizeLiteral } from './normalize';
 import { reportError } from './report-error';
@@ -168,6 +171,8 @@ export async function upsertApprovedAlias(
   domainId:   number | null,
 ): Promise<number> {
   if (getWarehouseAdapter().kind === 'mssql') return upsertApprovedAliasMssql(connection, aliasName, domainId);
+  if (getWarehouseAdapter().kind === 'postgres') return upsertApprovedAliasPg(connection, aliasName, domainId);
+  if (getWarehouseAdapter().kind === 'mysql') return upsertApprovedAliasMysql(connection, aliasName, domainId);
   // domainFilter for MERGE uses alias 't'; selectFilter for plain SELECT uses no alias
   const domainFilter  = domainId != null
     ? `AND t.domain_id = ${Number(domainId)}`
@@ -179,7 +184,7 @@ export async function upsertApprovedAlias(
 
   await exec(
     connection,
-    `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES AS t
+    `MERGE INTO ${internalTable('APPROVED_ALIAS_NAMES')} AS t
      USING (SELECT ? AS alias_name, ${domainLiteral} AS domain_id) AS s
        ON t.alias_name = s.alias_name ${domainFilter}
      WHEN MATCHED THEN UPDATE SET
@@ -194,7 +199,7 @@ export async function upsertApprovedAlias(
   const rows = await exec(
     connection,
     `SELECT alias_id
-     FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+     FROM ${internalTable('APPROVED_ALIAS_NAMES')}
      WHERE alias_name = ? ${selectFilter}`,
     [aliasName],
   );
@@ -219,6 +224,8 @@ async function bulkUpsertApprovedAliases(
   domainId:   number | null,
 ): Promise<Map<string, number>> {
   if (getWarehouseAdapter().kind === 'mssql') return bulkUpsertApprovedAliasesMssql(connection, aliasNames, domainId);
+  if (getWarehouseAdapter().kind === 'postgres') return bulkUpsertApprovedAliasesPg(connection, aliasNames, domainId);
+  if (getWarehouseAdapter().kind === 'mysql') return bulkUpsertApprovedAliasesMysql(connection, aliasNames, domainId);
   const result = new Map<string, number>();
   const names  = Array.from(new Set(aliasNames)).filter((n) => n != null && n !== '');
   if (names.length === 0) return result;
@@ -234,7 +241,7 @@ async function bulkUpsertApprovedAliases(
     const valuePlaceholders = batch.map(() => '(?)').join(', ');
     await exec(
       connection,
-      `MERGE INTO PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES AS t
+      `MERGE INTO ${internalTable('APPROVED_ALIAS_NAMES')} AS t
        USING (SELECT column1 AS alias_name FROM VALUES ${valuePlaceholders}) AS s
          ON t.alias_name = s.alias_name ${domainFilter}
        WHEN MATCHED THEN UPDATE SET
@@ -253,7 +260,7 @@ async function bulkUpsertApprovedAliases(
     const rows = await exec(
       connection,
       `SELECT alias_name, alias_id
-       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+       FROM ${internalTable('APPROVED_ALIAS_NAMES')}
        WHERE alias_name IN (${inPlaceholders}) ${selectFilter}`,
       batch,
     );
@@ -332,6 +339,8 @@ async function bulkUpsertLiteralMatches(
   entries = deduped;
 
   if (getWarehouseAdapter().kind === 'mssql') return bulkUpsertLiteralMatchesMssql(connection, entries, domainId, runId);
+  if (getWarehouseAdapter().kind === 'postgres') return bulkUpsertLiteralMatchesPg(connection, entries, domainId, runId);
+  if (getWarehouseAdapter().kind === 'mysql') return bulkUpsertLiteralMatchesMysql(connection, entries, domainId, runId);
 
   const domainFilter  = domainId != null
     ? `AND t.domain_id = ${Number(domainId)}`
@@ -347,7 +356,7 @@ async function bulkUpsertLiteralMatches(
 
     await exec(
       connection,
-      `MERGE INTO PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES AS t
+      `MERGE INTO ${internalTable('LITERAL_ALIAS_MATCHES')} AS t
        USING (
          SELECT column1 AS literal_value,
                 column2 AS alias_id,
@@ -503,8 +512,8 @@ async function fetchCaseBContext(
     const exactRows = await exec(
       connection,
       `${limitOne} lam.literal_value
-       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-       JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+       JOIN ${internalTable('APPROVED_ALIAS_NAMES')}  aan ON lam.alias_id = aan.alias_id
        WHERE aan.alias_name = ? AND lam.literal_value = ? ${domainFilter} ${limitTail}`,
       [raw.original_alias_name, raw.original_alias_name],
     );
@@ -528,8 +537,8 @@ async function fetchCaseBContext(
     const allKnownRows = await exec(
       connection,
       `SELECT lam.literal_value, COUNT(*) AS total
-       FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-       JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES  aan ON lam.alias_id = aan.alias_id
+       FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+       JOIN ${internalTable('APPROVED_ALIAS_NAMES')}  aan ON lam.alias_id = aan.alias_id
        WHERE aan.alias_name = ? ${domainFilter}
        GROUP BY lam.literal_value`,
       [raw.original_alias_name],
@@ -844,7 +853,7 @@ async function writeAllDecisions(
     const fromRows = await exec(
       connection,
       `SELECT alias_id, usage_count
-       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+       FROM ${internalTable('APPROVED_ALIAS_NAMES')}
        WHERE alias_name = ? ${domainFilter}`,
       [rename.from],
     );
@@ -856,7 +865,7 @@ async function writeAllDecisions(
     const toRows = await exec(
       connection,
       `SELECT alias_id
-       FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+       FROM ${internalTable('APPROVED_ALIAS_NAMES')}
        WHERE alias_name = ? ${domainFilter}`,
       [rename.to],
     );
@@ -873,21 +882,21 @@ async function writeAllDecisions(
         // ')'" (msg 102) — verified live on both. The paren-less form is valid
         // on Snowflake AND T-SQL, which is why the sibling UPDATE just below
         // already used it. See KI-105.
-        `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES
+        `UPDATE ${internalTable('LITERAL_ALIAS_MATCHES')}
          SET alias_id = ?, confirmed_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [toId, fromId],
       );
       await exec(
         connection,
-        `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+        `UPDATE ${internalTable('APPROVED_ALIAS_NAMES')}
          SET usage_count = usage_count + ?, last_used_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [fromCount, toId],
       );
       await exec(
         connection,
-        `DELETE FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`,
+        `DELETE FROM ${internalTable('APPROVED_ALIAS_NAMES')} WHERE alias_id = ?`,
         [fromId],
       );
     } else {
@@ -896,7 +905,7 @@ async function writeAllDecisions(
       await exec(
         connection,
         // Paren-less for the same dual-dialect reason as above (KI-105).
-        `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES
+        `UPDATE ${internalTable('APPROVED_ALIAS_NAMES')}
          SET alias_name = ?, last_used_at = CURRENT_TIMESTAMP
          WHERE alias_id = ?`,
         [rename.to, fromId],
@@ -910,7 +919,7 @@ async function writeAllDecisions(
   // connection. Failures are logged but never fail the export.
   const vlogTable = getWarehouseAdapter().kind === 'mssql'
     ? 'INTERNAL.VALIDATION_LOG'
-    : 'PRISM_DB.INTERNAL.VALIDATION_LOG';
+    : internalTable('VALIDATION_LOG');
   const insertValidationLog = async (
     literalValue: string, originalAlias: string, changedTo: string, k: string,
   ) => {
@@ -1214,7 +1223,7 @@ async function runWriteAndValidatePass(
                 const wantNormalized = new Set(standardizedLiterals.map((lv) => normalizeLiteral(lv)));
                 const queueHitRows = await exec(
                   connection,
-                  `SELECT literal_value FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+                  `SELECT literal_value FROM ${internalTable('PIPELINE_QUEUE')}
                    WHERE pipeline_id = ?`,
                   [pipelineId],
                 );
@@ -1230,7 +1239,7 @@ async function runWriteAndValidatePass(
                   const batch = toRemove.slice(i, i + DEL_BATCH);
                   await exec(
                     connection,
-                    `DELETE FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE
+                    `DELETE FROM ${internalTable('PIPELINE_QUEUE')}
                      WHERE pipeline_id = ? AND literal_value IN (${batch.map(() => '?').join(', ')})`,
                     [pipelineId, ...batch],
                   );
@@ -1239,7 +1248,7 @@ async function runWriteAndValidatePass(
                 // Update queue_size (and last_queue_empty_at if now empty) regardless.
                 const [qRow] = await exec(
                   connection,
-                  `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.PIPELINE_QUEUE WHERE pipeline_id = ?`,
+                  `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,
                   [pipelineId],
                 );
                 const remaining = Number((qRow as any)?.CNT ?? (qRow as any)?.cnt ?? 0);

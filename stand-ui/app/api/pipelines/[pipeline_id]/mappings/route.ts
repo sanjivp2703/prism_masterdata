@@ -12,6 +12,11 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { normalizeLiteral } from '@/app/api/_lib/normalize';
 import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from '@/app/api/_lib/warehouse/mssql/dialect';
+import { quoteIdent as pgQuoteIdent } from '@/app/api/_lib/warehouse/postgres/dialect';
+import { pgTableRef } from '@/app/api/_lib/warehouse/postgres/detection';
+import { myTableRef } from '@/app/api/_lib/warehouse/mysql/detection';
+import { quoteIdent as myQuoteIdent, binaryCompare as myBinaryCompare } from '@/app/api/_lib/warehouse/mysql/dialect';
+import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { upsertApprovedAlias } from '@/app/api/_lib/op-export';
 import { refreshExportTable } from '@/app/api/_lib/export-table';
 import { asExportKind } from '@/app/api/_lib/export-kind';
@@ -65,22 +70,40 @@ export async function GET(
       // engine's filterUnknownValues) and scope/search/sort/paginate in
       // memory — bounded by MSSQL_CANDIDATE_CAP, a reasonable ceiling for a
       // manually-opened UI tab rather than a hot path.
-      if (getWarehouseAdapter().kind === 'mssql') {
+      if (getWarehouseAdapter().kind === 'mssql' || getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
+        const isPg = getWarehouseAdapter().kind === 'postgres';
+        const isMy = getWarehouseAdapter().kind === 'mysql';
         const domainRows = await exec(
           conn,
-          `SELECT TOP (${MSSQL_CANDIDATE_CAP}) lam.match_id, lam.alias_id, lam.literal_value, aan.alias_name, lam.run_id, lam.confirmed_at
-           FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-           JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES aan ON aan.alias_id = lam.alias_id
-           WHERE 1=1 ${domainFilter}
-           ORDER BY lam.confirmed_at DESC`,
+          isPg || isMy
+            // Postgres/MySQL: same app-side normalization pattern (no
+            // SQL-side normalize on either); LIMIT instead of TOP.
+            ? `SELECT lam.match_id, lam.alias_id, lam.literal_value, aan.alias_name, lam.run_id, lam.confirmed_at
+               FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+               JOIN ${internalTable('APPROVED_ALIAS_NAMES')} aan ON aan.alias_id = lam.alias_id
+               WHERE 1=1 ${domainFilter}
+               ORDER BY lam.confirmed_at DESC
+               LIMIT ${MSSQL_CANDIDATE_CAP}`
+            : `SELECT TOP (${MSSQL_CANDIDATE_CAP}) lam.match_id, lam.alias_id, lam.literal_value, aan.alias_name, lam.run_id, lam.confirmed_at
+               FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+               JOIN ${internalTable('APPROVED_ALIAS_NAMES')} aan ON aan.alias_id = lam.alias_id
+               WHERE 1=1 ${domainFilter}
+               ORDER BY lam.confirmed_at DESC`,
         );
 
         let scoped = domainRows;
-        if (parts.length === 3 && column_name) {
-          const { db, schema, table } = msParseFqn(table_fqn);
-          const tableRef = `${msQuoteIdent(db)}.${msQuoteIdent(schema)}.${msQuoteIdent(table)}`;
-          const colRef   = msQuoteIdent(column_name);
-          const srcRows  = await exec(conn, `SELECT DISTINCT ${colRef} AS v FROM ${tableRef} WHERE ${colRef} IS NOT NULL`);
+        if ((isPg ? parts.length >= 2 : isMy ? parts.length === 2 : parts.length === 3) && column_name) {
+          const tableRef = isPg
+            ? pgTableRef(table_fqn).ref
+            : isMy
+            ? myTableRef(table_fqn).ref
+            : (() => { const { db, schema, table } = msParseFqn(table_fqn); return `${msQuoteIdent(db)}.${msQuoteIdent(schema)}.${msQuoteIdent(table)}`; })();
+          const colRef   = isPg ? pgQuoteIdent(column_name) : isMy ? myQuoteIdent(column_name) : msQuoteIdent(column_name);
+          // binaryCompare on the DISTINCT for mysql — the app-side normalize
+          // below needs byte-distinct representatives (KI-138 rule).
+          const srcRows  = await exec(conn, isMy
+            ? `SELECT DISTINCT ${myBinaryCompare(colRef)} AS v FROM ${tableRef} WHERE ${colRef} IS NOT NULL`
+            : `SELECT DISTINCT ${colRef} AS v FROM ${tableRef} WHERE ${colRef} IS NOT NULL`);
           const normSet  = new Set(
             srcRows.map((r: any) => normalizeLiteral(String(r.v ?? r.V ?? ''))).filter(Boolean),
           );
@@ -137,8 +160,8 @@ export async function GET(
            aan.alias_name,
            lam.run_id,
            lam.confirmed_at
-         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
-         JOIN PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES  aan
+         FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
+         JOIN ${internalTable('APPROVED_ALIAS_NAMES')}  aan
            ON aan.alias_id = lam.alias_id
          WHERE 1=1
            ${domainFilter}
@@ -162,7 +185,7 @@ export async function GET(
       const countRows = await exec(
         conn,
         `SELECT COUNT(*) AS cnt
-         FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES lam
+         FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
          WHERE 1=1 ${domainFilter} ${colScopeFilter}`,
       );
       const total = Number((countRows[0] as any).CNT ?? (countRows[0] as any).cnt ?? 0);
@@ -226,7 +249,11 @@ export async function PATCH(
   try {
     return await withWarehouse(async (conn) => {
       const isMssql = getWarehouseAdapter().kind === 'mssql';
-      const nowExpr = isMssql ? 'SYSUTCDATETIME()' : 'CURRENT_TIMESTAMP()';
+      // Postgres: CURRENT_TIMESTAMP takes no parens there — use now().
+      const nowExpr = isMssql ? 'SYSUTCDATETIME()'
+        : getWarehouseAdapter().kind === 'postgres' ? 'now()'
+        : getWarehouseAdapter().kind === 'mysql' ? 'NOW(3)'
+        : 'CURRENT_TIMESTAMP()';
 
       const pRow = getDb()
         .prepare(`SELECT domain_id, table_fqn, column_name, export_table_fqn, export_kind FROM pipelines WHERE pipeline_id = ?`)
@@ -244,7 +271,7 @@ export async function PATCH(
       // pipeline's edit touch another spec's mapping via a guessed match_id.
       const matchRows = await exec(
         conn,
-        `SELECT match_id, alias_id FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES WHERE match_id = ? AND ${domainFilter}`,
+        `SELECT match_id, alias_id FROM ${internalTable('LITERAL_ALIAS_MATCHES')} WHERE match_id = ? AND ${domainFilter}`,
         [match_id],
       );
       const matchRow = matchRows[0] as any;
@@ -256,22 +283,22 @@ export async function PATCH(
         if (targetAliasId !== currentAliasId) {
           await exec(
             conn,
-            `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES SET alias_id = ?, confirmed_at = ${nowExpr} WHERE match_id = ?`,
+            `UPDATE ${internalTable('LITERAL_ALIAS_MATCHES')} SET alias_id = ?, confirmed_at = ${nowExpr} WHERE match_id = ?`,
             [targetAliasId, match_id],
           );
           await exec(
             conn,
-            `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES SET usage_count = CASE WHEN usage_count > 0 THEN usage_count - 1 ELSE 0 END WHERE alias_id = ?`,
+            `UPDATE ${internalTable('APPROVED_ALIAS_NAMES')} SET usage_count = CASE WHEN usage_count > 0 THEN usage_count - 1 ELSE 0 END WHERE alias_id = ?`,
             [currentAliasId],
           );
           const remaining = await exec(
             conn,
-            `SELECT COUNT(*) AS cnt FROM PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES WHERE alias_id = ?`,
+            `SELECT COUNT(*) AS cnt FROM ${internalTable('LITERAL_ALIAS_MATCHES')} WHERE alias_id = ?`,
             [currentAliasId],
           );
           const remainingCount = Number((remaining[0] as any)?.cnt ?? (remaining[0] as any)?.CNT ?? 0);
           if (remainingCount === 0) {
-            await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`, [currentAliasId]);
+            await exec(conn, `DELETE FROM ${internalTable('APPROVED_ALIAS_NAMES')} WHERE alias_id = ?`, [currentAliasId]);
           }
         }
       } else {
@@ -279,7 +306,7 @@ export async function PATCH(
         // one if the target name already belongs to a different alias.
         const existing = await exec(
           conn,
-          `SELECT alias_id FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_name = ? AND ${domainFilter}`,
+          `SELECT alias_id FROM ${internalTable('APPROVED_ALIAS_NAMES')} WHERE alias_name = ? AND ${domainFilter}`,
           [newAliasName],
         );
         const existingAliasId = existing[0] ? Number((existing[0] as any).alias_id ?? (existing[0] as any).ALIAS_ID) : null;
@@ -287,19 +314,19 @@ export async function PATCH(
         if (existingAliasId == null || existingAliasId === currentAliasId) {
           await exec(
             conn,
-            `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES SET alias_name = ?, last_used_at = ${nowExpr} WHERE alias_id = ?`,
+            `UPDATE ${internalTable('APPROVED_ALIAS_NAMES')} SET alias_name = ?, last_used_at = ${nowExpr} WHERE alias_id = ?`,
             [newAliasName, currentAliasId],
           );
         } else {
           await exec(
             conn,
-            `UPDATE PRISM_DB.INTERNAL.LITERAL_ALIAS_MATCHES SET alias_id = ?, confirmed_at = ${nowExpr} WHERE alias_id = ?`,
+            `UPDATE ${internalTable('LITERAL_ALIAS_MATCHES')} SET alias_id = ?, confirmed_at = ${nowExpr} WHERE alias_id = ?`,
             [existingAliasId, currentAliasId],
           );
-          await exec(conn, `DELETE FROM PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES WHERE alias_id = ?`, [currentAliasId]);
+          await exec(conn, `DELETE FROM ${internalTable('APPROVED_ALIAS_NAMES')} WHERE alias_id = ?`, [currentAliasId]);
           await exec(
             conn,
-            `UPDATE PRISM_DB.INTERNAL.APPROVED_ALIAS_NAMES SET last_used_at = ${nowExpr} WHERE alias_id = ?`,
+            `UPDATE ${internalTable('APPROVED_ALIAS_NAMES')} SET last_used_at = ${nowExpr} WHERE alias_id = ?`,
             [existingAliasId],
           );
         }
