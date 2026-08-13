@@ -89,10 +89,20 @@ pipeline locks — same constraint as the standard edition's "one long-lived
 Node process" rule). `MIN_NODES = 1`, documented as by-design in the listing.
 Availability trade-off is accepted; it is identical to the standard edition's.
 
-### 2.4 DECIDED (owner, 2026-08-12) — LLM: Cortex
-**Decision: option A (Cortex).** The N0 grouping-quality spike is the
-validation gate — a material quality regression on Cortex-served Claude
-models reopens this in favor of option B. The options, for the record:
+### 2.4 DECIDED (owner, 2026-08-12) — LLM: Cortex · **SPIKE PASSED 2026-08-13**
+**Decision: option A (Cortex), validated.** The grouping-quality spike
+(`scripts/cortex-spike.mts` — the exact production chunk prompt on the demo
+fixtures, Anthropic API `claude-sonnet-4-6` vs Cortex `claude-4-sonnet`):
+valid JSON both paths; 100% pairwise same-group agreement on the company
+column with identical names; 99.8% on carriers, the sole divergence being
+Cortex correctly leaving the deliberately-ambiguous "C1" ungrouped from
+"Capital One"; Cortex ~25% FASTER per chunk (2.6–2.7 s vs 3.3–3.7 s).
+Two operational findings: (1) **`CORTEX_ENABLED_CROSS_REGION`** — Claude
+models aren't hosted in every region, so consumer accounts may need
+`ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US'` (or equivalent
+geography) — a documented one-time prerequisite for the listing, far lighter
+than an EAI; (2) larger-scale validation (multi-chunk runs, merge pass)
+rides the N3 test lifecycle. The options, for the record:
 - **(A) Snowflake Cortex (recommended).** Declare `SNOWFLAKE.CORTEX_USER` in
   the manifest; call Cortex's REST/SQL COMPLETE interface as a fourth provider
   in the existing dispatch layer (`anthropic-key.ts` /

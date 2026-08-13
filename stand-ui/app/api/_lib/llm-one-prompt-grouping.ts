@@ -400,7 +400,7 @@ function buildConventionBlock(conv: NamingConvention | null | undefined): string
   return block;
 }
 
-function buildSystemPrompt(
+export function buildSystemPrompt(
   conceptName: string,
   conceptDefinition: string,
   convention?: NamingConvention | null,
@@ -452,7 +452,7 @@ function sanitizeProposedName(name: unknown): string | null {
   return t.length > 200 ? t.slice(0, 200).trim() : t;
 }
 
-function buildUserTurn(
+export function buildUserTurn(
   chunkItems: RunItemForPairing[],
   conceptName: string,
 ): string {
