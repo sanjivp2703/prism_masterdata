@@ -1,0 +1,53 @@
+# Snowflake Native App manifest — Prism (docs/NATIVE_APP_PLAN.md N3).
+# DRAFT: authored 2026-08-13, not yet install-tested. Version/artifact paths
+# get finalized when the application package is first created.
+manifest_version: 1
+
+version:
+  name: v1_0
+  label: "Prism 1.0"
+  comment: "Warehouse-native data standardization"
+
+artifacts:
+  setup_script: setup.sql
+  readme: README.md
+  default_web_endpoint:
+    service: app_code.prism_app
+    endpoint: app
+  container_services:
+    images:
+      - /prism_db/internal/prism_images/prism-native:latest   # repo path finalized at packaging
+
+privileges:
+  - CREATE COMPUTE POOL:
+      description: "Run Prism's application container (single small node)."
+  - CREATE WAREHOUSE:
+      description: "Create the dedicated PRISM_WH warehouse (XSMALL, auto-suspend 60s) so Prism's compute cost is isolated and attributable."
+  - BIND SERVICE ENDPOINT:
+      description: "Serve Prism's web interface through a Snowflake-authenticated URL."
+  # Cortex: the consumer grants the SNOWFLAKE.CORTEX_USER database role at
+  # install (listing guidance: declare it specifically, never broad imported
+  # privileges). All AI runs in-account — no data leaves Snowflake.
+
+references:
+  - source_table:
+      label: "Source table to standardize"
+      description: "A table whose text column(s) Prism standardizes. Prism reads it and watches it for changes; it never modifies this table."
+      privileges: [SELECT]
+      object_type: TABLE
+      multi_valued: true
+      register_callback: app_code.register_reference
+  - writable_source_table:
+      label: "Source table for Column output mode"
+      description: "ONLY for the consent-gated Column output mode: Prism maintains a <col>_STANDARDIZED companion column ON this table (guarded UPDATEs; never touches other columns)."
+      privileges: [SELECT, UPDATE]
+      object_type: TABLE
+      multi_valued: true
+      register_callback: app_code.register_reference
+  - export_schema:
+      label: "Schema for standardized outputs"
+      description: "Where Prism creates export tables/views (standardized copies of your sources)."
+      privileges: [USAGE, CREATE TABLE, CREATE VIEW]
+      object_type: SCHEMA
+      multi_valued: true
+      register_callback: app_code.register_reference
