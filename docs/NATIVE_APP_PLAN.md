@@ -285,7 +285,27 @@ calendar time in N5/N6). Total ≈ 6–9 weeks of build.
   account, running entirely inside the local container. Standard-edition
   regression: `test:parity` + a normal dev-server smoke pass unchanged.
 
-### Phase N2 — SPCS hosting (bare, not yet a Native App) · ~1.5–2 wk · **CODE BUILT 2026-08-12, live SPCS deploy + exit test pending**
+### Phase N2 — SPCS hosting (bare, not yet a Native App) · ~1.5–2 wk · **LIVE-VERIFIED 2026-08-13 (core); tail items open**
+
+**Verified live in the dev account:** service running in SPCS (`PRISM_APP` on
+`PRISM_POOL`, image via `PRISM_IMAGES` repo); ambient-token warehouse auth
+end-to-end (reads, writes, stream creation, export CREATE TABLE — zero
+configured credentials); `Sf-Context-Current-User` → cookie bootstrap with
+auto-provisioning + admin bootstrap; block-volume SQLite surviving container
+replacement (twice — the §2.5 spike is answered YES); full pipeline
+lifecycle through the ingress incl. LLM grouping (59 mappings, 30-row export
+on the demo table). **Found + fixed live:** the /home setup gate didn't
+recognize the `'spcs'` source; the invite button rendered in native;
+**LLM egress needs an External Access Integration** (SPCS has no default
+outbound — network rule + `PRISM_ANTHROPIC_EAI` now in `spcs-dev-setup.sql`;
+this is interim scaffolding that §2.4's Cortex decision removes).
+**Also verified (2026-08-13):** SSE Live pulse through the ingress; the
+insert→minute-mark-detect→10-minute-tick standardize flow; the formal
+suspend/resume drill (service stops fully, resumes READY in ~12 s, poller +
+tick restart, state intact). **The one open exit item: second-user role
+check** (a different Snowflake user arrives as 'user', not admin). Service +
+pool left SUSPENDED after testing — resume with
+`ALTER SERVICE PRISM_DB.INTERNAL.PRISM_APP RESUME` (pool auto-resumes).
 Run the image as a hand-created SPCS service in the dev account first —
 isolates SPCS problems from Native-App-packaging problems.
 - Image repo push; compute pool; service with ingress endpoint + block volume.

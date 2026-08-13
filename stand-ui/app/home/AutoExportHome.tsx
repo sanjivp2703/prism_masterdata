@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -1192,7 +1193,8 @@ export default function AutoExportHome() {
             })}
           </nav>
 
-          {isAdmin === true && (
+          {/* Native edition: Snowflake owns membership — no email invitations. */}
+          {isAdmin === true && !isNativeEdition() && (
             <div style={{ marginTop: 'auto', padding: 12, borderTop: '0.5px solid var(--border)' }}>
               <Link
                 href="/invite"

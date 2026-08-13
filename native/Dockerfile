@@ -13,7 +13,11 @@
 # platforms without a matching prebuild.
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-FROM node:22-bookworm-slim AS builder
+# Pinned to the HOST platform: `next build` crashes under QEMU emulation
+# (worker NODE_OPTIONS rejection), and its output JS is arch-independent
+# anyway. The runtime stage below is the target arch; the only arch-specific
+# artifact (better-sqlite3's binary) is refreshed there.
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS builder
 WORKDIR /app
 
 # Toolchain fallback for native addons (better-sqlite3) if no prebuild matches.
@@ -56,6 +60,20 @@ ENV NODE_ENV=production \
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
+
+# The builder may run on a different arch (Apple Silicon host building
+# linux/amd64 for SPCS): better-sqlite3's .node binary is arch-specific, and
+# the standalone trace strips its build scaffolding (no binding.gyp), so
+# `npm rebuild` cannot fix it up. Instead: fresh-install the SAME version in
+# a scratch dir on THIS stage's arch (downloads the matching prebuilt) and
+# copy the binary over. re2-wasm is WebAssembly — portable, nothing to do.
+RUN set -e; \
+  V=$(node -p "require('/app/node_modules/better-sqlite3/package.json').version"); \
+  mkdir /tmp/bs3 && cd /tmp/bs3 && npm init -y >/dev/null 2>&1 \
+  && npm install --no-save --ignore-scripts=false better-sqlite3@"$V" \
+  && cp /tmp/bs3/node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+        /app/node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+  && rm -rf /tmp/bs3 /root/.npm
 
 # Run as the unprivileged node user; /data must be writable by it.
 RUN mkdir -p /data && chown node:node /data /app

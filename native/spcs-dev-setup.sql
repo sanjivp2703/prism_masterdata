@@ -25,6 +25,20 @@ CREATE COMPUTE POOL IF NOT EXISTS PRISM_POOL
   INSTANCE_FAMILY = CPU_X64_XS
   AUTO_RESUME = TRUE;
 
+-- ── Anthropic egress (N2 interim — Cortex removes this need, plan §2.4) ──────
+-- SPCS containers have NO outbound internet by default; the env-key LLM path
+-- needs explicit egress to api.anthropic.com. Network rule is schema-level
+-- (PRISM_SERVICE can create it); the integration is ACCOUNT-level.
+CREATE NETWORK RULE IF NOT EXISTS PRISM_DB.INTERNAL.ANTHROPIC_EGRESS
+  MODE = EGRESS TYPE = HOST_PORT VALUE_LIST = ('api.anthropic.com:443');
+CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS PRISM_ANTHROPIC_EAI
+  ALLOWED_NETWORK_RULES = (PRISM_DB.INTERNAL.ANTHROPIC_EGRESS)
+  ENABLED = TRUE;
+GRANT USAGE ON INTEGRATION PRISM_ANTHROPIC_EAI TO ROLE PRISM_SERVICE;
+-- Attach to the service (after CREATE SERVICE below, or include at create):
+--   ALTER SERVICE PRISM_DB.INTERNAL.PRISM_APP
+--     SET EXTERNAL_ACCESS_INTEGRATIONS = (PRISM_ANTHROPIC_EAI);
+
 -- ── The service ──────────────────────────────────────────────────────────────
 -- Runs AS the owning role: grant that role what the app needs (PRISM_SERVICE's
 -- grants from 01_internal_tables.sql; the service's ambient token acts with

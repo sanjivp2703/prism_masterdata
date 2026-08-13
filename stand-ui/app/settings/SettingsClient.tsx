@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 // ── Shared styling helpers ────────────────────────────────────────────────────
 
@@ -644,9 +645,12 @@ function TeamSection({ currentAccountId }: { currentAccountId: number | null }) 
           <h2 style={sectionTitle}>Team</h2>
           <p style={sectionHint}>Everyone with access to this workspace. Every member can view all pipelines, mappings, and the data values Prism standardizes.</p>
         </div>
-        <a href="/invite" style={{ ...primaryBtn, textDecoration: 'none', display: 'inline-block' }}>
-          Invite teammate
-        </a>
+        {/* Native edition: Snowflake owns membership — no email invitations. */}
+        {!isNativeEdition() && (
+          <a href="/invite" style={{ ...primaryBtn, textDecoration: 'none', display: 'inline-block' }}>
+            Invite teammate
+          </a>
+        )}
       </div>
 
       {loadState === 'loading' && (

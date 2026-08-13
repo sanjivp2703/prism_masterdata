@@ -24,7 +24,9 @@ async function needsWorkspaceSetup(): Promise<boolean> {
   const freshSim = isFreshSetupSim();
   const sf  = serviceConnectionSource();
   const llm = anthropicKeySource();
-  const sfOk  = sf  === 'workspace' || (!freshSim && sf  === 'env');
+  // 'spcs' = native edition's ambient token — always a real connection, never
+  // subject to the fresh-setup simulation (a dev tool for the standard edition).
+  const sfOk  = sf === 'spcs' || sf === 'workspace' || (!freshSim && sf === 'env');
   const llmOk = llm === 'workspace' || (!freshSim && llm === 'env');
   return !(sfOk && llmOk);
 }
