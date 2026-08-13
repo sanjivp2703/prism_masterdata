@@ -11,6 +11,17 @@
 
 import { cookies } from 'next/headers';
 import { withWarehouse, withUserWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { isNativeEdition } from '@/app/api/_lib/edition';
+import { reportError } from '@/app/api/_lib/report-error';
+
+/** Native edition: the app's own database name IS the application name the
+ *  consumer chose — the grantee for consumer-side access grants. */
+async function currentAppName(conn: unknown): Promise<string> {
+  try {
+    const r = await exec(conn as any, 'SELECT CURRENT_DATABASE() AS D');
+    return String(r?.[0]?.D ?? (r?.[0] as any)?.d ?? 'PRISM');
+  } catch { return 'PRISM'; }
+}
 import { isMssqlAccessError, getServiceLoginName } from '@/app/api/_lib/warehouse/mssql/connection';
 import { quoteIdent as msQuoteIdent } from '@/app/api/_lib/warehouse/mssql/dialect';
 import { isPgAccessError, getServiceRoleName } from '@/app/api/_lib/warehouse/postgres/connection';
@@ -363,6 +374,9 @@ export async function POST(request: Request) {
           source_relation, target_fqn, mode, columns, nonce: sessionNonce,
         });
       } catch (exportErr: any) {
+        // Full detail server-side ALWAYS — the install test lost hours to this
+        // branch classifying and responding without logging the underlying error.
+        reportError(exportErr, { where: 'one-time export', target_fqn, mode });
         const isMssql = getWarehouseAdapter().kind === 'mssql';
         const isPg = getWarehouseAdapter().kind === 'postgres';
         const isMy = getWarehouseAdapter().kind === 'mysql';
@@ -486,20 +500,27 @@ export async function POST(request: Request) {
         if (isPermission) {
           const { db, schema, table } = parseFqn(target_fqn);
           const qi = (s: string) => quoteIdent(s);
+          // Native (Marketplace) edition: the app IS the identity — grants go
+          // TO APPLICATION <name> (the consumer-chosen app name = the app's
+          // own database), never to PRISM_SERVICE (install-test bug: the
+          // panel showed standard-edition SQL that does nothing for the app).
+          const grantee = isNativeEdition()
+            ? `APPLICATION ${qi(await currentAppName(conn))}`
+            : 'ROLE PRISM_SERVICE';
           const lines = [
             `-- Run as ACCOUNTADMIN or SYSADMIN in Snowflake`,
-            `GRANT USAGE ON DATABASE ${qi(db)} TO ROLE PRISM_SERVICE;`,
-            `GRANT USAGE ON SCHEMA ${qi(db)}.${qi(schema)} TO ROLE PRISM_SERVICE;`,
-            `GRANT CREATE TABLE ON SCHEMA ${qi(db)}.${qi(schema)} TO ROLE PRISM_SERVICE;`,
+            `GRANT USAGE ON DATABASE ${qi(db)} TO ${grantee};`,
+            `GRANT USAGE ON SCHEMA ${qi(db)}.${qi(schema)} TO ${grantee};`,
+            `GRANT CREATE TABLE ON SCHEMA ${qi(db)}.${qi(schema)} TO ${grantee};`,
           ];
           if (mode === 'overwrite') {
             lines.push(
               ``,
               `-- Target table already exists. Choose one option:`,
               `-- Option A — full replace (handles schema changes):`,
-              `GRANT OWNERSHIP ON TABLE ${qi(db)}.${qi(schema)}.${qi(table)} TO ROLE PRISM_SERVICE COPY CURRENT GRANTS;`,
+              `GRANT OWNERSHIP ON TABLE ${qi(db)}.${qi(schema)}.${qi(table)} TO ${grantee} COPY CURRENT GRANTS;`,
               `-- Option B — data-only update (table schema must match source):`,
-              `GRANT SELECT, INSERT, DELETE ON TABLE ${qi(db)}.${qi(schema)}.${qi(table)} TO ROLE PRISM_SERVICE;`,
+              `GRANT SELECT, INSERT, DELETE ON TABLE ${qi(db)}.${qi(schema)}.${qi(table)} TO ${grantee};`,
             );
           }
           return Response.json(

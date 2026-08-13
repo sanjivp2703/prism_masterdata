@@ -176,6 +176,42 @@ END;
 $$;
 
 GRANT USAGE ON PROCEDURE app_code.start_app() TO APPLICATION ROLE app_user;
+GRANT USAGE ON PROCEDURE app_code.upgrade_app() TO APPLICATION ROLE app_user;
+
+-- Temporary install-test diagnostic (remove before distribution): runs the
+-- one-time export's suspect statements as the app and returns real errors.
+CREATE OR REPLACE PROCEDURE app_code.diag()
+RETURNS STRING LANGUAGE SQL AS
+$$
+BEGIN
+  BEGIN
+    CREATE TABLE internal_state.DIAG_TEST (x INT);
+    DROP TABLE internal_state.DIAG_TEST;
+  EXCEPTION WHEN OTHER THEN RETURN 'runtime DDL in own schema FAILED: ' || SQLERRM;
+  END;
+  BEGIN
+    CREATE OR REPLACE TABLE TEST_DB.PUBLIC.PRISM_DIAG_TEST AS
+      SELECT app_code.PRISM_NORMALIZE(RAW_CARRIER_VALUE) AS v
+      FROM TEST_DB.PUBLIC.RAW_MOBILE_CARRIERS_SHORT LIMIT 5;
+    DROP TABLE TEST_DB.PUBLIC.PRISM_DIAG_TEST;
+  EXCEPTION WHEN OTHER THEN RETURN 'consumer CTAS FAILED: ' || SQLERRM;
+  END;
+  RETURN 'all ok';
+END;
+$$;
+GRANT USAGE ON PROCEDURE app_code.diag() TO APPLICATION ROLE app_user;
+
+-- Cost control: suspend the app without uninstalling (consumer-facing need).
+CREATE OR REPLACE PROCEDURE app_code.stop_app()
+RETURNS STRING LANGUAGE SQL AS
+$$
+BEGIN
+  ALTER SERVICE IF EXISTS services.prism_app SUSPEND;
+  ALTER COMPUTE POOL IF EXISTS prism_app_pool SUSPEND;
+  RETURN 'Prism suspended (start_app() to resume)';
+END;
+$$;
+GRANT USAGE ON PROCEDURE app_code.stop_app() TO APPLICATION ROLE app_user;
 -- The reference callback must be callable by the consumer's Security UI
 -- (install warning 2026-08-13 when this grant was missing).
 GRANT USAGE ON PROCEDURE app_code.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_user;

@@ -83,9 +83,14 @@ function createSpcsSnowflakeConnection(): SnowflakeConnection {
   const token = fs.readFileSync(SPCS_TOKEN_PATH, 'utf8').trim();
   const port  = getOptionalEnv('SNOWFLAKE_PORT') ?? '443';
 
-  const database  = getOptionalEnv('SNOWFLAKE_DATABASE')  ?? 'PRISM_DB';
-  const schema    = getOptionalEnv('SNOWFLAKE_SCHEMA')    ?? 'INTERNAL';
-  const warehouse = getOptionalEnv('SNOWFLAKE_WAREHOUSE') ?? 'PRISM_WH';
+  // Inside a NATIVE APP the session database must be the APPLICATION (the
+  // consumer names it — unknowable statically). PRISM_INTERNAL_DB pins it
+  // when set; otherwise the session default is left ALONE so ambient
+  // resolution lands on the app database. Never force PRISM_DB here — the
+  // app has no access to it (install-test failure 2026-08-13).
+  const database  = getOptionalEnv('PRISM_INTERNAL_DB') ?? getOptionalEnv('SNOWFLAKE_DATABASE');
+  const schema    = getOptionalEnv('SNOWFLAKE_SCHEMA');
+  const warehouse = getOptionalEnv('SNOWFLAKE_WAREHOUSE') ?? 'PRISM_APP_WH';
 
   return snowflake.createConnection({
     accessUrl: `https://${host}:${port}`,
@@ -93,8 +98,8 @@ function createSpcsSnowflakeConnection(): SnowflakeConnection {
     token,
     authenticator: 'OAUTH',
     warehouse,
-    database,
-    schema,
+    ...(database ? { database } : {}),
+    ...(schema ? { schema } : {}),
   } as any);
 }
 
