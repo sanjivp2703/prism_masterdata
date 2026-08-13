@@ -44,10 +44,7 @@ references:
       object_type: TABLE
       multi_valued: true
       register_callback: app_code.register_reference
-  - export_schema:
-      label: "Schema for standardized outputs"
-      description: "Where Prism creates export tables/views (standardized copies of your sources)."
-      privileges: [USAGE, CREATE TABLE, CREATE VIEW]
-      object_type: SCHEMA
-      multi_valued: true
-      register_callback: app_code.register_reference
+# Export destinations: SCHEMA is not a referenceable object_type (validator,
+# 2026-08-13) — consumers grant export-schema access DIRECTLY instead:
+#   GRANT USAGE, CREATE TABLE, CREATE VIEW ON SCHEMA <x> TO APPLICATION <app>;
+# (surfaced by the in-app consent copy at export setup).
