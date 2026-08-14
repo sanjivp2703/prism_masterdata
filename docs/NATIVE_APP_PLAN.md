@@ -408,6 +408,15 @@ isolates SPCS problems from Native-App-packaging problems.
   browsing. Column-mode consent → reference with UPDATE/ALTER.
 - First-run experience replaces the credential wizard: choose LLM
   (or nothing to choose, if §2.4=A), grant references, done.
+  **BUILT 2026-08-13:** `/setup` in native renders `NativeSetup` instead of
+  BOTH the admin wizard and the personal-credentials variant (each describes
+  surfaces this edition doesn't have): "Prism is ready" + the durable
+  app-grant SQL + the §2.9 caller-grant opt-in + the Cortex cross-region
+  note (admins) + Go. The grant SQL lives in ONE shared module
+  (`app/components/native-grant-sql.ts`) used by both this page and
+  `NativeTablePicker`'s panel, so the two can't drift. Note the `/home`
+  setup gate already passes native (spcs + cortex), so nothing routes here
+  automatically — the page exists for deliberate visits and links.
 - **Metering + billing (§2.8):** the shared `billing-meter.ts` on every
   lookup-write path (MERGE-reported insert counts — build this early in the
   phase; it's edition-agnostic and the standard edition wants it for

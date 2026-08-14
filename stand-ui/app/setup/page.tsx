@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import { buildNativeAppGrantSql, buildNativeCallerGrantSql } from '@/app/components/native-grant-sql';
 
 function PrismLogo() {
   return (
@@ -2732,6 +2733,87 @@ function PersonalSetupForm({ nextUrl }: { nextUrl: string }) {
   );
 }
 
+// ── Native-edition first run (docs/NATIVE_APP_PLAN.md N3 · §2.9) ─────────────
+// Inside the Native App there is nothing to configure: the app IS the
+// warehouse identity (no credentials), AI runs on Snowflake Cortex in-account
+// (no keys), and access arrives as Snowflake grants. So first-run collapses
+// to: here's the grant SQL, go. Replaces BOTH the admin credential wizard and
+// the personal-credentials variant, which describe surfaces this edition
+// doesn't have.
+
+function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user' }) {
+  const router = useRouter();
+  const [appName, setAppName] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/accounts/accessible-tables', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(b => { if (!cancelled && b?.app_name) setAppName(String(b.app_name)); })
+      .catch(() => { /* placeholder name is fine */ });
+    return () => { cancelled = true; };
+  }, []);
+  const isAdmin = role === 'admin';
+
+  return (
+    <div>
+      <h1 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
+        Prism is ready
+      </h1>
+      <p className="text-sm mt-2" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+        This edition runs entirely inside your Snowflake account. There are no
+        credentials to enter and no AI keys to manage — Prism connects as the
+        application itself, and AI runs on Snowflake Cortex, so your data never
+        leaves Snowflake. The only setup is deciding what Prism can see.
+      </p>
+
+      <SectionTitle>Give Prism data to work with</SectionTitle>
+      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+        Prism sees only what your team grants it — nothing is shared automatically.
+        {isAdmin
+          ? ' Run this for each schema you want standardized (whoever owns the schema can run it):'
+          : ' Send this to whoever owns the data (they don’t need to be ACCOUNTADMIN):'}
+      </p>
+      <div className="mt-2">
+        <CodeBlock code={buildNativeAppGrantSql(appName)} maxHeight={200} />
+      </div>
+
+      <SectionTitle>Optional: instant access for one-time cleaning</SectionTitle>
+      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+        {isAdmin
+          ? 'A one-time opt-in that lets Prism clean any table a signed-in user can already read — using that user’s own access, so nobody repeats the grant ritual per table. Pipelines still require the grants above.'
+          : 'An admin can opt in once so Prism can clean any table you can already read, using your own access. Pipelines still require the grants above.'}
+      </p>
+      <div className="mt-2">
+        <CodeBlock code={buildNativeCallerGrantSql(appName)} maxHeight={200} />
+      </div>
+
+      {isAdmin && (
+        <>
+          <SectionTitle>If AI calls fail in your region</SectionTitle>
+          <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            Cortex serves Claude models in most regions. If standardization
+            reports the model is unavailable, enable cross-region inference
+            once (ACCOUNTADMIN; pick your geography):
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={`ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';`} maxHeight={60} />
+          </div>
+        </>
+      )}
+
+      <div className="mt-6 flex justify-end">
+        <button
+          onClick={() => router.push(nextUrl)}
+          className="rounded-button text-sm font-medium"
+          style={{ backgroundColor: 'var(--accent)', color: '#fff', padding: '10px 18px', border: 'none', cursor: 'pointer' }}
+        >
+          Go to Prism
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Page shell ────────────────────────────────────────────────────────────────
 
 function SetupForm() {
@@ -2784,7 +2866,9 @@ function SetupForm() {
         <PrismLogo />
 
         <div className="rounded-card border-[0.5px]" style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)', padding: '32px 28px' }}>
-          {role === 'admin'
+          {isNativeEdition()
+            ? <NativeSetup nextUrl={nextUrl} role={role} />
+            : role === 'admin'
             ? <AdminOnboarding nextUrl={nextUrl} />
             : platform === 'mssql'    ? <PersonalSetupFormMssql nextUrl={nextUrl} />
             : platform === 'postgres' ? <PersonalSetupFormPg nextUrl={nextUrl} />
@@ -2793,8 +2877,10 @@ function SetupForm() {
         </div>
 
         <p className="text-xs text-center mt-4" style={{ color: 'var(--text-hint)' }}>
-          {role === 'admin'
-            ? (isNativeEdition() ? 'This edition of Prism runs inside your Snowflake account and stores no credentials at all — access is granted through Snowflake, and AI runs on Snowflake Cortex.' : 'Prism only ever stores the low-privilege service credentials and your AI provider key, encrypted. Admin credentials are never saved.')
+          {isNativeEdition()
+            ? 'This edition of Prism runs inside your Snowflake account and stores no credentials at all — access is granted through Snowflake, and AI runs on Snowflake Cortex.'
+            : role === 'admin'
+            ? 'Prism only ever stores the low-privilege service credentials and your AI provider key, encrypted. Admin credentials are never saved.'
             : `Credentials are stored encrypted in your account and used only to connect to ${PLATFORM_LABELS[platform]} on your behalf.`}
         </p>
       </div>

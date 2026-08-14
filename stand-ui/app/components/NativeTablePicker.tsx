@@ -15,6 +15,7 @@
  * Standard edition never renders this — callers gate on isNativeEdition().
  */
 import { useEffect, useId, useMemo, useState } from 'react';
+import { buildNativeAppGrantSql, buildNativeCallerGrantSql } from './native-grant-sql';
 
 interface AccessibleTable { fqn: string; db: string; schema: string; table: string }
 
@@ -39,39 +40,9 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
     return () => { cancelled = true; };
   }, []);
 
-  const grantSql = useMemo(() => {
-    const app = appName || '<your Prism app name>';
-    return [
-      `-- Run as a role with grant authority on the schema (its owner, or ACCOUNTADMIN)`,
-      `GRANT USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
-      `GRANT USAGE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-      `-- one table:`,
-      `GRANT SELECT ON TABLE <db>.<schema>.<table> TO APPLICATION "${app}";`,
-      `-- or the whole schema, current and future tables:`,
-      `GRANT SELECT ON ALL TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-      `GRANT SELECT ON FUTURE TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-      `-- to let Prism write export tables there too:`,
-      `GRANT CREATE TABLE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-    ].join('\n');
-  }, [appName]);
-
-  // §2.9 caller grants — the one-time admin OPT-IN that lets Prism's
-  // interactive work (one-time cleaning, table preview) run with each
-  // signed-in user's OWN Snowflake access, so nobody repeats the grant
-  // ritual per table. Pipelines still require the durable grants above.
-  const callerGrantSql = useMemo(() => {
-    const app = appName || '<your Prism app name>';
-    return [
-      `-- Optional, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
-      `-- Lets Prism clean any table the signed-in user can ALREADY read — using that`,
-      `-- user's own access, per database you opt in:`,
-      `GRANT CALLER USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
-      `GRANT INHERITED CALLER USAGE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
-      `GRANT INHERITED CALLER SELECT ON ALL TABLES IN DATABASE <db> TO APPLICATION "${app}";`,
-      `-- (add CREATE TABLE the same way to let one-time results export to your schemas:)`,
-      `GRANT INHERITED CALLER CREATE TABLE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
-    ].join('\n');
-  }, [appName]);
+  const grantSql = useMemo(() => buildNativeAppGrantSql(appName), [appName]);
+  // §2.9 caller grants — the one-time admin opt-in for interactive work.
+  const callerGrantSql = useMemo(() => buildNativeCallerGrantSql(appName), [appName]);
 
   return (
     <div>
