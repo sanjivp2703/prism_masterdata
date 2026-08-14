@@ -95,7 +95,10 @@ function AcceptTermsInner() {
             </a>
             , which describe how Prism connects to your data warehouse, what
             data is processed by the AI provider during standardization, and
-            your responsibilities as a user. Both open in a new tab.
+            your responsibilities as a user. Both open in a new tab. Prism is
+            a shared workspace: every member can view all pipelines, mappings,
+            and the data values Prism standardizes, regardless of their own
+            database permissions.
           </div>
 
           <label

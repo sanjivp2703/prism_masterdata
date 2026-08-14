@@ -2769,6 +2769,10 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       <SectionTitle>Give Prism data to work with</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         Prism sees only what your team grants it — nothing is shared automatically.
+        One thing to know before granting: Prism is a shared workspace, so every
+        person you give app access to can view all pipelines, mappings, and the
+        standardized values — including ones built from tables their own
+        Snowflake permissions can&apos;t read.
         {isAdmin
           ? ' Run this for each schema you want standardized (whoever owns the schema can run it):'
           : ' Send this to whoever owns the data (they don’t need to be ACCOUNTADMIN):'}
