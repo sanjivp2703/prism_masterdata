@@ -599,7 +599,13 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
         }
       }
     } else {
-      await exec(connection, `CREATE OR REPLACE TABLE ${targetRef} AS ${selectSQL}`);
+      // 'create' must FAIL on an existing table — plain CREATE TABLE does
+      // (same rule the pg/mysql/mssql paths already implement; the route's
+      // 409 branch turns "already exists" into the honest collision message).
+      // The old CREATE OR REPLACE silently replaced visible tables, and under
+      // native caller's rights errored as a baffling "must have CALLER
+      // OWNERSHIP" that misclassified as needs-grants (live-found 2026-08-14).
+      await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
     }
 
     const cntRows = await exec(connection, `SELECT COUNT(*) AS cnt FROM ${targetRef}`);
