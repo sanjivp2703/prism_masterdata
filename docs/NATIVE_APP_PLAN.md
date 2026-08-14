@@ -210,19 +210,41 @@ the "connect personal credentials" messages; `NativeTablePicker`'s panel
 carries the per-database `GRANT CALLER` opt-in SQL (MANAGE CALLER GRANTS
 required); `manifest.yml` declares `restricted_callers_rights`.
 
-**Live-verify at the next N3 install test (none of this is provable
-offline):** (1) manifest accepts the `restricted_callers_rights` block for a
-containers-only app (drop it if the validator refuses); (2) the header
-actually arrives with `executeAsCaller` on, and the dot-joined token opens a
-session; (3) the caller session can USE the app's warehouse (the tutorial
-caller-granted a warehouse — the app-owned `PRISM_APP_WH` may need
-`GRANT CALLER USAGE ON WAREHOUSE`, or app-owned may just work); (4) the
-caller session can call the app's `PRISM_NORMALIZE` UDF + write the one-time
-run's `RUN_STATE` via the SERVICE connection split (already split in code —
-verify the caller path never needs app-schema access); (5) the exact
-`GRANT CALLER` statements in the picker panel parse verbatim on a real
-account; (6) with NO caller grants opted in, a caller-session probe fails
-closed as a clean access error (the §2.9 "warehouse's own rejection").
+**LIVE-VERIFIED END-TO-END 2026-08-13/14 (patches 12–14, dev account):**
+full one-time flow — probe → Cortex grouping → review → export CTAS —
+on a database the app holds ZERO direct grants on (`CALLER_TEST_DB`),
+entirely via the caller session; the output table lands owned by the
+CALLER's role (the app cannot even see it — the ACL-backed "visibility
+groups" premise confirmed). All six original verify items passed;
+metering ran on the service connection (no billing errors). **Four
+operational findings, each load-bearing:**
+1. **Dev-mode superset rule:** an app installed directly from a package
+   requires its OWNER ROLE to hold ≥ the app's caller grants
+   (`GRANT ... TO ROLE PRISM_SERVICE` mirror). Dev-loop-only friction —
+   listing installs have no such owner. Error names it explicitly.
+2. **The app must grant its own warehouse + UDF to `app_user`** (now in
+   setup.sql): caller-session privileges = caller's own ∩ caller grants,
+   and nobody outside the app has USAGE on `PRISM_APP_WH` or
+   `PRISM_NORMALIZE` — without the grants every caller session died with
+   "No active warehouse selected" / would fail UDF resolution.
+3. **The opt-in must be `GRANT ALL INHERITED CALLER PRIVILEGES ON ALL
+   SCHEMAS/TABLES IN DATABASE <db>`** (+ `CALLER USAGE` on db and on
+   `PRISM_APP_WH`): restricted caller's rights checks EVERY privilege
+   against the opt-in — even INSERT into a scratch table the session
+   itself just created — so a SELECT-only set stalls the export. "ALL of
+   the caller's own privileges, where you opt in" is also the honest
+   consent statement (the app can never exceed the signed-in user).
+   `native-grant-sql.ts` carries the corrected set. Snowsight footgun:
+   ▶ runs one statement — partial pastes look like grant bugs.
+4. **Image rolls are `upgrade_app()` (ALTER SERVICE FROM SPEC), never
+   suspend/resume:** RESUME keeps the pinned digest, and overwriting
+   `:latest` invalidated the old digest — the service sat "Failed to pull
+   image" indefinitely until the spec refresh re-resolved the tag.
+Also landed in the same round (commit c73ea9f): the caller-path one-time
+export fixes — isFileSession short-circuit, scratch tables to the TARGET
+schema on the user path, metering on a service connection (all three
+latent in the standard edition's personal-credentials path too; mssql/pg/
+mysql parity gap recorded in WAREHOUSES.md).
 
 ### 2.8 DECIDED (owner, 2026-08-12) — Pricing: $25 per 1,000 new distinct values, first 1,000 free
 Usage-based pricing on the Marketplace listing via **Custom Event Billing**

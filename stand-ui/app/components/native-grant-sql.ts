@@ -25,18 +25,26 @@ export function buildNativeAppGrantSql(appName: string): string {
 }
 
 /** §2.9 caller grants — the one-time admin OPT-IN that lets interactive work
- *  (one-time cleaning, table preview) run with each signed-in user's OWN
- *  Snowflake access. Pipelines still require the durable grants above. */
+ *  (one-time cleaning, table preview, one-time exports) run with each
+ *  signed-in user's OWN Snowflake access. Pipelines still require the
+ *  durable grants above.
+ *
+ *  The ALL forms are deliberate (live-found 2026-08-14): restricted caller's
+ *  rights checks EVERY privilege against the opt-in — a SELECT-only set
+ *  stalls the export's INSERT even on a table the session itself created.
+ *  "All of the caller's own privileges, in the databases you opt in" is both
+ *  the working set and the honest consent statement — the app can never do
+ *  more than the signed-in user themselves can. */
 export function buildNativeCallerGrantSql(appName: string): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   return [
     `-- Optional, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
-    `-- Lets Prism clean any table the signed-in user can ALREADY read — using that`,
-    `-- user's own access, per database you opt in:`,
+    `-- Lets Prism clean any table the signed-in user can ALREADY access — using that`,
+    `-- user's own access (never more), per database you opt in:`,
     `GRANT CALLER USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
-    `GRANT INHERITED CALLER USAGE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
-    `GRANT INHERITED CALLER SELECT ON ALL TABLES IN DATABASE <db> TO APPLICATION "${app}";`,
-    `-- (add CREATE TABLE the same way to let one-time results export to your schemas:)`,
-    `GRANT INHERITED CALLER CREATE TABLE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
+    `GRANT ALL INHERITED CALLER PRIVILEGES ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
+    `GRANT ALL INHERITED CALLER PRIVILEGES ON ALL TABLES IN DATABASE <db> TO APPLICATION "${app}";`,
+    `-- once per account (Prism's own warehouse, used for the queries it runs as you):`,
+    `GRANT CALLER USAGE ON WAREHOUSE PRISM_APP_WH TO APPLICATION "${app}";`,
   ].join('\n');
 }
