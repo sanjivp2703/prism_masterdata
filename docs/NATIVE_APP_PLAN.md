@@ -481,6 +481,17 @@ isolates SPCS problems from Native-App-packaging problems.
   sealed-proc invariant re-verified after.)
 - Install as a private app (`DISTRIBUTION=INTERNAL`) in the dev account, then
   in the test-consumer account from a listing share.
+  **IN-APP PIPELINE LIFECYCLE VERIFIED 2026-08-14 (patch 20, dev install —
+  the packaged app's first pipeline ever):** create → baseline review →
+  accept → Begin (lookup committed, export table created APP-OWNED in the
+  consumer schema) → poller creates+consumes the stream in app context →
+  insert detection (2 rows queued, correct lookup-hit/new split) →
+  10-minute tick standardizes (zero-LLM lookup path + Cortex for the new
+  value; 2 mappings, 0 ungrouped; export → 12 rows) → delete-hygiene
+  rebuild same-minute (→ 10 rows). The billing quiet-skip fired correctly
+  on the pipeline path. Patch 20 validated with ZERO warnings (diag()
+  removal). Fixture: TEST_DB.PUBLIC.RAW_NATIVE_PIPE_TEST + pipeline 1
+  left in place in the dev install.
 - **Exit criteria (the port-plan-style lifecycle test, run in the TEST
   CONSUMER account):** fresh install from the package → grant references →
   full pipeline lifecycle on a consumer table incl. delete-hygiene rebuild
