@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS internal_state.BILLING_EVENTS (
     emitted_at       TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
 
+-- app_user needs the normalization UDF: caller's-rights one-time exports
+-- (§2.9) run the standardized CTAS as the CALLING USER, and its join calls
+-- app_code.PRISM_NORMALIZE on the source side. Pure string function — no
+-- data exposure. (Live-found 2026-08-13 alongside the warehouse grant.)
+GRANT USAGE ON SCHEMA app_code TO APPLICATION ROLE app_user;
+GRANT USAGE ON FUNCTION app_code.PRISM_NORMALIZE(VARCHAR) TO APPLICATION ROLE app_user;
+
 -- app_data_admin: manual lookup maintenance only (mirror of PRISM_DATA_ADMIN).
 GRANT USAGE ON SCHEMA internal_state TO APPLICATION ROLE app_data_admin;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE internal_state.LITERAL_ALIAS_MATCHES TO APPLICATION ROLE app_data_admin;
@@ -170,6 +177,12 @@ BEGIN
     MIN_INSTANCES = 1 MAX_INSTANCES = 1;             -- single-node BY DESIGN (in-process poller/locks/SSE)
   ALTER SERVICE IF EXISTS services.prism_app RESUME;  -- start = resume when suspended (stop_app pairs with this)
   GRANT SERVICE ROLE services.prism_app!ALL_ENDPOINTS_USAGE TO APPLICATION ROLE app_user;
+  -- Caller's-rights sessions (§2.9) run as the CALLING USER with privileges =
+  -- (user's own ∩ caller grants). Nobody outside the app has USAGE on the
+  -- app-owned warehouse, so without this grant every caller session dies with
+  -- "No active warehouse selected" (live-found 2026-08-13). The app owns the
+  -- warehouse, so it grants usage to its own users.
+  GRANT USAGE ON WAREHOUSE PRISM_APP_WH TO APPLICATION ROLE app_user;
   -- Visibility for consumer admins (and provider dev tooling): without these,
   -- SHOW ENDPOINTS/SERVICE CONTAINERS is impossible outside the app.
   GRANT USAGE ON SCHEMA services TO APPLICATION ROLE app_user;
@@ -184,6 +197,9 @@ RETURNS STRING LANGUAGE SQL AS
 $$
 BEGIN
   ALTER SERVICE IF EXISTS services.prism_app FROM SPECIFICATION_FILE = '/service-spec.yaml';
+  -- Same caller's-rights warehouse grant as start_app() — existing installs
+  -- upgraded to this version pick it up here (the warehouse already exists).
+  GRANT USAGE ON WAREHOUSE PRISM_APP_WH TO APPLICATION ROLE app_user;
   RETURN 'Prism service upgraded';
 END;
 $$;

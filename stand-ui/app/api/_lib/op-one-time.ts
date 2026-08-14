@@ -31,7 +31,8 @@ import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
 import { internalObject, prismNormalizeFn } from './warehouse-tables';
 import { recordStandardizedUnits } from './billing-meter';
-import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { executeQuery as exec, getWarehouseAdapter, withWarehouse } from './warehouse';
+import { reportError } from './report-error';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
 import {
   diffScan as pgDiffScan,
@@ -436,6 +437,14 @@ export interface ExportOneTimeArgs {
   mode:            'create' | 'overwrite';
   columns:         OneTimeExportColumn[];
   nonce:           string;   // simple ident fragment for the temp map table
+  /** True when `connection` is the USER's own access (personal credentials,
+   *  or the native caller's-rights session — §2.9). That connection cannot
+   *  touch the app-internal schema, so scratch tables go to the TARGET
+   *  schema (session-scoped TEMPORARY; the export already requires CREATE
+   *  TABLE there) and metering runs on a separate service connection
+   *  (live-found 2026-08-13: internal-schema scratch + metering both failed
+   *  on the caller session). */
+  usedUserConnection?: boolean;
 }
 
 /**
@@ -494,7 +503,15 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
     return await exportOneTimeToMssqlTarget(connection, { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched });
   }
 
-  const mapTable = `${internalObject(quoteIdent(`OTS_MAP_${nonce}`))}`;
+  // Scratch home: internal schema for the service connection (always
+  // writable by it); the TARGET schema for a user/caller connection (the one
+  // place that connection is guaranteed CREATE TABLE — the export needs it
+  // anyway). TEMPORARY = session-scoped either way, dropped in finally.
+  const scratchName = (n: string) =>
+    args.usedUserConnection
+      ? `${quoteIdent(tgt.db)}.${quoteIdent(tgt.schema)}.${quoteIdent(n)}`
+      : `${internalObject(quoteIdent(n))}`;
+  const mapTable = scratchName(`OTS_MAP_${nonce}`);
 
   try {
     // ── Build the transient mapping table ──────────────────────────────────
@@ -569,9 +586,10 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
           m.includes('access control error') || m.includes('sql access control');
         if (!isPermErr) throw replaceErr;
 
-        // Build staging table in INTERNAL (always writable), then
+        // Build a session-scoped staging table (internal schema for the
+        // service connection; target schema for a user/caller one), then
         // overwrite target rows. Target schema must match the source.
-        const stageRef = `${internalObject(quoteIdent(`OTS_FALLBACK_${nonce}`))}`;
+        const stageRef = scratchName(`OTS_FALLBACK_${nonce}`);
         try {
           await exec(connection, `CREATE OR REPLACE TEMPORARY TABLE ${stageRef} AS ${selectSQL}`);
           await exec(connection, `DELETE FROM ${targetRef} WHERE TRUE`);
@@ -601,7 +619,18 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
       0,
     );
-    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+    // The user/caller connection cannot write the internal BILLING_METER —
+    // meter on a service connection instead (a caller-path export must never
+    // be a billing bypass). Failures never block the export either way.
+    if (args.usedUserConnection) {
+      try {
+        await withWarehouse((sconn) => recordStandardizedUnits(sconn, standardizedDistinct, 'one_time_export'));
+      } catch (meterErr) {
+        reportError(meterErr, { where: 'one-time export metering (service conn)' });
+      }
+    } else {
+      await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
+    }
 
     return { rows_written };
   } finally {

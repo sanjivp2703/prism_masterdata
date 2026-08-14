@@ -212,8 +212,13 @@ export async function POST(request: Request) {
       // Whether this session's source was an uploaded file / Sheet: the rows
       // were stored under the nonce at creation. Derived from the DATA rather
       // than from a request field so a client cannot mislabel a session and
-      // send the export down the wrong path.
-      const isFileSession = (await countOneTimeFileRows(conn, sessionNonce)) > 0;
+      // send the export down the wrong path. A connection='user' session is
+      // by construction a warehouse-table one (only the table-probe path sets
+      // it), so skip the check there — the user/caller connection cannot read
+      // the app-internal ONE_TIME_FILE_ROWS anyway (live-found 2026-08-13,
+      // native caller's-rights round). Still meta-derived, never client input.
+      const isFileSession = !useUserConnection
+        && (await countOneTimeFileRows(conn, sessionNonce)) > 0;
 
       /**
        * Archive the session and mark its runs complete — shared by the
@@ -372,6 +377,7 @@ export async function POST(request: Request) {
       try {
         result = await exportOneTimeToSnowflake(conn, {
           source_relation, target_fqn, mode, columns, nonce: sessionNonce,
+          usedUserConnection: useUserConnection,
         });
       } catch (exportErr: any) {
         // Full detail server-side ALWAYS — the install test lost hours to this
