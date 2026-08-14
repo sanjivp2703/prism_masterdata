@@ -66,7 +66,7 @@ db.prepare(
    VALUES ('mysql-setup-test', 'mysql-setup-test@example.com', 'Setup Test', 'user', 'localhost', 3306, 'prism_internal', 'prism_svc', ?)`,
 ).run(encryptSecret(SVC_PASSWORD));
 const accountId = Number((db.prepare(`SELECT account_id FROM accounts WHERE google_id = 'mysql-setup-test'`).get() as any).account_id);
-check('hasUserConfig sees personal mysql creds', hasUserWarehouseConfig(accountId) === true);
+check('hasUserConfig sees personal mysql creds', (await hasUserWarehouseConfig(accountId)) === true);
 await withUserWarehouse(accountId, async (conn) => {
   const rows = await exec(conn, `SELECT CURRENT_USER() AS u`);
   check('personal connection works', String(rows[0]?.u ?? '').length > 0, rows[0]);

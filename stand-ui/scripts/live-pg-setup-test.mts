@@ -67,7 +67,7 @@ db.prepare(
    VALUES ('pg-setup-test', 'pg-setup-test@example.com', 'Setup Test', 'user', 'localhost', 5432, ?, 'prism_svc', ?)`,
 ).run(DBNAME, encryptSecret(SVC_PASSWORD));
 const accountId = Number((db.prepare(`SELECT account_id FROM accounts WHERE google_id = 'pg-setup-test'`).get() as any).account_id);
-check('hasUserConfig sees personal pg creds', hasUserWarehouseConfig(accountId) === true);
+check('hasUserConfig sees personal pg creds', (await hasUserWarehouseConfig(accountId)) === true);
 await withUserWarehouse(accountId, async (conn) => {
   const rows = await exec(conn, `SELECT current_user AS u`);
   check('personal connection works', String(rows[0]?.u ?? '').length > 0, rows[0]);

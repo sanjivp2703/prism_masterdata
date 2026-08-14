@@ -65,7 +65,7 @@ db.prepare(
    VALUES ('setup-test', 'setup-test@example.com', 'Setup Test', 'user', 'localhost', 1433, 'PRISM_DB', 'sa', ?)`,
 ).run(encryptSecret(SA_PASSWORD));
 const accountId = Number((db.prepare(`SELECT account_id FROM accounts WHERE google_id = 'setup-test'`).get() as any).account_id);
-check('hasUserConfig sees personal mssql creds', hasUserWarehouseConfig(accountId) === true);
+check('hasUserConfig sees personal mssql creds', (await hasUserWarehouseConfig(accountId)) === true);
 await withUserWarehouse(accountId, async (conn) => {
   const rows = await exec(conn, `SELECT SUSER_SNAME() AS u`);
   check('personal connection works', String(rows[0]?.u ?? '').length > 0);

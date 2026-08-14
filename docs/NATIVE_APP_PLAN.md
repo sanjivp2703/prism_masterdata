@@ -415,6 +415,21 @@ isolates SPCS problems from Native-App-packaging problems.
   `EMIT_BILLING` proc, free-tier gate, and the Settings → Usage surface.
   Verify emitted events appear in the provider's billing-event views from
   the test-consumer install.
+  **CODE-COMPLETE 2026-08-13 (emission built; live verification pending).**
+  Emission design as implemented: two append-only ledgers — `BILLING_METER`
+  (accrual, 4dp) + `BILLING_EVENTS` (emitted, whole cents) — with pending =
+  their difference, drained after every metering write by
+  `emitPendingBillingEvents` (native-only, in-process-serialized,
+  self-healing each pass). `SYSTEM$CREATE_BILLING_EVENT` caps `base_charge`
+  at TWO decimals while the unit price is $0.025, so events floor to whole
+  cents and the sub-cent tail carries forward (`planBillingEmission`,
+  parity-tested incl. the carry and the 99,999.98 per-event cap). Failure
+  side: event row recorded before the system call, deleted on call failure —
+  a crash window UNDER-bills, never double-bills. ⚠ The event class
+  `STANDARDIZED_VALUES` must match the paid listing's billable-item class
+  (configure in N5/N6 — a mismatch bills nothing, silently). Live-verify:
+  proc callable from the service session, events visible in provider
+  billing views, rate-limit behavior (~1/min) under back-to-back passes.
 - Install as a private app (`DISTRIBUTION=INTERNAL`) in the dev account, then
   in the test-consumer account from a listing share.
 - **Exit criteria (the port-plan-style lifecycle test, run in the TEST

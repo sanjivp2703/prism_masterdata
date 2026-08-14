@@ -68,6 +68,13 @@ export function internalObject(name: string): string {
   return `PRISM_DB.INTERNAL.${name}`;
 }
 
+/** Native-only: a reference into the app's versioned code schema — stored
+ *  procedures the container calls (e.g. EMIT_BILLING). The standard edition
+ *  has no code schema; callers must gate on isNativeEdition() first. */
+export function appCodeObject(name: string): string {
+  return `${nativeDbPrefix()}app_code.${name}`;
+}
+
 /** The internal schema itself, for schema-level SQL —
  *  `SHOW STREAMS IN SCHEMA <x>` / `CREATE STREAM <x>."NAME"` style text. */
 export function internalSchemaFqn(): string {

@@ -105,17 +105,29 @@ CREATE TABLE IF NOT EXISTS internal_state.VALIDATION_LOG (
     llm_decision        VARCHAR,
     decided_at          TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
--- §2.8 billing meter: cumulative billable-unit count + append-only emission
--- ledger (effectively-once event emission; free tier enforced in-app).
--- Billing is LINEAR PER VALUE after the free 1,000 — each row is one emitted
--- aggregate event (units × $0.025), never a quantized 1,000-block.
+-- §2.8 billing: TWO append-only ledgers (billing-meter.ts drives both).
+-- BILLING_METER = accrual: one row per standardization pass, its free/billable
+-- split frozen at write time (LINEAR per value after the free 1,000; charge =
+-- billable × $0.025, stored at 4dp). Rows are METERING records, not events.
 CREATE TABLE IF NOT EXISTS internal_state.BILLING_METER (
     id            INTEGER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY NOT NULL,
-    event_units   INTEGER NOT NULL,           -- billable units in this emitted event
-    charge_usd    NUMBER(12,4) NOT NULL,      -- event_units x 0.025 at emission time
-    total_after   INTEGER NOT NULL,           -- cumulative billable+free total after this event
+    event_units   INTEGER NOT NULL,           -- newly standardized distinct values in this pass
+    charge_usd    NUMBER(12,4) NOT NULL,      -- billable portion x 0.025, accrued (4dp)
+    total_after   INTEGER NOT NULL,           -- cumulative billable+free total after this pass
     source        VARCHAR,                     -- pipeline_export | commit_standardizations | one_time_export
-    emitted_at    TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+    emitted_at    TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()  -- historical name: row-creation time
+);
+-- BILLING_EVENTS = emission: one row per billing event actually sent via
+-- EMIT_BILLING. pending = SUM(meter.charge_usd) − SUM(events.charge_usd);
+-- events are WHOLE CENTS (SYSTEM$CREATE_BILLING_EVENT caps base_charge at
+-- two decimals), so the sub-cent tail of the 4dp accrual carries forward.
+-- Rows are inserted BEFORE the system call and deleted if it fails — a crash
+-- in that window under-bills (customer's favor), never double-bills.
+CREATE TABLE IF NOT EXISTS internal_state.BILLING_EVENTS (
+    id               INTEGER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY NOT NULL,
+    charge_usd       NUMBER(12,2) NOT NULL,   -- whole-cent event amount
+    through_meter_id INTEGER,                  -- last BILLING_METER row covered
+    emitted_at       TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
 
 -- app_data_admin: manual lookup maintenance only (mirror of PRISM_DATA_ADMIN).
@@ -201,6 +213,41 @@ BEGIN
 END;
 $$;
 GRANT USAGE ON PROCEDURE app_code.diag() TO APPLICATION ROLE app_user;
+
+-- ── §2.8 billing emission ────────────────────────────────────────────────────
+-- SYSTEM$CREATE_BILLING_EVENT is callable ONLY from a stored procedure defined
+-- in this setup script — that constraint is why this proc exists. The Node
+-- service calls it (owner's rights: the service session IS the app) with a
+-- whole-cent aggregate computed from the two ledgers above; see
+-- billing-meter.ts emitPendingBillingEvents. Deliberately NOT granted to any
+-- application role — consumers must not be able to bill themselves.
+--
+-- Constraints honored (docs, verified 2026-08-13): base_charge > 0,
+-- < 99,999.99, ≤ 2 decimal places; timestamps are Unix epoch MILLISECONDS
+-- (UTC); rate limit ~1 call/minute (our cadence is per standardization pass —
+-- a limit rejection just leaves the charge pending for the next pass).
+-- ⚠ LISTING COUPLING: the class 'STANDARDIZED_VALUES' must match the billable
+-- item class configured on the paid listing (verify when the listing is set
+-- up in N5/N6 — a mismatched class bills nothing, silently).
+CREATE OR REPLACE PROCEDURE app_code.EMIT_BILLING(CHARGE_USD FLOAT, THROUGH_METER_ID FLOAT)
+RETURNS STRING LANGUAGE SQL AS
+$$
+DECLARE
+  ts  BIGINT;
+  res STRING;
+BEGIN
+  ts := DATE_PART(EPOCH_MILLISECOND, SYSDATE())::BIGINT;
+  SELECT SYSTEM$CREATE_BILLING_EVENT(
+    'STANDARDIZED_VALUES',                       -- class (listing billable item)
+    '',                                          -- subclass
+    :ts, :ts,                                    -- no time range: start = event time
+    :CHARGE_USD,                                 -- whole cents, pre-validated app-side
+    '[]',                                        -- objects
+    TO_JSON(OBJECT_CONSTRUCT('through_meter_id', :THROUGH_METER_ID))
+  ) INTO :res;
+  RETURN res;
+END;
+$$;
 
 -- Cost control: suspend the app without uninstalling (consumer-facing need).
 CREATE OR REPLACE PROCEDURE app_code.stop_app()

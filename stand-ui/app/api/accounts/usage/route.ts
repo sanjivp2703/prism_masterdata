@@ -27,6 +27,10 @@ export async function GET() {
     billable_units: 0,
     charged_usd: 0,
     usd_per_unit: USD_PER_UNIT,
+    // Native edition only (billing-event emission): accrued charge already
+    // sent to Snowflake billing vs. still pending (sub-cent carry included).
+    emitted_usd: 0,
+    pending_usd: 0,
   };
 
   // Meter is Snowflake-only for now (see billing-meter.ts).
@@ -46,6 +50,16 @@ export async function GET() {
       const total = Number(r.TOTAL ?? r.total ?? 0);
       const charged = Number(r.CHARGED ?? r.charged ?? 0);
       const freeUsed = Math.min(total, FREE_UNITS);
+      // Emission ledger (native edition). Missing table (standard edition, or
+      // nothing emitted yet) reads as zero emitted — everything pending.
+      let emitted = 0;
+      try {
+        const eRows = await executeQuery(
+          conn,
+          `SELECT COALESCE(SUM(charge_usd), 0) AS C FROM ${internalObject('BILLING_EVENTS')}`,
+        );
+        emitted = Number(eRows?.[0]?.C ?? eRows?.[0]?.c ?? 0);
+      } catch { /* no emission ledger — zeros */ }
       return Response.json({
         ...empty,
         total_units: total,
@@ -53,6 +67,8 @@ export async function GET() {
         free_remaining: FREE_UNITS - freeUsed,
         billable_units: Math.max(0, total - FREE_UNITS),
         charged_usd: Math.round(charged * 100) / 100,
+        emitted_usd: Math.round(emitted * 100) / 100,
+        pending_usd: Math.round(Math.max(0, charged - emitted) * 10_000) / 10_000,
       });
     });
   } catch (err) {
