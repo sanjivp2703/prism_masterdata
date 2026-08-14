@@ -173,6 +173,22 @@ philosophy as `sqlite.ts` migrations. This discipline is also owed to the
 standard edition (DEPLOY.md's "warehouse-side schema changes are NOT automated
 yet"); building it here should produce a shared mechanism, not a fork.
 
+### 2.9 DECIDED (owner, 2026-08-13) — Access model: caller grants for interactive work, app grants only at pipeline activation
+The consumer approves **caller grants** at install (opt-in): interactive
+operations — one-time standardization, table probing, baseline creation, the
+table input's suggestions — run with the CALLING USER's privileges. If you
+can read the table, Prism can clean it for you instantly; if you can't, you
+get the warehouse's own rejection. No per-table admin ritual for interactive
+use. **Durable grants TO THE APPLICATION remain required exactly once per
+pipeline activation** — background detection/standardization runs with
+nobody logged in, so session rights cannot power it (physics, not policy);
+the admin-ask kit generates that SQL for whoever owns the schema. Follow-on
+feature (backlog "visibility groups", now ACL-backed): the mappings section
+shows values only to users whose own access can read the underlying table.
+Trade-off recorded: caller grants soften the "SHOW GRANTS TO APPLICATION is
+the complete audit" story — hence consumer OPT-IN, with strict-list mode
+remaining fully functional for security-conscious accounts.
+
 ### 2.8 DECIDED (owner, 2026-08-12) — Pricing: $25 per 1,000 new distinct values, first 1,000 free
 Usage-based pricing on the Marketplace listing via **Custom Event Billing**
 (GA 2025-07): the app emits billable events through
