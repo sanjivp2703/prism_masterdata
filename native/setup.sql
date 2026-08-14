@@ -249,21 +249,33 @@ CREATE OR REPLACE PROCEDURE app_code.EMIT_BILLING(CHARGE_USD FLOAT, THROUGH_METE
 RETURNS STRING LANGUAGE SQL AS
 $$
 DECLARE
-  ts  BIGINT;
-  res STRING;
+  ts   BIGINT;
+  stmt STRING;
 BEGIN
   ts := DATE_PART(EPOCH_MILLISECOND, SYSDATE())::BIGINT;
-  SELECT SYSTEM$CREATE_BILLING_EVENT(
-    'STANDARDIZED_VALUES',                       -- class (listing billable item)
-    '',                                          -- subclass
-    :ts, :ts,                                    -- no time range: start = event time
-    :CHARGE_USD,                                 -- whole cents, pre-validated app-side
-    '[]',                                        -- objects
-    TO_JSON(OBJECT_CONSTRUCT('through_meter_id', :THROUGH_METER_ID))
-  ) INTO :res;
-  RETURN res;
+  -- SYSTEM$CREATE_BILLING_EVENT demands LITERAL CONSTANTS (live-found
+  -- 2026-08-14 across three iterations: expressions → "All arguments must
+  -- be constant"; variables — even a typed DOUBLE local — → "Argument
+  -- 'Base Charge' must be of type double", because scripting binds
+  -- variables as fixed-point NUMBER). So the call is assembled as a string
+  -- and EXECUTE IMMEDIATE'd: every argument is a literal by construction.
+  -- The 'e0' suffix makes the charge a DOUBLE literal (Snowflake exponent
+  -- notation); CHARGE_USD is whole cents pre-validated app-side.
+  stmt := 'SELECT SYSTEM$CREATE_BILLING_EVENT(' ||
+          '''STANDARDIZED_VALUES'', '''', ' ||   -- class (listing billable item), subclass
+          ts::STRING || ', ' || ts::STRING || ', ' ||
+          TO_VARCHAR(CHARGE_USD::DOUBLE) || 'e0, ' ||
+          '''[]'', ' ||
+          '''{"through_meter_id": ' || THROUGH_METER_ID::STRING || '}'')';
+  EXECUTE IMMEDIATE :stmt;
+  RETURN 'ok';
 END;
 $$;
+-- (A TEMP-DEV grant of EMIT_BILLING to app_user existed only in patch 18,
+-- for one direct-CALL debug iteration — removed the same day. The proc is
+-- deliberately granted to NO application role: only the app can bill, and
+-- the upgrade to this patch revokes the dev grant since app_code is a
+-- versioned schema rebuilt per version.)
 
 -- Cost control: suspend the app without uninstalling (consumer-facing need).
 CREATE OR REPLACE PROCEDURE app_code.stop_app()

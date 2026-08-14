@@ -458,9 +458,27 @@ isolates SPCS problems from Native-App-packaging problems.
   side: event row recorded before the system call, deleted on call failure —
   a crash window UNDER-bills, never double-bills. ⚠ The event class
   `STANDARDIZED_VALUES` must match the paid listing's billable-item class
-  (configure in N5/N6 — a mismatch bills nothing, silently). Live-verify:
-  proc callable from the service session, events visible in provider
-  billing views, rate-limit behavior (~1/min) under back-to-back passes.
+  (configure in N5/N6 — a mismatch bills nothing, silently).
+  **LIVE-TESTED 2026-08-14 (patches 15–19, 1,200-value drive):** the meter
+  end is fully verified — free-tier boundary split exact (201 prior +
+  1,200 → 401 billable), a straddling pass billed only its post-free
+  portion, re-exports re-counted as documented. Emission findings, three
+  iterations deep: `SYSTEM$CREATE_BILLING_EVENT` demands **literal
+  constants** — expressions fail ("All arguments must be constant") and
+  even typed DOUBLE scripting variables fail ("Argument 'Base Charge'
+  must be of type double"; scripting binds variables as fixed-point
+  NUMBER) — so `EMIT_BILLING` assembles the call via `EXECUTE IMMEDIATE`
+  with everything interpolated as literals (the `e0` exponent suffix
+  makes the charge a DOUBLE literal). Definitive terminal result: the
+  statement validates completely, then returns **"Application instance is
+  not installed from listing"** — billing events are structurally
+  unavailable to dev/package installs. The emitter treats that as a quiet
+  skip (logged once, never an error); charges accumulate as pending and
+  drain on the first pass after a LISTING install. Provider-view
+  visibility + the ~1/min rate limit therefore verify at the N3
+  test-consumer LISTING install, not before. (A TEMP dev grant of the
+  proc existed for one debug CALL in patch 18, removed in 19 — the
+  sealed-proc invariant re-verified after.)
 - Install as a private app (`DISTRIBUTION=INTERNAL`) in the dev account, then
   in the test-consumer account from a listing share.
 - **Exit criteria (the port-plan-style lifecycle test, run in the TEST

@@ -118,6 +118,8 @@ let _emitChain: Promise<void> = Promise.resolve();
  * only; never throws. Self-healing: pending = SUM(meter) − SUM(events), so a
  * failed or skipped emission is retried by the next standardization pass.
  */
+let _listingUnavailableLogged = false;
+
 export async function emitPendingBillingEvents(conn: Conn): Promise<void> {
   if (!isNativeEdition() || getWarehouseAdapter().kind !== 'snowflake') return;
   const run = _emitChain.then(async () => {
@@ -155,6 +157,18 @@ export async function emitPendingBillingEvents(conn: Conn): Promise<void> {
   try {
     await run;
   } catch (err) {
+    // Dev/package installs cannot emit billing events at all —
+    // SYSTEM$CREATE_BILLING_EVENT requires a LISTING install (live-found
+    // 2026-08-14: "Application instance is not installed from listing").
+    // Not an error: the charge stays pending in the ledgers and drains on
+    // the first pass after a listing install. Log once, quietly.
+    if (/not installed from listing/i.test(String((err as Error)?.message ?? err))) {
+      if (!_listingUnavailableLogged) {
+        _listingUnavailableLogged = true;
+        console.log('[billing] emission unavailable (not a listing install) — charges stay pending');
+      }
+      return;
+    }
     // Stays pending; the next pass retries. Loud — this is revenue.
     reportError(err, { where: 'billing-emit' });
   }
