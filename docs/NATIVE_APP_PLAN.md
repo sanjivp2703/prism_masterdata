@@ -189,6 +189,41 @@ Trade-off recorded: caller grants soften the "SHOW GRANTS TO APPLICATION is
 the complete audit" story — hence consumer OPT-IN, with strict-list mode
 remaining fully functional for security-conscious accounts.
 
+**IMPLEMENTED 2026-08-13 (code complete; live SPCS verification pending).**
+The mechanism (per the SPCS caller's-rights tutorial + GRANT CALLER docs):
+`executeAsCaller: true` under top-level `capabilities.securityContext` in
+`service-spec.yaml` makes Snowflake attach the ingress user's token to every
+request as the `Sf-Context-Current-User-Token` header; dot-joining it onto
+the service OAuth token (`<service>.<user>`, authenticator OAUTH) opens a
+session that executes as the caller, restricted to the consumer's caller
+grants. Code: the native edition's "user connection" IS this session —
+`withUserSnowflake` / `hasUserSnowflakeConfig` branch on
+`spcsAmbientAvailable()` (token read via `next/headers`, null outside a
+request scope, e.g. the poller — background work can never use a caller).
+`hasUserWarehouseConfig` became async facade-wide (`boolean |
+Promise<boolean>` in the adapter contract; all 8 call sites await). Every
+existing user-connection consumer — one-time create/export, `/api/columns`,
+`create-initial-run`'s change-tracking fix, column/table-mode provisioning —
+gets caller powers with zero call-site changes; `accessible-tables` now
+merges app-visible ∪ caller-visible suggestions; native-aware copy replaced
+the "connect personal credentials" messages; `NativeTablePicker`'s panel
+carries the per-database `GRANT CALLER` opt-in SQL (MANAGE CALLER GRANTS
+required); `manifest.yml` declares `restricted_callers_rights`.
+
+**Live-verify at the next N3 install test (none of this is provable
+offline):** (1) manifest accepts the `restricted_callers_rights` block for a
+containers-only app (drop it if the validator refuses); (2) the header
+actually arrives with `executeAsCaller` on, and the dot-joined token opens a
+session; (3) the caller session can USE the app's warehouse (the tutorial
+caller-granted a warehouse — the app-owned `PRISM_APP_WH` may need
+`GRANT CALLER USAGE ON WAREHOUSE`, or app-owned may just work); (4) the
+caller session can call the app's `PRISM_NORMALIZE` UDF + write the one-time
+run's `RUN_STATE` via the SERVICE connection split (already split in code —
+verify the caller path never needs app-schema access); (5) the exact
+`GRANT CALLER` statements in the picker panel parse verbatim on a real
+account; (6) with NO caller grants opted in, a caller-session probe fails
+closed as a clean access error (the §2.9 "warehouse's own rejection").
+
 ### 2.8 DECIDED (owner, 2026-08-12) — Pricing: $25 per 1,000 new distinct values, first 1,000 free
 Usage-based pricing on the Marketplace listing via **Custom Event Billing**
 (GA 2025-07): the app emits billable events through

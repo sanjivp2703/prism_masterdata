@@ -76,11 +76,47 @@ export function spcsAmbientAvailable(): boolean {
   try { return fs.statSync(SPCS_TOKEN_PATH).isFile(); } catch { return false; }
 }
 
-function createSpcsSnowflakeConnection(): SnowflakeConnection {
+// ── SPCS caller's rights (native edition — docs/NATIVE_APP_PLAN.md §2.9) ────
+//
+// With `executeAsCaller: true` in the service spec, Snowflake attaches the
+// ingress user's short-lived token to EVERY request as the
+// Sf-Context-Current-User-Token header. Concatenating it onto the service
+// token (dot-separated) opens a connection that executes SQL as the CALLING
+// USER — restricted to the caller grants the consumer opted into
+// (GRANT CALLER ... TO APPLICATION). This is the native edition's analog of
+// the standard edition's personal-credential connections: interactive
+// operations (one-time flow, table probing, baseline creation) run with the
+// user's own access; background work never has a caller and stays on the
+// service connection.
+
+const SPCS_CALLER_TOKEN_HEADER = 'sf-context-current-user-token';
+
+/** The current request's ingress caller token, or null when absent — which
+ *  includes every non-request context (poller, tick): next/headers throws
+ *  outside a request scope, and that is the correct "no caller here" answer. */
+export async function getSpcsCallerToken(): Promise<string | null> {
+  if (!spcsAmbientAvailable()) return null;
+  try {
+    // Dynamic import: this module is also loaded from instrumentation.ts
+    // (poller/tick startup), where pulling next/headers in statically would
+    // couple background startup to the request runtime.
+    const { headers } = await import('next/headers');
+    const token = (await headers()).get(SPCS_CALLER_TOKEN_HEADER)?.trim();
+    return token || null;
+  } catch {
+    return null; // outside a request scope
+  }
+}
+
+function createSpcsSnowflakeConnection(callerToken?: string): SnowflakeConnection {
   const host    = getRequiredEnv('SNOWFLAKE_HOST');
   const account = getRequiredEnv('SNOWFLAKE_ACCOUNT');
   // Fresh read every connection — the platform rotates the token in place.
-  const token = fs.readFileSync(SPCS_TOKEN_PATH, 'utf8').trim();
+  const serviceToken = fs.readFileSync(SPCS_TOKEN_PATH, 'utf8').trim();
+  // Dot-joining the ingress user token yields a CALLER'S RIGHTS session
+  // (executes as the ingress user, restricted to the consumer's caller
+  // grants); the service token alone is the app's own session.
+  const token = callerToken ? `${serviceToken}.${callerToken}` : serviceToken;
   const port  = getOptionalEnv('SNOWFLAKE_PORT') ?? '443';
 
   // Inside a NATIVE APP the session database must be the APPLICATION (the
@@ -308,12 +344,20 @@ export async function withSnowflake<T>(
 // under the user's own Snowflake entitlements, and the output table is written
 // under them too. Pipelines and the shared lookup always use the service
 // connection (withSnowflake).
+//
+// NATIVE EDITION: there are no saved personal credentials — the "user
+// connection" is the SPCS caller's-rights session instead (§2.9 above). Same
+// call sites, same semantics ("run this with the user's own access"), zero
+// stored secrets. Both helpers below branch on spcsAmbientAvailable().
 
 // (The "no personal credentials" error class lives in ../types.ts as
 // NoUserWarehouseConfig — shared across adapters.)
 
-/** True when the account has a usable personal Snowflake credential saved. */
-export function hasUserSnowflakeConfig(accountId: number): boolean {
+/** True when a user-scoped connection is possible: native = the current
+ *  request carries an ingress caller token; standard = the account has a
+ *  usable personal credential saved. */
+export async function hasUserSnowflakeConfig(accountId: number): Promise<boolean> {
+  if (spcsAmbientAvailable()) return (await getSpcsCallerToken()) != null;
   const r = getDb()
     .prepare(
       `SELECT sf_account, sf_user, sf_warehouse,
@@ -357,11 +401,24 @@ function createUserSnowflakeConnection(accountId: number): SnowflakeConnection {
   } as any);
 }
 
-/** Like withSnowflake, but connects with the account's PERSONAL credentials. */
+/** Like withSnowflake, but with the USER'S OWN access: the account's personal
+ *  credentials (standard edition), or a caller's-rights session built from the
+ *  current request's ingress token (native edition — §2.9). */
 export async function withUserSnowflake<T>(
   accountId: number,
   fn: (connection: SnowflakeConnection) => Promise<T>,
 ): Promise<T> {
+  if (spcsAmbientAvailable()) {
+    const callerToken = await getSpcsCallerToken();
+    if (!callerToken) throw new NoUserWarehouseConfig();
+    const connection = createSpcsSnowflakeConnection(callerToken);
+    try {
+      await connect(connection);
+      return await fn(connection);
+    } finally {
+      await destroy(connection);
+    }
+  }
   const connection = createUserSnowflakeConnection(accountId);
   try {
     await connect(connection);

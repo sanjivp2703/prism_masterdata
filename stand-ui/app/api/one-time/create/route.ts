@@ -16,6 +16,7 @@ import {
   executeQuery, getWarehouseAdapter,
 } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { createOneTimeRun, isSimpleIdent, parseFqn, quoteIdent, OneTimeTooLargeError } from '@/app/api/_lib/op-one-time';
 import { pgTableRef } from '@/app/api/_lib/warehouse/postgres/detection';
 import { myTableRef } from '@/app/api/_lib/warehouse/mysql/detection';
@@ -336,7 +337,16 @@ export async function POST(request: Request) {
     if (!isWarehouseAccessError(serviceErr)) {
       return warehouseErrorResponse(serviceErr, 'Failed to read the source table');
     }
-    if (!hasUserWarehouseConfig(Number(session.accountId))) {
+    if (!(await hasUserWarehouseConfig(Number(session.accountId)))) {
+      // Native: the user connection is the ingress caller token (§2.9) — a
+      // missing token is a request anomaly, not a credentials gap, and the
+      // "connect your credentials" copy would point at a surface that
+      // doesn't exist in this edition.
+      if (isNativeEdition()) {
+        return Response.json({
+          error: "Prism doesn't have access to this table, and this request carried no Snowflake identity to check your own access with. Reload the app and try again, or grant the app access to the table.",
+        }, { status: 403 });
+      }
       return Response.json({
         // Carries the encryption clause, same as the columns route. Fixing only
         // ONE of the two needs_user_connection surfaces left the other still
@@ -352,7 +362,11 @@ export async function POST(request: Request) {
     } catch (userErr) {
       if (isWarehouseAccessError(userErr)) {
         return Response.json({
-          error: 'Neither Prism nor your connected Snowflake user has read access to this table.',
+          error: isNativeEdition()
+            // Caller's-rights session: "your access" is literally the caller's
+            // Snowflake privileges ∩ the account's caller grants for the app.
+            ? "Neither Prism nor your own Snowflake access can read this table. Ask the table's owner for access, or grant the app access (see “Don't see your table?” under the table field)."
+            : 'Neither Prism nor your connected Snowflake user has read access to this table.',
         }, { status: 403 });
       }
       return warehouseErrorResponse(userErr, 'Failed to read the source table with your Snowflake credentials');

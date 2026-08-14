@@ -18,6 +18,17 @@ artifacts:
     images:
       - /prism_db/internal/prism_images/prism-native:latest   # repo path finalized at packaging
 
+# Caller's rights (§2.9): the service spec sets executeAsCaller, and the
+# consumer OPTS IN with caller grants (GRANT CALLER / GRANT INHERITED CALLER
+# ... TO APPLICATION — needs MANAGE CALLER GRANTS). Declared here so the
+# install UI discloses it. VERIFY at the next install test: this block is
+# documented for EXECUTE AS RESTRICTED CALLER procedures — if the validator
+# rejects it for a containers-only app, drop the block (the consumer-side
+# caller grants + service-spec capability are what actually power it).
+restricted_callers_rights:
+  enabled: true
+  description: "Optional: lets Prism clean any table the signed-in user can already read (one-time standardization, table preview) using that user's own access. Background pipelines never use it."
+
 privileges:
   - CREATE COMPUTE POOL:
       description: "Run Prism's application container (single small node)."

@@ -170,7 +170,7 @@ export async function POST(
         // login lacks. enableCt is safe to call when CT is already on.
         if (ctConsent && state.mode === 'diff'
             && (state.diff_reason === 'ct_disabled' || state.diff_reason === 'ct_no_grant')
-            && hasUserWarehouseConfig(Number(session.accountId))) {
+            && (await hasUserWarehouseConfig(Number(session.accountId)))) {
           try {
             await withUserWarehouse(Number(session.accountId), async (conn) => {
               await enableCt(conn, pipeline.table_fqn);
@@ -218,7 +218,7 @@ export async function POST(
           console.warn(`[InitialRun] Pipeline ${pid}: could not pre-create stream:`, streamErr?.message ?? streamErr);
           if (isChangeTrackingPrivilegeError(streamErr)) {
             let fixed = false;
-            if (hasUserWarehouseConfig(Number(session.accountId))) {
+            if (await hasUserWarehouseConfig(Number(session.accountId))) {
               try {
                 await withUserWarehouse(Number(session.accountId), async (conn) => {
                   await exec(conn, `ALTER TABLE ${tableRef} SET CHANGE_TRACKING = TRUE`);

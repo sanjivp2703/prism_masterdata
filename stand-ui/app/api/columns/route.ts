@@ -15,6 +15,7 @@
 
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { getPrimaryKeyColumns, isCtEnabled } from '@/app/api/_lib/warehouse/mssql/detection';
 import { parseFqn as pgParseFqn, assertFqnInDatabase } from '@/app/api/_lib/warehouse/postgres/dialect';
 import { getConnectedPgDatabase } from '@/app/api/_lib/warehouse/postgres/connection';
@@ -219,11 +220,12 @@ export async function GET(request: Request) {
     } catch (serviceErr) {
       // Service connection itself broken — fall through to the personal one
       // if available; otherwise surface the sanitized error.
-      if (!hasUserWarehouseConfig(Number(session.accountId))) throw serviceErr;
+      if (!(await hasUserWarehouseConfig(Number(session.accountId)))) throw serviceErr;
     }
 
-    // 2. Personal connection fallback (one-time standardization use case).
-    if (hasUserWarehouseConfig(Number(session.accountId))) {
+    // 2. User-connection fallback (one-time standardization use case) —
+    // personal credentials, or the caller's-rights session in native.
+    if (await hasUserWarehouseConfig(Number(session.accountId))) {
       result = await withUserWarehouse(Number(session.accountId), async (conn) => {
         const cols = await fetchColumns(conn, db, schema, table);
         const ct_status = isMssql ? await fetchMssqlCtStatus(conn, table_fqn) : undefined;
@@ -235,11 +237,24 @@ export async function GET(request: Request) {
       // Neither connection can see it.
       return json({
         columns: {}, fields: [], connection: 'user',
-        error: 'Neither Prism nor your connected Snowflake user can see this table. Check the name and your access.',
+        error: isNativeEdition()
+          ? "Neither Prism nor your own Snowflake access can see this table. Check the name, or ask the table's owner for access (see “Don't see your table?” under the table field)."
+          : 'Neither Prism nor your connected Snowflake user can see this table. Check the name and your access.',
       });
     }
 
-    // Service saw nothing and there's no personal connection to try.
+    // Service saw nothing and there's no user connection to try (native: the
+    // request carried no caller token — an anomaly, since ingress always
+    // attaches one when executeAsCaller is on).
+    if (isNativeEdition()) {
+      return json({
+        columns: {}, fields: [],
+        connection: 'service',
+        error: surface === 'pipeline'
+          ? "Prism can't see this table. Pipelines read with the app's own access, so the app needs a grant on the table — copy the SQL from “Don't see your table?” under the table field."
+          : "Prism can't see this table, and this request carried no Snowflake identity to check your own access with. Reload the app and try again, or grant the app access to the table.",
+      });
+    }
     return json({
       columns: {}, fields: [], connection: 'service',
       needs_user_connection: true,

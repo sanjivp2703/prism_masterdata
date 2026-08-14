@@ -73,8 +73,10 @@ export function withWarehouse<T>(
   return getWarehouseAdapter().withConnection(fn);
 }
 
-/** Like withWarehouse, but with the account's PERSONAL credentials.
- *  Throws NoUserWarehouseConfig when none are saved. */
+/** Like withWarehouse, but with the USER'S OWN access — saved personal
+ *  credentials, or (native edition) an SPCS caller's-rights session from the
+ *  current request's ingress token (docs/NATIVE_APP_PLAN.md §2.9).
+ *  Throws NoUserWarehouseConfig when neither is available. */
 export function withUserWarehouse<T>(
   accountId: number,
   fn: (conn: WarehouseConnection) => Promise<T>,
@@ -82,8 +84,10 @@ export function withUserWarehouse<T>(
   return getWarehouseAdapter().withUserConnection(accountId, fn);
 }
 
-/** True when the account has a usable personal credential saved. */
-export function hasUserWarehouseConfig(accountId: number): boolean {
+/** True when a user-scoped connection is possible. Async — the native
+ *  edition's answer comes from the current request's headers. ALWAYS await
+ *  this: an un-awaited Promise is truthy and silently takes the wrong branch. */
+export async function hasUserWarehouseConfig(accountId: number): Promise<boolean> {
   return getWarehouseAdapter().hasUserConfig(accountId);
 }
 

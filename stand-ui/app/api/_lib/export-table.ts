@@ -634,7 +634,7 @@ export async function provisionColumnModeAccess(
   column_name:      string,
   creatorAccountId: number,
 ): Promise<'granted' | 'manual_required'> {
-  if (!Number.isFinite(creatorAccountId) || !hasUserWarehouseConfig(creatorAccountId)) {
+  if (!Number.isFinite(creatorAccountId) || !(await hasUserWarehouseConfig(creatorAccountId))) {
     return 'manual_required';
   }
   const companion = standardizedColumnName(column_name);
@@ -709,7 +709,7 @@ export async function provisionTableModeAccess(
   creatorAccountId:  number,
 ): Promise<'granted' | 'manual_required' | 'not_applicable'> {
   if (getWarehouseAdapter().kind !== 'mssql') return 'not_applicable';
-  if (!Number.isFinite(creatorAccountId) || !hasUserWarehouseConfig(creatorAccountId)) {
+  if (!Number.isFinite(creatorAccountId) || !(await hasUserWarehouseConfig(creatorAccountId))) {
     return 'manual_required';
   }
   try {

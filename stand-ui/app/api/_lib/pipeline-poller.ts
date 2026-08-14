@@ -223,7 +223,7 @@ function attemptChangeTrackingFix(p: PipelineRef): void {
       .get(pid) as any)?.created_by;
     const createdBy = createdByRaw != null ? Number(createdByRaw) : null;
 
-    if (createdBy != null && hasUserWarehouseConfig(createdBy)) {
+    if (createdBy != null && (await hasUserWarehouseConfig(createdBy))) {
       try {
         await withUserWarehouse(createdBy, async (conn) => {
           await exec(conn, `ALTER TABLE ${tableRef} SET CHANGE_TRACKING = TRUE`);

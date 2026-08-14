@@ -27,6 +27,7 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
   const [appName, setAppName] = useState('');
   const [showGrantHelp, setShowGrantHelp] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copiedCaller, setCopiedCaller] = useState(false);
   const listId = useId();
 
   useEffect(() => {
@@ -51,6 +52,24 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
       `GRANT SELECT ON FUTURE TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
       `-- to let Prism write export tables there too:`,
       `GRANT CREATE TABLE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
+    ].join('\n');
+  }, [appName]);
+
+  // §2.9 caller grants — the one-time admin OPT-IN that lets Prism's
+  // interactive work (one-time cleaning, table preview) run with each
+  // signed-in user's OWN Snowflake access, so nobody repeats the grant
+  // ritual per table. Pipelines still require the durable grants above.
+  const callerGrantSql = useMemo(() => {
+    const app = appName || '<your Prism app name>';
+    return [
+      `-- Optional, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
+      `-- Lets Prism clean any table the signed-in user can ALREADY read — using that`,
+      `-- user's own access, per database you opt in:`,
+      `GRANT CALLER USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
+      `GRANT INHERITED CALLER USAGE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
+      `GRANT INHERITED CALLER SELECT ON ALL TABLES IN DATABASE <db> TO APPLICATION "${app}";`,
+      `-- (add CREATE TABLE the same way to let one-time results export to your schemas:)`,
+      `GRANT INHERITED CALLER CREATE TABLE ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
     ].join('\n');
   }, [appName]);
 
@@ -90,6 +109,19 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             onClick={() => { navigator.clipboard?.writeText(grantSql).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}
             style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
             {copied ? 'Copied' : 'Copy SQL'}
+          </button>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
+            Or skip the per-table ritual for one-time cleaning: an admin can opt in once,
+            and Prism will clean any table you can already read — using your own access.
+            Pipelines still need the grants above.
+          </p>
+          <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
+            {callerGrantSql}
+          </pre>
+          <button type="button"
+            onClick={() => { navigator.clipboard?.writeText(callerGrantSql).then(() => { setCopiedCaller(true); setTimeout(() => setCopiedCaller(false), 1500); }); }}
+            style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
+            {copiedCaller ? 'Copied' : 'Copy SQL'}
           </button>
         </div>
       )}

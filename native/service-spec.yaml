@@ -39,3 +39,14 @@ spec:
     - name: app
       port: 8000
       public: true
+# Caller's rights (docs/NATIVE_APP_PLAN.md §2.9): with executeAsCaller on,
+# Snowflake attaches the ingress user's token to every request
+# (Sf-Context-Current-User-Token header). Interactive operations — one-time
+# standardization, table probing, baseline creation, picker suggestions — run
+# as the CALLING USER (their privileges ∩ the consumer's opt-in caller
+# grants). Background work (poller/tick) has no caller and stays on the
+# service identity. NOTE: `capabilities` is a TOP-LEVEL key, sibling of
+# `spec`, not nested inside it.
+capabilities:
+  securityContext:
+    executeAsCaller: true

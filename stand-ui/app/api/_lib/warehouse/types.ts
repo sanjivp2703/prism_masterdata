@@ -71,16 +71,23 @@ export interface WarehouseAdapter {
    *  Opens a fresh connection and destroys it in `finally` — no pooling. */
   withConnection<T>(fn: (conn: WarehouseConnection) => Promise<T>): Promise<T>;
 
-  /** Like withConnection, but with the account's PERSONAL credentials
-   *  (one-time flow access fallback + change-tracking auto-fix only).
-   *  Throws NoUserWarehouseConfig when none are saved. */
+  /** Like withConnection, but with the USER'S OWN access (one-time flow
+   *  access fallback + change-tracking auto-fix only): the account's saved
+   *  personal credentials — or, native edition on Snowflake, an SPCS
+   *  caller's-rights session from the current request's ingress token
+   *  (docs/NATIVE_APP_PLAN.md §2.9). Throws NoUserWarehouseConfig when
+   *  neither is available. */
   withUserConnection<T>(
     accountId: number,
     fn: (conn: WarehouseConnection) => Promise<T>,
   ): Promise<T>;
 
-  /** True when the account has a usable personal credential saved. */
-  hasUserConfig(accountId: number): boolean;
+  /** True when a user-scoped connection is possible (saved personal
+   *  credentials; native = a caller token on the current request). Sync for
+   *  most adapters — the Snowflake adapter is async in native (it reads the
+   *  request headers), so consumers go through the facade's Promise-returning
+   *  hasUserWarehouseConfig and ALWAYS await it. */
+  hasUserConfig(accountId: number): boolean | Promise<boolean>;
 
   /** Execute one statement, resolving to its result rows. */
   executeQuery(
