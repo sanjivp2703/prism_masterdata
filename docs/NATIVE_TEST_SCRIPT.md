@@ -35,9 +35,16 @@ Companion docs: `NATIVE_APP_PLAN.md` (N3/N4 exit criteria this script covers),
       + service created; `SHOW ENDPOINTS IN SERVICE <app>.services.prism_app`
       returns an ingress URL within ~2 min.
 - [ ] **1.3 [CORE]** Installer opens the URL → Snowflake auth → terms
-      interstitial appears ONCE → accept → lands on home as **Admin**.
+      interstitial appears ONCE → accept → lands on home as **Admin**. The
+      interstitial's info box carries the shared-workspace sentence ("every
+      member can view all pipelines, mappings, and the data values … 
+      regardless of their own database permissions") — this is the ONLY
+      per-user disclosure native members ever see; its absence is a launch
+      blocker (owner decision 2026-08-14).
 - [ ] **1.4 [CORE]** `/setup` shows the native "Prism is ready" page (grant
-      SQL + caller opt-in + Cortex note) — NOT the credential wizard.
+      SQL + caller opt-in + Cortex note) — NOT the credential wizard. Its
+      grant section warns the admin that everyone given app access sees all
+      mappings, including from tables their own permissions can't read.
 - [ ] **1.5 [CORE]** Native cuts hold: one-time sources are Snowflake table /
       CSV·Excel / paste only (no Google Sheets anywhere); no email-invitation
       UI; `/debug` → 404.
