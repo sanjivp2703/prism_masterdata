@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 import NativeTablePicker from '@/app/components/NativeTablePicker';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -1226,26 +1227,46 @@ export default function AutoExportHome() {
         {/* ════════════════════════════════════════════════════════════════
             CONNECT TAB
         ════════════════════════════════════════════════════════════════ */}
+        {/* Native first-visit welcome (owner request 2026-08-16): a modal over
+            the dimmed page — the user explicitly chooses the grant guide or
+            Continue. Portaled per the floating-UI rule. */}
+        {showNativeIntro && typeof document !== 'undefined' && createPortal(
+          <div className="fixed inset-0 flex items-center justify-center"
+            style={{ backgroundColor: 'rgba(26, 26, 46, 0.45)', zIndex: 70 }}>
+            <div className="rounded-card border-[0.5px]"
+              style={{
+                maxWidth: 460, width: '90%', backgroundColor: 'var(--surface)',
+                borderColor: 'var(--border)', padding: 32,
+                boxShadow: '0 8px 30px rgba(0,0,0,0.18)',
+              }}>
+              <h2 className="text-base font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+                Welcome to Prism
+              </h2>
+              <p className="text-sm mb-6" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                Prism only sees the tables your team grants it — nothing is shared
+                automatically. If this workspace is new, start by giving Prism
+                access to the data you want standardized.
+              </p>
+              <div className="flex items-center justify-end gap-3">
+                <button type="button"
+                  onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* storage unavailable */ } setShowNativeIntro(false); }}
+                  className="rounded-button border-[0.5px] px-4 py-2.5 text-sm font-medium"
+                  style={{ backgroundColor: 'transparent', borderColor: 'var(--border)', color: 'var(--text-secondary)', cursor: 'pointer' }}
+                >Continue</button>
+                <Link href="/setup"
+                  onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* storage unavailable */ } }}
+                  className="rounded-button px-4 py-2.5 text-sm font-medium"
+                  style={{ backgroundColor: 'var(--accent)', color: '#FFFFFF' }}
+                >Give Prism access to your data</Link>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+
         {activeTab === 'connect' && (
           <div style={{ padding: '32px 40px', backgroundColor: 'var(--page-bg)' }}>
             <div className="mx-auto" style={{ maxWidth: 1100 }}>
-
-              {/* Native first-visit nudge (owner request 2026-08-16): nothing
-                  forces new users through /setup, so point at it once. */}
-              {showNativeIntro && (
-                <div className="rounded-card border-[0.5px] mb-6 flex items-center justify-between gap-4"
-                  style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)', padding: '14px 18px' }}>
-                  <p className="text-sm" style={{ color: 'var(--accent-strong)' }}>
-                    New here? Prism only sees the tables your team grants it —{' '}
-                    <Link href="/setup" className="underline font-medium">see how to give Prism access to your data</Link>.
-                  </p>
-                  <button type="button" aria-label="Dismiss"
-                    onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* private mode */ } setShowNativeIntro(false); }}
-                    className="text-sm font-medium shrink-0"
-                    style={{ color: 'var(--accent-strong)', background: 'none', border: 'none', cursor: 'pointer' }}
-                  >✕</button>
-                </div>
-              )}
 
               {/* Step summary — minimal graphics + brief copy */}
               {!pendingActivation && (
