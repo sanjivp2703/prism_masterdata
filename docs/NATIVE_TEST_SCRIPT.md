@@ -63,9 +63,11 @@ Companion docs: `NATIVE_APP_PLAN.md` (N3/N4 exit criteria this script covers),
       app name filled in.
 - [ ] **2.2 [CORE]** Run the single-table grant SQL → table appears in the
       picker suggestions; columns load.
-- [ ] **2.3 [CORE]** Run the whole-schema form (ALL + FUTURE TABLES) on a
-      second schema → create a brand-new table there afterwards → it's
-      immediately usable with no further grants.
+- [ ] **2.3 [CORE]** Run the whole-schema form (`ALL TABLES`) on a second
+      schema → all existing tables usable. Then create a brand-new table
+      there → it is NOT visible (Snowflake forbids FUTURE grants to an
+      application — live-confirmed 2026-08-16) → re-running the `ALL TABLES`
+      grant picks it up. The grant panel says exactly this.
 - [ ] **2.4 [CORE]** Caller grants NOT opted in: one-time on a table only the
       user (not the app) can read → clean rejection telling them to ask the
       owner / use the panel. Fails closed, no hang, no raw error.

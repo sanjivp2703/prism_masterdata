@@ -16,9 +16,10 @@ export function buildNativeAppGrantSql(appName: string): string {
     `GRANT USAGE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
     `-- one table:`,
     `GRANT SELECT ON TABLE <db>.<schema>.<table> TO APPLICATION "${app}";`,
-    `-- or the whole schema, current and future tables:`,
+    `-- or every table currently in the schema:`,
     `GRANT SELECT ON ALL TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-    `GRANT SELECT ON FUTURE TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
+    `-- (Snowflake does not allow FUTURE grants to an application — re-run the`,
+    `--  line above after adding new tables, or grant new tables one by one.)`,
     `-- to let Prism write export tables there too:`,
     `GRANT CREATE TABLE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
   ].join('\n');
