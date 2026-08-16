@@ -43,6 +43,9 @@ export default function OneTimeStandardizationCard() {
   // and unlike a pipeline, nothing here has to stay live afterwards.
   type OtSource = 'warehouse' | 'file' | 'sheets' | 'paste';
   const [sourceKind, setSourceKind] = useState<OtSource>('warehouse');
+  // Native edition: CSV and Excel are SEPARATE tabs (owner decision
+  // 2026-08-16) that share the 'file' machinery — this picks which one.
+  const [fileFlavor, setFileFlavor] = useState<'csv' | 'excel'>('csv');
 
   const [tableFqn, setTableFqn] = useState('');
 
@@ -349,33 +352,54 @@ export default function OneTimeStandardizationCard() {
         <h2 className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>One-time standardization</h2>
       </div>
       <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>
-        Clean a list once — from a {warehouseLabel} table, a CSV/Excel file, or values you paste in — and export the result however you need it. No lookup, no ongoing pipeline.
+        {isNativeEdition()
+          ? <>Clean a list once — from a {warehouseLabel} table or an uploaded CSV/Excel file — and export the result however you need it. No lookup, no ongoing pipeline.</>
+          : <>Clean a list once — from a {warehouseLabel} table, a CSV/Excel file, or values you paste in — and export the result however you need it. No lookup, no ongoing pipeline.</>}
       </p>
 
-      {/* Source picker */}
+      {/* Source picker. Native (owner decision 2026-08-16): Snowflake | CSV |
+          Excel — no Google integration, no paste tab; CSV and Excel are
+          separate tabs sharing the 'file' machinery via fileFlavor. */}
       <div className="mb-4">
         <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>Source</label>
         <div className="flex rounded-button border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}>
-          {([
-            { id: 'warehouse', label: warehouseLabel },
-            { id: 'file',      label: 'CSV / Excel' },
-            { id: 'sheets',    label: 'Google Sheet' },
-            { id: 'paste',     label: 'Paste values' },
-          ] as const)
-            // Native (Marketplace) edition has no Google integration.
-            .filter(({ id }) => id !== 'sheets' || !isNativeEdition())
-            .map(({ id, label }, i, arr) => (
+          {(isNativeEdition()
+            ? ([
+                { id: 'warehouse', label: warehouseLabel },
+                { id: 'file',      label: 'CSV',   flavor: 'csv' },
+                { id: 'file',      label: 'Excel', flavor: 'excel' },
+              ] as const)
+            : ([
+                { id: 'warehouse', label: warehouseLabel },
+                { id: 'file',      label: 'CSV / Excel' },
+                { id: 'sheets',    label: 'Google Sheet' },
+                { id: 'paste',     label: 'Paste values' },
+              ] as const)
+          ).map((tab, i, arr) => {
+            const flavor = 'flavor' in tab ? tab.flavor : undefined;
+            const active = sourceKind === tab.id && (!flavor || fileFlavor === flavor);
+            return (
             <button
-              key={id} type="button" disabled={submitting}
-              onClick={() => { setSourceKind(id); setSelected([]); setFields([]); setColumnsError(null); setFileError(null); }}
+              key={tab.label} type="button" disabled={submitting}
+              onClick={() => {
+                setSourceKind(tab.id); setSelected([]); setFields([]); setColumnsError(null); setFileError(null);
+                if (flavor && flavor !== fileFlavor) {
+                  // Switching CSV ↔ Excel drops the loaded file — a .xlsx must
+                  // not linger under the CSV tab.
+                  setFileFlavor(flavor); setFileName(''); setFileRows([]); setFileGrid([]);
+                  setFileTabs([]); setFileTab(''); setHeaderIdx(0); setFileB64(null);
+                  setTabGrids({}); setFileWarning(null);
+                }
+              }}
               className="flex-1 py-2 text-xs font-medium transition-colors disabled:opacity-50"
               style={{
-                backgroundColor: sourceKind === id ? 'var(--accent)' : 'transparent',
-                color:           sourceKind === id ? 'white' : 'var(--text-muted)',
+                backgroundColor: active ? 'var(--accent)' : 'transparent',
+                color:           active ? 'white' : 'var(--text-muted)',
                 borderRight:     i < arr.length - 1 ? '0.5px solid var(--border)' : undefined,
               }}
-            >{label}</button>
-          ))}
+            >{tab.label}</button>
+            );
+          })}
         </div>
       </div>
 
@@ -405,12 +429,51 @@ export default function OneTimeStandardizationCard() {
       {sourceKind === 'file' && (
         <div className="mb-4">
           <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>Upload a file</label>
-          <input
-            type="file" accept=".csv,.xlsx,.xls" disabled={submitting}
-            onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
-            className="w-full text-xs"
-            style={{ color: 'var(--text-secondary)' }}
-          />
+          {/* Styled control — never the browser's bare default file input
+              (live-found 2026-08-16: it read as "no upload button"). */}
+          <div className="flex items-center gap-3">
+            <label
+              htmlFor="ot-file-input"
+              className="rounded-button border-[0.5px] px-3.5 py-2 text-xs font-medium cursor-pointer select-none"
+              style={{
+                backgroundColor: 'var(--accent-tint)',
+                color: 'var(--accent-strong)',
+                borderColor: 'var(--accent-border)',
+                opacity: submitting ? 0.5 : 1,
+                pointerEvents: submitting ? 'none' : undefined,
+              }}
+            >
+              Choose {isNativeEdition() ? (fileFlavor === 'csv' ? 'a .csv file' : 'an Excel file') : 'a file'}
+            </label>
+            <input
+              id="ot-file-input" type="file"
+              accept={isNativeEdition() ? (fileFlavor === 'csv' ? '.csv' : '.xlsx,.xls') : '.csv,.xlsx,.xls'}
+              disabled={submitting}
+              onChange={e => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                if (isNativeEdition()) {
+                  const isCsv = f.name.toLowerCase().endsWith('.csv');
+                  if (fileFlavor === 'csv' && !isCsv) {
+                    setFileError('That is not a .csv file — use the Excel tab for .xlsx and .xls files.');
+                    e.target.value = '';
+                    return;
+                  }
+                  if (fileFlavor === 'excel' && isCsv) {
+                    setFileError('That is a .csv file — use the CSV tab for it.');
+                    e.target.value = '';
+                    return;
+                  }
+                }
+                setFileError(null);
+                handleFile(f);
+              }}
+              className="hidden"
+            />
+            <span className="text-xs truncate" style={{ color: fileName ? 'var(--text-secondary)' : 'var(--text-hint)' }}>
+              {fileName || 'No file selected'}
+            </span>
+          </div>
           {fileTabs.length > 1 && (
             <div className="mt-2">
               <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Sheet tab</label>

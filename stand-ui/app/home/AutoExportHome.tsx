@@ -373,6 +373,14 @@ export default function AutoExportHome() {
   type Tab = 'connect' | 'pipelines' | 'history' | 'how-it-works';
   const [activeTab, setActiveTab] = useState<Tab>('connect');
 
+  // Native first-visit nudge — shown once, dismissed into localStorage.
+  const [showNativeIntro, setShowNativeIntro] = useState(false);
+  useEffect(() => {
+    try {
+      if (isNativeEdition() && !localStorage.getItem('prism_native_intro_dismissed')) setShowNativeIntro(true);
+    } catch { /* storage unavailable — skip the nudge */ }
+  }, []);
+
   // Switch to the tab specified in the URL (e.g. ?tab=connect from the logo link).
   useEffect(() => {
     const raw = searchParams.get('tab');
@@ -1221,6 +1229,23 @@ export default function AutoExportHome() {
         {activeTab === 'connect' && (
           <div style={{ padding: '32px 40px', backgroundColor: 'var(--page-bg)' }}>
             <div className="mx-auto" style={{ maxWidth: 1100 }}>
+
+              {/* Native first-visit nudge (owner request 2026-08-16): nothing
+                  forces new users through /setup, so point at it once. */}
+              {showNativeIntro && (
+                <div className="rounded-card border-[0.5px] mb-6 flex items-center justify-between gap-4"
+                  style={{ backgroundColor: 'var(--accent-tint)', borderColor: 'var(--accent-border)', padding: '14px 18px' }}>
+                  <p className="text-sm" style={{ color: 'var(--accent-strong)' }}>
+                    New here? Prism only sees the tables your team grants it —{' '}
+                    <Link href="/setup" className="underline font-medium">see how to give Prism access to your data</Link>.
+                  </p>
+                  <button type="button" aria-label="Dismiss"
+                    onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* private mode */ } setShowNativeIntro(false); }}
+                    className="text-sm font-medium shrink-0"
+                    style={{ color: 'var(--accent-strong)', background: 'none', border: 'none', cursor: 'pointer' }}
+                  >✕</button>
+                </div>
+              )}
 
               {/* Step summary — minimal graphics + brief copy */}
               {!pendingActivation && (
