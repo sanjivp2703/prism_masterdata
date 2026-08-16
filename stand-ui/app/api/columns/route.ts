@@ -13,7 +13,7 @@
  * role can't see the table and no personal credentials are saved.
  */
 
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 import { getPrimaryKeyColumns, isCtEnabled } from '@/app/api/_lib/warehouse/mssql/detection';
@@ -226,19 +226,29 @@ export async function GET(request: Request) {
     // 2. User-connection fallback (one-time standardization use case) —
     // personal credentials, or the caller's-rights session in native.
     if (await hasUserWarehouseConfig(Number(session.accountId))) {
-      result = await withUserWarehouse(Number(session.accountId), async (conn) => {
-        const cols = await fetchColumns(conn, db, schema, table);
-        const ct_status = isMssql ? await fetchMssqlCtStatus(conn, table_fqn) : undefined;
-        return { ...cols, ct_status };
-      });
-      if (result.fields.length > 0) {
+      try {
+        result = await withUserWarehouse(Number(session.accountId), async (conn) => {
+          const cols = await fetchColumns(conn, db, schema, table);
+          const ct_status = isMssql ? await fetchMssqlCtStatus(conn, table_fqn) : undefined;
+          return { ...cols, ct_status };
+        });
+      } catch (userErr) {
+        // An ACCESS failure here is the expected no-grants answer, not an
+        // exception (live-found 2026-08-16, consumer test 2.1: with no
+        // database grant at all, BOTH probes throw — Snowflake refuses even
+        // INFORMATION_SCHEMA — and the generic catch printed "Failed to
+        // fetch column order" where the clean can't-see message belongs).
+        if (!isWarehouseAccessError(userErr)) throw userErr;
+        result = null;
+      }
+      if (result && result.fields.length > 0) {
         return json({ ...result, connection: 'user' });
       }
       // Neither connection can see it.
       return json({
         columns: {}, fields: [], connection: 'user',
         error: isNativeEdition()
-          ? "Neither Prism nor your own Snowflake access can see this table. Check the name, or ask the table's owner for access (see “Don't see your table?” under the table field)."
+          ? "Prism can't see this table, and neither can your own Snowflake access. Check the name, or grant access — the SQL is under “Don't see your table?” below the table field."
           : 'Neither Prism nor your connected Snowflake user can see this table. Check the name and your access.',
       });
     }
