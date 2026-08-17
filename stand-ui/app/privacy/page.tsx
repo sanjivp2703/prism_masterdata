@@ -97,9 +97,9 @@ export default function PrivacyPage() {
           <h2 style={sectionTitle}>1. Data we collect</h2>
           {native && (
             <p style={bodyText}>
-              First, the most important fact about this edition: everything described
-              below lives entirely inside your company&apos;s own Snowflake account — the
-              application, its configuration, and all Customer Data. Nothing is
+              Everything described below lives entirely inside your company&apos;s own
+              Snowflake account — the application, its configuration, and all Customer
+              Data. Nothing is
               transmitted to us; the application has no network egress and sends no
               telemetry. <strong>Prism and its employees have no access to the data you
               process using Prism.</strong> &ldquo;Collect&rdquo; below means the application
