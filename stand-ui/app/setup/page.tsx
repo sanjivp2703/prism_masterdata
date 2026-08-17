@@ -2780,6 +2780,11 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       <div className="mt-2">
         <CodeBlock code={buildNativeAppGrantSql(appName)} maxHeight={200} />
       </div>
+      <p className="text-sm mt-2" style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
+        One Snowflake limitation to know: tables created <em>after</em> the grant
+        aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
+        app) — re-run the &quot;all tables&quot; line whenever new tables are added.
+      </p>
 
       <SectionTitle>Optional: instant access for one-time cleaning</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>

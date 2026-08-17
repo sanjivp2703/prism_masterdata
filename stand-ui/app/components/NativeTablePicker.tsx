@@ -81,6 +81,11 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
             {copied ? 'Copied' : 'Copy SQL'}
           </button>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '10px 0 0', lineHeight: 1.5 }}>
+            One Snowflake limitation to know: tables created <em>after</em> the grant
+            aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
+            app) — re-run the &quot;all tables&quot; line whenever new tables are added.
+          </p>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
             Or skip the per-table ritual for one-time cleaning: an admin can opt in once,
             and Prism will clean any table you can already read — using your own access.
