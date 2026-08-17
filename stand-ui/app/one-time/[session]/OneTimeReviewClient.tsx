@@ -10,6 +10,7 @@ import {
   type ConventionRules,
 } from '@/app/api/_lib/convention-rules';
 import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -147,7 +148,7 @@ function ExportModal({
    *  writes a table, which is the only thing it has ever done. */
   isFileSession: boolean;
   onClose:     () => void;
-  onExport:    (target: string, mode: 'create' | 'overwrite', format: ExportFormat) => void;
+  onExport:    (target: string, mode: 'create' | 'overwrite', format: ExportFormat, readRole?: string) => void;
   busy:        boolean;
   error:       string | null;
   grantsNeeded: string | null;
@@ -158,6 +159,23 @@ function ExportModal({
   const [mode, setMode]     = useState<'create' | 'overwrite'>('create');
   const [target, setTarget] = useState(defaultTarget);
   const [format, setFormat] = useState<ExportFormat>(isFileSession ? 'csv' : 'warehouse');
+  // Native: who may read the exported table (owner request 2026-08-17).
+  // 'PUBLIC' = everyone in the account (default), 'NONE' = only the creator's
+  // role, '__custom__' switches to a free-text role input (SHOW ROLES is
+  // best-effort — the app's session may not see every role).
+  const [readRole, setReadRole]         = useState('PUBLIC');
+  const [customRole, setCustomRole]     = useState('');
+  const [roleOptions, setRoleOptions]   = useState<string[]>([]);
+  useEffect(() => {
+    if (!isNativeEdition()) return;
+    let cancelled = false;
+    fetch('/api/accounts/roles', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(b => { if (!cancelled && Array.isArray(b?.roles)) setRoleOptions(b.roles); })
+      .catch(() => { /* dropdown keeps its fixed options */ });
+    return () => { cancelled = true; };
+  }, []);
+  const effectiveReadRole = readRole === '__custom__' ? customRole.trim() : readRole;
   const overwritingSource = target.trim().toUpperCase() === sourceRelation.trim().toUpperCase();
   // Only the warehouse format needs a destination table; the others produce a
   // download or a new spreadsheet.
@@ -247,6 +265,35 @@ function ExportModal({
             This is your source table — overwriting it replaces the original data.
           </p>
         )}
+
+        {isNativeEdition() && (
+          <div className="mt-3">
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+              Who can read this table
+            </label>
+            <select
+              value={readRole} disabled={busy}
+              onChange={e => setReadRole(e.target.value)}
+              className="w-full text-sm px-3 py-2 rounded-button border-[0.5px] outline-none disabled:opacity-50"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+            >
+              <option value="PUBLIC">Everyone in this account</option>
+              <option value="NONE">Only my role</option>
+              {roleOptions.map(r => <option key={r} value={r}>Role: {r}</option>)}
+              <option value="__custom__">Another role…</option>
+            </select>
+            {readRole === '__custom__' && (
+              <input
+                type="text" value={customRole} onChange={e => setCustomRole(e.target.value)}
+                placeholder="ROLE_NAME"
+                autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
+                disabled={busy}
+                className="w-full text-sm px-3 py-2 mt-2 rounded-button border-[0.5px] outline-none font-mono disabled:opacity-50"
+                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+              />
+            )}
+          </div>
+        )}
         </>)}
 
         {/* Grant access section */}
@@ -283,7 +330,8 @@ function ExportModal({
             style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}>
             Cancel
           </button>
-          <button type="button" onClick={() => onExport(target.trim(), mode, format)} disabled={busy || (needsTarget && !target.trim())}
+          <button type="button" onClick={() => onExport(target.trim(), mode, format, effectiveReadRole || 'PUBLIC')}
+            disabled={busy || (needsTarget && !target.trim()) || (readRole === '__custom__' && !customRole.trim())}
             className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-button text-white disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ backgroundColor: 'var(--accent)' }}>
             {busy ? <><Spinner /> Exporting…</>
@@ -696,7 +744,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   // ── Export ────────────────────────────────────────────────────────────────
 
-  async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse') {
+  async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse', readRole?: string) {
     setExporting(true); setExportError(null); setExportGrants(null);
     try {
       const r = await fetch('/api/one-time/export', {
@@ -704,7 +752,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         // target_fqn is still sent for the non-warehouse formats: the route
         // validates it up front regardless, and sending a placeholder would
         // mean two different validation paths to keep in step.
-        body: JSON.stringify({ session, target_fqn: target, mode, format }),
+        body: JSON.stringify({ session, target_fqn: target, mode, format, ...(readRole ? { read_role: readRole } : {}) }),
       });
       const b = await r.json().catch(() => ({}));
       // Sheets export needs the lazily-granted Google scopes; sign-in itself

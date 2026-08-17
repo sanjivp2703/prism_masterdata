@@ -107,6 +107,11 @@ export async function POST(request: Request) {
   const sessionNonce = String(body?.session ?? '').trim();
   const target_fqn   = String(body?.target_fqn ?? '').trim();
   const mode: 'create' | 'overwrite' = body?.mode === 'overwrite' ? 'overwrite' : 'create';
+  // Native: who may read the exported table (owner request 2026-08-17).
+  // 'PUBLIC' (default) | 'NONE' (no grant) | a role name. Validated for
+  // identifier safety in the export function; anything unusable degrades to
+  // no grant plus the access_note.
+  const read_role = typeof body?.read_role === 'string' ? body.read_role.trim() : undefined;
   // Output format. Only meaningful for FILE/SHEET sessions — a warehouse-source
   // session has always written a warehouse table and still does, so an omitted
   // format keeps the historical behaviour exactly.
@@ -378,6 +383,7 @@ export async function POST(request: Request) {
         result = await exportOneTimeToSnowflake(conn, {
           source_relation, target_fqn, mode, columns, nonce: sessionNonce,
           usedUserConnection: useUserConnection,
+          readRole: read_role,
         });
       } catch (exportErr: any) {
         // Full detail server-side ALWAYS — the install test lost hours to this
