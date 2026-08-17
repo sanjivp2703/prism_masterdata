@@ -322,7 +322,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   // SYSADMIN" even while displaying valid T-SQL on a SQL Server install, so the
   // instruction contradicted the SQL directly beneath it (OT-07).
   const [exportGrantsRunAs, setExportGrantsRunAs] = useState<string>('ACCOUNTADMIN or SYSADMIN in Snowflake');
-  const [done, setDone]               = useState<{ target: string; rows: number } | null>(null);
+  const [done, setDone]               = useState<{ target: string; rows: number; accessNote?: string } | null>(null);
 
   // ── Per-active-column editing state (resets on tab switch) ─────────────────
   const [editingKey, setEditingKey]             = useState<string | null>(null);
@@ -767,7 +767,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         return;
       }
       setShowExport(false); setExportGrants(null);
-      setDone({ target: b.target_fqn ?? b.target ?? target, rows: b.rows_written ?? 0 });
+      setDone({ target: b.target_fqn ?? b.target ?? target, rows: b.rows_written ?? 0, accessNote: b.access_note ?? undefined });
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed.');
     } finally {
@@ -804,6 +804,12 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
             {done.target ? <>Wrote <span className="font-mono" style={{ wordBreak: 'break-all' }}>{done.target}</span></> : 'This session was already exported.'}
           </p>
           {done.rows > 0 && <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>{done.rows.toLocaleString()} rows</p>}
+          {done.accessNote && (
+            <p className="text-xs mb-5 rounded-button border-[0.5px] px-3 py-2 text-left"
+              style={{ color: 'var(--text-secondary)', borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)', lineHeight: 1.5 }}>
+              {done.accessNote}
+            </p>
+          )}
           <button onClick={() => router.push('/home')} className="text-sm font-medium rounded-button px-5 py-2.5 text-white" style={{ backgroundColor: 'var(--accent)' }}>
             Return home
           </button>

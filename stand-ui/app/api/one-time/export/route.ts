@@ -555,7 +555,22 @@ export async function POST(request: Request) {
       }
 
       await finishOneTimeSession({ target: target_fqn, runRows });
-      return Response.json({ ok: true, rows_written: result.rows_written, target_fqn, mode });
+      return Response.json({
+        ok: true, rows_written: result.rows_written, target_fqn, mode,
+        // Native + service connection: the created table is OWNED BY THE APP,
+        // so the customer's own roles can't SELECT it until an admin grants it
+        // (MANAGE GRANTS covers app-owned objects — live-verified 2026-08-16).
+        // The client surfaces this line with the success message. Caller-path
+        // exports (the native default) don't need it — the table lands owned
+        // by the user's role.
+        ...(isNativeEdition() && !useUserConnection
+          ? {
+              access_note:
+                `The table was created by the Prism app. If your SQL queries can't see it, have an admin run: ` +
+                `GRANT SELECT ON TABLE ${target_fqn} TO ROLE <your role>;`,
+            }
+          : {}),
+      });
     });
   } catch (err) {
     return warehouseErrorResponse(err, 'Failed to export one-time standardization');

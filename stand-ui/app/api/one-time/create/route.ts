@@ -13,7 +13,7 @@ import { cookies } from 'next/headers';
 import {
   withWarehouse, withUserWarehouse, hasUserWarehouseConfig,
   isWarehouseAccessError, warehouseErrorResponse,
-  executeQuery, getWarehouseAdapter,
+  executeQuery, getWarehouseAdapter, NoUserWarehouseConfig,
 } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { isNativeEdition } from '@/app/api/_lib/edition';
@@ -330,6 +330,35 @@ export async function POST(request: Request) {
   const probe = async (conn: any) => { await executeQuery(conn, probeSql); };
 
   let connectionSource: 'service' | 'user';
+  if (isNativeEdition()) {
+    // §2.9, caller-first (live-found 2026-08-16): a service-connection export
+    // creates a table OWNED BY THE APPLICATION, which the customer's own
+    // roles cannot even SELECT without a MANAGE GRANTS intervention. Running
+    // the whole session as the CALLER makes the output a normal table owned
+    // by the user's role. The service connection remains the fallback for
+    // accounts that haven't opted into caller grants (there the client shows
+    // the one grant line an admin must run).
+    try {
+      await withUserWarehouse(Number(session.accountId), probe);
+      connectionSource = 'user';
+    } catch (callerErr) {
+      const noCaller = callerErr instanceof NoUserWarehouseConfig;
+      if (!noCaller && !isWarehouseAccessError(callerErr)) {
+        return warehouseErrorResponse(callerErr, 'Failed to read the source table');
+      }
+      try {
+        await withWarehouse(probe);
+        connectionSource = 'service';
+      } catch (serviceErr) {
+        if (!isWarehouseAccessError(serviceErr)) {
+          return warehouseErrorResponse(serviceErr, 'Failed to read the source table');
+        }
+        return Response.json({
+          error: "Neither Prism nor your own Snowflake access can read this table. Ask the table's owner for access, or grant the app access (see “Don't see your table?” under the table field).",
+        }, { status: 403 });
+      }
+    }
+  } else {
   try {
     await withWarehouse(probe);
     connectionSource = 'service';
@@ -371,6 +400,7 @@ export async function POST(request: Request) {
       }
       return warehouseErrorResponse(userErr, 'Failed to read the source table with your Snowflake credentials');
     }
+  }
   }
 
   const withChosen = connectionSource === 'user'
