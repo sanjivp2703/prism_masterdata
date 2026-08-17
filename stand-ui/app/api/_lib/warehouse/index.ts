@@ -80,8 +80,9 @@ export function withWarehouse<T>(
 export function withUserWarehouse<T>(
   accountId: number,
   fn: (conn: WarehouseConnection) => Promise<T>,
+  opts?: { role?: string },
 ): Promise<T> {
-  return getWarehouseAdapter().withUserConnection(accountId, fn);
+  return getWarehouseAdapter().withUserConnection(accountId, fn, opts);
 }
 
 /** True when a user-scoped connection is possible. Async — the native

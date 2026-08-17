@@ -112,6 +112,14 @@ export async function POST(request: Request) {
   // identifier safety in the export function; anything unusable degrades to
   // no grant plus the access_note.
   const read_role = typeof body?.read_role === 'string' ? body.read_role.trim() : undefined;
+  // Native "act as" (owner decision 2026-08-17): the caller session starts at
+  // the user's DEFAULT role, and CREATE privileges consult the primary role
+  // only — so the export dialog lets the user pick any role they hold, and
+  // the caller connection is opened with it. Snowflake itself refuses roles
+  // the user doesn't hold; identifier-checked here so no malformed value can
+  // reach connection config.
+  const act_role_raw = typeof body?.act_role === 'string' ? body.act_role.trim() : '';
+  const act_role = act_role_raw && isSimpleIdent(act_role_raw) ? act_role_raw : undefined;
   // Output format. Only meaningful for FILE/SHEET sessions — a warehouse-source
   // session has always written a warehouse table and still does, so an omitted
   // format keeps the historical behaviour exactly.
@@ -175,7 +183,7 @@ export async function POST(request: Request) {
     const firstMeta = firstRun ? await loadOneTimeMeta(null, Number(firstRun.run_id)) : null;
     const useUserConnection = firstMeta?.connection === 'user';
     const withChosen = useUserConnection
-      ? <T,>(fn: (conn: any) => Promise<T>) => withUserWarehouse(Number(session.accountId), fn)
+      ? <T,>(fn: (conn: any) => Promise<T>) => withUserWarehouse(Number(session.accountId), fn, { role: act_role })
       : withWarehouse;
 
     return await withChosen(async (conn) => {

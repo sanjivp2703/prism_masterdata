@@ -80,6 +80,9 @@ export interface WarehouseAdapter {
   withUserConnection<T>(
     accountId: number,
     fn: (conn: WarehouseConnection) => Promise<T>,
+    /** Native Snowflake only: request a primary role for the caller session
+     *  ("act as" — the user must hold it). Other adapters ignore this. */
+    opts?: { role?: string },
   ): Promise<T>;
 
   /** True when a user-scoped connection is possible (saved personal

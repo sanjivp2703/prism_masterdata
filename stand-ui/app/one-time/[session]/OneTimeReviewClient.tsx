@@ -148,7 +148,7 @@ function ExportModal({
    *  writes a table, which is the only thing it has ever done. */
   isFileSession: boolean;
   onClose:     () => void;
-  onExport:    (target: string, mode: 'create' | 'overwrite', format: ExportFormat, readRole?: string) => void;
+  onExport:    (target: string, mode: 'create' | 'overwrite', format: ExportFormat, readRole?: string, actRole?: string) => void;
   busy:        boolean;
   error:       string | null;
   grantsNeeded: string | null;
@@ -166,6 +166,12 @@ function ExportModal({
   const [readRole, setReadRole]         = useState('PUBLIC');
   const [customRole, setCustomRole]     = useState('');
   const [roleOptions, setRoleOptions]   = useState<string[]>([]);
+  // "Act as" (owner decision 2026-08-17): the caller session starts at the
+  // user's DEFAULT role, and table creation only consults the primary role —
+  // this picker lets the export run under any role the user actually holds
+  // (like Snowsight's role switcher, but for Prism's session).
+  const [actRole, setActRole]           = useState('');
+  const [myRoles, setMyRoles]           = useState<string[]>([]);
   useEffect(() => {
     if (!isNativeEdition()) return;
     let cancelled = false;
@@ -173,6 +179,10 @@ function ExportModal({
       .then(r => (r.ok ? r.json() : null))
       .then(b => { if (!cancelled && Array.isArray(b?.roles)) setRoleOptions(b.roles); })
       .catch(() => { /* dropdown keeps its fixed options */ });
+    fetch('/api/accounts/my-roles', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(b => { if (!cancelled && Array.isArray(b?.roles)) setMyRoles(b.roles); })
+      .catch(() => { /* picker falls back to the session default */ });
     return () => { cancelled = true; };
   }, []);
   const effectiveReadRole = readRole === '__custom__' ? customRole.trim() : readRole;
@@ -266,6 +276,27 @@ function ExportModal({
           </p>
         )}
 
+        {isNativeEdition() && myRoles.length > 0 && (
+          <div className="mt-3">
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+              Create as role
+            </label>
+            <select
+              value={actRole} disabled={busy}
+              onChange={e => setActRole(e.target.value)}
+              className="w-full text-sm px-3 py-2 rounded-button border-[0.5px] outline-none disabled:opacity-50"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+            >
+              <option value="">My default role</option>
+              {myRoles.map(r => <option key={r} value={r}>{r}</option>)}
+            </select>
+            <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>
+              The table is created with this role&apos;s permissions — it needs CREATE TABLE
+              on the destination schema.
+            </p>
+          </div>
+        )}
+
         {isNativeEdition() && (
           <div className="mt-3">
             <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
@@ -277,7 +308,7 @@ function ExportModal({
               className="w-full text-sm px-3 py-2 rounded-button border-[0.5px] outline-none disabled:opacity-50"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             >
-              <option value="PUBLIC">Everyone in this account</option>
+              <option value="PUBLIC">Public</option>
               <option value="NONE">Only my role</option>
               {roleOptions.map(r => <option key={r} value={r}>Role: {r}</option>)}
               <option value="__custom__">Another role…</option>
@@ -330,7 +361,7 @@ function ExportModal({
             style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)', backgroundColor: 'var(--surface)' }}>
             Cancel
           </button>
-          <button type="button" onClick={() => onExport(target.trim(), mode, format, effectiveReadRole || 'PUBLIC')}
+          <button type="button" onClick={() => onExport(target.trim(), mode, format, effectiveReadRole || 'PUBLIC', actRole || undefined)}
             disabled={busy || (needsTarget && !target.trim()) || (readRole === '__custom__' && !customRole.trim())}
             className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-button text-white disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ backgroundColor: 'var(--accent)' }}>
@@ -744,7 +775,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   // ── Export ────────────────────────────────────────────────────────────────
 
-  async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse', readRole?: string) {
+  async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse', readRole?: string, actRole?: string) {
     setExporting(true); setExportError(null); setExportGrants(null);
     try {
       const r = await fetch('/api/one-time/export', {
@@ -752,7 +783,11 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         // target_fqn is still sent for the non-warehouse formats: the route
         // validates it up front regardless, and sending a placeholder would
         // mean two different validation paths to keep in step.
-        body: JSON.stringify({ session, target_fqn: target, mode, format, ...(readRole ? { read_role: readRole } : {}) }),
+        body: JSON.stringify({
+          session, target_fqn: target, mode, format,
+          ...(readRole ? { read_role: readRole } : {}),
+          ...(actRole ? { act_role: actRole } : {}),
+        }),
       });
       const b = await r.json().catch(() => ({}));
       // Sheets export needs the lazily-granted Google scopes; sign-in itself

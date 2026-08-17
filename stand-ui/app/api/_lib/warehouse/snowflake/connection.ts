@@ -108,14 +108,19 @@ export async function getSpcsCallerToken(): Promise<string | null> {
   }
 }
 
-function createSpcsSnowflakeConnection(callerToken?: string): SnowflakeConnection {
+function createSpcsSnowflakeConnection(callerToken?: string, callerRole?: string): SnowflakeConnection {
   const host    = getRequiredEnv('SNOWFLAKE_HOST');
   const account = getRequiredEnv('SNOWFLAKE_ACCOUNT');
   // Fresh read every connection — the platform rotates the token in place.
   const serviceToken = fs.readFileSync(SPCS_TOKEN_PATH, 'utf8').trim();
   // Dot-joining the ingress user token yields a CALLER'S RIGHTS session
   // (executes as the ingress user, restricted to the consumer's caller
-  // grants); the service token alone is the app's own session.
+  // grants); the service token alone is the app's own session. callerRole
+  // requests a PRIMARY role for that session ("act as" — the user must hold
+  // it; Snowflake refuses the connection otherwise). Without it the session
+  // starts at the user's DEFAULT role, which is what made a SYSADMIN-default
+  // ACCOUNTADMIN-holding user unable to CREATE TABLE (live-found 2026-08-17
+  // — CREATE privileges are evaluated against the primary role only).
   const token = callerToken ? `${serviceToken}.${callerToken}` : serviceToken;
   const port  = getOptionalEnv('SNOWFLAKE_PORT') ?? '443';
 
@@ -134,6 +139,7 @@ function createSpcsSnowflakeConnection(callerToken?: string): SnowflakeConnectio
     token,
     authenticator: 'OAUTH',
     warehouse,
+    ...(callerRole ? { role: callerRole } : {}),
     ...(database ? { database } : {}),
     ...(schema ? { schema } : {}),
   } as any);
@@ -403,17 +409,26 @@ function createUserSnowflakeConnection(accountId: number): SnowflakeConnection {
 
 /** Like withSnowflake, but with the USER'S OWN access: the account's personal
  *  credentials (standard edition), or a caller's-rights session built from the
- *  current request's ingress token (native edition — §2.9). */
+ *  current request's ingress token (native edition — §2.9). opts.role
+ *  requests a primary role for the caller session ("act as" — native only;
+ *  the personal-credentials path has its own saved role). */
 export async function withUserSnowflake<T>(
   accountId: number,
   fn: (connection: SnowflakeConnection) => Promise<T>,
+  opts?: { role?: string },
 ): Promise<T> {
   if (spcsAmbientAvailable()) {
     const callerToken = await getSpcsCallerToken();
     if (!callerToken) throw new NoUserWarehouseConfig();
-    const connection = createSpcsSnowflakeConnection(callerToken);
+    const connection = createSpcsSnowflakeConnection(callerToken, opts?.role);
     try {
       await connect(connection);
+      // Reads should match everything the person holds, not just their
+      // default role (owner decision 2026-08-17). Best-effort: if a
+      // restricted caller session refuses this, the session simply keeps
+      // its default role set. (Creation is unaffected either way — CREATE
+      // privileges only ever consult the primary role.)
+      await executeQuery(connection, 'USE SECONDARY ROLES ALL').catch(() => {});
       return await fn(connection);
     } finally {
       await destroy(connection);
