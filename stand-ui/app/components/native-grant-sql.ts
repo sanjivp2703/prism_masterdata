@@ -53,7 +53,7 @@ export function buildNativeAppGrantSql(appName: string): string {
 export function buildNativeCallerGrantSql(appName: string): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   return [
-    `-- Optional, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
+    `-- Recommended, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
     `-- Lets Prism clean any table the signed-in user can ALREADY access — using that`,
     `-- user's own access (never more), per database you opt in:`,
     `GRANT CALLER USAGE ON DATABASE <db> TO APPLICATION "${app}";`,

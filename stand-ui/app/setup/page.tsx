@@ -2744,12 +2744,18 @@ function PersonalSetupForm({ nextUrl }: { nextUrl: string }) {
 function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user' }) {
   const router = useRouter();
   const [appName, setAppName] = useState('');
+  // null = still checking; the SQL block shows only when AI is NOT working.
+  const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
   useEffect(() => {
     let cancelled = false;
     fetch('/api/accounts/accessible-tables', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
       .then(b => { if (!cancelled && b?.app_name) setAppName(String(b.app_name)); })
       .catch(() => { /* placeholder name is fine */ });
+    fetch('/api/accounts/ai-status', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(b => { if (!cancelled) setAiConfigured(b?.configured === true); })
+      .catch(() => { if (!cancelled) setAiConfigured(false); });
     return () => { cancelled = true; };
   }, []);
   const isAdmin = role === 'admin';
@@ -2766,18 +2772,28 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         leaves Snowflake. The only setup is deciding what Prism can see.
       </p>
 
-      <SectionTitle>Run once after install (ACCOUNTADMIN)</SectionTitle>
-      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        Two statements every installation needs before the AI can run — the
-        install dialog cannot ask for them (live-found on the first consumer
-        install: Claude on Cortex needs cross-region inference enabled, and
-        database roles can&apos;t be requested by an app):
-      </p>
-      <div className="mt-2">
-        <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
-      </div>
+      {aiConfigured === true ? (
+        <>
+          <SectionTitle>AI</SectionTitle>
+          <p className="text-sm" style={{ color: 'var(--confidence-high)', lineHeight: 1.6 }}>
+            ✓ AI is enabled for this installation — nothing to run.
+          </p>
+        </>
+      ) : (
+        <>
+          <SectionTitle>Enable the AI (once per account, ACCOUNTADMIN)</SectionTitle>
+          <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            If Snowflake Cortex hasn&apos;t already been enabled for this installation,
+            an administrator runs these two statements once — the install dialog
+            can&apos;t ask for them. Skip this if standardizations already work.
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
+          </div>
+        </>
+      )}
 
-      <SectionTitle>Give Prism data to work with</SectionTitle>
+      <SectionTitle>Give Prism access to tables you want standardized</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         Prism sees only what your team grants it — nothing is shared automatically.
         One thing to know before granting: Prism is a shared workspace, so every
@@ -2797,7 +2813,7 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         app) — re-run the &quot;all tables&quot; line whenever new tables are added.
       </p>
 
-      <SectionTitle>Optional: instant access for one-time cleaning</SectionTitle>
+      <SectionTitle>Recommended: instant access for one-time cleaning</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         {isAdmin
           ? 'A one-time opt-in that lets Prism clean any table a signed-in user can already read — using that user’s own access, so nobody repeats the grant ritual per table. Pipelines still require the grants above.'
