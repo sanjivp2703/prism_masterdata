@@ -32,6 +32,7 @@ import { normalizeLiteral } from './normalize';
 import { internalObject, prismNormalizeFn } from './warehouse-tables';
 import { recordStandardizedUnits } from './billing-meter';
 import { executeQuery as exec, getWarehouseAdapter, withWarehouse } from './warehouse';
+import { isNativeEdition } from './edition';
 import { reportError } from './report-error';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
 import {
@@ -606,6 +607,19 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       // native caller's rights errored as a baffling "must have CALLER
       // OWNERSHIP" that misclassified as needs-grants (live-found 2026-08-14).
       await exec(connection, `CREATE TABLE ${targetRef} AS ${selectSQL}`);
+    }
+
+    // Native (owner decision 2026-08-17): the export is readable by every
+    // role in the account. The terms disclose exactly this ("every user
+    // within your company's Snowflake account can view … standardized
+    // values"), and without it a caller-path export is visible only to the
+    // creator's primary role — live-found when a SYSADMIN-default user's
+    // exports were invisible to everyone else. Best-effort: on the caller
+    // path the session owns the fresh table so the grant always works; an
+    // app-owned (service-path) table may refuse, which the export's
+    // access_note already covers.
+    if (isNativeEdition()) {
+      await exec(connection, `GRANT SELECT ON TABLE ${targetRef} TO ROLE PUBLIC`).catch(() => {});
     }
 
     const cntRows = await exec(connection, `SELECT COUNT(*) AS cnt FROM ${targetRef}`);
