@@ -70,8 +70,23 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
         <div style={{ marginTop: 8, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', borderRadius: 'var(--radius-button)', padding: '10px 12px' }}>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
             Prism can only see tables your team has granted to it — nothing is shared
-            automatically. Send this to whoever owns the schema (they don&apos;t need to be
-            ACCOUNTADMIN), then try again:
+            automatically. There are two ways to grant access — run one <em>or</em> the
+            other. <strong>Recommended:</strong> an admin opts in once per database, and
+            Prism can clean any table you can already read — using your own access:
+          </p>
+          <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
+            {callerGrantSql}
+          </pre>
+          <button type="button"
+            onClick={() => { navigator.clipboard?.writeText(callerGrantSql).then(() => { setCopiedCaller(true); setTimeout(() => setCopiedCaller(false), 1500); }); }}
+            style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
+            {copiedCaller ? 'Copied' : 'Copy SQL'}
+          </button>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
+            <strong>Or</strong>, if you&apos;d rather not enable user-based access: grant Prism
+            its own access, schema by schema (whoever owns the schema can run it —
+            they don&apos;t need to be ACCOUNTADMIN). Pipelines always need these direct
+            grants:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
             {grantSql}
@@ -86,19 +101,6 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
             app) — re-run the &quot;all tables&quot; line whenever new tables are added.
           </p>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
-            Or skip the per-table ritual for one-time cleaning: an admin can opt in once,
-            and Prism will clean any table you can already read — using your own access.
-            Pipelines still need the grants above.
-          </p>
-          <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
-            {callerGrantSql}
-          </pre>
-          <button type="button"
-            onClick={() => { navigator.clipboard?.writeText(callerGrantSql).then(() => { setCopiedCaller(true); setTimeout(() => setCopiedCaller(false), 1500); }); }}
-            style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
-            {copiedCaller ? 'Copied' : 'Copy SQL'}
-          </button>
         </div>
       )}
     </div>

@@ -2799,10 +2799,29 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         One thing to know before granting: Prism is a shared workspace, so every
         person you give app access to can view all pipelines, mappings, and the
         standardized values — including ones built from tables their own
-        Snowflake permissions can&apos;t read.
+        Snowflake permissions can&apos;t read. There are two ways to grant access —
+        run <strong>one or the other</strong>.
+      </p>
+
+      <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>
+        Recommended: let Prism use each person&apos;s own access
+      </p>
+      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         {isAdmin
-          ? ' Run this for each schema you want standardized (whoever owns the schema can run it):'
-          : ' Send this to whoever owns the data (they don’t need to be ACCOUNTADMIN):'}
+          ? 'One opt-in per database: anyone can then clean any table they can already read — instantly, using their own access, with results they own. No per-table ritual.'
+          : 'One admin opt-in per database: you can then clean any table you can already read — instantly, using your own access.'}
+      </p>
+      <div className="mt-2">
+        <CodeBlock code={buildNativeCallerGrantSql(appName)} maxHeight={200} />
+      </div>
+
+      <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>
+        Or, if you&apos;d rather not enable user-based access: grant Prism directly
+      </p>
+      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+        {isAdmin
+          ? 'Grant the app its own access, schema by schema (whoever owns the schema can run it). Note: PIPELINES always need these direct grants — background standardization runs with nobody signed in.'
+          : 'Send this to whoever owns the data (they don’t need to be ACCOUNTADMIN). Note: PIPELINES always need these direct grants.'}
       </p>
       <div className="mt-2">
         <CodeBlock code={buildNativeAppGrantSql(appName)} maxHeight={200} />
@@ -2812,30 +2831,6 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
         app) — re-run the &quot;all tables&quot; line whenever new tables are added.
       </p>
-
-      <SectionTitle>Recommended: instant access for one-time cleaning</SectionTitle>
-      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        {isAdmin
-          ? 'A one-time opt-in that lets Prism clean any table a signed-in user can already read — using that user’s own access, so nobody repeats the grant ritual per table. Pipelines still require the grants above.'
-          : 'An admin can opt in once so Prism can clean any table you can already read, using your own access. Pipelines still require the grants above.'}
-      </p>
-      <div className="mt-2">
-        <CodeBlock code={buildNativeCallerGrantSql(appName)} maxHeight={200} />
-      </div>
-
-      {isAdmin && (
-        <>
-          <SectionTitle>If AI calls fail in your region</SectionTitle>
-          <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Cortex serves Claude models in most regions. If standardization
-            reports the model is unavailable, enable cross-region inference
-            once (ACCOUNTADMIN; pick your geography):
-          </p>
-          <div className="mt-2">
-            <CodeBlock code={`ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';`} maxHeight={60} />
-          </div>
-        </>
-      )}
 
       <div className="mt-6 flex justify-end">
         <button
