@@ -126,8 +126,17 @@ export default function TermsPage() {
           <h2 style={sectionTitle}>3. Customer data and credentials</h2>
           <p style={bodyText}>
             You retain all right, title, and interest in the data you connect to or process
-            through the Service (&ldquo;Customer Data&rdquo;). You grant us a limited license to access,
-            process, and store Customer Data solely to provide and improve the Service for you.
+            through the Service (&ldquo;Customer Data&rdquo;). You grant us a limited license to access
+            and process Customer Data solely to provide the Service for you.{' '}
+            {native ? (
+              <>The Service stores its outputs — mappings, run state, and standardized
+              tables — entirely within your own Snowflake account. We do not receive or
+              store Customer Data on systems we operate.</>
+            ) : (
+              <>Customer Data values — mappings, run state, and standardized outputs — are
+              stored in your connected {warehouse} account; the hosted application itself
+              stores only configuration and metadata (never your data values).</>
+            )}
           </p>
           <ul style={listStyle}>
             {native ? (
@@ -209,7 +218,13 @@ export default function TermsPage() {
             the Service will be uninterrupted, error-free, or that proposed standardizations will
             be accurate or complete. Automated groupings are proposals — you are responsible for
             reviewing and confirming mappings before relying on them. We may modify, suspend, or
-            discontinue features at any time.
+            discontinue features at any time. Some features write to your account with the
+            access you grant them — creating and replacing export tables, overwriting tables
+            you designate, and (where enabled) maintaining standardized columns on your own
+            tables. To the maximum extent permitted by law, we are not liable for loss,
+            corruption, or modification of Customer Data arising from the Service&rsquo;s
+            operation or your use of it; you are responsible for maintaining appropriate
+            backups and for the targets you direct the Service to write to.
           </p>
 
           <h2 style={sectionTitle}>7. Limitation of liability</h2>
@@ -244,8 +259,8 @@ export default function TermsPage() {
           <h2 style={sectionTitle}>10. Contact</h2>
           <p style={bodyText}>
             Questions about these Terms can be sent to{' '}
-            <a href="mailto:legal@prism.example.com" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
-              legal@prism.example.com
+            <a href="mailto:sanjivp2703@gmail.com" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
+              sanjivp2703@gmail.com
             </a>.
           </p>
         </div>

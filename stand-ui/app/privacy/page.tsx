@@ -220,8 +220,8 @@ export default function PrivacyPage() {
           <h2 style={sectionTitle}>8. Contact</h2>
           <p style={bodyText}>
             Questions about this policy or your data can be sent to{' '}
-            <a href="mailto:privacy@prism.example.com" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
-              privacy@prism.example.com
+            <a href="mailto:sanjivp2703@gmail.com" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
+              sanjivp2703@gmail.com
             </a>.
           </p>
         </div>
