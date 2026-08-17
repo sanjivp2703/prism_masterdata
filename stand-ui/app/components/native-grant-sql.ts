@@ -6,6 +6,20 @@
 
 export const APP_NAME_PLACEHOLDER = '<your Prism app name>';
 
+/** The two statements EVERY installation must run once (ACCOUNTADMIN) before
+ *  the AI can work — the install dialog cannot request either (live-found on
+ *  the first consumer install, 2026-08-16): Claude on Cortex requires
+ *  cross-region inference, and database roles can't be granted through an
+ *  app manifest. */
+export function buildNativeStarterSql(appName: string): string {
+  const app = appName || APP_NAME_PLACEHOLDER;
+  return [
+    `-- Run once as ACCOUNTADMIN, right after installing:`,
+    `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';  -- lets Cortex reach Claude`,
+    `GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO APPLICATION "${app}";`,
+  ].join('\n');
+}
+
 /** Durable grants TO THE APPLICATION — what pipelines require (and the only
  *  path in strict-list mode). Runnable by whoever owns the schema. */
 export function buildNativeAppGrantSql(appName: string): string {

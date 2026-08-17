@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { buildNativeAppGrantSql, buildNativeCallerGrantSql } from '@/app/components/native-grant-sql';
+import { buildNativeAppGrantSql, buildNativeCallerGrantSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
 
 function PrismLogo() {
   return (
@@ -2765,6 +2765,17 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         application itself, and AI runs on Snowflake Cortex, so your data never
         leaves Snowflake. The only setup is deciding what Prism can see.
       </p>
+
+      <SectionTitle>Run once after install (ACCOUNTADMIN)</SectionTitle>
+      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+        Two statements every installation needs before the AI can run — the
+        install dialog cannot ask for them (live-found on the first consumer
+        install: Claude on Cortex needs cross-region inference enabled, and
+        database roles can&apos;t be requested by an app):
+      </p>
+      <div className="mt-2">
+        <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
+      </div>
 
       <SectionTitle>Give Prism data to work with</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
