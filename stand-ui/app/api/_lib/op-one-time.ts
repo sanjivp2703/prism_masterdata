@@ -444,7 +444,11 @@ export interface ExportOneTimeArgs {
    *  schema (session-scoped TEMPORARY; the export already requires CREATE
    *  TABLE there) and metering runs on a separate service connection
    *  (live-found 2026-08-13: internal-schema scratch + metering both failed
-   *  on the caller session). */
+   *  on the caller session). The mssql/pg/mysql writers relocate scratch the
+   *  same way but still meter on the chosen connection — safe only because
+   *  recordStandardizedUnits no-ops off Snowflake; if metering ever extends
+   *  to those warehouses, their user path must meter on a service connection
+   *  too. */
   usedUserConnection?: boolean;
   /** Native: who may read the exported table (owner request 2026-08-17).
    *  undefined/'PUBLIC' → GRANT SELECT TO ROLE PUBLIC; 'NONE' → no grant
@@ -506,7 +510,7 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
   const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
 
   if (getWarehouseAdapter().kind === 'mssql') {
-    return await exportOneTimeToMssqlTarget(connection, { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched });
+    return await exportOneTimeToMssqlTarget(connection, { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched, usedUserConnection: args.usedUserConnection });
   }
 
   // Scratch home: internal schema for the service connection (always
@@ -712,8 +716,17 @@ async function exportOneTimeToPgTarget(
   const sourceColsUpper = new Set(sourceCols.map((c) => c.toUpperCase()));
   const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
 
-  const mapTable = `prism_internal.${pgQuoteIdent(`ots_map_${nonce}`)}`;
-  const stageTable = `prism_internal.${pgQuoteIdent(`ots_stage_${nonce}`)}`;
+  // Scratch home: internal schema for the service connection (always writable
+  // by it); the TARGET schema for a personal-credentials connection, which
+  // cannot write prism_internal (same fix the Snowflake writer got from the
+  // 2026-08 native round — the export already requires CREATE on the target
+  // schema, so this adds no privilege). Pre-dropped and dropped in finally.
+  const scratchName = (n: string) =>
+    args.usedUserConnection
+      ? `${pgQuoteIdent(tgt.schema)}.${pgQuoteIdent(n)}`
+      : `prism_internal.${pgQuoteIdent(n)}`;
+  const mapTable = scratchName(`ots_map_${nonce}`);
+  const stageTable = scratchName(`ots_stage_${nonce}`);
 
   try {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
@@ -887,8 +900,20 @@ async function exportOneTimeToMysqlTarget(
   const sourceColsUpper = new Set(sourceCols.map((c) => c.toUpperCase()));
   const watched = columns.filter((c) => sourceColsUpper.has(c.column_name.toUpperCase()));
 
-  const mapTable = `prism_internal.${myQuoteIdent(`ots_map_${nonce}`)}`;
-  const stageTable = `prism_internal.${myQuoteIdent(`ots_stage_${nonce}`)}`;
+  // Scratch home: internal database for the service connection (always
+  // writable by it); the TARGET database for a personal-credentials
+  // connection, which cannot write prism_internal (same fix the Snowflake
+  // writer got from the 2026-08 native round — the export already requires
+  // CREATE on the target database, so this adds no privilege). Regular
+  // nonce-named tables rather than TEMPORARY: CREATE TEMPORARY TABLES is a
+  // separate MySQL privilege the user may not hold, while CREATE is already
+  // the export's bar. Pre-dropped and dropped in finally either way.
+  const scratchName = (n: string) =>
+    args.usedUserConnection
+      ? `${myQuoteIdent(tgt.db)}.${myQuoteIdent(n)}`
+      : `prism_internal.${myQuoteIdent(n)}`;
+  const mapTable = scratchName(`ots_map_${nonce}`);
+  const stageTable = scratchName(`ots_stage_${nonce}`);
 
   try {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
@@ -1034,13 +1059,26 @@ async function exportOneTimeToMssqlTarget(
   args: {
     source_relation: string; target_fqn: string; mode: 'create' | 'overwrite';
     nonce: string; sourceRef: string; targetRef: string; sourceCols: string[];
-    watched: OneTimeExportColumn[];
+    watched: OneTimeExportColumn[]; usedUserConnection?: boolean;
   },
 ): Promise<{ rows_written: number }> {
   const { source_relation, target_fqn, mode, nonce, sourceRef, targetRef, sourceCols, watched } = args;
   const BIN2 = 'Latin1_General_100_BIN2';
-  const mapTable = `${internalObject(quoteIdent(`OTS_MAP_${nonce}`))}`;
-  const stageTable = `${internalObject(quoteIdent(`OTS_STAGE_${nonce}`))}`;
+  const tgt = parseFqn(target_fqn);
+  // Scratch home: internal schema for the service connection (always writable
+  // by it); the TARGET schema for a personal-credentials connection, which
+  // cannot write the internal schema (same fix the Snowflake writer got from
+  // the 2026-08 native round — the export already requires CREATE TABLE on
+  // the target schema, so this adds no privilege). Regular nonce-named tables
+  // rather than #temp: the mssql adapter hands us a ConnectionPool, and #temp
+  // tables are per-session — a pooled statement could land on a session that
+  // can't see them. Pre-dropped and dropped in finally either way.
+  const scratchName = (n: string) =>
+    args.usedUserConnection
+      ? `${quoteIdent(tgt.db)}.${quoteIdent(tgt.schema)}.${quoteIdent(n)}`
+      : `${internalObject(quoteIdent(n))}`;
+  const mapTable = scratchName(`OTS_MAP_${nonce}`);
+  const stageTable = scratchName(`OTS_STAGE_${nonce}`);
 
   try {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`);
@@ -1126,7 +1164,6 @@ async function exportOneTimeToMssqlTarget(
       `SELECT\n         ${selectList}\n       INTO ${dest}\n       ${fromClause}`;
 
     if (mode === 'overwrite') {
-      const tgt = parseFqn(target_fqn);
       const bracketRef = `[${tgt.db.replace(/]/g, ']]')}].[${tgt.schema.replace(/]/g, ']]')}].[${tgt.table.replace(/]/g, ']]')}]`;
       const existsRows = await exec(connection, `SELECT OBJECT_ID(?) AS oid`, [bracketRef]);
       if (existsRows[0]?.oid != null) {

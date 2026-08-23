@@ -40,6 +40,11 @@ export interface PgPipelineRef {
   domain_id: number | null;
   export_table_fqn: string | null;
   status_message: string | null;
+  // Raw passthrough (finding #17): with export_unmapped_rows ON, newly
+  // queued values also trigger an export rebuild the same cycle. Table-kind
+  // exports only (pg views are live and need no rebuild).
+  export_kind?: string;
+  export_unmapped_rows?: boolean;
 }
 
 export interface PgPollResult {
@@ -235,6 +240,10 @@ export async function pollOnePgPipeline(p: PgPipelineRef): Promise<PgPollResult>
         console.warn(`[Poller/pg] Pipeline ${pid}: diff scan truncated at cap — remaining values queue on later scans`);
       }
       const unknown = await filterUnknownValues(conn, pid, p.domain_id, scan.values);
+      const rawPassthrough =
+        p.export_unmapped_rows === true &&
+        p.export_table_fqn != null &&
+        String(p.export_kind ?? 'table') === 'table';
       if (unknown.length) {
         await queueValues(conn, pid, unknown);
         console.log(`[Poller/pg] Pipeline ${pid}: diff scan queued ${unknown.length} new value(s) (scan ${scan.durationMs}ms)`);
@@ -250,7 +259,7 @@ export async function pollOnePgPipeline(p: PgPipelineRef): Promise<PgPollResult>
       updateQueueMetric(pid, await getQueueSize(conn, pid));
       await updateSourceValueCount(conn, pid, p.table_fqn, p.column_name);
       touchLastPolled(pid);
-      return { checked: true, needsExportRefresh: sawDeletes };
+      return { checked: true, needsExportRefresh: sawDeletes || (rawPassthrough && unknown.length > 0) };
     });
   } catch (err) {
     const kind = classifyPgPollError(err);

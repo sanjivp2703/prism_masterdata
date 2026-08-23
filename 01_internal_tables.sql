@@ -2,18 +2,15 @@ USE DATABASE PRISM_DB;
 USE SCHEMA INTERNAL;
 
 -- ============================================================================
--- CUSTOMER INSTALL SCRIPT — everything Prism requires in the customer's
--- Snowflake account: the PRISM_NORMALIZE UDF, the four internal data-plane
--- tables, and the roles/grants. Contains NO demo or test data — that lives in
--- 02_demo_data.sql (dev/demo only, never run on a customer account).
+-- PRISM INSTALL SCRIPT — everything Prism requires in your Snowflake
+-- account: the PRISM_NORMALIZE function, Prism's internal tables, the
+-- roles/grants, and Prism's own warehouse. It creates objects only inside
+-- PRISM_DB (plus the PRISM_WH warehouse and the two Prism roles) and touches
+-- none of your own databases or data.
 --
--- FULL DEV RESET = 00 + THIS FILE + 02_demo_data.sql + THE APP-STATE RESET
--- Re-running this file resets the Snowflake side (lookup tables, queue, file
--- rows, pipeline streams); 02_demo_data.sql resets the demo source table.
--- PIPELINES / RUNS / specs live in the local SQLite app database, which
--- snowsql cannot touch — reset them with the companion:
---     cd stand-ui && npm run reset-app-state
--- then restart the dev server (the poller holds in-memory state).
+-- ⚠️ Re-running this script RESETS Prism's internal tables (confirmed
+-- mappings, queued values, pipeline streams). Run it once at install time;
+-- re-run only if you intend to start Prism over from scratch.
 -- ============================================================================
 
 -- ============================================================================
@@ -24,9 +21,9 @@ USE SCHEMA INTERNAL;
 --
 -- The ORIGINAL value is always what gets stored in literal_value (so the LLM
 -- still sees casing — useful for acronyms); this function is applied only when
--- comparing/matching/deduping.  It is mirrored EXACTLY by normalizeLiteral() in
--- stand-ui/app/api/_lib/normalize.ts (same JS engine semantics) so in-memory
--- matching and SQL matching always agree — keep the two in sync.
+-- comparing/matching/deduping.  It is mirrored EXACTLY by the Prism
+-- application's own normalization function, so in-memory matching and SQL
+-- matching always agree.
 -- ============================================================================
 CREATE OR REPLACE FUNCTION PRISM_DB.INTERNAL.PRISM_NORMALIZE(V STRING)
 RETURNS STRING
@@ -61,13 +58,10 @@ DROP TABLE IF EXISTS PIPELINE_QUEUE;
 -- re-running it CLEANS UP a long-lived install rather than leaving orphans
 -- behind forever. A fresh account never had them, and the DROPs are no-ops.
 --
--- Two generations of leftovers:
---
--- 1. App-state tables that moved to SQLite (2026-07). Prism's metadata —
+-- 1. App-state tables from earlier Prism versions. Prism's metadata —
 --    accounts, invitations, pipelines, runs, the one-time archive — lives in
---    the local SQLite file now; only tables that get JOINed against customer
---    data inside warehouse SQL stayed here. DOMAINS went further and was
---    removed outright, replaced by per-column specs.
+--    the application's own database now; only tables that get JOINed against
+--    your data inside warehouse SQL stayed here.
 DROP TABLE IF EXISTS ACCOUNTS;
 DROP TABLE IF EXISTS INVITATIONS;
 DROP TABLE IF EXISTS PIPELINES;
@@ -75,14 +69,12 @@ DROP TABLE IF EXISTS RUNS;
 DROP TABLE IF EXISTS DOMAINS;
 DROP TABLE IF EXISTS ONE_TIME_STANDARDIZATIONS;
 --
--- 2. PIPELINE_FILE_ROWS — row snapshots for file-based PIPELINES. Files,
---    Google Sheets and pasted lists are one-shot by nature and moved to the
---    one-time flow (which has its own ONE_TIME_FILE_ROWS); pipelines are
---    warehouse-only, so nothing writes this any more.
+-- 2. PIPELINE_FILE_ROWS — used by earlier Prism versions for file-based
+--    pipelines; one-shot file sources now live in the one-time flow's own
+--    tables, so nothing writes this any more.
 DROP TABLE IF EXISTS PIPELINE_FILE_ROWS;
 --
--- 3. The original deterministic grouping pipeline, deleted from the codebase
---    long before this. Unreferenced by any live code path.
+-- 3. Tables from Prism's earliest grouping engine, long retired.
 DROP TABLE IF EXISTS CONCEPTS;
 DROP TABLE IF EXISTS ALIASES;
 DROP TABLE IF EXISTS ALIAS_SUMMARY;
@@ -97,10 +89,10 @@ DROP TABLE IF EXISTS AUDIT_LOG;
 DROP TABLE IF EXISTS CLASSIFICATION_METADATA_PROFILES;
 DROP TABLE IF EXISTS CONCEPT_COMPATIBILITY;
 
--- Drop ALL pipeline streams — the pipelines they belong to are reset by the
--- companion app-state reset (npm run reset-app-state), and stale streams from
--- previous pipeline generations otherwise accumulate forever. New pipelines
--- get new ids, so their streams are recreated fresh by the poller.
+-- Drop ALL pipeline streams — part of the same reset semantics as the table
+-- drops above; stale streams from previous pipeline generations otherwise
+-- accumulate forever. New pipelines get new ids, so their streams are
+-- recreated fresh automatically.
 EXECUTE IMMEDIATE $$
 BEGIN
   SHOW STREAMS LIKE 'PIPELINE_STREAM_%' IN SCHEMA PRISM_DB.INTERNAL;
@@ -113,12 +105,11 @@ END;
 $$;
 
 
--- NOTE: RUNS, PIPELINES, and per-column standardization specs (COLUMN_SPECS)
--- live in the local SQLite app database (stand-ui/app/api/_lib/sqlite.ts). The
--- `domain_id` columns below are a HISTORICAL name — they now hold a
--- COLUMN_SPECS.spec_id (the per-column lookup scope; domains were removed). The
--- run_id / pipeline_id / domain_id columns are cross-store references —
--- Snowflake never enforced FKs anyway.
+-- NOTE: run, pipeline, and column-spec METADATA lives in the Prism
+-- application's own database, not in Snowflake. The `domain_id` columns below
+-- are a historical name — they hold the per-column spec id that scopes each
+-- column's lookup. The run_id / pipeline_id / domain_id columns are plain
+-- integer references to those app-side records.
 
 
 -- ----------------------------------------------------------------------------
@@ -129,7 +120,7 @@ $$;
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE TABLE PIPELINE_QUEUE (
     queue_id        INTEGER         AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY NOT NULL,
-    pipeline_id     INTEGER         NOT NULL,  -- SQLite pipelines.pipeline_id (cross-store ref)
+    pipeline_id     INTEGER         NOT NULL,  -- Prism's app-side pipeline id
     literal_value    VARCHAR         NOT NULL,
     source_frequency INTEGER         NOT NULL DEFAULT 1,                 -- source rows this distinct value currently represents
     detected_at      TIMESTAMP_NTZ   NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -149,7 +140,7 @@ CREATE OR REPLACE TABLE PIPELINE_QUEUE (
 CREATE OR REPLACE TABLE APPROVED_ALIAS_NAMES (
     alias_id      INTEGER         AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY NOT NULL,
     alias_name    VARCHAR(1000)   NOT NULL,
-    domain_id     INTEGER,                                         -- SQLite column_specs.spec_id (per-column scope; historical name)
+    domain_id     INTEGER,                                         -- Prism's per-column spec id (lookup scope; historical name)
     usage_count   INTEGER         NOT NULL DEFAULT 0,
     last_used_at  TIMESTAMP_NTZ,
     CONSTRAINT uq_approved_alias_names UNIQUE (alias_name, domain_id)
@@ -184,8 +175,8 @@ CREATE OR REPLACE TABLE LITERAL_ALIAS_MATCHES (
     alias_id        INTEGER         NOT NULL
                                     REFERENCES APPROVED_ALIAS_NAMES(alias_id)
                                     ON DELETE RESTRICT,
-    domain_id       INTEGER,                                        -- SQLite column_specs.spec_id (per-column scope; denormalized from alias)
-    run_id          INTEGER         NOT NULL,  -- SQLite runs.run_id (cross-store ref; 0 = seed sentinel)
+    domain_id       INTEGER,                                        -- Prism's per-column spec id (denormalized from alias)
+    run_id          INTEGER         NOT NULL,  -- Prism's app-side run id (0 = seed sentinel)
     confirmed_at    TIMESTAMP_NTZ   NOT NULL DEFAULT CURRENT_TIMESTAMP()
 );
 
@@ -201,9 +192,9 @@ CREATE OR REPLACE TABLE LITERAL_ALIAS_MATCHES (
 -- must reproduce EVERY source row with the standardized columns substituted, so
 -- the rows have to outlive the request that uploaded them.
 --
--- Why here and not SQLite: these are customer VALUES. The data-residency rule
--- is that values live in the customer's warehouse and SQLite keeps only
--- metadata/config.
+-- Why here: these rows contain your data VALUES. The data-residency rule is
+-- that values live in your warehouse, and Prism's application-side database
+-- keeps only metadata/config.
 --
 -- Lifecycle: written at session creation, read at export, deleted when the
 -- session is discarded or its archive row is removed.
@@ -240,12 +231,11 @@ CREATE OR REPLACE TABLE ONE_TIME_FILE_BLOBS (
 -- ----------------------------------------------------------------------------
 -- RUN_STATE — the run review state blob (data residency).
 -- One row per run: the full grouping/review JSON for that run. The blob
--- contains the customer's distinct column values under review, so it lives in
--- the CUSTOMER's warehouse, never in the app's local SQLite (which keeps only
--- run metadata: status, source, nonce). The optimistic-concurrency revision
--- counter lives INSIDE the blob (state:rev; missing = 0) — the app's
--- rev-checked save compares it in SQL. run_id references the SQLite runs
--- table (plain integer, no FK — same as pipeline_id elsewhere).
+-- contains your distinct column values under review, so it lives here, in
+-- YOUR warehouse — never in the Prism application's own storage (which keeps
+-- only run metadata: status, source, nonce). The optimistic-concurrency
+-- revision counter lives INSIDE the blob (state:rev; missing = 0). run_id
+-- references Prism's app-side run record.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE TABLE RUN_STATE (
     run_id      INTEGER         NOT NULL PRIMARY KEY,
@@ -268,13 +258,11 @@ CREATE OR REPLACE TABLE VALIDATION_LOG (
 );
 
 -- ============================================================================
--- MOVED TO SQLITE
--- ACCOUNTS, INVITATIONS, ONE_TIME_STANDARDIZATIONS, RUNS (metadata only —
--- the state blob is warehouse-side in RUN_STATE above), and PIPELINES live in
--- the local app database (stand-ui/app/api/_lib/sqlite.ts), not in Snowflake.
--- The rule: anything holding customer VALUES lives here in the customer's
--- warehouse; pure app-state (accounts, configs, run/pipeline metadata) stays
--- in SQLite.
+-- DATA RESIDENCY
+-- The Prism application's own database keeps only accounts, configuration,
+-- and run/pipeline metadata. Anything holding your data VALUES — the lookup
+-- tables, run review state, validation log, and every export — lives here,
+-- in your Snowflake account.
 -- ============================================================================
 
 -- ============================================================================
@@ -363,7 +351,7 @@ GRANT USAGE ON FUNCTION PRISM_DB.INTERNAL.PRISM_NORMALIZE(VARCHAR)              
 -- Human admins who hand-edit lookup/config tables get PRISM_DATA_ADMIN only.
 -- Never give the service user PRISM_DATA_ADMIN; never give human users PRISM_SERVICE.
 -- (The setup wizard's step 2 creates the PRISM_SVC service user and grants it
--- PRISM_SERVICE; dev-account grants live in 02_demo_data.sql.)
+-- PRISM_SERVICE.)
 -- GRANT ROLE PRISM_SERVICE      TO USER <service_user>;
 -- GRANT ROLE PRISM_DATA_ADMIN TO USER <human_admin>;
 
@@ -378,7 +366,6 @@ GRANT USAGE ON FUNCTION PRISM_DB.INTERNAL.PRISM_NORMALIZE(VARCHAR)              
 -- Let the customer's consuming roles read every export table Prism creates in
 -- the schema — COPY GRANTS carries the materialized grant through rebuilds:
 -- GRANT SELECT ON FUTURE TABLES IN SCHEMA <export_db>.<schema>      TO ROLE <consumer_role>;
--- (Dev/test grants for TEST_DB live in 02_demo_data.sql.)
 
 -- ── Verification (run after setup to confirm) ─────────────────────────────────
 -- SHOW GRANTS TO ROLE PRISM_SERVICE;

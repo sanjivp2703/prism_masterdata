@@ -558,3 +558,27 @@ would be silently void — through no fault of Prism's code.
 role, `ZERO_GRANTS_TEST` role) were dropped after the investigation. The
 onboarding checklist item added as a result of this finding is in
 `CLIENT_ONBOARDING.md` §Appendix A.
+
+## Export referee disabled — the customer's mapping always wins (2026-08-18)
+
+**Decision (owner, during the standard-edition client-sim rehearsal):** the
+export validation referee (Case A/B/C LLM review of user changes that
+contradict the lookup or a high-confidence initial grouping) is DISABLED.
+Whatever the reviewer exports is written to the lookup verbatim, always.
+
+**Trigger:** matrix test C3 — the owner deliberately moved a lookup-confirmed
+"Boost" into the AT&T group; the referee reverted it to "Boost Mobile"
+exactly per its spec ("revert only when extremely confident the change is a
+mistake"). Working as designed — and the owner judged the design itself
+wrong: user sovereignty over the shared lookup beats protection from
+accidental drags.
+
+**Trade accepted:** an accidental mis-drag exported by a reviewer now lands
+in the shared lookup with no automatic backstop; the remedy is human (re-move
+and re-export).
+
+**Implementation:** `EXPORT_REFEREE_ENABLED = false` in op-export.ts's
+`runWriteAndValidatePass` — the referee block is skipped, `decisions = null`
+rides the long-standing fail-open path, `VALIDATION_LOG` gets no new rows
+(table retained, vestigial). Detection machinery, prompts, and the Case C
+`initial_*` stamps are all retained; re-enabling is a one-line change.

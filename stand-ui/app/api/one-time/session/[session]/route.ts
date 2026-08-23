@@ -45,6 +45,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
       const states = await loadOpRunStatesBatch(runIds, conn);
 
       const source_relation = String((rows[0] as any).SOURCE_RELATION ?? (rows[0] as any).source_relation ?? '');
+      // Which connection this session runs on — recorded at creation when the
+      // service login couldn't see the source. The review UI needs it to
+      // suggest a destination the session can actually write (finding #28):
+      // PRISM_OUT is the service login's granted output schema, but a
+      // personal-credentials session writes with the USER's rights instead.
+      const firstMeta = safeJson((rows[0] as any).STATS_SNAPSHOT ?? (rows[0] as any).stats_snapshot) ?? {};
+      const uses_user_connection = String(firstMeta.connection ?? 'service') === 'user';
       let exported = false;
       const columns = rows.map((r) => {
         const a = r as any;
@@ -68,7 +75,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ ses
       // options on this: a file session can be exported as CSV/Excel/Sheets/table,
       // a warehouse session writes a table as it always has.
       const isFileSession = (await countOneTimeFileRows(conn, sessionNonce)) > 0;
-      return Response.json({ session: sessionNonce, source_relation, exported, columns, is_file_session: isFileSession });
+      return Response.json({ session: sessionNonce, source_relation, exported, columns, is_file_session: isFileSession, uses_user_connection });
     });
   } catch (err) {
     return warehouseErrorResponse(err, 'Failed to load one-time session');

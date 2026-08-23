@@ -67,6 +67,9 @@ const pipelineForProcessing = {
 const pollRef = {
   pipeline_id: PID, table_fqn: SRC_FQN, column_name: 'RAW_CARRIER_VALUE',
   domain_id: 1, export_table_fqn: EXP_FQN, status_message: null, change_tracking_consent: true,
+  // As above: service connection, table export, mapped-only.
+  use_user_connection: false, created_by: null, export_kind: 'table',
+  export_unmapped_rows: false,
 };
 const pipelineRow = () => getDb().prepare(`SELECT * FROM pipelines WHERE pipeline_id = ?`).get(PID) as any;
 

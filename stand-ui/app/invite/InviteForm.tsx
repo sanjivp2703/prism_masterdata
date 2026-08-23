@@ -5,9 +5,9 @@ import Link from 'next/link';
 
 const DISCLOSURE = `By inviting a new user to this workspace, you acknowledge and agree to the following:
 
-1. Data access. The invited user will gain access to this Prism workspace upon acceptance. This includes the ability to view run history, canonical mappings, raw literal values, and any other data that has been standardised within this workspace.
+1. Data access. The invited user will gain access to this Prism workspace upon acceptance. This includes the ability to view run history, canonical mappings, raw literal values, and any other data that has been standardized within this workspace.
 
-2. Your responsibility. You are solely responsible for ensuring that you have the necessary authority to grant the invited person access to the data contained in this workspace. You should not invite anyone unless you are certain that sharing the relevant data with that person is appropriate and permitted under any applicable legal, contractual, or organisational obligations.
+2. Your responsibility. You are solely responsible for ensuring that you have the necessary authority to grant the invited person access to the data contained in this workspace. You should not invite anyone unless you are certain that sharing the relevant data with that person is appropriate and permitted under any applicable legal, contractual, or organizational obligations.
 
 3. No liability. Prism and its operators expressly disclaim all liability for any consequences — including, without limitation, data breaches, regulatory violations, contractual disputes, or commercial losses — arising from or related to your decision to invite a new user or that user's subsequent access to data on this platform.
 
@@ -16,12 +16,12 @@ By proceeding you confirm that you have read, understood, and agreed to the abov
 const ROLE_INFO = {
   admin: {
     label: 'Admin',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings', 'Invite new users', 'Remove accounts'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings', 'Invite new users', 'Remove accounts'],
     cannot: [] as string[],
   },
   user: {
     label: 'User',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings'],
     cannot: ['Invite new users', 'Remove accounts'],
   },
 };
@@ -104,15 +104,17 @@ export default function InviteForm() {
                 </p>
                 <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
                   {emailSent
-                    ? <><strong>{sentEmail}</strong> has been invited as <strong>{ROLE_INFO[role].label}</strong>. The link expires in 7 days.</>
-                    : <>Email couldn&apos;t be sent (SMTP not configured). Copy and share this link with <strong>{sentEmail}</strong>:</>
+                    ? <><strong>{sentEmail}</strong> has been invited as <strong>{ROLE_INFO[role].label}</strong>. The link expires in 7 days. Invitation emails sometimes land in <strong>spam</strong> — if it hasn&apos;t arrived in a few minutes, ask them to check there, or send them the link below yourself.</>
+                    : <>The email couldn&apos;t be sent, but the invitation is valid. Copy and share this link with <strong>{sentEmail}</strong>:</>
                   }
                 </p>
               </div>
             </div>
 
-            {/* Copy-link box — shown when email wasn't delivered */}
-            {!emailSent && acceptUrl && (
+            {/* Copy-link box — shown whenever a link exists, including after a
+                successful send: the mail may be spam-filtered, and this is the
+                inviter's only workaround (finding #24). */}
+            {acceptUrl && (
               <div
                 className="rounded-[8px] border-[0.5px] flex items-center gap-2 mb-4 overflow-hidden"
                 style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}
@@ -146,7 +148,7 @@ export default function InviteForm() {
 
             {!emailSent && (
               <p className="text-xs mb-4" style={{ color: 'var(--text-hint)' }}>
-                To enable automatic emails, add SMTP_HOST, SMTP_USER, and SMTP_PASS to your .env.local — see .env.local.example for setup instructions.
+                To enable automatic emails, set RESEND_API_KEY (an HTTPS email API — works on hosts that block SMTP, which most cloud providers do) or the SMTP_HOST / SMTP_USER / SMTP_PASS trio in .env.local.
               </p>
             )}
 

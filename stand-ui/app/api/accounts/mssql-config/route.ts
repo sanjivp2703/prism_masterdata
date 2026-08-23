@@ -28,7 +28,7 @@ export async function GET() {
   return Response.json({
     server: r?.ms_server ?? ws?.server ?? null,
     port: r?.ms_port ?? ws?.port ?? 1433,
-    database: r?.ms_database ?? ws?.database ?? 'PRISM_DB',
+    database: r?.ms_database ?? null,
     user: r?.ms_user ?? null,
     has_secret: Boolean(r?.has_secret),
   });
@@ -52,7 +52,10 @@ export async function POST(request: Request) {
   const ws = getWorkspaceMsConfig();
   const server = String(body?.server ?? '').trim() || ws?.server || '';
   const port = Number(body?.port ?? ws?.port ?? 1433);
-  const database = String(body?.database ?? '').trim() || ws?.database || 'PRISM_DB';
+  // Personal credentials: an empty database stays empty (finding #26).
+  // Inheriting the workspace's PRISM_DB pointed personal logins at Prism's
+  // internal database, which they are not granted on.
+  const database = String(body?.database ?? '').trim();
   const user = String(body?.user ?? '').trim();
   let password = typeof body?.password === 'string' ? body.password : '';
 

@@ -1,8 +1,39 @@
 import 'server-only';
 import nodemailer from 'nodemailer';
 
+/** HTTPS email API (Resend). Preferred over SMTP because many hosts block
+ *  outbound SMTP entirely — DigitalOcean blocks 25/465/587 on new accounts,
+ *  which made invitation email impossible on a standard droplet deploy
+ *  (live-verified 2026-08-19). Nothing here needs a mail port. */
+function getResendKey(): string | undefined {
+  return process.env.RESEND_API_KEY?.trim() || undefined;
+}
+
 export function isEmailConfigured(): boolean {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  return !!(getResendKey() || (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS));
+}
+
+/** Sends via Resend's HTTP API. Throws on a non-2xx so the caller's
+ *  degrade-to-link path handles it exactly like an SMTP failure. */
+async function sendViaResend(args: {
+  apiKey: string; from: string; to: string; subject: string; html: string; text: string;
+}): Promise<void> {
+  const res = await fetch('https://api.resend.com/emails', {
+    method:  'POST',
+    headers: { Authorization: `Bearer ${args.apiKey}`, 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      from: args.from, to: [args.to], subject: args.subject, html: args.html, text: args.text,
+    }),
+    // Same fail-fast posture as the SMTP transport.
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    // Resend returns a JSON body explaining the refusal (unverified domain,
+    // bad key, rate limit) — surface it, since those are exactly the setup
+    // mistakes an operator needs to see.
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Resend API ${res.status}: ${detail.slice(0, 300)}`);
+  }
 }
 
 function getTransport() {
@@ -22,11 +53,21 @@ function getTransport() {
     port,
     secure: port === 465,
     auth: { user, pass },
+    // Fail fast. Outbound SMTP is blocked by default on many hosts
+    // (DigitalOcean does it on new accounts) and nodemailer's default
+    // timeouts leave the invite request hanging for minutes before the
+    // caller can fall back to showing the link.
+    connectionTimeout: 10_000,
+    greetingTimeout:   10_000,
+    socketTimeout:     20_000,
   });
 }
 
 function getFrom() {
-  return process.env.SMTP_FROM || process.env.SMTP_USER || 'Prism <noreply@prism.app>';
+  // EMAIL_FROM is the provider-neutral name; SMTP_FROM stays supported so
+  // existing installs keep working. With Resend this address must be on a
+  // domain verified in the Resend dashboard.
+  return process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || 'Prism <noreply@prism.app>';
 }
 
 function getAppUrl() {
@@ -42,12 +83,12 @@ const BRAND_MUTED = '#6B7280';
 const ROLE_DESCRIPTIONS: Record<'admin' | 'user', { label: string; can: string[]; cannot: string[] }> = {
   admin: {
     label:  'Admin',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings', 'Invite new users (admin or user)', 'Remove existing accounts'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings', 'Invite new users (admin or user)', 'Remove existing accounts'],
     cannot: [],
   },
   user: {
     label:  'User',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings'],
     cannot: ['Invite new users', 'Remove accounts'],
   },
 };
@@ -107,7 +148,7 @@ function inviteHtml(inviterName: string, inviterEmail: string, acceptUrl: string
               <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.6;">
                 <strong>${inviterName || inviterEmail}</strong> has invited you to join
                 <strong>Prism</strong> as a <strong>${ROLE_DESCRIPTIONS[role].label}</strong> — a data
-                standardisation platform for unifying inconsistent categorical values across
+                standardization platform for unifying inconsistent categorical values across
                 your data warehouse's tables.
               </p>
 
@@ -139,13 +180,13 @@ function inviteHtml(inviterName: string, inviterEmail: string, acceptUrl: string
                 </p>
                 <p style="margin:0;font-size:11px;color:${BRAND_MUTED};line-height:1.7;">
                   By accepting this invitation, you will gain access to the Prism workspace
-                  associated with this account. Any data submitted for standardisation on
+                  associated with this account. Any data submitted for standardization on
                   this platform — including raw values, canonical mappings, and run
                   history — may be viewable by other members of this workspace.
                   You should only proceed if you have the authority to share the relevant
                   data with other workspace members and accept this as a condition of use.
                   <strong>Prism and its operators are not liable for any consequences
-                  arising from the disclosure, sharing, or standardisation of data on this
+                  arising from the disclosure, sharing, or standardization of data on this
                   platform.</strong> If you did not expect this invitation, you may safely
                   disregard this email.
                 </p>
@@ -178,6 +219,30 @@ export function buildAcceptUrl(token: string): string {
 
 // Returns the accept URL always. If SMTP isn't configured, logs it to console
 // and returns { sent: false, acceptUrl } so the caller can surface it in the UI.
+/** Plain-text alternative — identical wording to the SMTP path's inline
+ *  version, extracted so both transports send the same body. */
+function inviteText(
+  inviterName: string | undefined,
+  inviterEmail: string,
+  acceptUrl: string,
+  invitedRole: 'user' | 'admin',
+): string {
+  const roleDesc = ROLE_DESCRIPTIONS[invitedRole];
+  return [
+    `You've been invited to Prism by ${inviterName || inviterEmail} as ${roleDesc.label}.`,
+    '',
+    `Your role (${roleDesc.label}) permissions:`,
+    ...roleDesc.can.map(pp => `  \u2713 ${pp}`),
+    ...roleDesc.cannot.map(pp => `  \u2717 ${pp}`),
+    '',
+    `Accept your invitation: ${acceptUrl}`,
+    '',
+    'DISCLOSURE: By accepting, you may gain access to data submitted by other workspace members. Prism is not liable for any consequences related to data shared on this platform.',
+    '',
+    'This link expires in 7 days.',
+  ].join('\n');
+}
+
 export async function sendInviteEmail(opts: {
   to: string;
   inviterName: string;
@@ -195,27 +260,29 @@ export async function sendInviteEmail(opts: {
     return { sent: false, acceptUrl };
   }
 
-  const transport = getTransport();
+  // A send FAILURE degrades exactly like "not configured" (finding #23):
+  // the invitation itself is already valid, so the caller must be able to
+  // show the link rather than report a failure that didn't happen. Only the
+  // delivery failed, and that is what `sent: false` means.
+  const subject   = `${opts.inviterName || opts.inviterEmail} invited you to Prism as ${roleDesc.label}`;
+  const html      = inviteHtml(opts.inviterName, opts.inviterEmail, acceptUrl, opts.invitedRole);
+  const text      = inviteText(opts.inviterName, opts.inviterEmail, acceptUrl, opts.invitedRole);
+  const resendKey = getResendKey();
 
-  await transport.sendMail({
-    from:    getFrom(),
-    to:      opts.to,
-    subject: `${opts.inviterName || opts.inviterEmail} invited you to Prism as ${roleDesc.label}`,
-    html:    inviteHtml(opts.inviterName, opts.inviterEmail, acceptUrl, opts.invitedRole),
-    text: [
-      `You've been invited to Prism by ${opts.inviterName || opts.inviterEmail} as ${roleDesc.label}.`,
-      '',
-      `Your role (${roleDesc.label}) permissions:`,
-      ...roleDesc.can.map(p => `  ✓ ${p}`),
-      ...roleDesc.cannot.map(p => `  ✗ ${p}`),
-      '',
-      `Accept your invitation: ${acceptUrl}`,
-      '',
-      'DISCLOSURE: By accepting, you may gain access to data submitted by other workspace members. Prism is not liable for any consequences related to data shared on this platform.',
-      '',
-      'This link expires in 7 days.',
-    ].join('\n'),
-  });
+  try {
+    if (resendKey) {
+      await sendViaResend({ apiKey: resendKey, from: getFrom(), to: opts.to, subject, html, text });
+    } else {
+      await getTransport().sendMail({ from: getFrom(), to: opts.to, subject, html, text });
+    }
+  } catch (err) {
+    console.error(
+      `[Prism] Invitation email to ${opts.to} could not be sent (the invitation is still valid — ` +
+      `share the link manually):`,
+      (err as { message?: string })?.message ?? err,
+    );
+    return { sent: false, acceptUrl };
+  }
 
   return { sent: true, acceptUrl };
 }

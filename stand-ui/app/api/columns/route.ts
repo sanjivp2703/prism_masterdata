@@ -16,6 +16,7 @@
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import { isSimpleIdent } from '@/app/api/_lib/op-one-time';
 import { getPrimaryKeyColumns, isCtEnabled } from '@/app/api/_lib/warehouse/mssql/detection';
 import { parseFqn as pgParseFqn, assertFqnInDatabase } from '@/app/api/_lib/warehouse/postgres/dialect';
 import { getConnectedPgDatabase } from '@/app/api/_lib/warehouse/postgres/connection';
@@ -198,11 +199,22 @@ export async function GET(request: Request) {
       return json({ error: 'table_fqn must be DATABASE.TABLE (MySQL has no schema level)' }, 400);
     }
   } else {
+    // A pasted URL splits into three dot-parts and sails past the count
+    // check, then blows up in SQL ("Incorrect syntax near 'HTTPS:'") — and
+    // the failure used to surface as "Prism can't see this table", sending
+    // the user chasing grants for a typo (live-found 2026-08-17, client-sim
+    // finding #8). Name the real problem before any SQL runs.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(table_fqn)) {
+      return json({ error: 'That looks like a web address, not a table name. Enter the table as DATABASE.SCHEMA.TABLE (for example CLIENT_DB.dbo.CUSTOMER_ORDERS).' }, 400);
+    }
     const parts = table_fqn.split('.');
     if (parts.length !== 3) {
       return json({ error: 'table_fqn must be DATABASE.SCHEMA.TABLE' }, 400);
     }
     [db, schema, table] = parts.map(p => p.trim().replace(/^"|"$/g, '').toUpperCase());
+    if (!db || !schema || !table || ![db, schema, table].every(isSimpleIdent)) {
+      return json({ error: "That doesn't look like a valid table name. Enter it as DATABASE.SCHEMA.TABLE (for example CLIENT_DB.dbo.CUSTOMER_ORDERS)." }, 400);
+    }
   }
 
   try {
@@ -218,9 +230,19 @@ export async function GET(request: Request) {
         return json({ ...viaService, connection: 'service' });
       }
     } catch (serviceErr) {
-      // Service connection itself broken — fall through to the personal one
-      // if available; otherwise surface the sanitized error.
-      if (!(await hasUserWarehouseConfig(Number(session.accountId)))) throw serviceErr;
+      // An ACCESS-classified failure here IS the answer, not an exception: a
+      // table inside an accessible database shows up as zero rows, but a
+      // database the service login can't touch at all THROWS (live-found
+      // 2026-08-18 — the thrown path skipped the friendly can't-see response,
+      // so the connect form's grant-SQL panel never rendered for exactly the
+      // tables that need it most). Fall through to the can't-see/fallback
+      // responses below. A NON-access failure (service connection itself
+      // broken) still surfaces as an error unless a personal connection can
+      // be tried instead.
+      if (!isWarehouseAccessError(serviceErr) &&
+          !(await hasUserWarehouseConfig(Number(session.accountId)))) {
+        throw serviceErr;
+      }
     }
 
     // 2. User-connection fallback (one-time standardization use case) —
@@ -269,7 +291,15 @@ export async function GET(request: Request) {
       columns: {}, fields: [], connection: 'service',
       needs_user_connection: true,
       error: surface === 'pipeline'
-        ? "Prism can't see this table. Pipelines always read with Prism's own service connection, so an administrator needs to grant it access — the exact GRANT statements are in setup step 2, Part D."
+        // Warehouse-aware (2026-08-17): "Part D" is the SNOWFLAKE wizard's
+        // grants section, and "always the service connection" stopped being
+        // true on SQL Server the day user-connection pipelines shipped —
+        // there, saving personal credentials is a legitimate second remedy.
+        ? (isMssql
+            ? "Prism's service login can't see this table. An administrator can grant it access — the SQL is in setup step 2, Part C — or save your own SQL Server credentials in Setup, and the pipeline can read the table with your access instead."
+            : getWarehouseAdapter().kind === 'snowflake'
+              ? "Prism can't see this table. Pipelines always read with Prism's own service connection, so an administrator needs to grant it access — the exact GRANT statements are in setup step 2, Part D."
+              : "Prism can't see this table. Pipelines read with Prism's own service connection, so an administrator needs to grant it access — the data-access SQL is in setup step 2.")
         // The "stored encrypted, used only on your behalf" clause has to live
         // HERE, not only in the client's `??` fallback. The client prefers
         // body.error whenever the server sends one — which is always on this

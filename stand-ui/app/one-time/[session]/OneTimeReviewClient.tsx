@@ -9,7 +9,7 @@ import {
   sanitizeConventionRules,
   type ConventionRules,
 } from '@/app/api/_lib/convention-rules';
-import { useWarehouseLabel } from '@/app/components/use-warehouse-label';
+import { useWarehouseLabel, useWarehouseKind } from '@/app/components/use-warehouse-label';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -139,10 +139,13 @@ function CopyButton({ text }: { text: string }) {
 }
 
 function ExportModal({
-  defaultTarget, sourceRelation, onClose, onExport, busy, error, grantsNeeded, grantsRunAs,
+  defaultTarget, sourceRelation, usesUserConnection, onClose, onExport, busy, error, grantsNeeded, grantsRunAs,
   isFileSession,
 }: {
   defaultTarget:  string;
+  /** Session runs on the user's own credentials — changes whose permissions
+   *  the destination advice should talk about (finding #28). */
+  usesUserConnection?: boolean;
   sourceRelation: string;
   /** File/paste sessions can be exported in any format; a warehouse session
    *  writes a table, which is the only thing it has ever done. */
@@ -156,6 +159,7 @@ function ExportModal({
   grantsRunAs: string;
 }) {
   const warehouseLabel = useWarehouseLabel();
+  const warehouseKind  = useWarehouseKind();
   const [mode, setMode]     = useState<'create' | 'overwrite'>('create');
   const [target, setTarget] = useState(defaultTarget);
   const [format, setFormat] = useState<ExportFormat>(isFileSession ? 'csv' : 'warehouse');
@@ -260,6 +264,29 @@ function ExportModal({
           className="w-full text-sm px-3 py-2 rounded-button border-[0.5px] outline-none font-mono disabled:opacity-50"
           style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
         />
+
+        {/* Where to write, and what a different destination costs. Prism's
+            login is deliberately least-privilege: it can create tables in the
+            PRISM_OUT schema the setup wizard grants it, and nowhere else — so
+            anyone typing another schema needs to know which permissions to
+            arrange BEFORE the export fails (owner request 2026-08-18). */}
+        {mode === 'create' && !grantsNeeded && warehouseKind === 'mssql' && (
+          usesUserConnection ? (
+            <p className="text-[11px] mt-2 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              This export runs with <strong>your own SQL Server login</strong>, so it can write
+              anywhere you can create tables — the suggestion above keeps it beside the source
+              table. If you choose another schema, it must be one your login can create tables in.
+            </p>
+          ) : (
+            <p className="text-[11px] mt-2 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+              Writing to the <span className="font-mono">PRISM_OUT</span> schema is recommended — it is
+              set up for Prism&apos;s output during installation. To write anywhere else, that database
+              needs <span className="font-mono">GRANT CREATE TABLE</span> for Prism&apos;s login and that
+              schema needs <span className="font-mono">GRANT ALTER ON SCHEMA::&lt;schema&gt;</span>;
+              without both, the export fails with a permission error.
+            </p>
+          )
+        )}
 
         {mode === 'overwrite' && !grantsNeeded && (
           <div className="rounded-button border-[0.5px] px-3 py-2.5 mt-3" style={{ backgroundColor: '#FFF7ED', borderColor: '#FED7AA' }}>
@@ -380,14 +407,41 @@ function ExportModal({
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+/** Where a one-time export should be suggested to land.
+ *
+ *  SQL Server: the PRISM_OUT schema the setup wizard's Part C creates and
+ *  grants — NOT the source's own schema. Prism's service login deliberately
+ *  holds create rights in PRISM_OUT only, so suggesting `<source>_STANDARDIZED`
+ *  (i.e. dbo) recommended the one destination guaranteed to fail with a
+ *  permission error (owner report 2026-08-18; the pipeline connect form was
+ *  already fixed this way as finding #5).
+ *
+ *  Every other warehouse keeps the alongside-the-source suggestion. */
+function suggestOneTimeTarget(sourceRelation: string, kind: string, usesUserConnection = false): string {
+  const src = sourceRelation.trim();
+  if (!src) return '';
+  // PRISM_OUT is the schema the setup wizard grants PRISM'S SERVICE LOGIN, in
+  // the databases the DBA ran Part C against. A session running on the USER'S
+  // own credentials writes with their rights instead — and the source's
+  // database may have no PRISM_OUT at all (live-hit: PRIVATE_DB had only dbo).
+  // There, the source's own schema is both writable and expected.
+  if (kind === 'mssql' && !usesUserConnection) {
+    const parts = src.split('.');
+    if (parts.length === 3) return `${parts[0]}.PRISM_OUT.${parts[2]}_STANDARDIZED`;
+  }
+  return `${src}_STANDARDIZED`;
+}
+
 export default function OneTimeReviewClient({ session }: { session: string }) {
   const router = useRouter();
   const warehouseLabel = useWarehouseLabel();
+  const warehouseKind  = useWarehouseKind();
 
   const [loading, setLoading]       = useState(true);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [sourceRelation, setSourceRelation] = useState('');
   const [isFileSession, setIsFileSession] = useState(false);
+  const [usesUserConn, setUsesUserConn] = useState(false);
   const [columns, setColumns]       = useState<ColMeta[]>([]);
   const [pages, setPages]           = useState<Record<number, PageState>>({});
   const [active, setActive]         = useState(0);
@@ -460,6 +514,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         if (cancelled) return;
         setSourceRelation(body.source_relation ?? '');
         setIsFileSession(body.is_file_session === true);
+        setUsesUserConn(body.uses_user_connection === true);
         const cols: any[] = body.columns ?? [];
         setColumns(cols.map((c) => {
           // Parse the per-column convention into the shape the rename guard needs.
@@ -1192,7 +1247,8 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
       {showExport && (
         <ExportModal
-          defaultTarget={sourceRelation ? `${sourceRelation}_STANDARDIZED` : ''}
+          defaultTarget={suggestOneTimeTarget(sourceRelation, warehouseKind, usesUserConn)}
+          usesUserConnection={usesUserConn}
           sourceRelation={sourceRelation}
           isFileSession={isFileSession}
           onClose={() => { setShowExport(false); setExportError(null); setExportGrants(null); }}

@@ -1,4 +1,4 @@
-import { warehouseErrorResponse, withWarehouse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { warehouseErrorResponse, withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
 import { clearBaseline } from '@/app/api/_lib/auto-export-seen';
 import { requireValidSession } from '@/app/api/_lib/account-security';
@@ -72,7 +72,23 @@ export async function GET(request: Request) {
   }
 
   try {
-    return await withWarehouse(async (connection) => {
+    // Same connection ladder as /api/columns (finding #29): the service login
+    // first, then — only when it is refused for ACCESS reasons — the
+    // creator's own saved credentials. Without this, connecting a pipeline to
+    // a table only the user can see reported "Failed to fetch source values"
+    // on the setup screen, even though creation itself would have succeeded
+    // via the same fallback.
+    const runProbe = async <T,>(fn: (connection: any) => Promise<T>): Promise<T> => {
+      try {
+        return await withWarehouse(fn);
+      } catch (serviceErr) {
+        if (!isWarehouseAccessError(serviceErr)) throw serviceErr;
+        if (!(await hasUserWarehouseConfig(Number(authz.accountId)))) throw serviceErr;
+        return await withUserWarehouse(Number(authz.accountId), fn);
+      }
+    };
+
+    return await runProbe(async (connection) => {
       // Postgres: 2-part reference — a connection is bound to one database,
       // and a 3-part form naming another database can't be honored anyway
       // (pgTableRef validates that upstream surfaces; here the db part is

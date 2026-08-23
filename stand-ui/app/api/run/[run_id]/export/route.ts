@@ -146,6 +146,34 @@ export async function POST(
       // just mark the run approved and return its pipeline so the activation card
       // can drive the commit. The pipeline stays pending_baseline (hidden from the
       // pipelines list) until Begin commits + activates it.
+      //
+      // Deferral exists FOR that initial-setup wizard, and ONLY for it. The
+      // client hardcodes defer:true for every pipeline-mode run, so a manual
+      // re-standardization review on an already-LIVE pipeline used to land
+      // here too: the run was marked 'approved', nothing was exported, and
+      // the client routed the reviewer back into the "Begin pipeline" wizard
+      // (owner report 2026-08-18, client-sim rehearsal). When the run's
+      // pipeline is anything other than pending_baseline, ignore `defer` and
+      // run the real export below — the reviewer's decisions land
+      // immediately and the client returns straight to the pipelines page.
+      let livePipeline = false;
+      if (deferWrite) {
+        const liveCheck = getDb()
+          .prepare(
+            `SELECT p.status
+             FROM pipelines p
+             JOIN runs r ON r.run_id = ?
+             WHERE p.table_fqn = r.source_relation
+               AND p.column_name = r.source_column
+               AND ((p.domain_id IS NULL AND r.domain_id IS NULL) OR p.domain_id = r.domain_id)
+             LIMIT 1`,
+          )
+          .get(runId) as any;
+        if (liveCheck && String(liveCheck.status ?? '') !== 'pending_baseline') {
+          deferWrite = false;
+          livePipeline = true;
+        }
+      }
       if (deferWrite) {
         getDb()
           .prepare(`UPDATE runs SET run_status = 'approved', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE run_id = ?`)
@@ -221,14 +249,14 @@ export async function POST(
           // Export table refresh is handled inside runWriteAndValidatePass (op-export.ts)
           // AFTER the literal writes commit — not here, where the writes are still in flight.
 
-          return Response.json({ data: result, pipeline_id: pid }, { status: 200 });
+          return Response.json({ data: result, pipeline_id: pid, pipeline_active: livePipeline }, { status: 200 });
         }
        } catch (qErr) {
         console.warn(`[export] Could not clear pipeline queue for run ${runId}:`, qErr);
        }
       }
 
-      return Response.json({ data: result }, { status: 200 });
+      return Response.json({ data: result, pipeline_active: livePipeline }, { status: 200 });
     });
   } catch (error) {
     console.error(`[export] Error for run ${runId}:`, error);

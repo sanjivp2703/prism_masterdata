@@ -447,6 +447,13 @@ export async function filterUnknownValues(
   pipelineId: number,
   domainId: number | null,
   candidates: Array<{ literal_value: string; frequency: number }>,
+  // Change Tracking hands us values that ACTUALLY CHANGED, so an
+  // already-mapped one still represents new rows the export has to publish
+  // (finding #30). Those callers pass includeMapped: true and get
+  // Snowflake's consistent-snapshot behaviour — dedup against the queue
+  // only. Diff scans must NOT: they re-read the whole column each pass, so
+  // including mapped values would re-queue everything forever.
+  opts: { includeMapped?: boolean } = {},
 ): Promise<Array<{ literal_value: string; frequency: number }>> {
   if (!candidates.length) return [];
 
@@ -459,6 +466,7 @@ export async function filterUnknownValues(
 
   const unqueued = candidates.filter(c => !queuedNorms.has(normalizeLiteral(c.literal_value)));
   if (!unqueued.length) return [];
+  if (opts.includeMapped) return unqueued;
 
   // Batched semi-join against the lookup (bind ceiling ~2100 → 500/batch,
   // +1 scope/spec_id bind).

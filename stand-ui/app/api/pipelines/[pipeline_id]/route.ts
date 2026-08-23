@@ -12,6 +12,7 @@ import { refreshExportTable, columnModeSetupSql } from '@/app/api/_lib/export-ta
 import { tableModeSetupSql } from '@/app/api/_lib/warehouse/mssql/export';
 import { asUpdateSchedule, serializeUpdateSchedule } from '@/app/api/_lib/update-schedule';
 import { type ExportKind, asExportKind } from '@/app/api/_lib/export-kind';
+import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims';
 import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 
@@ -56,8 +57,22 @@ export async function PATCH(
     binds.push(serializeUpdateSchedule(schedule));
   }
   if (body?.export_table_fqn !== undefined) {
+    // Same collision guard as creation (finding #21) — retargeting an
+    // existing pipeline onto another source's output, or onto a one-time
+    // export's table, would overwrite it on the next rebuild. Ignores this
+    // pipeline's own claim so a no-op save still works.
+    const nextExport = body.export_table_fqn ? String(body.export_table_fqn).trim() : null;
+    if (nextExport) {
+      const ownerRow = getDb()
+        .prepare(`SELECT table_fqn FROM pipelines WHERE pipeline_id = ?`)
+        .get(pid) as any;
+      const claim = findExportClaim(nextExport, String(ownerRow?.table_fqn ?? ''), { ignorePipelineId: pid });
+      if (claim) {
+        return Response.json({ error: exportClaimError(nextExport, claim) }, { status: 409 });
+      }
+    }
     setClauses.push('export_table_fqn = ?');
-    binds.push(body.export_table_fqn ? String(body.export_table_fqn).trim() : null);
+    binds.push(nextExport);
   }
   if (body?.export_kind !== undefined && ['table', 'view', 'column'].includes(body.export_kind)) {
     // A pipeline may NOT be switched into Column mode here.
@@ -288,29 +303,18 @@ export async function DELETE(
 
   try {
     const response = (() => {
-      // For Sheets pipelines: all columns for the same tab share the same
-      // table_fqn (created in one batch). Delete all siblings so the per-tab
-      // duplicate check doesn't block re-creation after a delete.
+      // Pipelines are warehouse-only since migration 016 (files/Sheets moved
+      // to the one-time flow). The old Sheets sibling-delete here keyed on the
+      // DROPPED source_type column, so this SELECT threw "no such column:
+      // source_type" and EVERY pipeline delete 500'd (live-found 2026-08-17
+      // in the client-sim rehearsal — finding #6). Per-pipeline delete only;
+      // the column's confirmed lookup rows (scoped by spec_id) are left in
+      // the warehouse — an orphaned spec_id is never joined again, so it's
+      // harmless and non-destructive; hard-deleting them would be a separate
+      // opt-in.
       const db = getDb();
-      const fqnRow = db
-        .prepare(`SELECT table_fqn, source_type FROM pipelines WHERE pipeline_id = ?`)
-        .get(pid) as any;
-      const fqn        = String(fqnRow?.table_fqn ?? '');
-      const sourceType = String(fqnRow?.source_type ?? '');
-      // Collect the pipeline_ids we're about to delete so their per-column specs
-      // go with them. (Sheets: all columns for the tab share one table_fqn.)
-      // The columns' confirmed lookup rows (scoped by spec_id) are left in
-      // Snowflake — an orphaned spec_id is never joined again, so it's harmless
-      // and non-destructive; hard-deleting them would be a separate opt-in.
-      const pidRows = fqn && sourceType === 'sheets'
-        ? db.prepare(`SELECT pipeline_id FROM pipelines WHERE table_fqn = ?`).all(fqn) as any[]
-        : [{ pipeline_id: pid }];
-      const pids = pidRows.map(r => Number(r.pipeline_id));
-      if (pids.length > 0) {
-        const ph = pids.map(() => '?').join(', ');
-        db.prepare(`DELETE FROM column_specs WHERE pipeline_id IN (${ph})`).run(...pids);
-        db.prepare(`DELETE FROM pipelines WHERE pipeline_id IN (${ph})`).run(...pids);
-      }
+      db.prepare(`DELETE FROM column_specs WHERE pipeline_id = ?`).run(pid);
+      db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
       return Response.json({ ok: true });
     })();
 

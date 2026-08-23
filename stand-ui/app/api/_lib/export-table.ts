@@ -63,6 +63,7 @@ const pgRefOf = (fqn: string): string => pgTableRef(fqn).ref;
 import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from './warehouse/mssql/dialect';
 import { getServiceLoginName } from './warehouse/mssql/connection';
 import { loadOpRunState } from './op-auto-group';
+import { pipelineConnInfo, userConnPauseMessage } from './pipeline-user-connection';
 import { getDb } from './sqlite';
 import { sqlStringLiteral, normalizeLiteral } from './normalize';
 import { internalTable, prismNormalizeFn } from './warehouse-tables';
@@ -186,7 +187,39 @@ export interface ExportTableResult {
  * works during initial setup, where the calling pipeline may not yet be fully
  * committed.
  */
+// Per-export-table build serialization. Sibling-column pipelines share ONE
+// export table, and their triggers can fire concurrently (live-found
+// 2026-08-18: a two-column Begin raced two rebuilds of the same table — the
+// loser died on sp_rename "name already in use", got misreported as a
+// missing-grants pause, and stranded its half-built __prism_new_ table).
+// Callers are CHAINED, not coalesced: the second rebuild must run AFTER the
+// first, because it may have been triggered by mappings the first build's
+// lookup read predates. On globalThis so dev hot-reload bundles share one map.
+const exportBuildChains: Map<string, Promise<unknown>> =
+  ((globalThis as any).__prismExportBuildChains ??= new Map());
+
 export async function refreshExportTable(
+  source_fqn:   string,
+  column_name:  string,
+  export_fqn:   string,
+  domain_id:    number | null,
+  pipelineId?:  number,
+  exportKind:   ExportKind = 'table',
+): Promise<ExportTableResult> {
+  const key = `${getWarehouseAdapter().kind}:${export_fqn.trim().toUpperCase()}`;
+  const prev = exportBuildChains.get(key) ?? Promise.resolve();
+  const run = prev
+    .catch(() => {}) // a failed predecessor must not fail the whole chain
+    .then(() => doRefreshExportTable(source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind));
+  exportBuildChains.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (exportBuildChains.get(key) === run) exportBuildChains.delete(key);
+  }
+}
+
+async function doRefreshExportTable(
   source_fqn:   string,
   column_name:  string,
   export_fqn:   string,
@@ -202,9 +235,29 @@ export async function refreshExportTable(
           () => refreshStandardizedColumnsMssql(conn, source_fqn, column_name, domain_id, pipelineId),
         );
       }
+      // User-connection pipelines (see pipeline-user-connection.ts): the
+      // source table AND the export destination live behind the creator's
+      // personal credentials — the whole build runs there, with only the
+      // lookup reads staying on the service connection (the builder splits
+      // internally via opts.sourceConn).
+      const connInfo = pipelineId != null ? pipelineConnInfo(pipelineId) : { useUser: false, createdBy: null };
       try {
+        if (connInfo.useUser && connInfo.createdBy != null) {
+          if (!(await hasUserWarehouseConfig(connInfo.createdBy))) {
+            throw new Error(userConnPauseMessage(source_fqn));
+          }
+          return await withUserWarehouse(connInfo.createdBy, (srcConn) =>
+            refreshExportTableMssql(conn, source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind, { sourceConn: srcConn }));
+        }
         return await refreshExportTableMssql(conn, source_fqn, column_name, export_fqn, domain_id, pipelineId, exportKind);
       } catch (err) {
+        // User-connection pipelines: an access failure means the creator's
+        // credentials are gone/broken (or their own table rights changed) —
+        // the "ask an admin for CREATE TABLE" prose below would misdirect.
+        if (connInfo.useUser && pipelineId != null && isWarehouseAccessError(err)) {
+          await pausePipelineWithMessage(pipelineId, userConnPauseMessage(source_fqn), 'error');
+          throw err;
+        }
         // Table-mode rebuilds need CREATE TABLE (database-scoped) + ALTER ON
         // SCHEMA (destination schema) — permissions the mssql onboarding
         // wizard doesn't grant up front (unlike Snowflake's Part D). Pause
@@ -530,6 +583,15 @@ type ColumnModeFailure = 'missing' | 'not_a_table' | 'privilege';
 
 function classifyColumnModeFailure(err: unknown): ColumnModeFailure {
   const msg = String((err as { message?: unknown } | null)?.message ?? err ?? '').toLowerCase();
+  // SQL Server's ALTER-permission failure reads "Cannot find the object X
+  // because it does not exist or you do not have permissions." — it HIDES
+  // objects the login can't alter, so the text is identical to a genuinely
+  // missing table. The mssql column sync only reaches ALTER after
+  // successfully LISTING the table's columns, so at this stage the object
+  // exists and the honest reading is permissions (live-found 2026-08-18:
+  // a brand-new column pipeline's expected first-run grant flag arrived
+  // alongside a spurious "table may have been dropped" alert).
+  if (/cannot find the object/.test(msg) && /do not have permission/.test(msg)) return 'privilege';
   // Order matters: Snowflake's "does not exist or not authorized" mentions
   // authorization too, but a missing object is the more actionable reading —
   // granting on something that isn't there cannot help.
@@ -730,6 +792,20 @@ export async function provisionTableModeAccess(
 export async function checkTableModeAccess(export_table_fqn: string): Promise<boolean> {
   if (getWarehouseAdapter().kind !== 'mssql') return true;
   return await withWarehouse((conn) => hasTableModePermissions(conn, export_table_fqn));
+}
+
+/** mssql: can the SERVICE connection see this source table at all? The
+ *  pipeline-creation gate uses it to tell "unbuildable export destination"
+ *  (block creation loudly) apart from "candidate user-connection pipeline"
+ *  (the service login can't read the source either — create-initial-run
+ *  decides the connection there, and the destination lives behind the
+ *  creator's own access). */
+export async function serviceCanSeeSourceMssql(table_fqn: string): Promise<boolean> {
+  try {
+    return await withWarehouse(async (conn) => (await listSourceColumnsMssql(conn, table_fqn)).length > 0);
+  } catch {
+    return false;
+  }
 }
 
 export { tableModeSetupSql };
@@ -959,8 +1035,17 @@ export async function updatePipelineMappedCount(
   return await withWarehouse(async (conn) => {
     if (getWarehouseAdapter().kind === 'mssql' || getWarehouseAdapter().kind === 'postgres' || getWarehouseAdapter().kind === 'mysql') {
       const kind = getWarehouseAdapter().kind;
-      const compute = kind === 'mssql' ? computeMappedCountsMssql : kind === 'mysql' ? computeMappedCountsMysql : computeMappedCountsPg;
-      const { totalSource, totalMapped } = await compute(conn, source_fqn, column_name, domain_id);
+      // mssql user-connection pipelines: the source aggregate must run on the
+      // creator's credentials (the service login can't read the table).
+      const connInfo = kind === 'mssql' ? pipelineConnInfo(pipelineId) : { useUser: false, createdBy: null };
+      const { totalSource, totalMapped } = await (async () => {
+        if (kind === 'mssql' && connInfo.useUser && connInfo.createdBy != null) {
+          return await withUserWarehouse(connInfo.createdBy, (srcConn) =>
+            computeMappedCountsMssql(conn, source_fqn, column_name, domain_id, { sourceConn: srcConn }));
+        }
+        const compute = kind === 'mssql' ? computeMappedCountsMssql : kind === 'mysql' ? computeMappedCountsMysql : computeMappedCountsPg;
+        return await compute(conn, source_fqn, column_name, domain_id);
+      })();
       getDb()
         .prepare(
           `UPDATE pipelines

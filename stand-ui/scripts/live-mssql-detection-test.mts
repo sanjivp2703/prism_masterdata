@@ -49,6 +49,11 @@ const pipelineRow = (id: number) =>
 const ref = (id: number, fqn: string, column: string) => ({
   pipeline_id: id, table_fqn: fqn, column_name: column, domain_id: 1,
   export_table_fqn: null, status_message: null, change_tracking_consent: true,
+  // Service-connection, table-kind, mapped-only — the defaults these detection
+  // tests have always assumed; named explicitly since MssqlPipelineRef grew
+  // the user-connection (2026-08-17) and raw-passthrough (2026-08-18) fields.
+  use_user_connection: false, created_by: null, export_kind: 'table',
+  export_unmapped_rows: false,
 });
 
 const CT_FQN = 'TEST_DB.dbo.RAW_MOBILE_CARRIERS_SHORT';

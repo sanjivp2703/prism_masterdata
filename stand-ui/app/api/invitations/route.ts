@@ -57,7 +57,9 @@ export async function POST(request: NextRequest) {
       invitedRole,
     });
 
-    return Response.json({ success: true, emailSent: sent, acceptUrl: sent ? null : acceptUrl });
+    // acceptUrl is returned even on success (finding #24): invitation mail
+    // can land in spam, and the link is the only remedy the inviter has.
+    return Response.json({ success: true, emailSent: sent, acceptUrl });
 
   } catch (err) {
     console.error('Invitation error:', err);

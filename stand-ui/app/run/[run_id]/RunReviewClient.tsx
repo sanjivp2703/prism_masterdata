@@ -1084,6 +1084,17 @@ export default function RunReviewClient({
       // The server persisted the patched state — autosave has nothing newer.
       dirtyRef.current = false;
 
+      // Already-LIVE pipeline (manual re-standardization review): the server
+      // ignored `defer` and exported the reviewer's decisions for real — no
+      // "Begin Pipeline" step exists for a running pipeline, so skip the
+      // activation card entirely and return to the pipelines page.
+      if (body?.pipeline_active === true) {
+        try { sessionStorage.removeItem(COL_WIZARD_KEY); } catch { /* ignore */ }
+        reportAcceptNav();
+        router.push('/home?tab=pipelines');
+        return;
+      }
+
       // Multi-column wizard: move on to the next column instead of going home.
       if (inWizard) {
         const outcome = await advanceWizardForward();

@@ -130,6 +130,15 @@ export async function POST(request: Request) {
   if (!sessionNonce || !isSimpleIdent(sessionNonce)) {
     return Response.json({ error: 'Invalid session.' }, { status: 400 });
   }
+  // Destination validation applies to WAREHOUSE exports only. The file
+  // formats (csv/excel/sheets) never read target_fqn — the client sends its
+  // prefilled destination regardless of the chosen format, and for an
+  // uploaded file that prefill is derived from the FILENAME ("My Data.csv —
+  // Sheet1_STANDARDIZED"), which no dialect parses as a table name. Until
+  // 2026-08-17 this check ran unconditionally, so exporting an uploaded CSV
+  // back AS a CSV died with "Invalid destination. Expected DB.SCHEMA.TABLE"
+  // (live-found in the client-sim rehearsal — finding #9).
+  if (format === 'warehouse') {
   if (!target_fqn) return Response.json({ error: 'A destination table is required.' }, { status: 400 });
   if (getWarehouseAdapter().kind === 'postgres') {
     // Postgres destinations may be 2-part (schema.table); pgTableRef rejects
@@ -164,6 +173,7 @@ export async function POST(request: Request) {
     } catch {
       return Response.json({ error: `Invalid destination. Expected DB.SCHEMA.TABLE, got: ${target_fqn}` }, { status: 400 });
     }
+  }
   }
 
   try {

@@ -14,7 +14,8 @@
  */
 
 import { cookies } from 'next/headers';
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError } from '@/app/api/_lib/warehouse';
+import { markPipelineUserConnection } from '@/app/api/_lib/pipeline-user-connection';
 import { diffScan, initDetection, enableCt, grantViewChangeTracking} from '@/app/api/_lib/warehouse/mssql/detection';
 import { diffScan as pgDiffScan, initDetection as pgInitDetection } from '@/app/api/_lib/warehouse/postgres/detection';
 import { diffScan as myDiffScan, initDetection as myInitDetection } from '@/app/api/_lib/warehouse/mysql/detection';
@@ -31,7 +32,7 @@ import {
 } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
 import { isChangeTrackingPrivilegeError } from '@/app/api/_lib/pipeline-poller';
-import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
+import { flagPipelineMessage, clearPipelineStatusMessage } from '@/app/api/_lib/pipeline-alerts';
 import { appendTiming } from '@/app/api/_lib/timing';
 
 function quoteIdent(ident: string): string {
@@ -156,11 +157,20 @@ export async function POST(
       // enabled is used, nothing is altered, and diff-scan is the fallback —
       // never blocks setup either way.
       const consentRow = getDb()
-        .prepare(`SELECT change_tracking_consent FROM pipelines WHERE pipeline_id = ?`)
+        .prepare(`SELECT change_tracking_consent, use_user_connection, created_by, export_kind FROM pipelines WHERE pipeline_id = ?`)
         .get(pid) as any;
       const ctConsent = consentRow?.change_tracking_consent === 1;
+      // A user-connection pipeline (source visible only to the creator's
+      // personal credentials — flag set below on the scan fallback, or on a
+      // previous visit) runs detection init on THAT connection: the detection
+      // state must reflect the connection the poller will actually poll with.
+      const alreadyUserConn = consentRow?.use_user_connection === 1;
+      const creatorId = consentRow?.created_by != null ? Number(consentRow.created_by) : Number(session.accountId);
+      const withDetectionConn = alreadyUserConn
+        ? <T,>(fn: (conn: any) => Promise<T>) => withUserWarehouse(creatorId, fn)
+        : withWarehouse;
       try {
-        let state = await withWarehouse(async (conn) =>
+        let state = await withDetectionConn(async (conn) =>
           initDetection(conn, pipeline.table_fqn, { tryEnable: ctConsent }));
         // 'ct_no_grant' escalates too, not just 'ct_disabled'. Splitting those
         // two reasons (INS-M09) would otherwise have narrowed this condition by
@@ -168,7 +178,7 @@ export async function POST(
         // missing-permission case — which is precisely the case that retry can
         // fix, since granting VIEW CHANGE TRACKING needs rights the service
         // login lacks. enableCt is safe to call when CT is already on.
-        if (ctConsent && state.mode === 'diff'
+        if (!alreadyUserConn && ctConsent && state.mode === 'diff'
             && (state.diff_reason === 'ct_disabled' || state.diff_reason === 'ct_no_grant')
             && (await hasUserWarehouseConfig(Number(session.accountId)))) {
           try {
@@ -244,7 +254,67 @@ export async function POST(
     }
 
     // Warehouse pipelines supply real summed counts on both adapters (REV-01).
-    const scanned = await withWarehouse(async (conn) => fetchSourceLiterals(conn, pipeline));
+    // mssql: a pipeline already marked user-connection scans on the creator's
+    // personal credentials; otherwise scan on the service connection and, when
+    // that fails with an ACCESS error, fall back to the creator's credentials
+    // (the pipeline analog of the one-time flow's personal-connection
+    // fallback) and persist the choice for the poller/tick/export.
+    let scanned: { literals: string[]; frequencies: Map<string, number> };
+    const isMssql = getWarehouseAdapter().kind === 'mssql';
+    const connRow = isMssql
+      ? getDb().prepare(`SELECT use_user_connection, created_by, export_kind FROM pipelines WHERE pipeline_id = ?`).get(pid) as any
+      : null;
+    const scanCreatorId = connRow?.created_by != null ? Number(connRow.created_by) : Number(session.accountId);
+    if (isMssql && connRow?.use_user_connection === 1) {
+      scanned = await withUserWarehouse(scanCreatorId, async (conn) => fetchSourceLiterals(conn, pipeline));
+    } else {
+      try {
+        scanned = await withWarehouse(async (conn) => fetchSourceLiterals(conn, pipeline));
+      } catch (scanErr) {
+        const canFallBack =
+          isMssql &&
+          isWarehouseAccessError(scanErr) &&
+          (await hasUserWarehouseConfig(scanCreatorId));
+        if (!canFallBack) throw scanErr;
+        // Column mode writes onto the source via the SERVICE connection at
+        // sync time — it cannot run split-connection. Refuse loudly rather
+        // than building a pipeline that will fail at its first sync.
+        if (String(connRow?.export_kind ?? '') === 'column') {
+          return Response.json(
+            {
+              error:
+                `Prism's service login can't see ${pipeline.table_fqn}, and the Column output mode ` +
+                `can't run on personal credentials. Grant the service login access to the table ` +
+                `(see the setup page's access SQL), or choose a different output mode.`,
+            },
+            { status: 400 },
+          );
+        }
+        scanned = await withUserWarehouse(scanCreatorId, async (conn) => fetchSourceLiterals(conn, pipeline));
+        markPipelineUserConnection(pid);
+        // The POST route's table-mode access preflight ran against the SERVICE
+        // login and may have flagged "needs CREATE TABLE …" — irrelevant now
+        // that the build runs on the creator's own access. Clear it.
+        await clearPipelineStatusMessage(pid).catch(() => {});
+        console.log(
+          `[InitialRun] Pipeline ${pid}: service login can't read ${pipeline.table_fqn} — ` +
+          `switched to the creator's personal credentials for source reads`,
+        );
+        // Detection init above ran (or failed) on the service connection —
+        // redo it on the connection the poller will actually use, so the
+        // stored mode/state reflect the polling identity's real permissions.
+        try {
+          const consent = getDb().prepare(`SELECT change_tracking_consent FROM pipelines WHERE pipeline_id = ?`).get(pid) as any;
+          const st = await withUserWarehouse(scanCreatorId, async (conn) =>
+            initDetection(conn, pipeline.table_fqn, { tryEnable: consent?.change_tracking_consent === 1 }));
+          getDb()
+            .prepare(`UPDATE pipelines SET detection_mode = ?, detection_state = ? WHERE pipeline_id = ?`)
+            .run(st.mode, JSON.stringify(st), pid);
+        } catch (detErr: any) {
+          console.warn(`[InitialRun] Pipeline ${pid}: user-connection detection re-init failed (poller will retry):`, detErr?.message ?? detErr);
+        }
+      }
+    }
     const literals = scanned.literals;
     appendTiming(`[Timing] initial-run.source_scan: ${Date.now() - _scanStart}ms (${literals.length} distinct value(s))`);
 

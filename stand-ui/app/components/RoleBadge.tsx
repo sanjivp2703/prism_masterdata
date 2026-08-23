@@ -8,7 +8,7 @@ const PERMISSIONS = {
     color:  '#185FA5',
     bg:     '#EAF1FE',
     border: '#C5D8FC',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings', 'Invite new users (admin or user)', 'Remove accounts'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings', 'Invite new users (admin or user)', 'Remove accounts'],
     cannot: [] as string[],
   },
   user: {
@@ -16,7 +16,7 @@ const PERMISSIONS = {
     color:  '#374151',
     bg:     '#F3F4F6',
     border: '#E5E7EB',
-    can:    ['View and standardise data', 'Create and review runs', 'Export canonical mappings'],
+    can:    ['View and standardize data', 'Create and review runs', 'Export canonical mappings'],
     cannot: ['Invite new users', 'Remove accounts'],
   },
 } as const;

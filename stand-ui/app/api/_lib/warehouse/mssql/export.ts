@@ -95,7 +95,16 @@ export async function refreshExportTableMssql(
   domain_id:   number | null,
   pipelineId?: number,
   exportKind:  'table' | 'view' = 'table',
+  // User-connection pipelines (pipeline-user-connection.ts): sourceConn is
+  // the CREATOR's personal connection and handles everything that touches the
+  // source table or the export destination (which live behind the creator's
+  // access); `conn` stays the service connection for the lookup reads. When
+  // absent, both roles are the same service connection — byte-identical
+  // behavior to before the option existed.
+  opts:        { sourceConn?: any } = {},
 ): Promise<MssqlExportResult> {
+  const srcConn = opts.sourceConn ?? conn;
+  const splitConns = opts.sourceConn != null && opts.sourceConn !== conn;
   if (exportKind === 'view') {
     // A view can't reference per-rebuild staging tables. Deliberate refusal
     // (loud, never silent) until a live-view strategy exists for mssql.
@@ -124,7 +133,7 @@ export async function refreshExportTableMssql(
 
   // ── Source columns (ordinal order) ─────────────────────────────────────────
   const colRows = await exec(
-    conn,
+    srcConn,
     `SELECT c.name AS col
      FROM ${quoteIdent(src.db)}.sys.columns c
      WHERE c.object_id = OBJECT_ID(?)
@@ -177,6 +186,12 @@ export async function refreshExportTableMssql(
   // ── Staging tables: one per watched column ─────────────────────────────────
   const nonce = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
   const stagingRefs: string[] = [];
+  // The replacement table's name, once built — dropped in finally so a build
+  // that fails AFTER the SELECT INTO (live-found: a rename race between two
+  // sibling-column rebuilds) doesn't strand a half-built __prism_new_ table
+  // in the customer's export schema. After a successful swap the name no
+  // longer exists (renamed away), so the drop is a no-op.
+  let newRefCleanup: string | null = null;
 
   try {
     const replaceMap = new Map<string, string>();
@@ -187,12 +202,19 @@ export async function refreshExportTableMssql(
       const w = watched[i];
       const colRef = quoteIdent(w.columnName);
       const stgName = `EXPORT_STG_${pipelineId ?? 0}_${i}_${nonce}`;
-      const stgRef = `${internalObject(quoteIdent(stgName))}`;
+      // Split connections: staging must be readable by the join below, which
+      // runs on the creator's connection — and that connection can't write
+      // the internal schema. Build it in the export destination schema
+      // instead (the export already requires create/write rights there) —
+      // the same relocation the one-time export's user path uses.
+      const stgRef = splitConns
+        ? `${quoteIdent(exp.db)}.${quoteIdent(exp.schema)}.${quoteIdent(stgName)}`
+        : `${internalObject(quoteIdent(stgName))}`;
       stagingRefs.push(stgRef);
 
       // 1–3. Distinct read (bounded) → app-side normalize + alias resolve →
       //       exact-match staging table (shared with the column-mode sync).
-      await materializeAliasStaging(conn, sourceRef, w.columnName, w.domainId, stgRef);
+      await materializeAliasStaging(srcConn, conn, sourceRef, w.columnName, w.domainId, stgRef);
 
       // 4. SELECT-list replacement + join for this column. Source side gets an
       //    explicit BIN2 collation cast so the exact-match promise holds even
@@ -220,12 +242,13 @@ export async function refreshExportTableMssql(
 
     // ── Ordering: PK → unique key → clustered index (best-effort physical
     //    order; guaranteed order = consumers ORDER BY these key columns) ──────
-    const ordering = await resolveSourceOrderingMssql(conn, source_fqn);
+    const ordering = await resolveSourceOrderingMssql(srcConn, source_fqn);
 
     // ── Build the replacement table ─────────────────────────────────────────
     const newTable = `${exp.table}__prism_new_${nonce}`;
     const newRef = `${quoteIdent(exp.db)}.${quoteIdent(exp.schema)}.${quoteIdent(newTable)}`;
-    await exec(conn, `DROP TABLE IF EXISTS ${newRef}`);
+    newRefCleanup = newRef;
+    await exec(srcConn, `DROP TABLE IF EXISTS ${newRef}`);
     // TOP is what makes the ORDER BY actually apply.
     //
     // SQL Server SILENTLY DISCARDS `ORDER BY` on a `SELECT … INTO` whose
@@ -245,7 +268,7 @@ export async function refreshExportTableMssql(
     // columns themselves, which are present in the export.
     const topClause = ordering ? 'TOP (9223372036854775807) ' : '';
     await exec(
-      conn,
+      srcConn,
       `SELECT ${topClause}${selectList}
        INTO ${newRef}
        FROM ${sourceRef} src
@@ -273,17 +296,26 @@ export async function refreshExportTableMssql(
     // (GRANT CONTROL ON SCHEMA::<export_schema>), which is what makes
     // both reading and re-granting possible; this verifies it was actually
     // done rather than trusting it. See KI-117.
-    const ownerRows = await exec(
-      conn,
+    // First-ever build: the export table doesn't exist yet, so there are no
+    // permissions to preserve — and HAS_PERMS_BY_NAME on a nonexistent object
+    // returns NULL, which used to read as "can't preserve" and flag a spurious
+    // warning on EVERY first build (live-found 2026-08-18, client-sim finding
+    // #12 — a healthy brand-new pipeline greeted its creator with a
+    // permissions scare). Skip the probe, the warning, and the capture.
+    const existsRows = await exec(srcConn, `SELECT OBJECT_ID(?) AS oid`, [exportRef]).catch(() => [] as any[]);
+    const targetExists = (existsRows[0] as any)?.oid != null;
+
+    const ownerRows = targetExists ? await exec(
+      srcConn,
       `SELECT HAS_PERMS_BY_NAME(?, 'OBJECT', 'VIEW DEFINITION') AS can_see,
               HAS_PERMS_BY_NAME(?, 'OBJECT', 'CONTROL')         AS can_grant`,
       [exportRef, exportRef],
-    ).catch(() => [] as any[]);
+    ).catch(() => [] as any[]) : [];
     const canPreserveGrants =
       Number((ownerRows[0] as any)?.can_see ?? 0) === 1 &&
       Number((ownerRows[0] as any)?.can_grant ?? 0) === 1;
 
-    if (!canPreserveGrants && pipelineId != null) {
+    if (targetExists && !canPreserveGrants && pipelineId != null) {
       await flagPipelineMessage(
         pipelineId,
         `Prism cannot preserve access permissions on ${export_fqn}: rebuilding the standardized table ` +
@@ -315,8 +347,8 @@ export async function refreshExportTableMssql(
     // Now: keep the row, and let the re-grant loop below skip the unresolvable
     // ones while we tell the operator exactly which access is about to be lost
     // and how to stop it.
-    const grants = await exec(
-      conn,
+    const grants = !targetExists ? [] as any[] : await exec(
+      srcConn,
       `SELECT dp.name AS grantee, p.permission_name AS perm, p.state AS state, p.minor_id AS minor_id, c.name AS col_name
        FROM ${quoteIdent(exp.db)}.sys.database_permissions p
        LEFT JOIN ${quoteIdent(exp.db)}.sys.database_principals dp ON dp.principal_id = p.grantee_principal_id
@@ -343,7 +375,7 @@ export async function refreshExportTableMssql(
     }
 
     await exec(
-      conn,
+      srcConn,
       `USE ${quoteIdent(exp.db)};
        BEGIN TRAN;
        DROP TABLE IF EXISTS ${quoteIdent(exp.schema)}.${quoteIdent(exp.table)};
@@ -392,13 +424,13 @@ export async function refreshExportTableMssql(
       : state === 'W' ? `GRANT ${perm} ON ${scoped} TO ${quoteIdent(grantee)} WITH GRANT OPTION`
       :                 `GRANT ${perm} ON ${scoped} TO ${quoteIdent(grantee)}`;
       try {
-        await exec(conn, `USE ${quoteIdent(exp.db)}; ${stmt}`);
+        await exec(srcConn, `USE ${quoteIdent(exp.db)}; ${stmt}`);
       } catch (e) {
         console.warn(`[ExportTable/mssql] Could not re-apply ${state === 'D' ? 'DENY' : 'GRANT'} ${perm} to ${grantee} on ${export_fqn}:`, (e as any)?.message ?? e);
       }
     }
 
-    const countRows = await exec(conn, `SELECT COUNT(*) AS c FROM ${exportRef}`);
+    const countRows = await exec(srcConn, `SELECT COUNT(*) AS c FROM ${exportRef}`);
     const rows_written = Number(countRows[0]?.c ?? 0);
 
     // ── Per-sibling metrics (same SQLite stamps as the Snowflake builder) ────
@@ -408,7 +440,7 @@ export async function refreshExportTableMssql(
     // review can sit for a while before Accept/activate actually runs this.
     // Every later rebuild still stamps the real current time, as before.
     for (const s of siblings) {
-      const { totalSource, totalMapped } = await computeMappedCountsMssql(conn, source_fqn, s.columnName, s.domainId);
+      const { totalSource, totalMapped } = await computeMappedCountsMssql(conn, source_fqn, s.columnName, s.domainId, { sourceConn: srcConn });
       getDb()
         .prepare(
           `UPDATE pipelines
@@ -430,7 +462,10 @@ export async function refreshExportTableMssql(
     return { rows_written };
   } finally {
     for (const stgRef of stagingRefs) {
-      await exec(conn, `DROP TABLE IF EXISTS ${stgRef}`).catch(() => {});
+      await exec(srcConn, `DROP TABLE IF EXISTS ${stgRef}`).catch(() => {});
+    }
+    if (newRefCleanup) {
+      await exec(srcConn, `DROP TABLE IF EXISTS ${newRefCleanup}`).catch(() => {});
     }
   }
 }
@@ -457,13 +492,19 @@ export async function listSourceColumnsMssql(conn: any, source_fqn: string): Pro
  * (normalizeLiteral — the ONE normalization implementation), aliases resolved
  * from the lookup in bind-batched IN queries, written as raw_value → alias_name
  * rows under BIN2 collation. The caller owns dropping stgRef.
+ *
+ * Two connections because the halves live behind different access: srcConn
+ * reads the source AND hosts the staging table (the join that consumes it
+ * runs there); lookupConn reads the internal lookup tables. For service-only
+ * pipelines both are the same connection.
  */
 async function materializeAliasStaging(
-  conn:      any,
-  sourceRef: string,
-  colName:   string,
-  domainId:  number | null,
-  stgRef:    string,
+  srcConn:    any,
+  lookupConn: any,
+  sourceRef:  string,
+  colName:    string,
+  domainId:   number | null,
+  stgRef:     string,
 ): Promise<void> {
   const colRef = quoteIdent(colName);
 
@@ -483,7 +524,7 @@ async function materializeAliasStaging(
   // Mixed-case spellings of one value are the exact input this product exists
   // to standardize, so this is a mainline path, not an edge case.
   const distinctRows = await exec(
-    conn,
+    srcConn,
     `SELECT DISTINCT TOP (${EXPORT_MAX_DISTINCT + 1}) ${colRef} COLLATE ${BIN2} AS v
      FROM ${sourceRef} WHERE ${colRef} IS NOT NULL`,
   );
@@ -513,7 +554,7 @@ async function materializeAliasStaging(
     const binds: any[] = [...batch];
     if (domainId != null) binds.push(domainId);
     const rows = await exec(
-      conn,
+      lookupConn,
       `SELECT lam.normalized_value AS nv, aan.alias_name AS an
        FROM ${internalTable('LITERAL_ALIAS_MATCHES')} lam
        JOIN ${internalTable('APPROVED_ALIAS_NAMES')} aan ON aan.alias_id = lam.alias_id
@@ -525,7 +566,7 @@ async function materializeAliasStaging(
 
   // 3. Materialize the exact-match staging table.
   await exec(
-    conn,
+    srcConn,
     // PRIMARY KEY NONCLUSTERED is load-bearing, not a style choice.
     //
     // A bare PRIMARY KEY defaults to CLUSTERED, and a clustered index key is
@@ -554,7 +595,7 @@ async function materializeAliasStaging(
   for (let j = 0; j < stagingRows.length; j += STAGING_INSERT_BATCH) {
     const batch = stagingRows.slice(j, j + STAGING_INSERT_BATCH);
     const valuesRows = batch.map(() => '(?, ?)').join(', ');
-    await exec(conn, `INSERT INTO ${stgRef} (raw_value, alias_name) VALUES ${valuesRows}`, batch.flat());
+    await exec(srcConn, `INSERT INTO ${stgRef} (raw_value, alias_name) VALUES ${valuesRows}`, batch.flat());
   }
 }
 
@@ -697,7 +738,7 @@ export async function refreshStandardizedColumnsMssql(
       const stgRef = `${internalObject(quoteIdent(`COLSYNC_STG_${pipelineId ?? 0}_${i}_${nonce}`))}`;
       stagingRefs.push(stgRef);
 
-      await materializeAliasStaging(conn, sourceRef, w.columnName, w.domainId, stgRef);
+      await materializeAliasStaging(conn, conn, sourceRef, w.columnName, w.domainId, stgRef);
 
       // Mapped values whose standardized value is missing or stale.
       await exec(
@@ -790,10 +831,14 @@ export async function computeMappedCountsMssql(
   source_fqn: string,
   column:     string,
   domainId:   number | null,
+  // User-connection pipelines: the source aggregate runs on the creator's
+  // connection; the lookup batches stay on `conn` (service). Defaults to conn.
+  opts:       { sourceConn?: any } = {},
 ): Promise<{ totalSource: number; totalMapped: number }> {
+  const srcConn = opts.sourceConn ?? conn;
   const colRef = quoteIdent(column);
   const rows = await exec(
-    conn,
+    srcConn,
     // Same BIN2 collation as the staging distinct read and the export join.
     // Grouping under the database's case-insensitive default folded 'ATT' and
     // 'att' into one bucket and SUMmed their counts, so rows the export had

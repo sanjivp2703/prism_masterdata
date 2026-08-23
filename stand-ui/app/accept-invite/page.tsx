@@ -105,7 +105,7 @@ export default async function AcceptInvitePage({ searchParams }: Props) {
           >
             <p className="font-semibold mb-1.5" style={{ color: '#92400E' }}>Before you continue</p>
             By accepting this invitation you will gain access to the Prism workspace and may be
-            able to view data standardised by other workspace members. Only proceed if you
+            able to view data standardized by other workspace members. Only proceed if you
             consent to this access.{' '}
             Signing in uses your Google account for identity only — Prism asks for
             spreadsheet access separately, and only if you later connect a Google Sheet.{' '}

@@ -98,13 +98,14 @@ function AcceptTermsInner() {
             data is processed during standardization, and your
             responsibilities as a user. Both open in a new tab.
             {' '}Two things to know before you start:
-            {' '}<strong>Prism is a shared workspace</strong> — every user
-            within your company&apos;s Snowflake account can view the pipelines,
-            mappings, and standardized values for tables standardized with
-            Prism.
+            {' '}<strong>Prism is a shared workspace</strong> — {isNativeEdition()
+              ? <>every user within your company&apos;s Snowflake account</>
+              : <>every member of your company&apos;s Prism workspace</>} can
+            view the pipelines, mappings, and standardized values for tables
+            standardized with Prism.
             {' '}<strong>Prism uses AI</strong>{isNativeEdition()
               ? <> — Claude models running on Snowflake Cortex inside your company&apos;s own Snowflake account. Your data never leaves Snowflake, and the AI compute bills to your company&apos;s Snowflake account (no separate AI subscription).</>
-              : <> — the AI provider your workspace admin configured (such as Claude). Distinct column values are sent to that provider during standardization, billed to your company&apos;s provider account.</>}
+              : <> — the AI provider configured for your Prism installation (such as Claude). Distinct column values are sent to that provider during standardization.</>}
           </div>
 
           <label

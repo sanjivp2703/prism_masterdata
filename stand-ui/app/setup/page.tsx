@@ -5,6 +5,7 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 import { buildNativeAppGrantSql, buildNativeCallerGrantSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
+import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 
 function PrismLogo() {
   return (
@@ -533,49 +534,16 @@ USE PRISM_DB;
 CREATE USER prism_svc FOR LOGIN prism_svc;
 ALTER ROLE PRISM_SERVICE ADD MEMBER prism_svc;`;
 
-const MSSQL_CT_SQL = `ALTER DATABASE <source_db> SET CHANGE_TRACKING = ON
-  (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
-
--- Repeat this ALTER TABLE line once for EVERY table you plan to standardize
--- with Prism (each needs its own primary key — Change Tracking can't be
--- enabled on a table without one):
-ALTER TABLE <schema>.<table> ENABLE CHANGE_TRACKING;
-ALTER TABLE <schema>.<table_2> ENABLE CHANGE_TRACKING;
-
--- One grant covers every current AND future table in the schema — no need
--- to repeat this per table:
-GRANT VIEW CHANGE TRACKING ON SCHEMA::<schema> TO prism_svc;
-
-
--- ===========================================================================
--- EXPORT AREA OWNERSHIP  (only if Prism will write standardized tables here)
--- ===========================================================================
--- WHAT THIS GIVES PRISM, precisely:
---   Full control of the ONE schema named below, and nothing outside it.
---   Inside <export_schema> Prism can create, replace, drop and grant access to
---   tables. It gets NO additional rights over your source tables, other
---   schemas, other databases, or the server.
---
--- WHY IT IS NEEDED:
---   SQL Server has no way to carry a table's access permissions across a
---   rebuild (Snowflake does; this is a real difference between the two).
---   Prism rebuilds the standardized table each refresh, so it must re-apply
---   the permissions itself afterwards — and SQL Server only lets the OWNER of
---   a schema read who currently has access and hand that access back out.
---
---   Without this line, a rebuild silently drops every permission on the
---   standardized table: anyone you granted access to (BI tools, analysts)
---   loses it, with no error and no warning. SQL Server does not tell a
---   non-owner "you may not see the access list" — it reports the list as
---   EMPTY, so Prism cannot even detect that it is about to lose them.
---
--- RECOMMENDED: point <export_schema> at a schema used ONLY for Prism's
--- standardized output, not one that also holds your own tables.
-GRANT CONTROL ON SCHEMA::<export_schema> TO prism_svc;`;
+// buildMssqlDataAccessSql moved to the shared module (also used by the
+// connect form's inline access-SQL panel) — app/components/mssql-access-sql.ts
 
 function StepInstallScriptMssql({ onBack, onNext }: { onBack: () => void; onNext: () => void }) {
   const [script, setScript] = useState<string | null>(null);
   const [scriptError, setScriptError] = useState<string | null>(null);
+  // Part C — database.schema pairs holding the source tables; the access SQL
+  // is generated from this input (mirrors the Snowflake step's Part D).
+  const [dataSchemas, setDataSchemas] = useState('');
+  const dataAccessSql = buildMssqlDataAccessSql(dataSchemas);
   const [checking, setChecking] = useState(false);
   const [checkFailures, setCheckFailures] = useState<CheckItem[] | null>(null);
   const INSTALL_CHECK_KEYS = ['database', 'schemas', 'tables', 'roles'];
@@ -656,21 +624,43 @@ function StepInstallScriptMssql({ onBack, onNext }: { onBack: () => void; onNext
         Prism signs in as a machine identity, never as a person. Replace the placeholder with a
         strong generated password and keep it for the next step. To cut Prism off at any time:
         {' '}<span style={{ fontFamily: 'monospace' }}>ALTER LOGIN prism_svc DISABLE;</span>
+        {' '}Run Part A first — until the install script has run, the{' '}
+        <span style={{ fontFamily: 'monospace' }}>USE PRISM_DB</span> line below fails with
+        &quot;Database &apos;PRISM_DB&apos; does not exist&quot;. (Re-running this block later? The
+        CREATE LOGIN line will report the login already exists — skip just that line.)
       </p>
       <CodeBlock code={MSSQL_SERVICE_LOGIN_SQL} maxHeight={140} />
-      <p className="text-xs mt-2 mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
-        For each database Prism should read, also run:{' '}
-        <span style={{ fontFamily: 'monospace' }}>USE &lt;source_db&gt;; CREATE USER prism_svc FOR LOGIN prism_svc; GRANT SELECT ON SCHEMA::&lt;schema&gt; TO prism_svc;</span>
-      </p>
 
-      <SectionTitle>Part C — Enable Change Tracking (recommended)</SectionTitle>
+      <SectionTitle>Part C — Give Prism access to your data</SectionTitle>
       <p className="text-xs mb-2" style={{ color: 'var(--text-muted)', lineHeight: 1.55 }}>
-        Change Tracking lets Prism detect new, changed, or deleted values within about a
-        minute instead of on a scheduled scan. We recommend enabling it now for every table
-        you plan to standardize — or skip this and Prism will offer to enable it (with your
-        consent) the first time you connect that table.
+        Prism reads your source tables and creates its standardized output next to them. Type
+        where your data lives (most SQL Server tables live under{' '}
+        <span style={{ fontFamily: 'monospace' }}>dbo</span>) and run the generated statements
+        in the same query window. <span style={{ fontFamily: 'monospace' }}>DATABASE.SCHEMA</span>{' '}
+        sets up every table in the schema; add{' '}
+        <span style={{ fontFamily: 'monospace' }}>DATABASE.SCHEMA.TABLE</span> entries instead to
+        set up only specific tables. The generated SQL includes Change Tracking, which lets
+        Prism detect new, changed, or deleted values within about a minute instead of on a
+        scheduled scan — skip those lines if you prefer, and Prism will offer to enable it (with
+        your consent) the first time you connect a table. Nothing here gives Prism{' '}
+        <strong>write access to your existing tables</strong>. You can come back and re-run this
+        anytime for new databases or tables.
       </p>
-      <CodeBlock code={MSSQL_CT_SQL} maxHeight={170} />
+      <input
+        type="text" value={dataSchemas}
+        onChange={e => setDataSchemas(e.target.value)}
+        placeholder="DATABASE.dbo — or DATABASE.dbo.ORDERS for one table"
+        autoCapitalize="off" autoCorrect="off" autoComplete="off" spellCheck={false}
+        className="w-full px-3.5 py-2.5 mb-2 rounded-button border-[0.5px] text-sm outline-none font-mono"
+        style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+      />
+      {dataSchemas.trim() && !dataAccessSql && (
+        <p className="text-[11px] mb-2" style={{ color: '#B45309' }}>
+          Each entry needs the form DATABASE.SCHEMA (whole schema) or DATABASE.SCHEMA.TABLE
+          (one table), using plain names. Separate multiple entries with commas.
+        </p>
+      )}
+      {dataAccessSql && <CodeBlock code={dataAccessSql} maxHeight={260} />}
 
       {checkFailures && (
         <div className="mt-5 rounded-card border-[0.5px] p-3" style={{ borderColor: '#FCA5A5', backgroundColor: '#FFF5F5' }}>
@@ -2214,10 +2204,14 @@ function PersonalSetupFormMssql({ nextUrl }: { nextUrl: string }) {
   const router = useRouter();
   const [server, setServer]     = useState('');
   const [port, setPort]         = useState('1433');
-  const [database, setDatabase] = useState('PRISM_DB');
+  // Blank, NOT the workspace's PRISM_DB — that is Prism's internal database
+  // and a personal login has no rights on it, so prefilling it made every
+  // save fail with a misleading "login failed" (finding #26).
+  const [database, setDatabase] = useState('');
   const [user, setUser]         = useState('');
   const [password, setPassword] = useState('');
   const [hasSavedSecret, setHasSavedSecret] = useState(false);
+  const [workspaceServer, setWorkspaceServer] = useState(false);
   const [busy, setBusy]         = useState(false);
   const [error, setError]       = useState<string | null>(null);
 
@@ -2227,7 +2221,7 @@ function PersonalSetupFormMssql({ nextUrl }: { nextUrl: string }) {
       .then(r => r.json())
       .then(b => {
         if (cancelled || !b) return;
-        if (b.server)   setServer(String(b.server));
+        if (b.server)   { setServer(String(b.server)); setWorkspaceServer(true); }
         if (b.port)     setPort(String(b.port));
         if (b.database) setDatabase(String(b.database));
         if (b.user)     setUser(String(b.user));
@@ -2274,18 +2268,40 @@ function PersonalSetupFormMssql({ nextUrl }: { nextUrl: string }) {
         it. Credentials are stored encrypted. You can always come back to this from Settings.
       </p>
       <div className="flex flex-col gap-3">
+        {/* Read-only when the workspace has a server (finding #27): there is
+            one SQL Server per installation, a different host would only
+            break the connection, and an editable field let any member point
+            the Prism host at an arbitrary address. */}
+        {workspaceServer ? (
+          <div>
+            <Label htmlFor="pms-server">Server</Label>
+            <div
+              id="pms-server"
+              className="w-full px-3.5 py-2.5 rounded-button border-[0.5px] text-sm font-mono"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)', color: 'var(--text-muted)' }}
+            >
+              {server}{port && port !== '1433' ? `, port ${port}` : ''}
+            </div>
+            <p className="text-[11px] mt-1" style={{ color: 'var(--text-hint)' }}>
+              Your company&apos;s SQL Server, already set up by your admin — you only need your own login below.
+            </p>
+          </div>
+        ) : (
         <div>
           <Label htmlFor="pms-server">Server</Label>
           <Input id="pms-server" value={server} onChange={setServer} placeholder="sql.yourcompany.com" />
         </div>
+        )}
         <div className="flex gap-3">
+          {!workspaceServer && (
+            <div className="flex-1">
+              <Label htmlFor="pms-port">Port</Label>
+              <Input id="pms-port" value={port} onChange={setPort} placeholder="1433" />
+            </div>
+          )}
           <div className="flex-1">
-            <Label htmlFor="pms-port">Port</Label>
-            <Input id="pms-port" value={port} onChange={setPort} placeholder="1433" />
-          </div>
-          <div className="flex-1">
-            <Label htmlFor="pms-database">Database</Label>
-            <Input id="pms-database" value={database} onChange={setDatabase} placeholder="PRISM_DB" />
+            <Label htmlFor="pms-database">Database (optional)</Label>
+            <Input id="pms-database" value={database} onChange={setDatabase} placeholder="Your login's default" />
           </div>
         </div>
         <div>

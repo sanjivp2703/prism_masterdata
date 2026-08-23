@@ -39,9 +39,11 @@ export default function OneTimeStandardizationCard() {
   const router = useRouter();
 
   // Where the values come from. A one-time standardization is "clean this list
-  // once", so a file or a pasted column is as legitimate a source as a table —
-  // and unlike a pipeline, nothing here has to stay live afterwards.
-  type OtSource = 'warehouse' | 'file' | 'sheets' | 'paste';
+  // once", so an uploaded file or a Google Sheet is as legitimate a source as
+  // a table — and unlike a pipeline, nothing here has to stay live afterwards.
+  // (A "paste values" tab existed until 2026-08-18; removed by owner decision
+  // — every real source is a table, a file, or a Sheet.)
+  type OtSource = 'warehouse' | 'file' | 'sheets';
   const [sourceKind, setSourceKind] = useState<OtSource>('warehouse');
   // Native edition: CSV and Excel are SEPARATE tabs (owner decision
   // 2026-08-16) that share the 'file' machinery — this picks which one.
@@ -72,9 +74,6 @@ export default function OneTimeStandardizationCard() {
   const [sheetBusy,  setSheetBusy]  = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
 
-  // Paste
-  const [pasteText,   setPasteText]   = useState('');
-  const [pasteColumn, setPasteColumn] = useState('value');
   const [fields, setFields]           = useState<TableColumn[]>([]);
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [columnsError, setColumnsError]     = useState<string | null>(null);
@@ -141,20 +140,8 @@ export default function OneTimeStandardizationCard() {
 
   // ── Source helpers ─────────────────────────────────────────────────────────
 
-  /** Rows to POST for a file/paste session. */
+  /** Rows to POST for an uploaded-file session. */
   function effectiveRows(): Record<string, string>[] {
-    if (sourceKind === 'paste') {
-      // One value per line. Tabs split into columns only if the pasted block
-      // actually has them, so pasting a single column out of a spreadsheet (the
-      // common case) yields one clean column rather than a ragged grid.
-      const lines = pasteText.split(/\r?\n/).map(l => l.replace(/\s+$/, '')).filter(l => l.trim() !== '');
-      const col   = pasteColumn.trim() || 'value';
-      return lines.map(l => {
-        const o: Record<string, string> = Object.create(null);
-        o[col] = l;
-        return o;
-      });
-    }
     return fileRows;
   }
 
@@ -278,9 +265,9 @@ export default function OneTimeStandardizationCard() {
   }
 
   const anyRegexInvalid = selected.some(s => conventionRegexValid(s.convention) === false);
-  // Submittable depends on the SOURCE: a warehouse session needs a full FQN, a
-  // file/paste session needs rows. Requiring the FQN unconditionally would have
-  // made the new sources permanently un-submittable.
+  // Submittable depends on the SOURCE: a warehouse session needs a full FQN,
+  // an uploaded file needs rows, a Sheet needs a chosen tab. Requiring the FQN
+  // unconditionally would have made the file/Sheet sources un-submittable.
   const sourceReady =
     sourceKind === 'warehouse' ? tableFqn.trim().split('.').filter(Boolean).length === 3
     : sourceKind === 'file'    ? fileRows.length > 0
@@ -296,15 +283,13 @@ export default function OneTimeStandardizationCard() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          // A file/paste session carries its rows with the request and uses a
-          // DISPLAY label for source_relation (a file name, or "Pasted
-          // values") — the server skips FQN parsing for those.
+          // A file session carries its rows with the request and uses a
+          // DISPLAY label for source_relation (the file name) — the server
+          // skips FQN parsing for those.
           source_type: sourceKind === 'warehouse' ? 'warehouse'
-            : sourceKind === 'paste'  ? 'csv'
             : sourceKind === 'sheets' ? 'sheets'
             : fileSourceType(),
           source_relation: sourceKind === 'warehouse' ? tableFqn.trim()
-            : sourceKind === 'paste'  ? 'Pasted values'
             : sourceKind === 'sheets' ? sheetTab
             : (fileTab ? `${fileName} — ${fileTab}` : fileName),
           // A Sheet is read server-side from these; the others carry their rows.
@@ -354,27 +339,23 @@ export default function OneTimeStandardizationCard() {
       <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>
         {isNativeEdition()
           ? <>Clean a list once — from a {warehouseLabel} table or an uploaded CSV/Excel file — and export the result however you need it. No lookup, no ongoing pipeline.</>
-          : <>Clean a list once — from a {warehouseLabel} table, a CSV/Excel file, or values you paste in — and export the result however you need it. No lookup, no ongoing pipeline.</>}
+          : <>Clean a list once — from a {warehouseLabel} table, a CSV or Excel file, or a Google Sheet — and export the result however you need it. No lookup, no ongoing pipeline.</>}
       </p>
 
-      {/* Source picker. Native (owner decision 2026-08-16): Snowflake | CSV |
-          Excel — no Google integration, no paste tab; CSV and Excel are
-          separate tabs sharing the 'file' machinery via fileFlavor. */}
+      {/* Source picker: <warehouse> | CSV | Excel, plus Google Sheet outside
+          the native edition (which ships no Google integration). CSV and Excel
+          are separate tabs sharing the 'file' machinery via fileFlavor — the
+          native edition's 2026-08-16 shape, adopted for both editions
+          2026-08-18 when the paste tab was removed. */}
       <div className="mb-4">
         <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>Source</label>
         <div className="flex rounded-button border-[0.5px] overflow-hidden" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)' }}>
-          {(isNativeEdition()
-            ? ([
-                { id: 'warehouse', label: warehouseLabel },
-                { id: 'file',      label: 'CSV',   flavor: 'csv' },
-                { id: 'file',      label: 'Excel', flavor: 'excel' },
-              ] as const)
-            : ([
-                { id: 'warehouse', label: warehouseLabel },
-                { id: 'file',      label: 'CSV / Excel' },
-                { id: 'sheets',    label: 'Google Sheet' },
-                { id: 'paste',     label: 'Paste values' },
-              ] as const)
+          {([
+            { id: 'warehouse', label: warehouseLabel },
+            { id: 'file',      label: 'CSV',   flavor: 'csv' },
+            { id: 'file',      label: 'Excel', flavor: 'excel' },
+            ...(isNativeEdition() ? [] : [{ id: 'sheets', label: 'Google Sheet' }]),
+          ] as ReadonlyArray<{ id: OtSource; label: string; flavor?: 'csv' | 'excel' }>
           ).map((tab, i, arr) => {
             const flavor = 'flavor' in tab ? tab.flavor : undefined;
             const active = sourceKind === tab.id && (!flavor || fileFlavor === flavor);
@@ -615,42 +596,6 @@ export default function OneTimeStandardizationCard() {
         </div>
       )}
 
-      {/* Paste */}
-      {sourceKind === 'paste' && (
-        <div className="mb-4">
-          <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>Paste values</label>
-          <textarea
-            value={pasteText} disabled={submitting}
-            onChange={e => {
-              setPasteText(e.target.value);
-              // One column, named by the user — the column picker below still
-              // drives spec/convention, so paste behaves like any other source.
-              setFields([{ name: pasteColumn.trim() || 'value', type: 'text', isText: true }]);
-            }}
-            rows={7}
-            placeholder={'One value per line\nAT&T\natt\nVerizon'}
-            className="w-full px-3 py-2 rounded-button border-[0.5px] text-xs outline-none"
-            style={{ ...inputStyle, fontFamily: 'monospace' }}
-          />
-          <div className="mt-2 flex items-center gap-2">
-            <label className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>Column name</label>
-            <input
-              type="text" value={pasteColumn} disabled={submitting}
-              onChange={e => {
-                setPasteColumn(e.target.value);
-                setSelected([]);
-                setFields([{ name: e.target.value.trim() || 'value', type: 'text', isText: true }]);
-              }}
-              className="w-40 px-2 py-1 rounded-button border-[0.5px] text-xs outline-none"
-              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
-            />
-            <span className="text-[11px]" style={{ color: 'var(--text-hint)' }}>
-              {effectiveRows().length.toLocaleString()} value{effectiveRows().length === 1 ? '' : 's'}
-            </span>
-          </div>
-        </div>
-      )}
-
       {/* Columns */}
       <label className="block text-sm font-medium mb-2" style={{ color: 'var(--text-primary)' }}>Columns to standardize</label>
       {columnsLoading && (
@@ -672,8 +617,7 @@ export default function OneTimeStandardizationCard() {
         <div className="rounded-[10px] border-[0.5px] px-3.5 py-5 text-center text-xs" style={{ borderColor: 'var(--border)', borderStyle: 'dashed', color: 'var(--text-hint)' }}>
           {sourceKind === 'warehouse' ? 'Enter a source table above to choose its columns.'
             : sourceKind === 'file' ? 'Upload a file above to choose its columns.'
-            : sourceKind === 'sheets' ? 'Load a Google Sheet above to choose its columns.'
-            : 'Paste some values above to continue.'}
+            : 'Load a Google Sheet above to choose its columns.'}
         </div>
       )}
       {!columnsLoading && !columnsError && textCols.length > 0 && (

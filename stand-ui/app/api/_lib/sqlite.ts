@@ -449,6 +449,17 @@ const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_sf_username
     ON accounts(sf_username) WHERE sf_username IS NOT NULL;
   `,
+
+  // 021 — user-connection pipelines (mssql only, 2026-08-17). When the
+  // service login cannot see a pipeline's source table but the CREATOR's
+  // saved personal credentials can, the pipeline runs its SOURCE reads on
+  // those credentials (set at create-initial-run, mirroring the one-time
+  // flow's fallback). Internal reads/writes stay on the service connection.
+  // 0 = service connection for everything (the default and only mode before
+  // this migration).
+  `
+  ALTER TABLE pipelines ADD COLUMN use_user_connection INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 let _db: Database.Database | null = null;

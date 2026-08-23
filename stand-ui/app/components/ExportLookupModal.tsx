@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useWarehouseKind } from '@/app/components/use-warehouse-label';
 import { isNativeEdition } from '@/app/api/_lib/edition';
@@ -76,6 +76,10 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
 
   const [format,   setFormat]   = useState<Format>('csv');
   const [sfTable,  setSfTable]  = useState('');
+  // Whether the user has typed their own destination. Until they do, the
+  // field tracks the computed default (which can change when the column
+  // picker selection or the resolved warehouse changes).
+  const [sfTableEdited, setSfTableEdited] = useState(false);
   const [busy,     setBusy]     = useState(false);
   const [error,    setError]    = useState<string | null>(null);
   const [success,  setSuccess]  = useState<string | null>(null);
@@ -101,6 +105,18 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
   const warehouseKind   = useWarehouseKind();
   const warehouseLabel  = warehouseKind === 'mssql' ? 'SQL Server' : warehouseKind === 'postgres' ? 'PostgreSQL' : warehouseKind === 'mysql' ? 'MySQL' : 'Snowflake';
   const defaultSchema   = warehouseKind === 'mssql' ? 'EXPORTS' : (warehouseKind === 'postgres' || warehouseKind === 'mysql') ? 'prism_exports' : 'PUBLIC';
+
+  // Mirrors the server's defaultFqn EXACTLY (see the export route),
+  // including the no-column-name fallback: the server creates
+  // PRISM_DB.<schema>.GLOBAL_CANONICAL_MAPPINGS when it has no column name.
+  const defaultSfTable = resolvedDomainName
+    ? `PRISM_DB.${defaultSchema}.${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+    : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`;
+
+  // Prefill, and keep following the default until the user takes over.
+  useEffect(() => {
+    if (!sfTableEdited) setSfTable(defaultSfTable);
+  }, [defaultSfTable, sfTableEdited]);
 
   async function handleExport() {
     if (resolvedDomainId == null) { setError('No column selected.'); return; }
@@ -259,20 +275,14 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
             <input
               type="text"
               value={sfTable}
-              onChange={e => setSfTable(e.target.value)}
-              // Mirrors the server's defaultFqn EXACTLY (see the export route) —
-              // including the no-column-name fallback, which used to show a
-              // generic 'DB.SCHEMA.TABLE_NAME' hint while the server would
-              // actually create PRISM_DB.<schema>.GLOBAL_CANONICAL_MAPPINGS.
-              // The label below promises "leave blank to use default", so the
-              // placeholder has to BE that default, not a shape hint.
-              placeholder={resolvedDomainName
-                ? `PRISM_DB.${defaultSchema}.${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
-                : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`}
+              onChange={e => { setSfTableEdited(true); setSfTable(e.target.value); }}
+              // Same string as the prefill — kept as the placeholder so that
+              // clearing the field still shows where the export will land
+              // (an empty value falls back to this default server-side).
+              placeholder={defaultSfTable}
               className="text-xs rounded-button border-[0.5px] outline-none px-3 py-1.5 w-full font-mono"
               style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
             />
-            <p className="text-[10px] mt-1" style={{ color: 'var(--text-hint)' }}>Leave blank to use default</p>
           </div>
         )}
 

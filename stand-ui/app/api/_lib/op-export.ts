@@ -1079,7 +1079,19 @@ async function runWriteAndValidatePass(
 
       const systemPrompt = buildValidationSystemPrompt(loadValidationSpecContext(runId));
 
-      if (caseAItems.length > 0 || rawCaseBGroups.length > 0 || caseCItems.length > 0) {
+      // OWNER DECISION 2026-08-18 (client-sim rehearsal, C3): the export
+      // referee is DISABLED. The reviewer's exported mappings are written
+      // exactly as specified — no LLM second-guessing, even for moves that
+      // contradict the confirmed lookup. (The owner watched Case A revert a
+      // deliberate move — "Boost" into the AT&T group — and chose user
+      // sovereignty over the safety net: the customer's specified mapping
+      // always wins.) The detection/validation machinery is retained behind
+      // this flag rather than deleted: decisions = null IS the documented
+      // fail-open path (every case keeps the user's change), VALIDATION_LOG
+      // simply receives no rows, and re-enabling is a one-line change.
+      const EXPORT_REFEREE_ENABLED = false;
+
+      if (EXPORT_REFEREE_ENABLED && (caseAItems.length > 0 || rawCaseBGroups.length > 0 || caseCItems.length > 0)) {
         const _valStart = Date.now();
         caseBGroups = await fetchCaseBContext(connection, runId, state, rawCaseBGroups, exportDomainId);
         userTurn    = buildValidationUserTurn(caseAItems, caseBGroups, caseCItems);
@@ -1405,7 +1417,7 @@ export async function runOpExport(
     // Step 2 — detect Case A/B/C from state (no DB writes).
     const { caseAItems, caseBGroups: rawCaseBGroups, caseCItems } = detectCases(state);
 
-    // Mark run as 'validating' so concurrent first-export calls are recognised.
+    // Mark run as 'validating' so concurrent first-export calls are recognized.
     setRunStatus(runId, 'validating');
 
     // Steps 3–4 — opens its own Snowflake connection.

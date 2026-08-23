@@ -1,31 +1,26 @@
 -- ============================================================================
--- Prism internal tables — MICROSOFT SQL SERVER install script
--- (T-SQL port of 00_bootstrap.sql + 01_internal_tables.sql; see
---  docs/MSSQL_PORT_PLAN.md Phase 3 and docs/WAREHOUSES.md.)
+-- Prism install script — MICROSOFT SQL SERVER
 --
--- CUSTOMER INSTALL SCRIPT — everything Prism requires on the customer's SQL
--- Server. Contains NO demo or test data — that lives in 02_demo_data.mssql.sql
--- (dev/demo only, never run on a customer server).
+-- Everything Prism requires inside your SQL Server: one new database
+-- (PRISM_DB) with Prism's internal tables and roles. It creates nothing
+-- outside PRISM_DB and does not touch any of your own databases or data.
 --
--- Run as a sysadmin / db_owner-capable login:
---   sqlcmd -S <server> -U sa -i 01_internal_tables.mssql.sql
--- or via the dev runner (which also runs the demo-data file):
---   cd stand-ui && npm run mssql:install
+-- Run as a sysadmin / db_owner-capable login, e.g.:
+--   sqlcmd -S <server> -U <admin_login> -i 01_internal_tables.mssql.sql
+-- (or paste it into SQL Server Management Studio / Azure Data Studio).
 --
--- Differences from the Snowflake script, by design:
---   * NO PRISM_NORMALIZE function — normalization is app-side only
---     (normalizeLiteral in TypeScript); SQL-side joins use exact-match staging
---     tables with BIN2 collation (plan decision 2.2).
---   * NO warehouse — SQL Server bills provisioned capacity, not wake-time.
---   * NO streams — change detection is Change Tracking / diff scans (Phase 4).
---   * String columns that participate in matching/uniqueness use
---     COLLATE Latin1_General_100_BIN2: SQL Server's default collations are
---     case-INsensitive, which would silently merge values Snowflake (and the
---     app) treat as distinct.
---   * Bounded NVARCHAR lengths on unique-indexed columns (SQL Server caps
---     nonclustered index keys at 1700 bytes): literal_value NVARCHAR(800),
---     alias_name NVARCHAR(450). The app caps alias names at 200 chars already;
---     800-char literals are far beyond any sane categorical value.
+-- ⚠️ Re-running this script RESETS Prism's internal tables (confirmed
+-- mappings, queued values). Run it once at install time; re-run only if you
+-- intend to start Prism over from scratch.
+--
+-- Two choices you may notice in the table definitions:
+--   * Columns that participate in matching use COLLATE
+--     Latin1_General_100_BIN2 — SQL Server's default collations are
+--     case-INsensitive, which would silently merge raw values Prism must
+--     keep distinct.
+--   * NVARCHAR lengths on unique-indexed columns are bounded (SQL Server
+--     caps nonclustered index keys at 1700 bytes): literal_value
+--     NVARCHAR(800), alias_name NVARCHAR(450).
 -- ============================================================================
 
 -- ── Database ────────────────────────────────────────────────────────────────
@@ -37,10 +32,8 @@ USE PRISM_DB;
 GO
 
 -- ── Schemas ─────────────────────────────────────────────────────────────────
--- INTERNAL: Prism's data plane (mirrors PRISM_DB.INTERNAL on Snowflake).
--- EXPORTS:  default destination for lookup-table exports. (Snowflake used
---           PRISM_DB.PUBLIC; "public" collides with SQL Server's built-in
---           database role, so the mssql install uses EXPORTS.)
+-- INTERNAL: Prism's data plane (lookup tables, queue, run state).
+-- EXPORTS:  default destination for lookup-table exports.
 IF SCHEMA_ID('INTERNAL') IS NULL
   EXEC('CREATE SCHEMA INTERNAL');
 IF SCHEMA_ID('EXPORTS') IS NULL
@@ -48,8 +41,8 @@ IF SCHEMA_ID('EXPORTS') IS NULL
 GO
 
 -- ============================================================================
--- DATA-PLANE TABLES (dropped and recreated — dev-reset semantics, same as the
--- Snowflake script's CREATE OR REPLACE)
+-- DATA-PLANE TABLES (dropped and recreated — this is what makes a re-run a
+-- full reset of Prism's internal data)
 -- ============================================================================
 
 DROP TABLE IF EXISTS INTERNAL.LITERAL_ALIAS_MATCHES;
@@ -63,7 +56,8 @@ GO
 
 -- ----------------------------------------------------------------------------
 -- PIPELINE_QUEUE — values detected by polling, waiting for the next
--- standardization tick. pipeline_id is a cross-store ref to SQLite.
+-- standardization tick. pipeline_id references Prism's app-side pipeline
+-- record.
 -- ----------------------------------------------------------------------------
 CREATE TABLE INTERNAL.PIPELINE_QUEUE (
     queue_id         INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
@@ -77,17 +71,15 @@ GO
 
 -- ----------------------------------------------------------------------------
 -- APPROVED_ALIAS_NAMES — catalog of confirmed canonical names.
--- domain_id is a HISTORICAL name: it now holds a SQLite column_specs.spec_id
--- (the per-column lookup scope; domains were removed). UNIQUE(alias_name,
--- domain_id): note SQL Server treats NULLs as EQUAL in unique constraints
--- (Snowflake treats them as distinct) — at most ONE scopeless (NULL) row per
--- name, which matches app semantics (scopeless aliases are deduped by name
--- anyway).
+-- domain_id is a historical column name: it holds the per-column spec id
+-- that scopes each column's lookup. UNIQUE(alias_name, domain_id): SQL
+-- Server treats NULLs as EQUAL in unique constraints, so there is at most
+-- ONE scopeless (NULL) row per name — which matches Prism's semantics.
 -- ----------------------------------------------------------------------------
 CREATE TABLE INTERNAL.APPROVED_ALIAS_NAMES (
     alias_id     INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
     alias_name   NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
-    domain_id    INT               NULL,      -- SQLite column_specs.spec_id (per-column scope; historical name)
+    domain_id    INT               NULL,      -- Prism's per-column spec id (lookup scope; historical name)
     usage_count  INT               NOT NULL CONSTRAINT DF_AAN_usage DEFAULT 0,
     last_used_at DATETIME2(3)      NULL,
     CONSTRAINT uq_approved_alias_names UNIQUE (alias_name, domain_id)
@@ -106,8 +98,8 @@ CREATE TABLE INTERNAL.LITERAL_ALIAS_MATCHES (
     normalized_value NVARCHAR(800) COLLATE Latin1_General_100_BIN2 NULL,
     alias_id         INT               NOT NULL
                      CONSTRAINT FK_LAM_alias REFERENCES INTERNAL.APPROVED_ALIAS_NAMES(alias_id),
-    domain_id        INT               NULL,  -- SQLite column_specs.spec_id (per-column scope; denormalized from alias)
-    run_id           INT               NOT NULL,  -- SQLite runs.run_id (0 = seed sentinel)
+    domain_id        INT               NULL,  -- Prism's per-column spec id (denormalized from alias)
+    run_id           INT               NOT NULL,  -- Prism's app-side run id (0 = seed sentinel)
     confirmed_at     DATETIME2(3)      NOT NULL CONSTRAINT DF_LAM_at DEFAULT SYSUTCDATETIME()
 );
 CREATE NONCLUSTERED INDEX IX_LAM_normalized ON INTERNAL.LITERAL_ALIAS_MATCHES (normalized_value, domain_id);
@@ -121,8 +113,8 @@ GO
 --
 -- A one-time session spans upload -> review -> export, so the rows must outlive
 -- the upload request; the export reproduces every source row with the
--- standardized columns substituted. Held in the warehouse rather than SQLite
--- because these are customer VALUES (data-residency rule).
+-- standardized columns substituted. Held here, in your SQL Server, because
+-- the rows contain your data values (data residency).
 --
 -- The index is NONCLUSTERED because the clustered index key limit is 900 bytes
 -- and session_nonce is variable-width.
@@ -140,15 +132,17 @@ GO
 -- ----------------------------------------------------------------------------
 -- RUN_STATE — the run review state blob (data residency).
 -- One JSON blob per run holding the full grouping/review state, which
--- contains the customer's distinct column values. It lives warehouse-side so
--- no customer values rest in the app's local SQLite (which keeps only run
--- metadata). The optimistic-concurrency revision lives INSIDE the blob
--- ($.rev; missing = 0) — the app's rev-checked save compares it via
--- JSON_VALUE. run_id is a cross-store ref to SQLite runs.
+-- contains your distinct column values. It lives here, in YOUR SQL Server,
+-- so no data values ever rest in the Prism application's own storage (which
+-- keeps only run metadata). The optimistic-concurrency revision lives INSIDE
+-- the blob ($.rev; missing = 0). run_id references Prism's app-side run
+-- record.
 -- ----------------------------------------------------------------------------
 -- ----------------------------------------------------------------------------
--- ONE_TIME_FILE_BLOBS — original uploaded file bytes (base64, chunked) for
--- the edit-in-place round trip (see the Snowflake script's comment).
+-- ONE_TIME_FILE_BLOBS — original uploaded file bytes (base64, chunked), so a
+-- one-time standardization can hand back your own file with only the
+-- standardized cells changed. Stored here, in your SQL Server, for the same
+-- data-residency reason as RUN_STATE.
 -- ----------------------------------------------------------------------------
 CREATE TABLE INTERNAL.ONE_TIME_FILE_BLOBS (
     session_nonce NVARCHAR(100)  NOT NULL,
@@ -188,8 +182,8 @@ GO
 
 -- ============================================================================
 -- ROLES AND GRANTS
--- Database roles mirror the Snowflake roles. Schema-level grants cover future
--- tables automatically (no FUTURE TABLES construct needed).
+-- Prism's least-privilege access model. Schema-level grants cover future
+-- tables automatically.
 -- ============================================================================
 
 IF DATABASE_PRINCIPAL_ID('PRISM_SERVICE') IS NULL
@@ -204,7 +198,7 @@ GO
 -- EXPORTS. (Creating a table needs the db-level CREATE TABLE permission PLUS
 -- ALTER on the target schema.)
 GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::INTERNAL TO PRISM_SERVICE;
-GRANT ALTER                           ON SCHEMA::INTERNAL TO PRISM_SERVICE;  -- staging tables (Phase 5)
+GRANT ALTER                           ON SCHEMA::INTERNAL TO PRISM_SERVICE;  -- staging tables
 GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::EXPORTS  TO PRISM_SERVICE;
 GRANT ALTER                           ON SCHEMA::EXPORTS  TO PRISM_SERVICE;
 GRANT CREATE TABLE TO PRISM_SERVICE;
@@ -232,7 +226,7 @@ GO
 --   CREATE USER prism_svc FOR LOGIN prism_svc;
 --   GRANT SELECT ON SCHEMA::<schema> TO prism_svc;
 --
--- Change Tracking (fast-path detection — Phase 4; optional but recommended):
+-- Change Tracking (fast-path detection; optional but recommended):
 --   ALTER DATABASE <source_db> SET CHANGE_TRACKING = ON
 --     (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
 --   ALTER TABLE <schema>.<table> ENABLE CHANGE_TRACKING;   -- requires a PK
@@ -251,9 +245,6 @@ GO
 -- in the standardized output. Nothing breaks either way — this is a load/latency
 -- trade, and it only applies to tables using diff-scan detection.
 
--- (The TEST_DB demo source table is dev-only and lives in
---  02_demo_data.mssql.sql — never run that file on a customer server.)
-
 -- ── Verification ─────────────────────────────────────────────────────────────
--- SELECT name FROM PRISM_DB.sys.tables;                       -- 6 tables
+-- SELECT name FROM PRISM_DB.sys.tables;                       -- 7 tables
 -- SELECT name, type_desc FROM PRISM_DB.sys.database_principals WHERE type = 'R' AND name LIKE 'PRISM%';

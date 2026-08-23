@@ -1912,7 +1912,7 @@ const PROVIDER_LABEL: Record<string, string> = {
 };
 
 /**
- * Returns a Response for a recognisable AI-provider failure, or null to let the
+ * Returns a Response for a recognizable AI-provider failure, or null to let the
  * caller handle it (warehouse error, bug, etc.).
  */
 export function llmErrorResponse(err: unknown): Response | null {

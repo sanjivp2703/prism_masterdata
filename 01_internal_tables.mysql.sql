@@ -1,37 +1,33 @@
 -- ============================================================================
--- Prism internal tables — MYSQL install script
--- (MySQL port of 00_bootstrap.sql + 01_internal_tables.sql; see
---  docs/MYSQL_PORT_PLAN.md Phase M1 and docs/WAREHOUSES.md.)
+-- Prism install script — MYSQL
 --
--- CUSTOMER INSTALL SCRIPT — everything Prism requires on the customer's MySQL
--- server. Contains NO demo or test data — that lives in 02_demo_data.mysql.sql
--- (dev/demo only, never run on a customer server).
+-- Everything Prism requires on your MySQL server: two new databases
+-- (prism_internal, prism_exports) holding Prism's internal tables and roles.
+-- It touches none of your own databases or data.
 --
 -- Run as root / an admin account:
 --   mysql -h <host> -u root -p < 01_internal_tables.mysql.sql
--- or via the dev runner (which also runs the demo-data file):
---   cd stand-ui && npm run mysql:install
 --
 -- Requires MySQL 8.0.13+ (functional key parts — see the uniqueness notes).
 --
--- Differences from the Snowflake script, by design:
---   * MySQL has NO schema level inside a database (CREATE SCHEMA is an alias
---     for CREATE DATABASE), and cross-database queries work freely — so Prism
---     gets two sibling DATABASES: prism_internal (data plane) and
---     prism_exports (default export destination). Lowercase names throughout:
---     table-name case sensitivity is OS-dependent (lower_case_table_names).
---   * NO PRISM_NORMALIZE function — normalization is app-side only
---     (normalizeLiteral in TypeScript); SQL-side joins use exact-match staging
---     tables under utf8mb4_bin (plan decision 2.3).
---   * NO warehouse — MySQL bills provisioned capacity, not wake-time.
---   * String columns that participate in matching/uniqueness use
---     CHARACTER SET utf8mb4 COLLATE utf8mb4_bin (byte-wise): MySQL's default
---     collations are case-INsensitive (utf8mb4_0900_ai_ci), which would
---     silently merge values the app treats as distinct.
+-- ⚠️ Re-running this script RESETS Prism's internal tables (confirmed
+-- mappings, queued values). Run it once at install time; re-run only if you
+-- intend to start Prism over from scratch.
+--
+-- Choices you may notice in the definitions:
+--   * MySQL has no schema level inside a database (CREATE SCHEMA is an alias
+--     for CREATE DATABASE), so Prism uses two sibling databases:
+--     prism_internal (data plane) and prism_exports (default export
+--     destination). Lowercase names throughout — table-name case sensitivity
+--     is OS-dependent (lower_case_table_names).
+--   * Columns that participate in matching use CHARACTER SET utf8mb4
+--     COLLATE utf8mb4_bin (byte-wise): MySQL's default collations are
+--     case-INsensitive (utf8mb4_0900_ai_ci), which would silently merge raw
+--     values Prism must keep distinct.
 --   * Scopeless-row uniqueness (NULL domain_id) uses FUNCTIONAL KEY PARTS
 --     with a COALESCE(-1) sentinel: MySQL has no partial indexes, and plain
 --     UNIQUE treats NULLs as always-distinct (unlimited NULL duplicates).
---     -1 is unreachable (spec_ids are positive SQLite autoincrements).
+--     -1 is unreachable (real spec ids are positive).
 -- ============================================================================
 
 -- ── Databases ───────────────────────────────────────────────────────────────
@@ -43,8 +39,8 @@ CREATE DATABASE IF NOT EXISTS prism_exports
 USE prism_internal;
 
 -- ============================================================================
--- DATA-PLANE TABLES (dropped and recreated — dev-reset semantics, same as the
--- Snowflake script's CREATE OR REPLACE)
+-- DATA-PLANE TABLES (dropped and recreated — this is what makes a re-run a
+-- full reset of Prism's internal data)
 -- ============================================================================
 
 DROP TABLE IF EXISTS prism_internal.literal_alias_matches;
@@ -57,7 +53,8 @@ DROP TABLE IF EXISTS prism_internal.validation_log;
 
 -- ----------------------------------------------------------------------------
 -- pipeline_queue — values detected by polling, waiting for the next
--- standardization tick. pipeline_id is a cross-store ref to SQLite.
+-- standardization tick. pipeline_id references Prism's app-side pipeline
+-- record.
 -- ----------------------------------------------------------------------------
 CREATE TABLE prism_internal.pipeline_queue (
     queue_id         INT AUTO_INCREMENT PRIMARY KEY,
@@ -75,8 +72,8 @@ CREATE TABLE prism_internal.pipeline_queue (
 
 -- ----------------------------------------------------------------------------
 -- approved_alias_names — catalog of confirmed canonical names.
--- domain_id is a HISTORICAL name: it holds a SQLite column_specs.spec_id (the
--- per-column lookup scope; domains were removed).
+-- domain_id is a historical column name: it holds the per-column spec id
+-- that scopes each column's lookup.
 -- Functional key: COALESCE(-1) sentinel makes NULL scopes collide like values
 -- (at most ONE scopeless row per name — the app invariant), and gives
 -- INSERT … ON DUPLICATE KEY UPDATE its target.
@@ -84,7 +81,7 @@ CREATE TABLE prism_internal.pipeline_queue (
 CREATE TABLE prism_internal.approved_alias_names (
     alias_id     INT AUTO_INCREMENT PRIMARY KEY,
     alias_name   VARCHAR(450) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    domain_id    INT          NULL,      -- SQLite column_specs.spec_id (per-column scope; historical name)
+    domain_id    INT          NULL,      -- Prism's per-column spec id (lookup scope; historical name)
     usage_count  INT          NOT NULL DEFAULT 0,
     last_used_at DATETIME(3)  NULL,
     UNIQUE KEY uq_approved_alias_names ((COALESCE(domain_id, -1)), alias_name)
@@ -103,8 +100,8 @@ CREATE TABLE prism_internal.literal_alias_matches (
     literal_value    VARCHAR(800) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     normalized_value VARCHAR(800) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
     alias_id         INT          NOT NULL,
-    domain_id        INT          NULL,  -- SQLite column_specs.spec_id (per-column scope; denormalized from alias)
-    run_id           INT          NOT NULL,  -- SQLite runs.run_id (0 = seed sentinel)
+    domain_id        INT          NULL,  -- Prism's per-column spec id (denormalized from alias)
+    run_id           INT          NOT NULL,  -- Prism's app-side run id (0 = seed sentinel)
     confirmed_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     UNIQUE KEY uq_lam_norm ((COALESCE(domain_id, -1)), (SHA2(normalized_value, 256))),
     KEY ix_lam_normalized (normalized_value(191), domain_id),
@@ -115,8 +112,8 @@ CREATE TABLE prism_internal.literal_alias_matches (
 -- ----------------------------------------------------------------------------
 -- one_time_file_rows — row snapshot for a ONE-TIME standardization sourced
 -- from an uploaded file or a Google Sheet. Keyed by the session nonce.
--- Held in the warehouse rather than SQLite because these are customer VALUES
--- (data-residency rule). column_data is native JSON — validates on write.
+-- Held here, on your server, because the rows contain your data values
+-- (data residency). column_data is native JSON — validates on write.
 -- ----------------------------------------------------------------------------
 CREATE TABLE prism_internal.one_time_file_rows (
     row_id        INT AUTO_INCREMENT PRIMARY KEY,
@@ -128,8 +125,10 @@ CREATE TABLE prism_internal.one_time_file_rows (
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
--- one_time_file_blobs — original uploaded file bytes (base64, chunked) for
--- the edit-in-place round trip (see the Snowflake script's comment).
+-- one_time_file_blobs — original uploaded file bytes (base64, chunked), so a
+-- one-time standardization can hand back your own file with only the
+-- standardized cells changed. Stored here, on your server, for the same
+-- data-residency reason as run_state.
 -- LONGTEXT: TEXT caps at 64 KB; chunks are ~6 MB.
 -- ----------------------------------------------------------------------------
 CREATE TABLE prism_internal.one_time_file_blobs (
@@ -146,10 +145,11 @@ CREATE TABLE prism_internal.one_time_file_blobs (
 
 -- ----------------------------------------------------------------------------
 -- run_state — the run review state blob (data residency).
--- One JSON blob per run holding the full grouping/review state (the
--- customer's distinct column values). The optimistic-concurrency revision
--- lives INSIDE the blob ($.rev; missing = 0) — the app's rev-checked save
--- compares COALESCE(CAST(state->>'$.rev' AS SIGNED), 0).
+-- One JSON blob per run holding the full grouping/review state, which
+-- contains your distinct column values. It lives here, on YOUR server, so no
+-- data values ever rest in the Prism application's own storage (which keeps
+-- only run metadata). The optimistic-concurrency revision lives INSIDE the
+-- blob ($.rev; missing = 0).
 -- ----------------------------------------------------------------------------
 CREATE TABLE prism_internal.run_state (
     run_id      INT          NOT NULL PRIMARY KEY,
@@ -207,9 +207,6 @@ GRANT SELECT ON prism_internal.* TO 'prism_readonly';
 -- Change detection needs NO extra grants or setup — Prism uses scheduled
 -- scans gated by information_schema write timestamps (readable with SELECT).
 
--- (The test_sources demo database is dev-only and lives in
---  02_demo_data.mysql.sql — never run that file on a customer server.)
-
 -- ── Verification ─────────────────────────────────────────────────────────────
--- SELECT table_name FROM information_schema.tables WHERE table_schema = 'prism_internal';  -- 6 tables
+-- SELECT table_name FROM information_schema.tables WHERE table_schema = 'prism_internal';  -- 7 tables
 -- SELECT DISTINCT from_user FROM mysql.role_edges;  -- role grants

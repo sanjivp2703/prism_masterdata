@@ -401,6 +401,16 @@ export interface PipelineRef {
   // mssql only — consent to Prism attempting to enable Change Tracking
   // automatically (schema-modifying DDL); see pipeline-poller-mssql.ts.
   change_tracking_consent: boolean;
+  // mssql only — source reads run on the CREATOR's personal credentials
+  // (see pipeline-user-connection.ts); internal state stays on the service
+  // connection. Always false on other warehouses.
+  use_user_connection: boolean;
+  created_by: number | null;
+  // Raw passthrough: unmapped rows appear in the export with their raw
+  // values. When ON, newly detected values also trigger an export rebuild
+  // the same cycle (finding #17) so they show up as-is immediately instead
+  // of waiting invisible until the tick standardizes them.
+  export_unmapped_rows: boolean;
 }
 
 /**
@@ -473,7 +483,7 @@ async function fetchActivePipelines(): Promise<PipelineRef[]> {
       const rows = getDb()
         .prepare(
           `SELECT pipeline_id, table_fqn, column_name, domain_id, export_table_fqn, export_kind, update_schedule, status_message,
-                  change_tracking_consent
+                  change_tracking_consent, use_user_connection, created_by, export_unmapped_rows
            FROM pipelines
            WHERE status = 'active'`,
         )
@@ -488,6 +498,9 @@ async function fetchActivePipelines(): Promise<PipelineRef[]> {
         update_schedule:  parseStoredSchedule(r.update_schedule),
         status_message:   r.status_message ?? null,
         change_tracking_consent: r.change_tracking_consent === 1,
+        use_user_connection: r.use_user_connection === 1,
+        created_by: r.created_by != null ? Number(r.created_by) : null,
+        export_unmapped_rows: r.export_unmapped_rows === 1 || r.export_unmapped_rows === true,
       }));
     })();
     activePipelinesCache = { fetchedAt: Date.now(), pipelines };
@@ -595,6 +608,7 @@ export async function pollOnePipeline(
   let listA:              ClassifiedRow[] = [];
   let hasDeletes          = false;
   let hasNullInserts      = false;   // new rows with a NULL in this column — exported as-is (NULL passthrough)
+  let newRowsQueued       = false;   // any new values queued this cycle (raw-passthrough rebuild trigger)
   let needsExportRefresh  = false;   // export-table rebuild required this cycle (see step 8)
   let sourceChecked       = false;   // the stream/source was genuinely consulted this cycle
   // Set when this cycle deliberately flags the pipeline for a forced health
@@ -985,6 +999,7 @@ export async function pollOnePipeline(
         `${listA.length} distinct already in the lookup, ` +
         `${listB.length} distinct need standardization (queue: ${queueAfter})`,
       );
+      newRowsQueued = totalNewRows > 0;
       sourceChecked = true;
       // The export rebuild (if any) runs AFTER this connection closes (see
       // below) to avoid nested withWarehouse calls on the same process.
@@ -1013,7 +1028,15 @@ export async function pollOnePipeline(
     // A view is live already — it never needs the periodic rebuild a table does,
     // so it's treated the same as "no export object" for this trigger.
     const isTableExport = p.export_table_fqn != null && p.export_kind !== 'view';
-    const rebuildNeeded = hasDeletes || (hasNullInserts && isTableExport);
+    // Raw passthrough (owner decision 2026-08-18, finding #17): when the
+    // pipeline opted into export_unmapped_rows, newly detected values should
+    // appear in the export THIS cycle — as raw rows — rather than being
+    // invisible until the tick standardizes them. That is what the toggle
+    // means: the export mirrors the source, standardized where known. The
+    // consistent-snapshot rule ("new values never cause a rebuild") still
+    // governs the default, toggle-OFF case.
+    const rawPassthroughRebuild = p.export_unmapped_rows && newRowsQueued && p.export_kind === 'table';
+    const rebuildNeeded = hasDeletes || ((hasNullInserts || rawPassthroughRebuild) && isTableExport);
     needsExportRefresh = rebuildNeeded && isTableExport;
     if (rebuildNeeded) {
       if (isTableExport && opts.deferStandardization) {

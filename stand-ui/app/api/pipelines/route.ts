@@ -10,9 +10,10 @@ import { getDb } from '@/app/api/_lib/sqlite';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import {
   refreshExportTable, assertCompanionColumnAvailable, CompanionColumnConflictError, provisionColumnModeAccess, columnModeSetupSql,
-  provisionTableModeAccess, checkTableModeAccess, tableModeSetupSql,
+  provisionTableModeAccess, checkTableModeAccess, tableModeSetupSql, serviceCanSeeSourceMssql,
 } from '@/app/api/_lib/export-table';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
+import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims';
 import {
   validateSpecBody, insertColumnSpec, updateColumnSpec,
   seedSpecValuesOnConn, setColumnSpecPipeline, deleteColumnSpec,
@@ -250,6 +251,56 @@ export async function POST(request: Request) {
             return Response.json({ error: e.message }, { status: 400 });
           }
           throw e;
+        }
+      }
+
+      // mssql table-mode exports: verify Prism can actually BUILD at the
+      // destination BEFORE creating anything (owner decision 2026-08-17,
+      // client-sim finding #7). Previously an unbuildable destination still
+      // created the pipeline and merely flagged it — the flag cleared on
+      // resume, leaving an "active" pipeline whose standardized table never
+      // existed. Now: missing access → try the consented automatic grant →
+      // still unbuildable → 400 with the exact fix SQL and NO pipeline row.
+      // Skipped when the service login can't read the SOURCE either: that's a
+      // candidate user-connection pipeline (create-initial-run decides), whose
+      // destination lives behind the creator's own access and is validated on
+      // that connection instead.
+      const creatingNew = !existingRow || String(existingRow.status ?? '') === 'pending_baseline';
+      // Refuse a destination another SOURCE already owns (finding #21).
+      // Rebuilds replace the whole table, so two sources pointed at one
+      // destination overwrite each other silently, and a pipeline aimed at a
+      // one-time export's table destroys it on the first rebuild. Columns of
+      // the SAME source sharing one export table are the documented
+      // multi-column design and stay allowed. Checked before ANY row is
+      // written, so a refusal leaves nothing behind.
+      if (creatingNew && export_kind !== 'column' && export_table_fqn) {
+        const claim = findExportClaim(export_table_fqn, table_fqn);
+        if (claim) {
+          return Response.json(
+            { error: `${exportClaimError(export_table_fqn, claim)} No pipeline was created.` },
+            { status: 409 },
+          );
+        }
+      }
+
+      if (creatingNew && export_kind === 'table' && export_table_fqn && getWarehouseAdapter().kind === 'mssql') {
+        if (await serviceCanSeeSourceMssql(table_fqn)) {
+          let buildable = await checkTableModeAccess(export_table_fqn).catch(() => false);
+          if (!buildable && table_mode_consent) {
+            buildable = (await provisionTableModeAccess(export_table_fqn, Number(session.accountId))) === 'granted';
+          }
+          if (!buildable) {
+            return Response.json(
+              {
+                error:
+                  `Prism can't create the standardized table at ${export_table_fqn}: its service login needs ` +
+                  `CREATE TABLE permission in that database plus ALTER on that schema (and the schema must exist). ` +
+                  `Point the destination at the PRISM_OUT schema created during setup, or ask an admin to run: ` +
+                  `${tableModeSetupSql(export_table_fqn)} No pipeline was created.`,
+              },
+              { status: 400 },
+            );
+          }
         }
       }
 

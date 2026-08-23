@@ -15,6 +15,7 @@ import PipelinesView, { type Pipeline } from './PipelinesView';
 import OneTimeArchiveView from './OneTimeArchiveView';
 import OneTimeStandardizationCard from './OneTimeStandardizationCard';
 import UpdateScheduleEditor from '@/app/components/UpdateScheduleEditor';
+import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 import { DEFAULT_UPDATE_SCHEDULE, type UpdateSchedule } from '@/app/api/_lib/update-schedule';
 
 // ── Layout ──────────────────────────────────────────────────────────────────────
@@ -38,9 +39,17 @@ function mkEntry(overrides: Partial<ColumnEntry> = {}): ColumnEntry {
   };
 }
 
-function suggestExport(tableFqn: string): string {
+function suggestExport(tableFqn: string, warehouseKind?: string): string {
   const t = tableFqn.trim();
   if (!t) return '';
+  // SQL Server: default the output into the PRISM_OUT export schema — the
+  // schema the setup wizard's Part C creates and grants (building in the
+  // source schema would need CREATE TABLE + ALTER on that schema, which
+  // onboarding deliberately does not give Prism).
+  if (warehouseKind === 'mssql') {
+    const parts = t.split('.');
+    if (parts.length === 3) return `${parts[0]}.PRISM_OUT.${parts[2]}_STANDARDIZED`;
+  }
   return `${t}_STANDARDIZED`;
 }
 
@@ -585,7 +594,7 @@ export default function AutoExportHome() {
   function setTableFqn(val: string) {
     setTableFqnRaw(val);
     if (!exportTableEdited) {
-      setExportTableFqnRaw(existingExportForTable(val) ?? suggestExport(val));
+      setExportTableFqnRaw(existingExportForTable(val) ?? suggestExport(val, warehouseKind));
     }
   }
 
@@ -613,6 +622,12 @@ export default function AutoExportHome() {
   // the "no primary key" info note below; actual consent now happens in the
   // submit-time preflight popup, not here.
   const [ctStatus, setCtStatus] = useState<'enabled' | 'available' | 'no_pk' | null>(null);
+  // mssql only — true when the columns probe answered "the service login
+  // can't see this table": the inline access-SQL panel renders the exact
+  // grant statements for the typed table (owner request 2026-08-17 — an
+  // access error must hand over the fix, not just point at the wizard).
+  const [needsGrantSql, setNeedsGrantSql] = useState(false);
+  const [grantSqlCopied, setGrantSqlCopied] = useState(false);
 
   useEffect(() => {
     const t = tableFqn.trim();
@@ -624,11 +639,11 @@ export default function AutoExportHome() {
       ? partCount === 2
       : partCount === 3 || (warehouseKind === 'postgres' && partCount === 2);
     if (!validFqn) {
-      setTableColumns([]); setColumnsError(null); setColumnsLoading(false); setCtStatus(null);
+      setTableColumns([]); setColumnsError(null); setColumnsLoading(false); setCtStatus(null); setNeedsGrantSql(false);
       return;
     }
     let cancelled = false;
-    setColumnsLoading(true); setColumnsError(null);
+    setColumnsLoading(true); setColumnsError(null); setNeedsGrantSql(false); setGrantSqlCopied(false);
     const timer = setTimeout(async () => {
       try {
         // `for=pipeline` so an access failure gets the remedy that applies HERE
@@ -639,6 +654,7 @@ export default function AutoExportHome() {
         if (cancelled) return;
         if (!res.ok) {
           setColumnsError(body?.error ?? 'Could not read this table — check the name and that the service role has access.');
+          setNeedsGrantSql(false);
           setTableColumns([]);
           setCtStatus(null);
         } else if ((body?.fields?.length ?? 0) === 0 && body?.error) {
@@ -651,20 +667,33 @@ export default function AutoExportHome() {
           // cause is missing access. The sibling one-time card already handled
           // this correctly; the connect form did not (PIPE-01).
           //
-          // Deliberately NOT linking to /setup here: pipelines always run on the
-          // SERVICE connection, so personal credentials would not help. The fix
-          // is an admin grant (setup step 2, Part D).
+          // On mssql this also lights up the inline access-SQL panel below the
+          // picker — the exact grant statements for the typed table, so nobody
+          // has to walk back to the wizard to find them.
           setColumnsError(body.error);
+          setNeedsGrantSql(warehouseKind === 'mssql');
           setTableColumns([]);
           setCtStatus(null);
         } else {
           const fields = (body.fields ?? []) as TableColumn[];
           setTableColumns(fields);
           setCtStatus(body?.ct_status ?? null);
-          // Drop any selected columns that aren't in this table (e.g. after a table change).
-          const names = new Set(fields.map(f => f.name.toUpperCase()));
+          // Keep only entries that are REAL, TEXT-eligible columns of THIS
+          // table, once each. Entries survive table changes and fetch errors
+          // (only this success branch can validate them), so a stale,
+          // duplicate, empty, or non-text leftover — reachable via manual
+          // mode or an errored previous table — could linger invisibly:
+          // the count read "2 selected" with one visible checkbox and the
+          // create button silently disabled (live-found 2026-08-18, A3).
+          const textNames = new Set(fields.filter(f => f.isText).map(f => f.name.toUpperCase()));
           setColumnEntries(prev => {
-            const kept = prev.filter(e => names.has(e.columnName.toUpperCase()));
+            const seen = new Set<string>();
+            const kept = prev.filter(e => {
+              const n = e.columnName.trim().toUpperCase();
+              if (!n || !textNames.has(n) || seen.has(n)) return false;
+              seen.add(n);
+              return true;
+            });
             return kept.length === prev.length ? prev : kept;
           });
         }
@@ -790,7 +819,7 @@ export default function AutoExportHome() {
       const { table_fqn, column_name } = JSON.parse(raw);
       if (!table_fqn || !column_name) return;
       setTableFqnRaw(table_fqn);
-      setExportTableFqnRaw(suggestExport(table_fqn));
+      setExportTableFqnRaw(suggestExport(table_fqn, warehouseKind));
       setExportTableEdited(false);
       setColumnEntries([mkEntry({ columnName: column_name })]);
     } catch { /* malformed — ignore */ }
@@ -1569,6 +1598,45 @@ export default function AutoExportHome() {
                               onToggle={toggleColumnSelection}
                               onSetSpec={setColumnSpecByName}
                             />
+                            {needsGrantSql && columnsError && (() => {
+                              const grantSql = buildMssqlDataAccessSql(tableFqn.trim());
+                              if (!grantSql) return null;
+                              return (
+                                <div
+                                  className="mt-2 rounded-card border-[0.5px] p-3"
+                                  style={{ borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}
+                                >
+                                  <div className="flex items-center justify-between gap-2 mb-2">
+                                    <p className="text-xs font-medium" style={{ color: 'var(--accent-strong)', margin: 0 }}>
+                                      Ask a SQL Server admin to run this — it grants Prism read access (and
+                                      fast change detection) for this table, nothing more:
+                                    </p>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard?.writeText(grantSql).then(() => {
+                                          setGrantSqlCopied(true);
+                                          setTimeout(() => setGrantSqlCopied(false), 2000);
+                                        }).catch(() => {});
+                                      }}
+                                      className="text-xs font-medium rounded-button px-2.5 flex-shrink-0"
+                                      style={{ height: 26, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--surface)', color: 'var(--accent-strong)', cursor: 'pointer' }}
+                                    >
+                                      {grantSqlCopied ? 'Copied' : 'Copy SQL'}
+                                    </button>
+                                  </div>
+                                  <pre
+                                    className="text-[11px] rounded-button p-2.5 m-0"
+                                    style={{ backgroundColor: 'var(--surface)', border: '0.5px solid var(--border)', color: 'var(--text-secondary)', maxHeight: 180, overflow: 'auto', whiteSpace: 'pre' }}
+                                  >{grantSql}</pre>
+                                  <p className="text-[11px] mt-2 mb-0" style={{ color: 'var(--text-muted)' }}>
+                                    The same SQL (for any table) lives in{' '}
+                                    <a href="/setup" style={{ color: 'var(--accent)', textDecoration: 'underline' }}>setup</a>, step 2, Part C.
+                                    Once it has been run, re-enter or re-type the table name above.
+                                  </p>
+                                </div>
+                              );
+                            })()}
                             <button
                               type="button"
                               onClick={() => { setManualColumns(true); if (columnEntries.length === 0) setColumnEntries([mkEntry()]); }}

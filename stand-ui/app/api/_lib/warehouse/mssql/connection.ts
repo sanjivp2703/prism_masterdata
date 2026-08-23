@@ -151,7 +151,8 @@ export async function withAdHocMssql<T>(
   const pool = new sql.ConnectionPool({
     server: cfg.server,
     port: cfg.port ?? 1433,
-    database: cfg.database ?? 'PRISM_DB',
+    // undefined = let SQL Server use the login's default database.
+    ...(cfg.database ? { database: cfg.database } : {}),
     user: cfg.user,
     password: cfg.password,
     options: { encrypt: cfg.encrypt !== false, trustServerCertificate: cfg.trustServerCertificate === true },
@@ -189,7 +190,11 @@ async function withUserMssql<T>(accountId: number, fn: (conn: sql.ConnectionPool
     {
       server: String(r.ms_server),
       port: Number(r.ms_port ?? 1433),
-      database: String(r.ms_database ?? ws?.database ?? 'PRISM_DB'),
+      // NOT ws.database: that is PRISM_DB, Prism's internal database, which
+      // a personal (least-privilege) login is not supposed to reach. Blank
+      // means "this login's own default database" — fine, because every
+      // source table is addressed by full three-part name (finding #26).
+      database: String(r.ms_database ?? '').trim() || undefined,
       user: String(r.ms_user),
       password: decryptSecret(String(r.ms_password)),
       encrypt: ws?.encrypt ?? true,
@@ -307,9 +312,25 @@ export function mssqlErrorResponse(error: unknown, fallbackPublicMessage: string
   if (message.startsWith('SQL Server credentials missing')) {
     return Response.json({ error: message }, { status: 500 });
   }
-  if (String(code) === '18456' || message.toLowerCase().includes('login failed')) {
+  // 4060 must be tested BEFORE 18456: SQL Server reports "Cannot open
+  // database ... The login failed", so the generic login-failed branch used
+  // to swallow it and blame the credentials, which were valid (finding #26).
+  const lower = message.toLowerCase();
+  if (String(code) === '4060' || lower.includes('cannot open database')) {
+    const named = /cannot open database "([^"]+)"/i.exec(message)?.[1];
     return Response.json(
-      { error: 'SQL Server login failed. Check the service user credentials.', code },
+      {
+        error: named
+          ? `Signed in successfully, but this login has no access to the database "${named}". Leave the database field blank to use the login's own default database, or enter one this login can open.`
+          : `Signed in successfully, but this login cannot open the database requested. Leave the database field blank to use the login's own default database.`,
+        code,
+      },
+      { status: 401 },
+    );
+  }
+  if (String(code) === '18456' || lower.includes('login failed')) {
+    return Response.json(
+      { error: 'SQL Server login failed. Check the username and password.', code },
       { status: 401 },
     );
   }

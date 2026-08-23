@@ -11,7 +11,8 @@
 import 'server-only';
 
 import { getDb } from './sqlite';
-import { withWarehouse, executeQuery as exec } from './warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec } from './warehouse';
+import { pipelineConnInfo, userConnPauseMessage } from './pipeline-user-connection';
 import {
   type MssqlDetectionState,
   initDetection,
@@ -44,6 +45,16 @@ export interface MssqlPipelineRef {
   // gate. Without it, detection init only reports current status; it never
   // runs DDL via the service login or the creator's personal credentials.
   change_tracking_consent: boolean;
+  // Source reads run on the CREATOR's personal credentials (see
+  // pipeline-user-connection.ts); internal state stays on the service
+  // connection.
+  use_user_connection: boolean;
+  created_by: number | null;
+  // Raw passthrough: with export_unmapped_rows ON, newly queued values also
+  // trigger an export rebuild the same cycle so they appear as-is
+  // immediately (finding #17). Table-kind exports only.
+  export_kind: string;
+  export_unmapped_rows: boolean;
 }
 
 export interface MssqlPollResult {
@@ -135,17 +146,26 @@ export async function reconcileMssqlQueue(
   p: { pipeline_id: number; table_fqn: string; column_name: string; domain_id: number | null },
   cap = 5_000,
 ): Promise<number> {
-  return await withWarehouse(async (conn) => {
-    const scan = await diffScan(conn, p.table_fqn, p.column_name);
+  // Source reads on the pipeline's connection (creator's personal credentials
+  // for a user-connection pipeline); queue/lookup work on the service
+  // connection. For the default case both are the same service connection.
+  const body = async (srcConn: any, conn: any): Promise<number> => {
+    const scan = await diffScan(srcConn, p.table_fqn, p.column_name);
     const unknown = await filterUnknownValues(conn, p.pipeline_id, p.domain_id, scan.values);
     const slice = unknown.slice(0, cap);
     if (slice.length) {
       await queueValues(conn, p.pipeline_id, slice);
       updateQueueMetric(p.pipeline_id, await getQueueSize(conn, p.pipeline_id));
     }
-    await updateSourceValueCount(conn, p.pipeline_id, p.table_fqn, p.column_name);
+    await updateSourceValueCount(srcConn, p.pipeline_id, p.table_fqn, p.column_name);
     return slice.length;
-  });
+  };
+  const info = pipelineConnInfo(p.pipeline_id);
+  if (info.useUser && info.createdBy != null) {
+    return await withUserWarehouse(info.createdBy, (srcConn) =>
+      withWarehouse((conn) => body(srcConn, conn)));
+  }
+  return await withWarehouse((conn) => body(conn, conn));
 }
 
 export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPollResult> {
@@ -166,7 +186,18 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
   }
 
   try {
-    return await withWarehouse(async (conn) => {
+    // srcConn reads the SOURCE table; conn handles internal state (queue,
+    // lookup). They are the same service connection except for
+    // user-connection pipelines, whose source reads run on the creator's
+    // personal credentials.
+    const pollBody = async (srcConn: any, conn: any): Promise<MssqlPollResult> => {
+      // Raw passthrough (finding #17): with export_unmapped_rows ON, queuing
+      // new values also rebuilds the table export this cycle, so they appear
+      // raw immediately instead of waiting invisible for the tick.
+      const rawPassthrough =
+        p.export_unmapped_rows === true &&
+        p.export_table_fqn != null &&
+        String(p.export_kind ?? 'table') === 'table';
       // ── Detection state (init on first poll) ────────────────────────────
       let { state } = loadState(pid);
       let initialized = false;
@@ -178,7 +209,7 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
         // DATABASE/ALTER TABLE are schema-modifying DDL, same consent-gate
         // principle as the Column output mode. Failure/no-consent falls back
         // to diff-scan — never pauses.
-        state = await initDetection(conn, p.table_fqn, { tryEnable: p.change_tracking_consent === true });
+        state = await initDetection(srcConn, p.table_fqn, { tryEnable: p.change_tracking_consent === true });
         saveState(pid, state);
         initialized = true;
         console.log(`[Poller/mssql] Pipeline ${pid}: detection initialized — mode=${state.mode}${state.diff_reason ? ` (${state.diff_reason})` : ''}`);
@@ -207,7 +238,7 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
                      || !!p.status_message
                      || counter % HEALTH_CHECK_EVERY === 1;
       if (healthDue) {
-        const health = await checkSourceHealthMssql(conn, p.table_fqn, p.column_name);
+        const health = await checkSourceHealthMssql(srcConn, p.table_fqn, p.column_name);
         if (!health.ok) {
           await pausePipelineWithMessage(pid, health.message);
           return { checked: false, needsExportRefresh: false };
@@ -235,24 +266,56 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
         lastPollErrored.delete(pid);
       }
 
+      // ── Gap recovery after a detection (re-)init ─────────────────────────
+      // initDetection baselines Change Tracking at the CURRENT version, so
+      // anything written before this moment is invisible to CT forever. That
+      // is fine on a pipeline's first-ever init (the baseline scan covered
+      // it) but NOT after a re-init — and a re-init happens on every
+      // activation, because PATCH status='active' clears the stored
+      // detection state. Rows inserted between the baseline scan and the
+      // first poll therefore vanished silently (live-found 2026-08-18:
+      // source 12 rows, export 11, CT reporting "nothing new").
+      //
+      // So every init reconciles from the source, exactly as the Snowflake
+      // poller's recoverAfterStreamReset does for a stream offset reset:
+      // queue the values that aren't already known, and rebuild the export
+      // so already-mapped gap rows (and raw-passthrough rows) appear too.
+      // On a genuinely fresh pipeline this finds nothing to queue and costs
+      // one bounded scan, once.
+      if (initialized) {
+        const gapScan = await diffScan(srcConn, p.table_fqn, p.column_name);
+        const gapNew  = await filterUnknownValues(conn, pid, p.domain_id, gapScan.values);
+        if (gapNew.length) await queueValues(conn, pid, gapNew);
+        updateQueueMetric(pid, await getQueueSize(conn, pid));
+        await updateSourceValueCount(srcConn, pid, p.table_fqn, p.column_name);
+        console.log(
+          `[Poller/mssql] Pipeline ${pid}: detection (re-)initialized — reconciled source, ` +
+          `queued ${gapNew.length} value(s) not yet known; export rebuild flagged`,
+        );
+        // Gap rows may still be awaiting standardization — do not claim
+        // "verified up to date" on this cycle.
+        touchLastPolled(pid, { claimSynced: false });
+        return { checked: true, needsExportRefresh: true };
+      }
+
       // ── CT mode ──────────────────────────────────────────────────────────
       if (state.mode === 'ct') {
-        if (!(await ctHasChanges(conn, p.table_fqn, state))) {
+        if (!(await ctHasChanges(srcConn, p.table_fqn, state))) {
           touchLastPolled(pid);
           return { checked: true, needsExportRefresh: false };
         }
-        const result = await ctConsume(conn, p.table_fqn, p.column_name, state);
+        const result = await ctConsume(srcConn, p.table_fqn, p.column_name, state);
         if (result.needsReconcile) {
           // Retention window expired — recover from the source: queue unknown
           // values now; already-mapped gap rows need the export rebuild
           // (Phase 5 on mssql). Do NOT claim synced while gaps may exist.
           console.warn(`[Poller/mssql] Pipeline ${pid}: CT retention window expired — running source reconcile`);
-          const scan = await diffScan(conn, p.table_fqn, p.column_name);
+          const scan = await diffScan(srcConn, p.table_fqn, p.column_name);
           const unknown = await filterUnknownValues(conn, pid, p.domain_id, scan.values);
           if (unknown.length) await queueValues(conn, pid, unknown);
           saveState(pid, result.state);
           updateQueueMetric(pid, await getQueueSize(conn, pid));
-          await updateSourceValueCount(conn, pid, p.table_fqn, p.column_name);
+          await updateSourceValueCount(srcConn, pid, p.table_fqn, p.column_name);
           touchLastPolled(pid, { claimSynced: false });
           return { checked: true, needsExportRefresh: true };
         }
@@ -265,10 +328,15 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
           // filterUnknownValues compares on the normalized form against both
           // the existing queue and the lookup, which is the same comparison the
           // rest of the system uses.
-          const unknown = await filterUnknownValues(conn, pid, p.domain_id, result.values);
+          // includeMapped: CT reported these as CHANGED, so even a value
+          // already in the lookup means new rows the export hasn't published
+          // yet. Queueing it costs no LLM (the tick resolves it from the
+          // lookup) and is what keeps the export — and the freshness stamp —
+          // honest (finding #30).
+          const unknown = await filterUnknownValues(conn, pid, p.domain_id, result.values, { includeMapped: true });
           if (unknown.length) await queueValues(conn, pid, unknown);
           console.log(
-            `[Poller/mssql] Pipeline ${pid}: queued ${unknown.length} of ${result.values.length} value(s) ` +
+            `[Poller/mssql] Pipeline ${pid}: queued ${unknown.length} of ${result.values.length} changed value(s) ` +
             `from Change Tracking${result.sawDeletes ? ' (+deletes seen)' : ''}`,
           );
         }
@@ -277,16 +345,20 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
         // Parity with Snowflake: a live row count on every cycle that touched
         // CT changes (inserts AND deletes affect this), independent of
         // total_mapped which waits for the next standardization tick.
-        await updateSourceValueCount(conn, pid, p.table_fqn, p.column_name);
+        await updateSourceValueCount(srcConn, pid, p.table_fqn, p.column_name);
         touchLastPolled(pid);
-        return { checked: true, needsExportRefresh: result.sawDeletes };
+        // Raw passthrough triggers on ANY change Change Tracking reported,
+        // not only the values that queued: a new row carrying an
+        // already-KNOWN value queues nothing (it is filtered against the
+        // lookup) but still has to appear in the export.
+        return { checked: true, needsExportRefresh: result.sawDeletes || (rawPassthrough && result.values.length > 0) };
       }
 
       // ── Diff mode ────────────────────────────────────────────────────────
       const passes = (state.passes_since_scan ?? 0) + 1;
 
       // Free heartbeat: skip everything when the table hasn't been written to.
-      const beat = await diffHeartbeat(conn, p.table_fqn);
+      const beat = await diffHeartbeat(srcConn, p.table_fqn);
       const beatUsable = beat !== 'unavailable';
 
       // How often the tier says to actually read the source column.
@@ -331,7 +403,7 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
         return { checked: false, needsExportRefresh: false };
       }
 
-      const scan = await diffScan(conn, p.table_fqn, p.column_name);
+      const scan = await diffScan(srcConn, p.table_fqn, p.column_name);
       if (scan.truncated) {
         console.warn(`[Poller/mssql] Pipeline ${pid}: diff scan truncated at cap — remaining values queue on later scans`);
       }
@@ -352,17 +424,38 @@ export async function pollOneMssqlPipeline(p: MssqlPipelineRef): Promise<MssqlPo
       // Parity with Snowflake: a live row count whenever a scan actually ran
       // (a scan is a real read of the source either way), independent of
       // total_mapped which waits for the next standardization tick.
-      await updateSourceValueCount(conn, pid, p.table_fqn, p.column_name);
+      await updateSourceValueCount(srcConn, pid, p.table_fqn, p.column_name);
       // Deletes in diff mode surface via the hourly safety rebuild — a scan
       // proves the queue state but not row-level deletions, so a truncated or
       // delete-blind scan must not block the freshness stamp: queue-empty
       // semantics still hold (every KNOWN value standardized and exported).
       touchLastPolled(pid);
-      return { checked: true, needsExportRefresh: false };
-    });
+      return { checked: true, needsExportRefresh: rawPassthrough && unknown.length > 0 };
+    };
+
+    if (p.use_user_connection) {
+      // The creator's credentials are this pipeline's ONLY path to the source.
+      // Missing credentials pause the pipeline with an actionable message —
+      // never a silent skip, and never a workspace-wide banner.
+      if (p.created_by == null || !(await hasUserWarehouseConfig(p.created_by))) {
+        await pausePipelineWithMessage(pid, userConnPauseMessage(p.table_fqn));
+        return { checked: false, needsExportRefresh: false };
+      }
+      return await withUserWarehouse(p.created_by, (srcConn) =>
+        withWarehouse((conn) => pollBody(srcConn, conn)));
+    }
+    return await withWarehouse((conn) => pollBody(conn, conn));
   } catch (err) {
     const kind = classifyMssqlPollError(err);
     console.error(`[Poller/mssql] Pipeline ${pid} poll failed (${kind}):`, (err as any)?.message ?? err);
+    // A user-connection pipeline failing to sign in is a problem with ONE
+    // person's saved credentials, not the workspace's SQL Server — pause that
+    // pipeline with the credentials message instead of the global banner or
+    // the generic table-access prose.
+    if (p.use_user_connection && (kind === 'global' || kind === 'table')) {
+      await pausePipelineWithMessage(pid, userConnPauseMessage(p.table_fqn)).catch(() => {});
+      return { checked: false, needsExportRefresh: false };
+    }
     if (kind === 'ct_reset') {
       // The table was almost certainly dropped and recreated (same name, new
       // object — Change Tracking registration is tied to the object, not the
