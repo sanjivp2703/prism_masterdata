@@ -560,6 +560,15 @@ export default function AutoExportHome() {
   // should proceed with once approved.
   interface PreflightItem { key: string; label: string; detail: string; }
   const [preflightItems, setPreflightItems] = useState<PreflightItem[] | null>(null);
+  // Prism can only apply the preflight grants with a privileged identity —
+  // SQL Server forbids a login granting permissions to itself. When the
+  // creator has no saved credentials the popup collects them inline, rather
+  // than bouncing to Setup and losing this half-filled form (owner request).
+  const [preflightNeedsCreds, setPreflightNeedsCreds] = useState(false);
+  const [credUser, setCredUser]         = useState('');
+  const [credPassword, setCredPassword] = useState('');
+  const [credError, setCredError]       = useState<string | null>(null);
+  const [showFixSql, setShowFixSql]     = useState(false);
   const [preflightExport, setPreflightExport] = useState('');
   const [preflightChecking, setPreflightChecking] = useState(false);
   const [preflightSubmitting, setPreflightSubmitting] = useState(false);
@@ -914,6 +923,7 @@ export default function AutoExportHome() {
       const items: PreflightItem[] = Array.isArray(body?.items) ? body.items : [];
       if (items.length > 0) {
         setPreflightItems(items);
+        setPreflightNeedsCreds(body?.needs_credentials === true);
         setPreflightExport(finalExport);
         return;
       }
@@ -1492,8 +1502,10 @@ export default function AutoExportHome() {
                                     style={{ accentColor: '#C2410C' }}
                                   />
                                   <span className="text-xs font-medium" style={{ color: '#9A3412' }}>
-                                    I understand — allow Prism to add and maintain standardized columns on this table.
-                                    This grants Prism update access to this specific table only.
+                                    I understand — allow Prism to add and maintain standardized columns on this table,
+                                    giving Prism update access to this table only. Prism grants that itself using your own
+                                    saved SQL Server credentials; if it can&apos;t, it shows you the exact SQL for an admin
+                                    to run instead.
                                   </span>
                                 </label>
                               </div>
@@ -1879,11 +1891,52 @@ export default function AutoExportHome() {
                               </div>
                             ))}
                           </div>
-                          <p className="text-xs mb-4" style={{ color: 'var(--text-hint)' }}>
-                            If Prism can&apos;t apply these automatically (e.g. no saved personal credentials), the
-                            pipeline is still created and flagged with the exact SQL for an admin to run instead —
-                            nothing happens silently either way.
-                          </p>
+                          {preflightNeedsCreds ? (
+                            <div className="rounded-button border-[0.5px] p-3 mb-4" style={{ borderColor: 'var(--accent-border)', backgroundColor: 'var(--accent-tint)' }}>
+                              <p className="text-xs leading-relaxed mb-3" style={{ color: 'var(--accent-strong)' }}>
+                                Prism signs in as its own restricted login, and SQL Server does not let a login grant
+                                permissions to itself — so it needs your database login once to apply the above. It is
+                                stored encrypted, used only on your behalf, and reused for future pipelines.
+                              </p>
+                              <div className="flex flex-col gap-2">
+                                <input
+                                  type="text" value={credUser} onChange={e => setCredUser(e.target.value)}
+                                  placeholder="Your SQL Server login" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                                  className="w-full px-3 py-2 rounded-button border-[0.5px] text-sm outline-none font-mono"
+                                  style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+                                />
+                                <input
+                                  type="password" value={credPassword} onChange={e => setCredPassword(e.target.value)}
+                                  placeholder="Password"
+                                  className="w-full px-3 py-2 rounded-button border-[0.5px] text-sm outline-none"
+                                  style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface)', color: 'var(--text-primary)' }}
+                                />
+                              </div>
+                              {credError && (
+                                <p className="text-[11px] mt-2" style={{ color: 'var(--confidence-low)' }}>{credError}</p>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => setShowFixSql(v => !v)}
+                                className="text-[11px] mt-2 underline"
+                                style={{ color: 'var(--accent-strong)', background: 'none', cursor: 'pointer' }}
+                              >
+                                {showFixSql ? 'Hide' : 'Or have a database admin run the SQL instead'}
+                              </button>
+                              {showFixSql && (
+                                <p className="text-[11px] mt-2 font-mono select-all leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                                  Ask your SQL Server admin to grant Prism&apos;s login the access described above on
+                                  this one table, then create the pipeline again — the exact statements are shown on
+                                  the pipeline card if you continue without credentials.
+                                </p>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="text-xs mb-4" style={{ color: 'var(--text-hint)' }}>
+                              Prism applies these with your saved personal credentials. If a grant can&apos;t be
+                              applied, nothing happens silently — you get the exact SQL for an admin to run.
+                            </p>
+                          )}
                           <div className="flex items-center justify-end gap-2">
                             <button
                               type="button"
@@ -1898,7 +1951,25 @@ export default function AutoExportHome() {
                               type="button"
                               onClick={async () => {
                                 setPreflightSubmitting(true);
+                                setCredError(null);
                                 try {
+                                  // Save the typed credentials first — the server
+                                  // live-tests them, so a bad login is reported
+                                  // here instead of failing mid-creation.
+                                  if (preflightNeedsCreds) {
+                                    const r = await fetch('/api/accounts/mssql-config', {
+                                      method:  'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body:    JSON.stringify({ user: credUser.trim(), password: credPassword }),
+                                    });
+                                    const b = await r.json().catch(() => ({}));
+                                    if (!r.ok) {
+                                      setCredError(b?.error ?? 'Those credentials could not be saved.');
+                                      return;
+                                    }
+                                    setPreflightNeedsCreds(false);
+                                    setCredPassword('');
+                                  }
                                   await proceedCreate(preflightExport, {
                                     ct:        preflightItems.some(i => i.key === 'change_tracking'),
                                     tableMode: preflightItems.some(i => i.key === 'table_mode_access'),
@@ -1907,14 +1978,14 @@ export default function AutoExportHome() {
                                   setPreflightSubmitting(false);
                                 }
                               }}
-                              disabled={preflightSubmitting}
+                              disabled={preflightSubmitting || (preflightNeedsCreds && (!credUser.trim() || !credPassword))}
                               className="text-[13px] font-medium px-4 py-2 rounded-button text-white transition-colors disabled:opacity-50 inline-flex items-center gap-2"
                               style={{ backgroundColor: 'var(--accent)' }}
                               onMouseEnter={e => { if (!preflightSubmitting) (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent-strong)'; }}
                               onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--accent)'; }}
                             >
                               {preflightSubmitting && <Spinner className="w-3 h-3" />}
-                              I approve, continue
+                              {preflightNeedsCreds ? 'Save credentials and continue' : 'I approve, continue'}
                             </button>
                           </div>
                         </div>

@@ -16,13 +16,14 @@
  * export_table_fqn (only meaningful for 'table').
  */
 import { requireValidSession } from '@/app/api/_lib/account-security';
-import { withWarehouse, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { getPrimaryKeyColumns, isCtEnabled, hasViewChangeTrackingPermission } from '@/app/api/_lib/warehouse/mssql/detection';
 import { hasTableModePermissions } from '@/app/api/_lib/warehouse/mssql/export';
-import { parseFqn } from '@/app/api/_lib/warehouse/mssql/dialect';
+import { parseFqn, quoteIdent } from '@/app/api/_lib/warehouse/mssql/dialect';
+import { standardizedColumnName } from '@/app/api/_lib/export-kind';
 
 export interface PreflightItem {
-  key:    'change_tracking' | 'table_mode_access';
+  key:    'change_tracking' | 'table_mode_access' | 'column_mode_access';
   label:  string;
   detail: string;
 }
@@ -37,6 +38,7 @@ export async function GET(request: Request) {
 
   const { searchParams } = new URL(request.url);
   const table_fqn         = searchParams.get('table_fqn')?.trim() ?? '';
+  const column_name       = searchParams.get('column_name')?.trim() ?? '';
   const export_kind       = searchParams.get('export_kind') ?? 'table';
   const export_table_fqn  = searchParams.get('export_table_fqn')?.trim() || null;
 
@@ -81,6 +83,36 @@ export async function GET(request: Request) {
           });
         }
       }
+
+      // ── Column mode: Prism must ADD a companion column to the customer's
+      // own table and UPDATE it. The service login deliberately has neither
+      // right (onboarding grants read-only on source schemas), and SQL Server
+      // forbids a login granting permissions to ITSELF — verified live:
+      // "Cannot grant, deny, or revoke permissions to … yourself". So this
+      // always needs a privileged identity: the creator's saved credentials,
+      // or a DBA running the SQL. ────────────────────────────────────────
+      if (export_kind === 'column' && table_fqn.split('.').filter(Boolean).length === 3) {
+        const p = parseFqn(table_fqn);
+        const obj = `${p.schema}.${p.table}`;
+        const rows = await exec(
+          conn,
+          `USE ${quoteIdent(p.db)}; SELECT HAS_PERMS_BY_NAME(?, 'OBJECT', 'ALTER') AS can_alter, HAS_PERMS_BY_NAME(?, 'OBJECT', 'UPDATE') AS can_update`,
+          [obj, obj],
+        ).catch(() => [] as any[]);
+        const r = rows[0] as any;
+        const ok = Number(r?.can_alter ?? 0) === 1 && Number(r?.can_update ?? 0) === 1;
+        if (!ok) {
+          const companion = standardizedColumnName(column_name || 'COLUMN');
+          items.push({
+            key:   'column_mode_access',
+            label: 'Allow the standardized column on your table',
+            detail:
+              `Adds the "${companion}" column to ${table_fqn} and grants Prism UPDATE on that ONE table, ` +
+              `so it can keep the column filled in. Prism's write statements can only target companion ` +
+              `columns it created — no other column, table or schema is affected.`,
+          });
+        }
+      }
     });
   } catch (err) {
     // Non-fatal — if the check itself can't run (e.g. connection hiccup),
@@ -89,5 +121,11 @@ export async function GET(request: Request) {
     console.warn('[Preflight] check failed:', (err as any)?.message ?? err);
   }
 
-  return Response.json({ items });
+  // Whether Prism has an identity able to perform the above. Without saved
+  // personal credentials the popup collects them inline rather than sending
+  // the user to Setup and losing the half-filled form (owner request).
+  const needs_credentials =
+    items.length > 0 && !(await hasUserWarehouseConfig(Number(auth.accountId)));
+
+  return Response.json({ items, needs_credentials });
 }

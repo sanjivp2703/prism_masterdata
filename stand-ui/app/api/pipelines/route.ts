@@ -11,6 +11,7 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import {
   refreshExportTable, assertCompanionColumnAvailable, CompanionColumnConflictError, provisionColumnModeAccess, columnModeSetupSql,
   provisionTableModeAccess, checkTableModeAccess, tableModeSetupSql, serviceCanSeeSourceMssql,
+  checkColumnModeAccess,
 } from '@/app/api/_lib/export-table';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims';
@@ -241,6 +242,28 @@ export async function POST(request: Request) {
         if (body?.column_write_consent !== true) {
           return Response.json(
             { error: 'The Column output edits the source table and requires explicit consent (column_write_consent).' },
+            { status: 400 },
+          );
+        }
+        // The consent checkbox tells the user that ticking it "grants Prism
+        // update access to this specific table only". Prism can only make
+        // that true when it has credentials able to issue the GRANT — with
+        // none, creation used to succeed and the pipeline immediately paused
+        // asking for SQL, i.e. the consent promised something the system
+        // could not deliver (finding #31). Check BEFORE creating anything,
+        // exactly like the table-mode gate, and refuse with the SQL instead
+        // of leaving a pipeline that cannot write.
+        const columnAccess = await checkColumnModeAccess(table_fqn, Number(session.accountId));
+        if (columnAccess === 'needs_admin') {
+          return Response.json(
+            {
+              error:
+                `Prism can't grant itself write access to ${table_fqn}, so the standardized column ` +
+                `can't be maintained yet. Either save your own SQL Server credentials in Setup (Prism ` +
+                `then grants access to this one table for you), or ask a SQL Server admin to run: ` +
+                `${columnModeSetupSql(table_fqn, column_name)} No pipeline was created.`,
+              code: 'column_mode_needs_grant',
+            },
             { status: 400 },
           );
         }

@@ -422,6 +422,40 @@ client DBA's job during the walkthrough (that's the rehearsal).
    even when mapped (Snowflake's consistent-snapshot semantics); the tick
    republishes them with zero LLM cost. Diff mode deliberately unchanged.
 
+31. **Column-mode consent promised access Prism couldn't grant (live; FIXED):**
+   the checkbox said ticking it grants Prism update access, but Prism can only
+   do that with a privileged identity — SQL Server refuses a login granting
+   permissions to *itself* (verified: "Cannot grant, deny, or revoke
+   permissions to … yourself"). With no saved personal credentials, creation
+   succeeded and the pipeline immediately paused asking for SQL. Now: creation
+   is gated up front (400, no pipeline created), the consent copy states what
+   actually happens, and the pre-create approval popup **collects credentials
+   inline** so the user never leaves the half-filled form.
+32. **Per-table write access outlived the pipeline (live; FIXED):** deleting a
+   column-mode pipeline left Prism holding UPDATE on the customer's table
+   forever — found by auditing grants after the column-mode test, where
+   `REGIONS` still carried a grant from a deleted pipeline. Deletion now
+   revokes it (best-effort, never blocks deletion, returns the SQL when Prism
+   can't), skipping the revoke when another column pipeline still claims the
+   table. The companion COLUMN is deliberately left behind — Prism never drops
+   a column — and the response says so.
+
+## Column output mode — verified live 2026-08-23 (closes PRELAUNCH §1 for mssql)
+
+Against `CLIENT_DB.dbo.CUSTOMER_ORDERS` (25 rows), snapshotted to
+`CUSTOMER_ORDERS_BACKUP` first:
+
+| Check | Result |
+|---|---|
+| Original columns unchanged (EXCEPT, both directions) | **0 rows drift** |
+| Row count | 25 / 25 |
+| Companion column filled | 25 / 25, correct canonicals (att, AT&T Wireless, a t and t → AT&T) |
+| Grant scope | UPDATE on `CUSTOMER_ORDERS` only |
+| Automatic provisioning via the creator's credentials | worked (added column + granted itself, one table) |
+
+⚠️ Still unverified for column mode: the privilege-revoked-mid-flight path
+(§1.4) and the pre-existing-companion-column refusal (§1.3) on a live table.
+
 ## Volume tests (2026-08-21, droplet — 4 GB box also hosting SQL Server, so
 these are pessimistic floors)
 

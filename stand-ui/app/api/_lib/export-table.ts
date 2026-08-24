@@ -691,6 +691,92 @@ export function columnModeSetupSql(table_fqn: string, column_name: string): stri
  * (assertCompanionColumnAvailable) must have passed before this runs, so the
  * ADD COLUMN can only ever create Prism's own column.
  */
+/**
+ * Can Prism obtain column-mode write access at all — WITHOUT changing
+ * anything? (finding #31)
+ *
+ * The connect form's consent checkbox says ticking it "grants Prism update
+ * access to this specific table only", but Prism can only make that true if
+ * the creator has saved personal credentials that can issue the GRANT. With
+ * none, creation used to succeed and the pipeline immediately paused asking
+ * for SQL — the consent promised something the system then couldn't do.
+ *
+ *   'ready'         — the service login already holds ALTER + UPDATE there.
+ *   'can_provision' — the creator has credentials to grant it at consent time.
+ *   'needs_admin'   — neither; the caller should refuse and show the SQL.
+ *
+ * mssql only (the gate's home warehouse); every other adapter returns
+ * 'can_provision' so their behaviour is unchanged.
+ */
+export async function checkColumnModeAccess(
+  table_fqn:        string,
+  creatorAccountId: number,
+): Promise<'ready' | 'can_provision' | 'needs_admin'> {
+  if (getWarehouseAdapter().kind !== 'mssql') return 'can_provision';
+  const p = msParseFqn(table_fqn);
+  const obj = `${p.schema}.${p.table}`;
+  const already = await withWarehouse(async (conn) => {
+    const rows = await exec(
+      conn,
+      `USE ${msQuoteIdent(p.db)}; SELECT HAS_PERMS_BY_NAME(?, 'OBJECT', 'ALTER') AS can_alter, HAS_PERMS_BY_NAME(?, 'OBJECT', 'UPDATE') AS can_update`,
+      [obj, obj],
+    );
+    const r = rows[0] as any;
+    return Number(r?.can_alter ?? 0) === 1 && Number(r?.can_update ?? 0) === 1;
+  }).catch(() => false);
+  if (already) return 'ready';
+  return (Number.isFinite(creatorAccountId) && (await hasUserWarehouseConfig(creatorAccountId)))
+    ? 'can_provision'
+    : 'needs_admin';
+}
+
+/**
+ * Give back the per-table write access when a column-mode pipeline is deleted
+ * — finding #32.
+ *
+ * Live-found 2026-08-23: deleting a column-mode pipeline left Prism holding
+ * UPDATE on that table forever. The grant was correctly scoped when issued
+ * (one table, nothing else — verified), but nothing ever handed it back, so a
+ * customer accumulates standing write access on tables Prism no longer
+ * manages. That quietly erodes the promise the consent checkbox makes.
+ *
+ * Best-effort and non-blocking: deletion must never fail because a revoke
+ * could not run. Returns the SQL for a human when Prism cannot do it itself
+ * (no saved credentials, or the revoke is refused), so it is never silent.
+ *
+ * The companion COLUMN is deliberately left in place — Prism must never drop
+ * a column it cannot prove is safe to drop; the customer removes it if they
+ * want it gone.
+ */
+export async function revokeColumnModeAccess(
+  table_fqn:        string,
+  creatorAccountId: number | null,
+): Promise<'revoked' | 'manual_required'> {
+  if (getWarehouseAdapter().kind !== 'mssql') return 'manual_required';
+  if (!creatorAccountId || !Number.isFinite(creatorAccountId)) return 'manual_required';
+  if (!(await hasUserWarehouseConfig(creatorAccountId))) return 'manual_required';
+  try {
+    await withUserWarehouse(creatorAccountId, async (conn) => {
+      const p = msParseFqn(table_fqn);
+      const obj = `${msQuoteIdent(p.schema)}.${msQuoteIdent(p.table)}`;
+      await exec(
+        conn,
+        `USE ${msQuoteIdent(p.db)}; REVOKE UPDATE ON OBJECT::${obj} FROM ${msQuoteIdent(getServiceLoginName())};`,
+      );
+    });
+    return 'revoked';
+  } catch (err) {
+    console.warn(`[ColumnMode] Could not revoke UPDATE on ${table_fqn}:`, (err as any)?.message ?? err);
+    return 'manual_required';
+  }
+}
+
+/** The statement a human runs when Prism can't hand the access back itself. */
+export function columnModeRevokeSql(table_fqn: string): string {
+  const p = msParseFqn(table_fqn);
+  return `USE ${msQuoteIdent(p.db)}; REVOKE UPDATE ON OBJECT::${msQuoteIdent(p.schema)}.${msQuoteIdent(p.table)} FROM ${msQuoteIdent(getServiceLoginName())};`;
+}
+
 export async function provisionColumnModeAccess(
   table_fqn:        string,
   column_name:      string,

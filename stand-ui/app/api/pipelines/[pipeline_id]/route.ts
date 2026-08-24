@@ -8,7 +8,7 @@ import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehou
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { dropPipelineStream } from '@/app/api/_lib/pipeline-poller';
-import { refreshExportTable, columnModeSetupSql } from '@/app/api/_lib/export-table';
+import { refreshExportTable, columnModeSetupSql, revokeColumnModeAccess, columnModeRevokeSql } from '@/app/api/_lib/export-table';
 import { tableModeSetupSql } from '@/app/api/_lib/warehouse/mssql/export';
 import { asUpdateSchedule, serializeUpdateSchedule } from '@/app/api/_lib/update-schedule';
 import { type ExportKind, asExportKind } from '@/app/api/_lib/export-kind';
@@ -313,12 +313,46 @@ export async function DELETE(
       // harmless and non-destructive; hard-deleting them would be a separate
       // opt-in.
       const db = getDb();
+      // Column-mode pipelines hold per-table UPDATE on the customer's own
+      // table. Read who granted it BEFORE the row goes away (finding #32) —
+      // the actual revoke happens after the response is built, since it needs
+      // a warehouse round trip and must never make deletion fail.
+      const doomed = db
+        .prepare(`SELECT table_fqn, column_name, export_kind, created_by FROM pipelines WHERE pipeline_id = ?`)
+        .get(pid) as any;
       db.prepare(`DELETE FROM column_specs WHERE pipeline_id = ?`).run(pid);
       db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
-      return Response.json({ ok: true });
+      return Response.json({ ok: true, doomed });
     })();
 
     dropPipelineStream(pid);
+
+    // Hand back the write access this pipeline was given (finding #32). Any
+    // other column-mode pipeline still pointing at the same table keeps its
+    // own claim, so only revoke when none remains. Never blocks deletion; the
+    // response carries the SQL when Prism can't do it itself, and the
+    // companion column is deliberately left for the customer to drop.
+    const body = await response.clone().json().catch(() => ({} as any));
+    const doomed = body?.doomed;
+    if (doomed && String(doomed.export_kind ?? '') === 'column' && doomed.table_fqn) {
+      const stillClaimed = getDb()
+        .prepare(`SELECT 1 FROM pipelines WHERE export_kind = 'column' AND table_fqn = ? LIMIT 1`)
+        .get(String(doomed.table_fqn));
+      if (!stillClaimed) {
+        const outcome = await revokeColumnModeAccess(
+          String(doomed.table_fqn),
+          doomed.created_by != null ? Number(doomed.created_by) : null,
+        );
+        return Response.json({
+          ok: true,
+          column_access_revoked: outcome === 'revoked',
+          ...(outcome === 'revoked' ? {} : { manual_revoke_sql: columnModeRevokeSql(String(doomed.table_fqn)) }),
+          companion_column_note:
+            `The ${doomed.column_name}_STANDARDIZED column is left in place — Prism never drops a column. ` +
+            `Drop it yourself if you no longer want it.`,
+        });
+      }
+    }
 
     return response;
   } catch (err) {
