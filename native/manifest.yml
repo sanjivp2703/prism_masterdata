@@ -8,6 +8,12 @@ version:
   label: "Prism 1.0"
   comment: "Warehouse-native data standardization"
 
+lifecycle_callbacks:
+  # Runs on every install/upgrade (incl. background auto-upgrades after a
+  # release-directive move): rolls the running service onto this version's
+  # image/spec. Guarded no-op on first install. Manual fallback: upgrade_app().
+  version_initializer: app_code.version_init
+
 artifacts:
   setup_script: setup.sql
   readme: README.md

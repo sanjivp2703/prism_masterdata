@@ -187,6 +187,26 @@ $$;
 GRANT USAGE ON PROCEDURE app_code.start_app() TO APPLICATION ROLE app_user;
 GRANT USAGE ON PROCEDURE app_code.upgrade_app() TO APPLICATION ROLE app_user;
 
+-- ── Auto-upgrade hook (manifest: lifecycle_callbacks.version_initializer) ────
+-- Snowflake runs this automatically on every install and upgrade — including
+-- the background auto-upgrade after a release-directive move — so the running
+-- service rolls onto this version's image and spec with no action needed from
+-- your account. On a first install (before privileges are granted, before the
+-- service exists) it quietly does nothing; the first start is start_app().
+-- A thrown error here would fail the upgrade itself, so every path is guarded.
+CREATE OR REPLACE PROCEDURE app_code.version_init()
+RETURNS STRING LANGUAGE SQL AS
+$$
+BEGIN
+  ALTER SERVICE IF EXISTS services.prism_app FROM SPECIFICATION_FILE = '/service-spec.yaml';
+  GRANT USAGE ON WAREHOUSE PRISM_APP_WH TO APPLICATION ROLE app_user;
+  RETURN 'service refreshed';
+EXCEPTION
+  WHEN OTHER THEN
+    RETURN 'nothing to refresh yet';  -- first install: no service/warehouse exists
+END;
+$$;
+
 -- (The install-test diag() proc lived here through patch 19 — removed
 -- 2026-08-14, a pre-distribution requirement. app_code is versioned, so the
 -- next upgrade drops it from installs automatically.)

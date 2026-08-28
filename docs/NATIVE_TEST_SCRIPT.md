@@ -62,9 +62,12 @@ Fixtures: `DEMO_DATA.OPEN` (analyst-visible), `DEMO_DATA.RESTRICTED`
       commits (`9464fa9`, `1830a88`, `b7641aa`, 2026-08-17). Build + push an
       image, `ADD PATCH`, move the release directive (ACCOUNTADMIN-only), then
       upgrade the consumer.
-- [ ] **0.2 [CORE]** Registry login works: `snow spcs image-registry login
-      --temporary-connection --authenticator SNOWFLAKE_JWT` (the snowsql/PAT
-      paths are MFA-blocked).
+- [ ] **0.2 [CORE]** Registry login works — the full flags are required (no
+      saved `snow` connection exists; bare `--temporary-connection` fails with
+      "User is empty"): `snow spcs image-registry login --temporary-connection
+      --account icc84228.us-east-1 --user PRISM_SVC --private-key-file
+      ~/rsa_key.p8 --authenticator SNOWFLAKE_JWT` (the snowsql/PAT paths are
+      MFA-blocked). Verified 2026-08-27.
 - [ ] **0.3 [CORE]** `CALL PRISM_TEST.app_code.start_app()` → pool +
       `PRISM_APP_WH` + service created; `SHOW ENDPOINTS IN SERVICE` returns the
       ingress URL within ~2 min.
@@ -381,6 +384,19 @@ charges under the old meter; they must vanish, not drain.)
 - [ ] **14.4 [CORE][UNVAL]** **Uninstall** leaves no orphaned account-level
       objects (pool, warehouse, endpoints); consumer-schema export tables owned by
       the user's role survive, and that is the documented behaviour.
+- [ ] **14.6 [CORE][UNVAL]** **Auto-upgrade rolls the container** (the
+      `version_initializer` added 2026-08-28, first shipped in patch 40): move
+      the release directive to a new patch and run `ALTER APPLICATION
+      PRISM_TEST UPGRADE` (or wait for the background auto-upgrade) —
+      **without calling `upgrade_app()`** → the service picks up the new
+      image/spec by itself (`SHOW SERVICE CONTAINERS IN SERVICE
+      PRISM_TEST.services.prism_app` shows a fresh container start), and the
+      app serves the new version.
+- [ ] **14.7 [CORE][UNVAL]** **version_init is harmless where there is nothing
+      to refresh**: a fresh listing install (no privileges granted yet, no
+      service) completes without error — the callback returns its quiet no-op
+      instead of failing the install. (Covered implicitly by any fresh 1.1
+      install on patch ≥40 — tick it there.)
 
 ## Phase 15 — Cosmetics, copy & disclosures (one pass at the end)
 

@@ -519,7 +519,12 @@ isolates SPCS problems from Native-App-packaging problems.
 - Failed-upgrade drill: a deliberately broken v1.2 setup script — confirm the
   framework's rollback leaves v1.1 functional.
 - Container-image update drill: new image in a patch → service upgraded via
-  the upgrade callback.
+  the upgrade callback. **BUILT 2026-08-28 (patch 40): the standard
+  `lifecycle_callbacks.version_initializer` (`app_code.version_init`) now
+  rolls the service automatically on every install/upgrade — guarded no-op on
+  first install, exception-swallowing (a thrown error fails the consumer's
+  upgrade). `upgrade_app()` stays as the manual fallback. Live test =
+  NATIVE_TEST_SCRIPT.md 14.6/14.7.**
 - Write `native/RELEASING.md`: the patch/version/channel/directive cadence,
   the two-active-versions constraint, expected scan latency, and the
   hotfix-is-hours reality.
