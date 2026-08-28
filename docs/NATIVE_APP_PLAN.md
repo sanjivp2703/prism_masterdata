@@ -246,7 +246,18 @@ schema on the user path, metering on a service connection (all three
 latent in the standard edition's personal-credentials path too; mssql/pg/
 mysql parity gap recorded in WAREHOUSES.md).
 
-### 2.8 DECIDED (owner, 2026-08-12) — Pricing: $25 per 1,000 new distinct values, first 1,000 free
+### 2.8 SUPERSEDED (owner, 2026-08-27) — the native edition is FREE
+> **The pricing below was reversed on 2026-08-27: the Marketplace listing is
+> free and the app does not meter usage at all.** `billing-meter.ts`,
+> `billing-math.ts`, the `BILLING_METER`/`BILLING_EVENTS` ledgers, the
+> `EMIT_BILLING` proc, the `/api/accounts/usage` route, and the Settings →
+> Usage surface were all removed; `setup.sql` drops the ledgers on upgrade.
+> Consumers still pay Snowflake directly for their own compute and Cortex
+> tokens — Prism adds no charge and keeps no count of standardized values.
+> Everything below is retained as the historical design record (recoverable
+> from git if pricing ever returns).
+
+*(historical)* Pricing: $25 per 1,000 new distinct values, first 1,000 free
 Usage-based pricing on the Marketplace listing via **Custom Event Billing**
 (GA 2025-07): the app emits billable events through
 `SYSTEM$CREATE_BILLING_EVENT(S)` — callable ONLY from a stored procedure
@@ -323,10 +334,9 @@ is the lever if per-customer revenue runs thin; revisit with real volumes.)
   column-mode tables: + UPDATE/ALTER... exact privilege set fixed in N3),
   version metadata, ingress endpoint declaration.
 - `native/setup.sql` — application roles, versioned code schema, unversioned
-  state schema (the INTERNAL tables + UDF + `BILLING_METER`),
-  post-install/upgrade callbacks (create compute pool + warehouse,
-  start/upgrade the service), and the `EMIT_BILLING` stored procedure
-  wrapping `SYSTEM$CREATE_BILLING_EVENTS` (§2.8).
+  state schema (the INTERNAL tables + UDF), post-install/upgrade callbacks
+  (create compute pool + warehouse, start/upgrade the service). (The
+  `EMIT_BILLING` proc + billing ledgers were removed 2026-08-27 — §2.8.)
 - `native/service-spec.yaml` — the Prism container, block volume mount
   (§2.5), ingress endpoint, `MIN_NODES=1`.
 - `native/Dockerfile` — Next.js standalone build. Note `xlsx` resolves from
@@ -337,8 +347,8 @@ is the lever if per-customer revenue runs thin; revisit with real volumes.)
 - `stand-ui`: `PRISM_EDITION` in `_lib/env.ts`; SPCS auth tier in
   `warehouse/snowflake/connection.ts`; header-based session mode in
   `session.ts`/`account-security.ts`; edition gates at the cut surfaces (§1);
-  `_lib/billing-meter.ts` + the Settings → Usage surface (§2.8 — shared
-  core, both editions).
+  (the billing meter + Usage surface listed here originally were removed
+  2026-08-27 — §2.8).
 - New SQLite migration: none expected v1 (accounts table gains rows keyed on
   Snowflake usernames instead of Google IDs — reuse `google_id` column
   semantics or add `sf_username`; decide in N2, keep it one migration).
@@ -439,7 +449,8 @@ isolates SPCS problems from Native-App-packaging problems.
   `NativeTablePicker`'s panel, so the two can't drift. Note the `/home`
   setup gate already passes native (spcs + cortex), so nothing routes here
   automatically — the page exists for deliberate visits and links.
-- **Metering + billing (§2.8):** the shared `billing-meter.ts` on every
+- **Metering + billing (§2.8): REMOVED 2026-08-27 — the app is free; no
+  metering exists. Historical record follows.** the shared `billing-meter.ts` on every
   lookup-write path (MERGE-reported insert counts — build this early in the
   phase; it's edition-agnostic and the standard edition wants it for
   invoicing regardless), the `BILLING_METER` table + emission ledger, the

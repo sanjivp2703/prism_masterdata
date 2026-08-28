@@ -582,3 +582,29 @@ and re-export).
 rides the long-standing fail-open path, `VALIDATION_LOG` gets no new rows
 (table retained, vestigial). Detection machinery, prompts, and the Case C
 `initial_*` stamps are all retained; re-enabling is a one-line change.
+
+---
+
+## Native (Marketplace) edition is free — usage metering removed entirely (2026-08-27)
+
+**Decision:** The Snowflake Marketplace edition ships free. The whole §2.8
+billing stack was deleted, not gated: `billing-meter.ts` / `billing-math.ts`,
+the warehouse `BILLING_METER` + `BILLING_EVENTS` ledgers (setup.sql now drops
+them on upgrade), the sealed `EMIT_BILLING` proc, `/api/accounts/usage`, and
+the Settings → Usage surface. Prism keeps **no count** of standardized values
+anywhere.
+
+**What we didn't do:** keep the meter running "just in case" (edition-gated or
+dark). Counting customers' activity while charging nothing is exactly the kind
+of quiet tracking the privacy page says we don't do, and dead metering code on
+every export path is a liability. The design survives in git and in
+`NATIVE_APP_PLAN.md` §2.8 (marked superseded) if pricing ever returns.
+
+**Cost knowingly accepted:** (1) no revenue from this channel — the listing is
+a distribution/adoption play; consumers still pay Snowflake for their own
+compute and Cortex tokens. (2) The standard edition loses the shared counter
+that was meant to drive invoice rollups someday — it was Snowflake-only and
+had no live consumer, so nothing breaks today; standard-edition invoicing
+needs its own counting story if/when it matters. (3) The never-fully-solved
+emission problem (billing events require a monetized listing install) becomes
+moot rather than solved.

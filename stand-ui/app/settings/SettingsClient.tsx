@@ -772,60 +772,6 @@ interface PipelineEntry {
 }
 
 
-// ── Usage section (§2.8 billing meter) ───────────────────────────────────────
-// The meter driving usage-based charges, shown to the admin. Reads
-// /api/accounts/usage once on mount (a deliberate one-shot warehouse read).
-function UsageSection() {
-  const [u, setU] = useState<null | {
-    available: boolean; total_units: number; free_units: number; free_used: number;
-    free_remaining: number; billable_units: number; charged_usd: number; usd_per_unit: number;
-  }>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/accounts/usage', { cache: 'no-store' })
-      .then(async (r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-      .then((b) => { if (!cancelled) setU(b); })
-      .catch(() => { if (!cancelled) setFailed(true); });
-    return () => { cancelled = true; };
-  }, []);
-
-  const stat = (label: string, value: string) => (
-    <div>
-      <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0 }}>{label}</p>
-      <p style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)', margin: '2px 0 0' }}>{value}</p>
-    </div>
-  );
-
-  return (
-    <section style={card}>
-      <div style={{ marginBottom: 16 }}>
-        <h2 style={sectionTitle}>Usage</h2>
-        <p style={sectionHint}>
-          Distinct values Prism has standardized for the first time. The first {Number(1000).toLocaleString()} are
-          free; after that each new value bills at $0.025 ($25 per 1,000).
-        </p>
-      </div>
-      {failed && <p style={{ fontSize: 12, color: 'var(--text-hint)' }}>Usage is unavailable right now.</p>}
-      {!failed && !u && <p style={{ fontSize: 12, color: 'var(--text-hint)' }}>Loading usage…</p>}
-      {u && !u.available && (
-        <p style={{ fontSize: 12, color: 'var(--text-hint)' }}>
-          Usage metering is not active on this installation.
-        </p>
-      )}
-      {u && u.available && (
-        <div style={{ display: 'flex', gap: 40, flexWrap: 'wrap' }}>
-          {stat('Values standardized', u.total_units.toLocaleString())}
-          {stat('Free values used', `${u.free_used.toLocaleString()} of ${u.free_units.toLocaleString()}`)}
-          {stat('Billable values', u.billable_units.toLocaleString())}
-          {stat('Billed to date', `$${u.charged_usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)}
-        </div>
-      )}
-    </section>
-  );
-}
-
 function PipelineHealthSection() {
   const [loadState, setLoadState] = useState<'loading' | 'error' | 'ready'>('loading');
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -991,7 +937,6 @@ export default function SettingsClient() {
         {isAdmin && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
             <SnowflakeSection />
-            <UsageSection />
             <TeamSection currentAccountId={session?.accountId ?? null} />
             <PipelineHealthSection />
           </div>

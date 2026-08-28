@@ -251,8 +251,10 @@ variants; the setup footer likewise):
 - **AI = Snowflake Cortex, in-account.** No external LLM provider, no vendor
   key, no egress (the container has no external access integration).
 - **No Google, no SMTP, no Sentry** in this edition (all gated off).
-- What the provider (we) receive: Marketplace billing events (counts only)
-  and Snowflake's aggregate provider reporting. Never values, never metadata.
+- What the provider (we) receive: only Snowflake's aggregate provider
+  reporting (install counts etc.). The app is free and meters nothing —
+  billing events and the usage counter were removed 2026-08-27. Never
+  values, never metadata, never usage counts.
 
 Any future feature that transmits anything off-account must update the
 edition-aware /terms + /privacy variants AND pass Snowflake's security

@@ -30,10 +30,8 @@ import { pickBestAliasName } from './namescore';
 import type { RunItemForPairing } from './grouping-types';
 import { normalizeLiteral } from './normalize';
 import { internalObject, prismNormalizeFn } from './warehouse-tables';
-import { recordStandardizedUnits } from './billing-meter';
-import { executeQuery as exec, getWarehouseAdapter, withWarehouse } from './warehouse';
+import { executeQuery as exec, getWarehouseAdapter } from './warehouse';
 import { isNativeEdition } from './edition';
-import { reportError } from './report-error';
 import { diffScan, DIFF_SCAN_MAX_DISTINCT } from './warehouse/mssql/detection';
 import {
   diffScan as pgDiffScan,
@@ -442,13 +440,9 @@ export interface ExportOneTimeArgs {
    *  or the native caller's-rights session — §2.9). That connection cannot
    *  touch the app-internal schema, so scratch tables go to the TARGET
    *  schema (session-scoped TEMPORARY; the export already requires CREATE
-   *  TABLE there) and metering runs on a separate service connection
-   *  (live-found 2026-08-13: internal-schema scratch + metering both failed
-   *  on the caller session). The mssql/pg/mysql writers relocate scratch the
-   *  same way but still meter on the chosen connection — safe only because
-   *  recordStandardizedUnits no-ops off Snowflake; if metering ever extends
-   *  to those warehouses, their user path must meter on a service connection
-   *  too. */
+   *  TABLE there — live-found 2026-08-13: internal-schema scratch failed on
+   *  the caller session). The mssql/pg/mysql writers relocate scratch the
+   *  same way. */
   usedUserConnection?: boolean;
   /** Native: who may read the exported table (owner request 2026-08-17).
    *  undefined/'PUBLIC' → GRANT SELECT TO ROLE PUBLIC; 'NONE' → no grant
@@ -647,28 +641,6 @@ export async function exportOneTimeToSnowflake(connection: any, args: ExportOneT
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
 
-    // §2.8 billing: one-time sessions never touch the shared lookup, so the
-    // billable unit here is each distinct value standardized in this export
-    // (leaving them free would make the one-time flow a billing bypass).
-    // A deliberate re-export of the SAME session re-counts — accepted edge
-    // (sessions export once in practice; the archive row marks completion).
-    const standardizedDistinct = watched.reduce(
-      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
-      0,
-    );
-    // The user/caller connection cannot write the internal BILLING_METER —
-    // meter on a service connection instead (a caller-path export must never
-    // be a billing bypass). Failures never block the export either way.
-    if (args.usedUserConnection) {
-      try {
-        await withWarehouse((sconn) => recordStandardizedUnits(sconn, standardizedDistinct, 'one_time_export'));
-      } catch (meterErr) {
-        reportError(meterErr, { where: 'one-time export metering (service conn)' });
-      }
-    } else {
-      await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
-    }
-
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
@@ -839,17 +811,6 @@ async function exportOneTimeToPgTarget(
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
-
-    // §2.8 billing: one-time sessions never touch the shared lookup, so the
-    // billable unit here is each distinct value standardized in this export
-    // (leaving them free would make the one-time flow a billing bypass).
-    // A deliberate re-export of the SAME session re-counts — accepted edge
-    // (sessions export once in practice; the archive row marks completion).
-    const standardizedDistinct = watched.reduce(
-      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
-      0,
-    );
-    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
 
     return { rows_written };
   } finally {
@@ -1030,17 +991,6 @@ async function exportOneTimeToMysqlTarget(
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
 
-    // §2.8 billing: one-time sessions never touch the shared lookup, so the
-    // billable unit here is each distinct value standardized in this export
-    // (leaving them free would make the one-time flow a billing bypass).
-    // A deliberate re-export of the SAME session re-counts — accepted edge
-    // (sessions export once in practice; the archive row marks completion).
-    const standardizedDistinct = watched.reduce(
-      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
-      0,
-    );
-    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
-
     return { rows_written };
   } finally {
     await exec(connection, `DROP TABLE IF EXISTS ${mapTable}`).catch(() => {});
@@ -1187,17 +1137,6 @@ async function exportOneTimeToMssqlTarget(
       `[OneTime] Wrote ${target_fqn} ← ${source_relation} ` +
       `(${mode}; columns: ${watched.map((w) => w.column_name).join(', ')}) — ${rows_written} rows`,
     );
-
-    // §2.8 billing: one-time sessions never touch the shared lookup, so the
-    // billable unit here is each distinct value standardized in this export
-    // (leaving them free would make the one-time flow a billing bypass).
-    // A deliberate re-export of the SAME session re-counts — accepted edge
-    // (sessions export once in practice; the archive row marks completion).
-    const standardizedDistinct = watched.reduce(
-      (n, w) => n + w.mappings.filter((m) => m.raw != null && m.standardized != null && m.standardized !== '').length,
-      0,
-    );
-    await recordStandardizedUnits(connection, standardizedDistinct, 'one_time_export');
 
     return { rows_written };
   } finally {

@@ -22,7 +22,6 @@ import { asExportKind, standardizedColumnName, assertCompanionColumnSafe } from 
 import { isProbablyCatastrophicRegex } from '../app/api/_lib/convention-rules';
 import { detectHeaderRow, columnLetter } from '../app/api/_lib/table-shape';
 import { asPrismEdition } from '../app/api/_lib/edition';
-import { splitBillableUnits, planBillingEmission, MAX_EVENT_USD } from '../app/api/_lib/billing-math';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -989,34 +988,6 @@ console.log('\ninternal-schema reference guard:');
   })(apiRoot);
   check('no hardcoded internal-schema reference outside the allowlist',
     offending.join(', ') || '(none)', '(none)');
-}
-
-// ── Billing math (billing-math.ts, §2.8) ─────────────────────────────────────
-// $25 per 1,000 = $0.025/value, first 1,000 free, LINEAR after the boundary.
-{
-  console.log('\nbilling math (splitBillableUnits):');
-  check('all free under the tier', JSON.stringify(splitBillableUnits(0, 500)), JSON.stringify({ free: 500, billable: 0, chargeUsd: 0 }));
-  check('exactly filling the tier bills nothing', JSON.stringify(splitBillableUnits(0, 1000)), JSON.stringify({ free: 1000, billable: 0, chargeUsd: 0 }));
-  check('value #1001 bills immediately', JSON.stringify(splitBillableUnits(1000, 1)), JSON.stringify({ free: 0, billable: 1, chargeUsd: 0.025 }));
-  check('straddling bills only the post-free portion', JSON.stringify(splitBillableUnits(900, 300)), JSON.stringify({ free: 100, billable: 200, chargeUsd: 5 }));
-  check('deep past the tier: fully billable', JSON.stringify(splitBillableUnits(5000, 1000)), JSON.stringify({ free: 0, billable: 1000, chargeUsd: 25 }));
-  check('zero units is a no-op split', JSON.stringify(splitBillableUnits(0, 0)), JSON.stringify({ free: 0, billable: 0, chargeUsd: 0 }));
-  check('negative/fractional inputs clamp sanely', JSON.stringify(splitBillableUnits(-5, 2.9)), JSON.stringify({ free: 2, billable: 0, chargeUsd: 0 }));
-}
-
-// Emission planning: whole-cent events (SYSTEM$CREATE_BILLING_EVENT caps
-// base_charge at 2 decimals; unit price is 3), sub-cent carry, per-event cap.
-{
-  console.log('\nbilling emission (planBillingEmission):');
-  check('nothing accrued emits nothing', JSON.stringify(planBillingEmission(0, 0)), JSON.stringify({ emitUsd: 0, carryUsd: 0 }));
-  check('even-cent accrual emits fully', JSON.stringify(planBillingEmission(6.25, 0)), JSON.stringify({ emitUsd: 6.25, carryUsd: 0 }));
-  check('odd-unit accrual carries the half-cent (251 units)', JSON.stringify(planBillingEmission(6.275, 0)), JSON.stringify({ emitUsd: 6.27, carryUsd: 0.005 }));
-  check('carry combines with the next accrual (one more odd unit)', JSON.stringify(planBillingEmission(6.3, 6.27)), JSON.stringify({ emitUsd: 0.03, carryUsd: 0 }));
-  check('sub-cent pending waits (single unit)', JSON.stringify(planBillingEmission(0.025, 0.02)), JSON.stringify({ emitUsd: 0, carryUsd: 0.005 }));
-  check('already fully emitted is a no-op', JSON.stringify(planBillingEmission(12.5, 12.5)), JSON.stringify({ emitUsd: 0, carryUsd: 0 }));
-  check('over-emitted (impossible, but) clamps to zero', JSON.stringify(planBillingEmission(1, 2)), JSON.stringify({ emitUsd: 0, carryUsd: 0 }));
-  check('per-event cap leaves the excess pending', JSON.stringify(planBillingEmission(200_000, 0)), JSON.stringify({ emitUsd: MAX_EVENT_USD, carryUsd: 200_000 - MAX_EVENT_USD }));
-  check('float dust cannot move a cent (0.1+0.2 style)', JSON.stringify(planBillingEmission(0.30000000000000004, 0.1)), JSON.stringify({ emitUsd: 0.2, carryUsd: 0 }));
 }
 
 // ── Result ───────────────────────────────────────────────────────────────────
