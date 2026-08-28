@@ -69,10 +69,12 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
       {showGrantHelp && (
         <div style={{ marginTop: 8, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', borderRadius: 'var(--radius-button)', padding: '10px 12px' }}>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
-            Prism can only see tables your team has granted to it — nothing is shared
-            automatically. There are two ways to grant access — run one <em>or</em> the
-            other. <strong>Recommended:</strong> an admin opts in once per database, and
-            Prism can clean any table you can already read — using your own access:
+            Prism can only see tables your team has granted to it. Nothing is shared
+            automatically. <strong>Recommended:</strong> an admin opts in once per
+            database, and Prism can clean any table you can already read, using your
+            own access. Run as a role with MANAGE CALLER GRANTS (ACCOUNTADMIN works),
+            replace <code>&lt;db&gt;</code>, and run every statement; the warehouse
+            line is needed once per account:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
             {callerGrantSql}
@@ -83,10 +85,13 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             {copiedCaller ? 'Copied' : 'Copy SQL'}
           </button>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
-            <strong>Or</strong>, if you&apos;d rather not enable user-based access: grant Prism
-            its own access, schema by schema (whoever owns the schema can run it —
-            they don&apos;t need to be ACCOUNTADMIN). Pipelines always need these direct
-            grants:
+            <strong>Pipelines</strong> always need a direct grant to the app itself,
+            because background standardization runs with nobody signed in. Whoever owns
+            the schema can run it; ACCOUNTADMIN is not required. The third line covers
+            every table currently in the schema; to share a single table instead, swap
+            it for <code>GRANT SELECT ON TABLE &lt;db&gt;.&lt;schema&gt;.&lt;table&gt;
+            TO APPLICATION &quot;&lt;app&gt;&quot;</code>. The last line lets Prism
+            create export tables in that schema:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
             {grantSql}
@@ -99,7 +104,7 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '10px 0 0', lineHeight: 1.5 }}>
             One Snowflake limitation to know: tables created <em>after</em> the grant
             aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
-            app) — re-run the &quot;all tables&quot; line whenever new tables are added.
+            app). Re-run the &quot;all tables&quot; line whenever new tables are added.
           </p>
         </div>
       )}

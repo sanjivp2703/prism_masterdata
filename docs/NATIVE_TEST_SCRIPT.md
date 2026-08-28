@@ -118,9 +118,12 @@ Fixtures: `DEMO_DATA.OPEN` (analyst-visible), `DEMO_DATA.RESTRICTED`
       card → clean "Prism can't see this table" message, never a raw SQL error.
       The "Don't see your table?" panel shows grant SQL with the REAL app name
       resolved live.
-- [ ] **2.2 [CORE]** Run the single-table grant SQL → table appears in the
-      picker's type-ahead suggestions; columns load. (Native input is a
-      **type-in with datalist**, never a dropdown — owner decision.)
+- [ ] **2.2 [CORE]** Run a single-table grant (the panel's ALL TABLES block
+      with the third line swapped for the `GRANT SELECT ON TABLE …` variant it
+      describes — copy edit 2026-08-28: no more separate single-table block) →
+      table appears in the picker's type-ahead suggestions; columns load.
+      (Native input is a **type-in with datalist**, never a dropdown — owner
+      decision.)
 - [ ] **2.3 [CORE]** Run the whole-schema form (`ALL TABLES`) on a second schema
       → all existing tables usable. Create a brand-new table there → it is **NOT**
       visible (Snowflake forbids FUTURE grants to an application — live-confirmed

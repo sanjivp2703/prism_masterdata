@@ -3,17 +3,16 @@
 ## Install (consumer quick start)
 
 After installing the app from the listing, run this once in a worksheet as
-**ACCOUNTADMIN** (substitute your app's name). The first two statements are
-required before the AI can run — the install dialog cannot ask for them:
+**ACCOUNTADMIN** (substitute your app's name). The first two statements enable
+the AI (the install dialog cannot ask for them; the first lets Cortex serve
+Claude from a nearby region). The third starts Prism's compute pool, warehouse,
+and web service, and the last returns your Prism URL after about two minutes:
 
 ```sql
--- AI prerequisites (required once per account):
-ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';   -- lets Cortex reach Claude
+ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';
 GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO APPLICATION <app_name>;
 
--- Start Prism (creates its compute pool, warehouse, and web service):
 CALL <app_name>.app_code.start_app();
--- After ~2 minutes, get your Prism URL:
 SHOW ENDPOINTS IN SERVICE <app_name>.services.prism_app;
 ```
 

@@ -14,8 +14,7 @@ export const APP_NAME_PLACEHOLDER = '<your Prism app name>';
 export function buildNativeStarterSql(appName: string): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   return [
-    `-- Run once as ACCOUNTADMIN, right after installing:`,
-    `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';  -- lets Cortex reach Claude`,
+    `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US';`,
     `GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO APPLICATION "${app}";`,
   ].join('\n');
 }
@@ -25,16 +24,9 @@ export function buildNativeStarterSql(appName: string): string {
 export function buildNativeAppGrantSql(appName: string): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   return [
-    `-- Run as a role with grant authority on the schema (its owner, or ACCOUNTADMIN)`,
     `GRANT USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
     `GRANT USAGE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-    `-- one table:`,
-    `GRANT SELECT ON TABLE <db>.<schema>.<table> TO APPLICATION "${app}";`,
-    `-- or every table currently in the schema:`,
     `GRANT SELECT ON ALL TABLES IN SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
-    `-- (Snowflake does not allow FUTURE grants to an application — re-run the`,
-    `--  line above after adding new tables, or grant new tables one by one.)`,
-    `-- to let Prism write export tables there too:`,
     `GRANT CREATE TABLE ON SCHEMA <db>.<schema> TO APPLICATION "${app}";`,
   ].join('\n');
 }
@@ -53,13 +45,9 @@ export function buildNativeAppGrantSql(appName: string): string {
 export function buildNativeCallerGrantSql(appName: string): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   return [
-    `-- Recommended, one-time. Run as a role with MANAGE CALLER GRANTS (e.g. ACCOUNTADMIN).`,
-    `-- Lets Prism clean any table the signed-in user can ALREADY access — using that`,
-    `-- user's own access (never more), per database you opt in:`,
     `GRANT CALLER USAGE ON DATABASE <db> TO APPLICATION "${app}";`,
     `GRANT ALL INHERITED CALLER PRIVILEGES ON ALL SCHEMAS IN DATABASE <db> TO APPLICATION "${app}";`,
     `GRANT ALL INHERITED CALLER PRIVILEGES ON ALL TABLES IN DATABASE <db> TO APPLICATION "${app}";`,
-    `-- once per account (Prism's own warehouse, used for the queries it runs as you):`,
     `GRANT CALLER USAGE ON WAREHOUSE PRISM_APP_WH TO APPLICATION "${app}";`,
   ].join('\n');
 }

@@ -2783,7 +2783,7 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       </h1>
       <p className="text-sm mt-2" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         This edition runs entirely inside your Snowflake account. There are no
-        credentials to enter and no AI keys to manage — Prism connects as the
+        credentials to enter and no AI keys to manage. Prism connects as the
         application itself, and AI runs on Snowflake Cortex, so your data never
         leaves Snowflake. The only setup is deciding what Prism can see.
       </p>
@@ -2792,7 +2792,7 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         <>
           <SectionTitle>AI</SectionTitle>
           <p className="text-sm" style={{ color: 'var(--confidence-high)', lineHeight: 1.6 }}>
-            ✓ AI is enabled for this installation — nothing to run.
+            ✓ AI is enabled for this installation. Nothing to run.
           </p>
         </>
       ) : (
@@ -2800,8 +2800,9 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
           <SectionTitle>Enable the AI (once per account, ACCOUNTADMIN)</SectionTitle>
           <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             If Snowflake Cortex hasn&apos;t already been enabled for this installation,
-            an administrator runs these two statements once — the install dialog
-            can&apos;t ask for them. Skip this if standardizations already work.
+            an administrator runs these two statements once as ACCOUNTADMIN; the
+            install dialog can&apos;t ask for them. The first lets Cortex serve Claude
+            from a nearby region. Skip this if standardizations already work.
           </p>
           <div className="mt-2">
             <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
@@ -2811,41 +2812,28 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
 
       <SectionTitle>Give Prism access to tables you want standardized</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        Prism sees only what your team grants it — nothing is shared automatically.
+        Prism sees only what your team grants it. Nothing is shared automatically.
         One thing to know before granting: Prism is a shared workspace, so every
         person you give app access to can view all pipelines, mappings, and the
-        standardized values — including ones built from tables their own
-        Snowflake permissions can&apos;t read. There are two ways to grant access —
-        run <strong>one or the other</strong>.
+        standardized values, including ones built from tables their own
+        Snowflake permissions can&apos;t read.
       </p>
 
       <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>
-        Recommended: let Prism use each person&apos;s own access
+        Let Prism use each person&apos;s own access
       </p>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         {isAdmin
-          ? 'One opt-in per database: anyone can then clean any table they can already read — instantly, using their own access, with results they own. No per-table ritual.'
-          : 'One admin opt-in per database: you can then clean any table you can already read — instantly, using your own access.'}
+          ? 'One opt-in per database: anyone can then clean any table they can already read, instantly, using their own access, with results they own. Run it as a role with MANAGE CALLER GRANTS (ACCOUNTADMIN works), replace <db>, and run every statement. The last line is Prism\u2019s own warehouse and is needed once per account.'
+          : 'One admin opt-in per database: you can then clean any table you can already read, instantly, using your own access.'}
       </p>
       <div className="mt-2">
         <CodeBlock code={buildNativeCallerGrantSql(appName)} maxHeight={200} />
       </div>
-
-      <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>
-        Or, if you&apos;d rather not enable user-based access: grant Prism directly
-      </p>
-      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        {isAdmin
-          ? 'Grant the app its own access, schema by schema (whoever owns the schema can run it). Note: PIPELINES always need these direct grants — background standardization runs with nobody signed in.'
-          : 'Send this to whoever owns the data (they don’t need to be ACCOUNTADMIN). Note: PIPELINES always need these direct grants.'}
-      </p>
-      <div className="mt-2">
-        <CodeBlock code={buildNativeAppGrantSql(appName)} maxHeight={200} />
-      </div>
       <p className="text-sm mt-2" style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
-        One Snowflake limitation to know: tables created <em>after</em> the grant
-        aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
-        app) — re-run the &quot;all tables&quot; line whenever new tables are added.
+        Pipelines work differently: background standardization runs with nobody
+        signed in, so a pipeline&apos;s source table needs a direct grant to the app.
+        Prism shows the exact SQL whenever you connect a table it can&apos;t see.
       </p>
 
       <div className="mt-6 flex justify-end">
