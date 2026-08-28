@@ -18,9 +18,11 @@
  * a forged header is meaningless.
  *
  * Provisioning: accounts are auto-created per Snowflake username on first
- * sight (`accounts.sf_username`, migration 020). The FIRST account ever
- * created on the installation becomes admin — same bootstrap semantics as
- * the standard edition; N3 may replace this with an application-role check.
+ * sight (`accounts.sf_username`, migration 020). EVERY native account is an
+ * admin (owner decision 2026-08-28: the app-level role split is gone in this
+ * edition — membership itself is governed by the Snowflake-side application
+ * role grant, so an in-app hierarchy bought nothing). Pre-decision rows that
+ * were provisioned as 'user' self-promote on their next visit.
  */
 import { NextRequest } from 'next/server';
 import { getDb } from '@/app/api/_lib/sqlite';
@@ -69,20 +71,16 @@ export async function GET(request: NextRequest) {
       .get(sfUsername) as AccountRow | undefined;
 
     if (!row) {
-      // First account on the installation bootstraps as admin (standard-
-      // edition semantics). google_id/email are NOT NULL UNIQUE — synthesize
-      // stable values from the username (no real email exists for a
-      // Snowflake identity).
-      const count = (db.prepare(`SELECT COUNT(*) AS n FROM accounts`).get() as { n: number }).n;
-      const role = count === 0 ? 'admin' : 'user';
+      // Every native account is an admin (see module doc). google_id/email
+      // are NOT NULL UNIQUE — synthesize stable values from the username (no
+      // real email exists for a Snowflake identity).
       db.prepare(
         `INSERT INTO accounts (google_id, email, name, role, sf_username, last_login_at)
-         VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+         VALUES (?, ?, ?, 'admin', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
       ).run(
         `spcs:${sfUsername}`,
         `${sfUsername.toLowerCase()}@spcs.invalid`,
         rawUser,
-        role,
         sfUsername,
       );
       row = db
@@ -92,10 +90,13 @@ export async function GET(request: NextRequest) {
         )
         .get(sfUsername) as AccountRow;
     } else {
+      // Self-heal rows provisioned before the everyone-is-admin decision.
       db.prepare(
-        `UPDATE accounts SET last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        `UPDATE accounts SET role = 'admin',
+                last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE account_id = ?`,
       ).run(row.account_id);
+      row.role = 'admin';
     }
   } catch (err) {
     reportError(err, { where: 'auth/spcs', sfUsername });

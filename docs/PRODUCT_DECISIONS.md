@@ -608,3 +608,24 @@ had no live consumer, so nothing breaks today; standard-edition invoicing
 needs its own counting story if/when it matters. (3) The never-fully-solved
 emission problem (billing events require a monetized listing install) becomes
 moot rather than solved.
+
+---
+
+## Native edition: app-level roles removed — everyone is admin (2026-08-28)
+
+**Decision:** Reverses the 2026-08-17 "keep admin/user roles" call. In the
+native edition every account now provisions as admin (existing 'user' rows
+self-promote on next visit) and the Settings → Team section is gone.
+Membership is governed solely by the Snowflake-side application role grant
+(`GRANT/REVOKE APPLICATION ROLE <app>.app_user`).
+
+**Why the reversal:** the roles' remaining value had thinned to nothing —
+billing/Usage (removed 2026-08-27) and Team management were the only gated
+surfaces, and Team management duplicated what Snowflake's grant already does
+better: revoking the application role blocks the person at the ingress,
+before Prism even sees them. An in-app hierarchy nobody needs is onboarding
+friction and test surface.
+
+**Cost knowingly accepted:** no in-app "remove this person" button — an org
+removes someone with a Snowflake REVOKE, which is where their DBA works
+anyway. The standard edition keeps its roles and invitations unchanged.

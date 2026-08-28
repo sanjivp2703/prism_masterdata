@@ -108,9 +108,10 @@ Fixtures: `DEMO_DATA.OPEN` (analyst-visible), `DEMO_DATA.RESTRICTED`
 - [ ] **1.8 [CORE]** Native cuts hold: one-time source tabs are **Snowflake |
       CSV | Excel** with no Google Sheets and **no paste tab** (SQL#18); no
       email-invitation UI anywhere; `/debug` → 404.
-- [ ] **1.9 [CORE]** Second user (`psanjiv`) opens the URL → arrives as **user**,
-      not admin: no Settings item, no member management; pipelines and mappings
-      visible.
+- [ ] **1.9 [CORE]** Second user (`psanjiv`) opens the URL → arrives as
+      **admin** like everyone else (roles removed 2026-08-28; their old 'user'
+      row self-promotes on this visit). Settings opens; **no Team section**
+      anywhere in this edition.
 
 ## Phase 2 — Access & grants (the consumer's first real friction)
 
@@ -366,18 +367,22 @@ charges under the old meter; they must vanish, not drain.)
 - [ ] **12.5 [EDGE]** The dev app (`PRISM_APP_TEST`) after its upgrade: old
       pending ledger charges are gone with the tables; nothing ever emits.
 
-## Phase 13 — Team, roles & sessions
+## Phase 13 — Membership & sessions (everyone is admin)
 
-- [ ] **13.1 [CORE]** First user is admin; `psanjiv` arrives as user. Roles gate
-      Team management, Usage and Pipeline health only.
-- [ ] **13.2 [CORE]** No invitation UI, no email anywhere in native.
-- [ ] **13.3 [CORE]** Promote/demote via Team → the affected user's live session
-      is revoked immediately (`session_version` bump).
-- [ ] **13.4 [CORE]** Last-admin and self-delete guards hold.
-- [ ] **13.5 [EDGE]** Both users see the same pipelines and mappings — including
-      values from tables their own permissions can't read. This is the disclosed
-      shared-workspace behaviour; confirm it matches the interstitial's wording
-      exactly.
+Roles were removed from the native edition 2026-08-28 (owner decision):
+every account provisions as admin, pre-decision 'user' rows self-promote on
+their next visit, and the Team section is gone — membership is governed
+entirely by the Snowflake-side application role grant.
+
+- [ ] **13.1 [CORE]** Every user is admin: `psanjiv` (old 'user' row) opens
+      the app after the upgrade → Settings visible, same surfaces as
+      `SANJIVP27`; no Team section for anyone.
+- [ ] **13.2 [CORE]** No email anywhere: no invitation UI, no invite links,
+      nothing SMTP-shaped in any surface.
+- [ ] **13.3 [CORE]** Revocation is Snowflake-side and real: `REVOKE
+      APPLICATION ROLE PRISM_TEST.app_user FROM USER psanjiv` → they cannot
+      reach the ingress at all (Snowflake blocks before Prism). Re-grant →
+      access returns, same account and history.
 
 ## Phase 14 — Upgrade, patch & uninstall drills (Phase N4)
 

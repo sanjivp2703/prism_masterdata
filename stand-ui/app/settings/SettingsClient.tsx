@@ -937,7 +937,10 @@ export default function SettingsClient() {
         {isAdmin && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
             <SnowflakeSection />
-            <TeamSection currentAccountId={session?.accountId ?? null} />
+            {/* Native: no Team section — everyone is admin (owner decision
+                2026-08-28) and membership is the Snowflake-side application
+                role grant, managed in Snowflake, not here. */}
+            {!isNativeEdition() && <TeamSection currentAccountId={session?.accountId ?? null} />}
             <PipelineHealthSection />
           </div>
         )}
