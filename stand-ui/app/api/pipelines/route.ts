@@ -26,6 +26,7 @@ import {
   DEFAULT_UPDATE_SCHEDULE,
 } from '@/app/api/_lib/update-schedule';
 import { asExportKind } from '@/app/api/_lib/export-kind';
+import { filterPipelineRowsForViewer } from '@/app/api/_lib/native-visibility';
 
 function parseMeta(v: any): Record<string, any> {
   if (typeof v === 'object' && v !== null) return v as Record<string, any>;
@@ -127,7 +128,10 @@ export async function GET() {
              p.created_at     DESC`,
         )
         .all() as any[];
-      const pipelines = rows.map(row2pipeline);
+      // Native edition: scope the list to the viewer (creator + RBAC-readable
+      // sources + file uploads). Standard edition passes through untouched.
+      const visibleRows = await filterPipelineRowsForViewer(auth.accountId, rows);
+      const pipelines = visibleRows.map(row2pipeline);
 
       // Expand multi-column Sheets pipelines into virtual per-column entries.
       // Each virtual entry shares the same pipeline_id but has a distinct

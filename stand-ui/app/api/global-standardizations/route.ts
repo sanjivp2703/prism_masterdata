@@ -5,6 +5,7 @@ import { upsertApprovedAliasMysql, bulkUpsertLiteralMatchesMysql } from '@/app/a
 import { internalTable, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
+import { visibleSpecIdsForViewer } from '@/app/api/_lib/native-visibility';
 
 // ── GET /api/global-standardizations ──────────────────────────────────────────
 // Returns all LITERAL_ALIAS_MATCHES grouped by alias_name.
@@ -17,6 +18,14 @@ export async function GET(request: Request) {
   const domainIdParam = searchParams.get('domain_id');
   const domainId = domainIdParam != null && domainIdParam !== '' ? Number(domainIdParam) : null;
 
+  // Native edition: mappings follow their spec's pipelines — a viewer sees a
+  // spec's mappings only if they can see one of its pipelines (or the spec
+  // has no pipeline). null = standard edition, no scoping.
+  const visibleSpecs = await visibleSpecIdsForViewer(authz.accountId);
+  if (visibleSpecs && domainId != null && !visibleSpecs.has(domainId)) {
+    return Response.json({ standardizations: {}, groups: {} });
+  }
+
   try {
     return await withWarehouse(async (connection) => {
       const rows = await exec(
@@ -28,7 +37,7 @@ export async function GET(request: Request) {
                ON lam.alias_id = aan.alias_id
              WHERE lam.domain_id = ?
              ORDER BY aan.alias_name, lam.literal_value`
-          : `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at
+          : `SELECT aan.alias_name, lam.literal_value, lam.run_id, lam.confirmed_at, lam.domain_id
              FROM ${internalTable('LITERAL_ALIAS_MATCHES')}  lam
              JOIN ${internalTable('APPROVED_ALIAS_NAMES')}   aan
                ON lam.alias_id = aan.alias_id
@@ -51,6 +60,10 @@ export async function GET(request: Request) {
       > = Object.create(null);
 
       for (const r of rows) {
+        if (visibleSpecs) {
+          const specRaw = r.DOMAIN_ID ?? r.domain_id;
+          if (specRaw != null && !visibleSpecs.has(Number(specRaw))) continue;
+        }
         const aliasName   = String(r.ALIAS_NAME    ?? r.alias_name    ?? '');
         const litVal      = String(r.LITERAL_VALUE ?? r.literal_value ?? '');
         const runId       = Number(r.RUN_ID        ?? r.run_id        ?? 0);

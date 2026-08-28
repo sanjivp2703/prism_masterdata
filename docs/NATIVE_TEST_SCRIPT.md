@@ -88,16 +88,17 @@ Fixtures: `DEMO_DATA.OPEN` (analyst-visible), `DEMO_DATA.RESTRICTED`
       first-login password reset). Both are documented in the listing README.
 - [ ] **1.3 [CORE]** Installer opens the URL → Snowflake auth → terms
       interstitial appears ONCE → accept → lands on home as **Admin**. The info
-      box carries the shared-workspace sentence ("every user within your
-      company's Snowflake account … regardless of their own database
-      permissions") — its absence is a launch blocker (owner decision
-      2026-08-14).
+      box carries the NEW visibility sentence ("Your view follows your
+      Snowflake access …" — replaced the shared-workspace disclosure when
+      RBAC-scoped visibility shipped, owner decision 2026-08-28) plus the AI
+      clause. A stale shared-workspace sentence here is a finding.
 - [ ] **1.4 [CORE]** Welcome modal appears on first visit and dismisses from
       **either** button; does not reappear on reload.
 - [ ] **1.5 [CORE]** `/setup` shows the native **"Prism is ready"** page (grant
       SQL + caller opt-in + Cortex note) — NOT the credential wizard. Its grant
-      section warns that everyone with app access sees all mappings, including
-      from tables their own permissions can't read.
+      section states the visibility model: each person's view follows their own
+      Snowflake access; file uploads visible to all; the caller opt-in is what
+      lets Prism check access, so without it teammates see only their own work.
 - [ ] **1.6 [CORE]** Starter SQL is present and correct on `/setup` **and** the
       listing README: `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'AWS_US'`
       + `GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO APPLICATION PRISM_TEST`.
@@ -367,7 +368,7 @@ charges under the old meter; they must vanish, not drain.)
 - [ ] **12.5 [EDGE]** The dev app (`PRISM_APP_TEST`) after its upgrade: old
       pending ledger charges are gone with the tables; nothing ever emits.
 
-## Phase 13 — Membership & sessions (everyone is admin)
+## Phase 13 — Membership, visibility & sessions
 
 Roles were removed from the native edition 2026-08-28 (owner decision):
 every account provisions as admin, pre-decision 'user' rows self-promote on
@@ -383,6 +384,22 @@ entirely by the Snowflake-side application role grant.
       APPLICATION ROLE PRISM_TEST.app_user FROM USER psanjiv` → they cannot
       reach the ingress at all (Snowflake blocks before Prism). Re-grant →
       access returns, same account and history.
+- [ ] **13.4 [CORE][UNVAL]** **RBAC visibility — the restricted table** (shipped
+      2026-08-28): admin creates a pipeline on `DEMO_DATA.RESTRICTED` → the
+      pipeline (and its spec's mappings on the Mappings tab) are **invisible to
+      `psanjiv`**, visible to the admin who created it. Deep-linking the
+      pipeline's URL as `psanjiv` → not found, not a peek.
+- [ ] **13.5 [CORE][UNVAL]** **Teammate visibility via RBAC**: with the caller
+      opt-in run on `DEMO_DATA`, a pipeline the admin created on
+      `DEMO_DATA.OPEN` **is visible to `psanjiv`** (their role can read it).
+- [ ] **13.6 [CORE][UNVAL]** **Unverifiable = creator-only**: a pipeline on a
+      table in a database with NO caller opt-in is visible only to its creator —
+      including to users who could read the table in Snowsight (Prism cannot
+      check, so it does not show; decided fallback 2026-08-28).
+- [ ] **13.7 [CORE][UNVAL]** **File uploads visible to all**: a CSV/Excel
+      pipeline shows for every user regardless of grants; visibility checks add
+      no warehouse cost (probes are SHOW-based — confirm no `PRISM_APP_WH`
+      resume attributable to list refreshes).
 
 ## Phase 14 — Upgrade, patch & uninstall drills (Phase N4)
 

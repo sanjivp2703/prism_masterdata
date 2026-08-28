@@ -9,6 +9,7 @@
 
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { canViewerSeePipeline } from '@/app/api/_lib/native-visibility';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { normalizeLiteral } from '@/app/api/_lib/normalize';
 import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from '@/app/api/_lib/warehouse/mssql/dialect';
@@ -37,6 +38,9 @@ export async function GET(
   const authz = await requireValidSession();
   if (authz instanceof Response) return authz;
   const { pipeline_id } = await params;
+  if (!(await canViewerSeePipeline(authz.accountId, Number(pipeline_id)))) {
+    return Response.json({ error: 'Pipeline not found' }, { status: 404 });
+  }
   const pid = Number(pipeline_id);
   if (!Number.isFinite(pid) || pid <= 0) {
     return Response.json({ error: 'Invalid pipeline_id' }, { status: 400 });
@@ -222,6 +226,9 @@ export async function PATCH(
   const authz = await requireValidSession();
   if (authz instanceof Response) return authz;
   const { pipeline_id } = await params;
+  if (!(await canViewerSeePipeline(authz.accountId, Number(pipeline_id)))) {
+    return Response.json({ error: 'Pipeline not found' }, { status: 404 });
+  }
   const pid = Number(pipeline_id);
   if (!Number.isFinite(pid) || pid <= 0) {
     return Response.json({ error: 'Invalid pipeline_id' }, { status: 400 });

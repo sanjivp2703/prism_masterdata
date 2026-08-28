@@ -2813,10 +2813,12 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       <SectionTitle>Give Prism access to tables you want standardized</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         Prism sees only what your team grants it. Nothing is shared automatically.
-        One thing to know before granting: Prism is a shared workspace, so every
-        person you give app access to can view all pipelines, mappings, and the
-        standardized values, including ones built from tables their own
-        Snowflake permissions can&apos;t read.
+        Each person&apos;s view follows their own Snowflake access: they see the
+        pipelines and standardized values for source tables their role can read,
+        plus anything they created themselves. File uploads (CSV or Excel) are
+        visible to everyone with access to the app. The opt-in below is also what
+        lets Prism check each person&apos;s access, so without it teammates only
+        see their own work.
       </p>
 
       <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>

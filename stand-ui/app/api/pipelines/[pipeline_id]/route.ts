@@ -6,6 +6,7 @@
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { canViewerSeePipeline } from '@/app/api/_lib/native-visibility';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { dropPipelineStream } from '@/app/api/_lib/pipeline-poller';
 import { refreshExportTable, columnModeSetupSql, revokeColumnModeAccess, columnModeRevokeSql } from '@/app/api/_lib/export-table';
@@ -30,6 +31,12 @@ export async function PATCH(
 ) {
   const auth = await requireValidSession();
   if (auth instanceof Response) return auth;
+  {
+    const { pipeline_id } = await params;
+    if (!(await canViewerSeePipeline(auth.accountId, Number(pipeline_id)))) {
+      return Response.json({ error: 'Pipeline not found' }, { status: 404 });
+    }
+  }
   const session = auth;
 
   const { pipeline_id } = await params;
@@ -293,6 +300,12 @@ export async function DELETE(
 ) {
   const auth = await requireValidSession();
   if (auth instanceof Response) return auth;
+  {
+    const { pipeline_id } = await params;
+    if (!(await canViewerSeePipeline(auth.accountId, Number(pipeline_id)))) {
+      return Response.json({ error: 'Pipeline not found' }, { status: 404 });
+    }
+  }
   const session = auth;
 
   const { pipeline_id } = await params;

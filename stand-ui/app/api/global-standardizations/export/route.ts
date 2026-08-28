@@ -9,6 +9,7 @@ import { parseFqn as pgParseFqn, quoteIdent as pgQuoteIdent, assertFqnInDatabase
 import { getConnectedPgDatabase } from '@/app/api/_lib/warehouse/postgres/connection';
 import { parseFqn as myParseFqn, quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
 import { requireValidSession } from '@/app/api/_lib/account-security';
+import { visibleSpecIdsForViewer } from '@/app/api/_lib/native-visibility';
 import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 
 /**
@@ -162,6 +163,12 @@ export async function POST(request: NextRequest) {
     if (!Number.isFinite(n)) {
       return Response.json({ error: 'domain_id must be a number.' }, { status: 400 });
     }
+  {
+    const visibleSpecs = await visibleSpecIdsForViewer(authz.accountId);
+    if (visibleSpecs && domainId != null && !visibleSpecs.has(domainId)) {
+      return Response.json({ error: 'Not found' }, { status: 404 });
+    }
+  }
     domainId = n;
   }
   const domainName = rawDomainName ? String(rawDomainName) : null;

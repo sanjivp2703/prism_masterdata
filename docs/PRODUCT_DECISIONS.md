@@ -629,3 +629,35 @@ friction and test surface.
 **Cost knowingly accepted:** no in-app "remove this person" button — an org
 removes someone with a Snowflake REVOKE, which is where their DBA works
 anyway. The standard edition keeps its roles and invitations unchanged.
+
+---
+
+## Native edition: RBAC-scoped visibility replaces the shared workspace (2026-08-28)
+
+**Decision:** Reverses the 2026-08-14 shared-workspace-with-disclosure model.
+In the native edition, "your role defines your view": a pipeline (and its
+spec's mappings) is visible to a user only if they created it, OR their own
+Snowflake access can read its source table, OR its source is an uploaded
+CSV/Excel file (no Snowflake object exists — file work is visible to everyone
+with app access). Access is checked on the viewer's caller-rights session via
+SHOW OBJECTS (metadata-only — no warehouse wake), cached ~5 min per
+(viewer, table). Where access CANNOT be verified — above all in databases
+without the caller-grant opt-in — the object stays creator-only (owner choice:
+unverifiable = hidden). The terms interstitial and /setup copy now state this
+model; the shared-workspace disclosure is gone from native (standard edition
+keeps its invitation-scoped shared workspace unchanged).
+
+**What we didn't do:** keep the shared workspace (the August disclosure
+model) or build per-team visibility groups. The owner chose the Snowflake
+norm — users should never see derived values from tables their RBAC can't
+read.
+
+**Costs knowingly accepted:** (1) the caller opt-in quietly became
+load-bearing for team visibility — a company that skips it gets
+everyone-sees-only-their-own; the /setup copy says so. (2) The shared lookup
+still accumulates across users (consistency is the product); scoping governs
+*viewing*, not writing — two users' pipelines on the same column still share
+mappings. (3) v1 scope: the pipelines list/detail/mappings surfaces and the
+Mappings tab are scoped; SSE event payloads (ids/status) and run-page deep
+links by guessed ID are not yet individually guarded — follow-up hardening
+before a multi-team customer.
