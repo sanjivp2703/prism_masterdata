@@ -65,6 +65,11 @@ export function buildNativeAppDbGrantSql(appName: string, dbs?: string[]): strin
       `GRANT USAGE ON DATABASE ${db} TO APPLICATION "${app}";`,
       `GRANT USAGE ON ALL SCHEMAS IN DATABASE ${db} TO APPLICATION "${app}";`,
       `GRANT SELECT ON ALL TABLES IN DATABASE ${db} TO APPLICATION "${app}";`,
+      // Pipelines write their standardized output to NEW tables next to the
+      // source (2026-09-02; without this the export build fails with a
+      // second grant ask after everything else works). Prism never writes to
+      // existing tables — column mode is off in this edition.
+      `GRANT CREATE TABLE ON ALL SCHEMAS IN DATABASE ${db} TO APPLICATION "${app}";`,
       // Change tracking is per-table with no ALL form — loop the database's
       // tables. Already-enabled tables are a no-op; the app can't do this
       // itself with read-only grants.
@@ -104,6 +109,7 @@ export function buildNativeGrantRefreshTaskSql(appName: string, dbs?: string[]):
     `BEGIN`,
     `  GRANT USAGE ON ALL SCHEMAS IN DATABASE ${db} TO APPLICATION "${app}";`,
     `  GRANT SELECT ON ALL TABLES IN DATABASE ${db} TO APPLICATION "${app}";`,
+    `  GRANT CREATE TABLE ON ALL SCHEMAS IN DATABASE ${db} TO APPLICATION "${app}";`,
     `  FOR r IN c1 DO`,
     `    EXECUTE IMMEDIATE 'ALTER TABLE ' || r.fqn || ' SET CHANGE_TRACKING = TRUE';`,
     `  END FOR;`,

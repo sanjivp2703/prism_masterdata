@@ -20,7 +20,7 @@
 import { useEffect, useId, useMemo, useState } from 'react';
 import { buildNativeAppDbGrantSql, dbFromFqn } from './native-grant-sql';
 
-interface AccessibleTable { fqn: string; db: string; schema: string; table: string }
+interface AccessibleTable { fqn: string; db: string; schema: string; table: string; app_visible?: boolean }
 
 export default function NativeTablePicker({ value, onChange, inputId }: {
   value: string;
@@ -47,6 +47,16 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
     return buildNativeAppDbGrantSql(appName, db ? [db] : undefined);
   }, [appName, value]);
 
+  // The typed table exists in the suggestions but only through the CALLER's
+  // own access (app_visible false): a pipeline on it would pause on its first
+  // poll. Surface that before creation instead of after.
+  const callerOnly = useMemo(() => {
+    const typed = value.trim().toUpperCase();
+    if (!typed) return false;
+    const hit = tables.find(t => t.fqn.toUpperCase() === typed);
+    return hit ? hit.app_visible === false : false;
+  }, [tables, value]);
+
   return (
     <div>
       <input
@@ -65,6 +75,13 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
       <datalist id={listId}>
         {tables.map(t => <option key={t.fqn} value={t.fqn} />)}
       </datalist>
+      {callerOnly && (
+        <p style={{ marginTop: 6, marginBottom: 0, fontSize: 12, color: 'var(--confidence-low)', lineHeight: 1.5 }}>
+          Only you can see this table right now. Pipelines run in the background with
+          the app&apos;s own access — run the access SQL below (or the setup page&apos;s
+          block for this database) first.
+        </p>
+      )}
       <button type="button" onClick={() => setShowGrantHelp(v => !v)}
         style={{ marginTop: 6, fontSize: 11, color: 'var(--accent)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
         {showGrantHelp ? 'Hide access help' : "Don't see your table?"}

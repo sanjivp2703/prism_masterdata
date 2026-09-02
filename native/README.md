@@ -26,7 +26,8 @@ password reset); the app URL takes a few minutes to appear after
 
 One step per database, never per table: run the `GRANT ... TO APPLICATION`
 block Prism's setup page (or the connect form's access help) generates for
-your database. It grants read access to every table in the database and turns
-on change detection for all of them in the same run. Add the optional hourly
-refresh task (also generated on the setup page) and tables created later are
-covered automatically — nothing to re-run, ever.
+your database. It grants read access to every table in the database, lets
+Prism create its standardized output tables there (Prism never modifies your
+existing tables), and turns on change detection — all in the same run. Add
+the optional hourly refresh task (also generated on the setup page) and
+tables created later are covered automatically — nothing to re-run, ever.

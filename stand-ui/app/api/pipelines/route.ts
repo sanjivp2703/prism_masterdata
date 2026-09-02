@@ -27,6 +27,7 @@ import {
 } from '@/app/api/_lib/update-schedule';
 import { asExportKind } from '@/app/api/_lib/export-kind';
 import { isNativeEdition } from '@/app/api/_lib/edition';
+import { probeNativeSourceAccess } from '@/app/api/_lib/native-access';
 import { filterPipelineRowsForViewer } from '@/app/api/_lib/native-visibility';
 
 function parseMeta(v: any): Record<string, any> {
@@ -222,6 +223,15 @@ export async function POST(request: Request) {
 
   try {
     return await withWarehouse(async (conn) => {
+      // Native preflight (2026-09-02): interactive screens run with the
+      // CALLER's access, so creation used to succeed on tables the APP can't
+      // read — producing a pipeline guaranteed to pause on its first poll,
+      // with resume flipping straight back. Refuse HERE, the one moment the
+      // user can act, with the setup-page fix in hand. Metadata-layer probes.
+      const accessProblem = await probeNativeSourceAccess(conn, table_fqn);
+      if (accessProblem) {
+        return Response.json({ error: accessProblem }, { status: 400 });
+      }
       const db = getDb();
       // One spec (and one pipeline) per (table_fqn, column_name): per-column
       // isolation means the scope id no longer participates in the dedup key.

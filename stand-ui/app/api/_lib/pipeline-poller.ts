@@ -14,6 +14,8 @@
  */
 
 import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter, resolveSourceReference, describeRowsToColumns } from './warehouse';
+import { isNativeEdition } from './edition';
+import { nativeChangeTrackingPauseMessage, nativeSourceAccessPauseMessage } from './native-access';
 import { pollOneMssqlPipeline } from './pipeline-poller-mssql';
 import { pollOnePgPipeline } from './pipeline-poller-postgres';
 import { pollOneMysqlPipeline } from './pipeline-poller-mysql';
@@ -182,8 +184,12 @@ export function isChangeTrackingPrivilegeError(e: unknown): boolean {
   return /CHANGE_TRACKING/i.test(msg) && /privileg|MODIFY/i.test(msg);
 }
 
-/** The pause/flag message when change tracking can't be enabled automatically. */
+/** The pause/flag message when change tracking can't be enabled automatically.
+ *  Native edition gets its own copy — the standard message names the
+ *  PRISM_SERVICE role and saved personal credentials, neither of which exists
+ *  there (the fix is the setup page's per-database access block). */
 export function changeTrackingFixMessage(tableFqn: string): string {
+  if (isNativeEdition()) return nativeChangeTrackingPauseMessage(tableFqn);
   return (
     `Prism can't watch ${tableFqn} for changes: change tracking is not enabled on the table and the service role can't enable it. ` +
     `Run in Snowflake as the table owner or an admin: ALTER TABLE ${tableFqn} SET CHANGE_TRACKING = TRUE; then resume this pipeline. ` +
@@ -304,6 +310,8 @@ async function checkSourceHealth(
         ok: false, action: 'pause',
         message: srcRefSql
           ? `Source table ${tableFqn} is not reachable through the app's granted reference — it may have been dropped, renamed, or removed from the app's Security tab. Re-add the table there (or grant it with SQL), then resume.`
+          : isNativeEdition()
+          ? nativeSourceAccessPauseMessage(tableFqn)
           : `Source table ${tableFqn} not found or not accessible — it may have been dropped, renamed, or access was revoked. Fix the source or update the pipeline, then resume.`,
       };
     }

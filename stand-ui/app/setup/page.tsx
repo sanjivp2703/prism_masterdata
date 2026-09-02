@@ -2873,8 +2873,9 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
           <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             {runLine} One paste covers everything{aiConfigured === false ? ': it enables AI, ' : ': it '}
             lets everyone use Prism on the selected databases with their own access, gives
-            background pipelines read access, and turns on change detection for every table.
-            Use Run All, not the single-statement play button.
+            background pipelines read access plus room to create their output tables, and
+            turns on change detection for every table. Use Run All, not the
+            single-statement play button.
           </p>
           <div className="mt-2">
             <CodeBlock

@@ -16,6 +16,8 @@ import { type ExportKind, asExportKind } from '@/app/api/_lib/export-kind';
 import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims';
 import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
+import { isNativeEdition } from '@/app/api/_lib/edition';
+import { probeNativeSourceAccess } from '@/app/api/_lib/native-access';
 
 /**
  * PATCH /api/pipelines/[pipeline_id]
@@ -187,6 +189,23 @@ export async function PATCH(
   }
 
   try {
+    // Native resume preflight (2026-09-02): if the APP still can't read the
+    // source, flipping to 'active' just lets the next poll flip it straight
+    // back — the "resume doesn't stick" loop. Refuse with the fix instead.
+    // Warehouse-table pipelines only (file/sheets sources have no app grant).
+    if (activating && isNativeEdition()) {
+      const src = getDb()
+        .prepare(`SELECT table_fqn, source_type FROM pipelines WHERE pipeline_id = ?`)
+        .get(pid) as { table_fqn?: string; source_type?: string } | undefined;
+      const sourceType = String(src?.source_type ?? 'snowflake');
+      if (src?.table_fqn && sourceType === 'snowflake') {
+        const accessProblem = await withWarehouse((conn) =>
+          probeNativeSourceAccess(conn, String(src.table_fqn)));
+        if (accessProblem) {
+          return Response.json({ error: accessProblem }, { status: 409 });
+        }
+      }
+    }
     const { httpResponse, pfe } = await (async () => {
       getDb()
         .prepare(`UPDATE pipelines SET ${setClauses.join(', ')} WHERE pipeline_id = ?`)

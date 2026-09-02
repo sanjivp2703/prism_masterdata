@@ -31,7 +31,8 @@ import {
   type PipelineForProcessing,
 } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
-import { isChangeTrackingPrivilegeError } from '@/app/api/_lib/pipeline-poller';
+import { isChangeTrackingPrivilegeError, changeTrackingFixMessage } from '@/app/api/_lib/pipeline-poller';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { flagPipelineMessage, clearPipelineStatusMessage } from '@/app/api/_lib/pipeline-alerts';
 import { appendTiming } from '@/app/api/_lib/timing';
 
@@ -253,9 +254,11 @@ export async function POST(
             if (!fixed) {
               flagPipelineMessage(
                 pid,
-                `Heads up: Prism won't be able to watch ${pipeline.table_fqn} for new values yet — change tracking is not enabled on the table and the service role can't enable it. ` +
-                `Run in Snowflake as the table owner or an admin: ALTER TABLE ${pipeline.table_fqn} SET CHANGE_TRACKING = TRUE; ` +
-                `(or GRANT MODIFY ON TABLE ${pipeline.table_fqn} TO ROLE PRISM_SERVICE; or save your own Snowflake credentials in Setup so Prism can enable it for you.)`,
+                isNativeEdition()
+                  ? changeTrackingFixMessage(pipeline.table_fqn)
+                  : `Heads up: Prism won't be able to watch ${pipeline.table_fqn} for new values yet — change tracking is not enabled on the table and the service role can't enable it. ` +
+                    `Run in Snowflake as the table owner or an admin: ALTER TABLE ${pipeline.table_fqn} SET CHANGE_TRACKING = TRUE; ` +
+                    `(or GRANT MODIFY ON TABLE ${pipeline.table_fqn} TO ROLE PRISM_SERVICE; or save your own Snowflake credentials in Setup so Prism can enable it for you.)`,
               ).catch(() => {});
             }
           }

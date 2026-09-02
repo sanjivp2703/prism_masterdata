@@ -27,13 +27,18 @@ const MAX_TABLES = 1_000;
 // Never useful as standardization sources; the app db is internal state.
 const SKIP_DBS = new Set(['SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA']);
 
-interface AccessibleTable { fqn: string; db: string; schema: string; table: string }
+// app_visible: whether the APPLICATION itself can see the table (durable
+// grants/references — what background pipelines need). false = caller-only:
+// the signed-in user can see it, but a pipeline on it would need the setup
+// page's database access block first. The picker surfaces that inline.
+interface AccessibleTable { fqn: string; db: string; schema: string; table: string; app_visible: boolean }
 
 /** SHOW-based enumeration of every table this connection can see (capped). */
 async function enumerateTables(
   conn: unknown,
   appName: string,
   cap: number,
+  appVisible: boolean,
 ): Promise<{ tables: AccessibleTable[]; truncated: boolean }> {
   const dbs = (await executeQuery(conn, 'SHOW DATABASES')) as Array<Record<string, unknown>>;
   const tables: AccessibleTable[] = [];
@@ -53,7 +58,7 @@ async function enumerateTables(
       const schema = String(r.schema_name ?? '');
       const table  = String(r.name ?? '');
       if (!schema || !table || schema.toUpperCase() === 'INFORMATION_SCHEMA') continue;
-      tables.push({ fqn: `${db}.${schema}.${table}`, db, schema, table });
+      tables.push({ fqn: `${db}.${schema}.${table}`, db, schema, table, app_visible: appVisible });
     }
     if (truncated) break;
   }
@@ -73,12 +78,12 @@ export async function GET() {
     const appView = await withWarehouse(async (conn) => {
       const appRows = await executeQuery(conn, 'SELECT CURRENT_DATABASE() AS D');
       const appName = String(appRows?.[0]?.D ?? appRows?.[0]?.d ?? '');
-      const { tables, truncated } = await enumerateTables(conn, appName, MAX_TABLES);
+      const { tables, truncated } = await enumerateTables(conn, appName, MAX_TABLES, true);
       for (const b of await listSourceTableBindings(conn)) {
         if (tables.length >= MAX_TABLES) break;
         const fqn = `${b.db}.${b.schema}.${b.table}`;
         if (!tables.some(t => t.fqn === fqn)) {
-          tables.push({ fqn, db: b.db, schema: b.schema, table: b.table });
+          tables.push({ fqn, db: b.db, schema: b.schema, table: b.table, app_visible: true });
         }
       }
       return { appName, tables, truncated };
@@ -91,7 +96,7 @@ export async function GET() {
     if (!truncated) {
       try {
         const callerView = await withUserWarehouse(Number(auth.accountId), (conn) =>
-          enumerateTables(conn, appView.appName, MAX_TABLES));
+          enumerateTables(conn, appView.appName, MAX_TABLES, false));
         for (const t of callerView.tables) {
           if (merged.size >= MAX_TABLES) { truncated = true; break; }
           if (!merged.has(t.fqn)) merged.set(t.fqn, t);
