@@ -1286,20 +1286,46 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     try {
       // Dedup: virtual multi-column entries share a pipeline_id; only delete each once.
       const seen = new Set<number>();
-      await Promise.all(
+      const results = await Promise.all(
         g.columns
           .filter(m => { if (seen.has(m.pipeline_id)) return false; seen.add(m.pipeline_id); return true; })
-          .map(m => fetch(`/api/pipelines/${m.pipeline_id}`, { method: 'DELETE' }).catch(() => {})),
+          .map(async m => {
+            try {
+              const res = await fetch(`/api/pipelines/${m.pipeline_id}`, { method: 'DELETE' });
+              if (res.ok) return { id: m.pipeline_id, ok: true as const, error: null };
+              const body = await res.json().catch(() => ({}));
+              return { id: m.pipeline_id, ok: false as const, error: typeof body?.error === 'string' ? body.error : null };
+            } catch {
+              return { id: m.pipeline_id, ok: false as const, error: null };
+            }
+          }),
       );
-      const ids = new Set(g.columns.map(m => m.pipeline_id));
-      setPipelines(prev => prev.filter(x => !ids.has(x.pipeline_id)));
-      if (expandedKey === g.key) setExpandedKey(null);
+      // Only remove what the server actually deleted — a swallowed failure
+      // here made the card vanish and then reappear on the next refetch.
+      const deletedIds = new Set(results.filter(r => r.ok).map(r => r.id));
+      setPipelines(prev => prev.filter(x => !deletedIds.has(x.pipeline_id)));
+      const firstError = results.find(r => !r.ok);
+      if (firstError) {
+        showToast(firstError.error ?? `Couldn't delete ${label}. Please try again.`, 'error');
+      } else if (expandedKey === g.key) {
+        setExpandedKey(null);
+      }
     } finally { setBusyKey(null); setDeletingKey(null); }
   }
 
   // Delete a single column from a card (per-column delete in Settings).
   async function handleDeleteMember(p: Pipeline) {
-    await fetch(`/api/pipelines/${p.pipeline_id}`, { method: 'DELETE' }).catch(() => {});
+    try {
+      const res = await fetch(`/api/pipelines/${p.pipeline_id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(typeof body?.error === 'string' ? body.error : `Couldn't delete ${p.column_name}. Please try again.`, 'error');
+        return;
+      }
+    } catch {
+      showToast(`Couldn't delete ${p.column_name}. Please try again.`, 'error');
+      return;
+    }
     setPipelines(prev => prev.filter(x => x.pipeline_id !== p.pipeline_id));
   }
 
