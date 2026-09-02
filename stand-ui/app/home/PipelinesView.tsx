@@ -1226,9 +1226,14 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status }),
         });
-        return { m, ok: res.ok };
+        if (res.ok) return { m, ok: true as const, error: null };
+        // Surface the server's reason — a refused resume (e.g. the native
+        // access preflight's 409) carries the exact fix; the old generic
+        // "please try again" hid it and made the flip look like a mystery.
+        const body = await res.json().catch(() => ({}));
+        return { m, ok: false as const, error: typeof body?.error === 'string' ? body.error : null };
       } catch {
-        return { m, ok: false };
+        return { m, ok: false as const, error: null };
       }
     }));
 
@@ -1241,7 +1246,8 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
           : x));
       const verb  = status === 'paused' ? 'pause' : 'resume';
       const what  = failed.length === 1 ? failed[0].m.column_name : `${failed.length} columns`;
-      showToast(`Couldn't ${verb} ${what}. Please try again.`, 'error');
+      const reason = failed.find(f => f.error)?.error;
+      showToast(reason ?? `Couldn't ${verb} ${what}. Please try again.`, 'error');
     }
   }
 

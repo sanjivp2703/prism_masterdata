@@ -202,6 +202,10 @@ export async function PATCH(
         const accessProblem = await withWarehouse((conn) =>
           probeNativeSourceAccess(conn, String(src.table_fqn)));
         if (accessProblem) {
+          // Also write it onto the card: the status-message area is the one
+          // place a persistent reason is guaranteed visible, whatever the
+          // toast does with the response body.
+          await flagPipelineMessage(pid, accessProblem, 'error').catch(() => {});
           return Response.json({ error: accessProblem }, { status: 409 });
         }
       }
