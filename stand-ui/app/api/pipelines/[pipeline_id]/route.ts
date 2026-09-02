@@ -17,7 +17,7 @@ import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims'
 import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { probeNativeSourceAccess, nativeExportBuildFixMessage } from '@/app/api/_lib/native-access';
+import { probeNativeSourceAccess, nativeExportBuildFixMessage, probeNativeExportCollision } from '@/app/api/_lib/native-access';
 
 /**
  * PATCH /api/pipelines/[pipeline_id]
@@ -247,8 +247,19 @@ export async function PATCH(
     // doesn't exist and can repair it ("Recreate view now" in Settings).
     if (pfe && pfe.export_table_fqn) {
       const exportRef = pfe;
-      refreshExportTable(exportRef.table_fqn, exportRef.column_name, exportRef.export_table_fqn!, exportRef.domain_id, pid, exportRef.export_kind).catch(err => {
+      refreshExportTable(exportRef.table_fqn, exportRef.column_name, exportRef.export_table_fqn!, exportRef.domain_id, pid, exportRef.export_kind).catch(async err => {
         console.error(`[ExportTable] Background refresh failed for pipeline ${pid}:`, err);
+        // Native: a destination the app doesn't OWN (pre-existing table, e.g.
+        // from a one-time export) fails every rebuild while grants look
+        // correct — explain that instead of the grants fallback below.
+        const collision = exportRef.export_kind !== 'column'
+          ? await withWarehouse((conn) =>
+              probeNativeExportCollision(conn, String(exportRef.export_table_fqn))).catch(() => null)
+          : null;
+        if (collision) {
+          flagPipelineMessage(pid, collision, 'error').catch(() => {});
+          return;
+        }
         // Curated messages (thrown by the column-mode sync) carry the exact fix
         // SQL — show them as-is. Anything else gets a per-kind message with the
         // likely fix, never raw driver text.

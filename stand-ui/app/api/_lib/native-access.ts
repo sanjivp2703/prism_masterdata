@@ -90,6 +90,49 @@ export function nativeSourceAccessPauseMessage(tableFqn: string): string {
   );
 }
 
+/**
+ * AFTER a failed export build: does the destination exist under someone
+ * else's ownership? CREATE OR REPLACE needs OWNERSHIP of the existing table —
+ * schema CREATE TABLE rights are not enough — so a table made outside the
+ * app (a caller-session one-time export, or one predating Prism) fails every
+ * rebuild while the grants all look correct (live-found 2026-09-02:
+ * DEMO_DATA.RESTRICTED.RAW_VENDORS_STANDARDIZED, created 08-16, owner
+ * ACCOUNTADMIN — the card blamed a CREATE TABLE grant that existed). Only
+ * called from failure handlers, never as a pre-block, so a probe quirk can
+ * never stop a healthy build. Returns the explanation, or null.
+ */
+export async function probeNativeExportCollision(
+  conn: unknown,
+  exportFqn: string,
+): Promise<string | null> {
+  if (!isNativeEdition()) return null;
+  const parts = String(exportFqn).trim().split('.');
+  if (parts.length !== 3) return null;
+  const [db, schema, table] = parts;
+  const appName = getOptionalEnv('SNOWFLAKE_DATABASE') ?? '';
+  if (!appName) return null;
+  try {
+    const rows = await executeQuery(
+      conn,
+      `SHOW TABLES LIKE '${table.replace(/'/g, "''")}' IN SCHEMA ${q(db)}.${q(schema)}`,
+    );
+    const first = rows?.[0] as Record<string, unknown> | undefined;
+    if (!first) return null;
+    const owner = String(first.owner ?? first.OWNER ?? '');
+    if (!owner || owner.toUpperCase() === appName.toUpperCase()) return null;
+    return (
+      `The output table ${exportFqn} already exists and is owned by ${owner}, not Prism — ` +
+      `it was created outside this pipeline (for example by a one-time export, or before ` +
+      `Prism was set up), and Prism can only maintain a table it owns. Rename or drop the ` +
+      `existing table (its standardized contents are rebuilt automatically): ` +
+      `ALTER TABLE ${exportFqn} RENAME TO ${table}_OLD; ` +
+      `then use "Rebuild export table now" in the card's Settings tab.`
+    );
+  } catch {
+    return null; // can't verify — let the build error speak for itself
+  }
+}
+
 /** Native wording for a failed export build (the standard edition's message
  *  says GRANT ... TO ROLE PRISM_SERVICE, which doesn't exist here). The app
  *  name comes from the SPCS env (SNOWFLAKE_DATABASE = the app's own db);

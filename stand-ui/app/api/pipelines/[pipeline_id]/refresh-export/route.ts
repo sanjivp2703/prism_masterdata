@@ -12,6 +12,7 @@ import { getDb } from '@/app/api/_lib/sqlite';
 import { refreshExportTable } from '@/app/api/_lib/export-table';
 import { asExportKind } from '@/app/api/_lib/export-kind';
 import { clearPipelineStatusMessage } from '@/app/api/_lib/pipeline-alerts';
+import { probeNativeExportCollision } from '@/app/api/_lib/native-access';
 
 export async function POST(
   _request: Request,
@@ -27,6 +28,8 @@ export async function POST(
     return Response.json({ error: 'Invalid pipeline_id' }, { status: 400 });
   }
 
+  // Hoisted so the catch can name the destination when explaining a failure.
+  let exportTableFqnForError: string | null = null;
   try {
     // Fetch the pipeline so we have all the info needed for the refresh.
     const row = getDb()
@@ -41,6 +44,7 @@ export async function POST(
     }
 
     const exportTableFqn = row.EXPORT_TABLE_FQN ?? row.export_table_fqn ?? null;
+    exportTableFqnForError = exportTableFqn != null ? String(exportTableFqn) : null;
     if (!exportTableFqn) {
       return Response.json(
         { error: 'This pipeline does not have an export table configured.' },
@@ -70,6 +74,15 @@ export async function POST(
 
     return Response.json({ ok: true, rows_written: result.rows_written, export_table_fqn: exportTableFqn, export_kind: exportKind });
   } catch (err) {
+    // Native: a build that failed against a destination the app doesn't OWN
+    // (pre-existing / one-time-export table) deserves its real explanation,
+    // not a sanitized driver error. Probe only after failure — never blocks
+    // a healthy rebuild.
+    if (exportTableFqnForError) {
+      const collision = await withWarehouse((conn) =>
+        probeNativeExportCollision(conn, exportTableFqnForError!)).catch(() => null);
+      if (collision) return Response.json({ error: collision }, { status: 409 });
+    }
     return warehouseErrorResponse(err, 'Failed to refresh export table');
   }
 }
