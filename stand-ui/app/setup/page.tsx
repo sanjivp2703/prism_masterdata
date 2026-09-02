@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { buildNativeAppDbGrantSql, buildNativeCallerGrantSql, buildNativeGrantRefreshTaskSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
+import { buildNativeGrantRefreshTaskSql, buildNativeSetupSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
 import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 
 function PrismLogo() {
@@ -2806,22 +2806,12 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         Prism is ready
       </h1>
 
-      {aiConfigured === true ? (
+      {aiConfigured === true && (
         <>
           <SectionTitle>AI</SectionTitle>
           <p className="text-sm" style={{ color: 'var(--confidence-high)', lineHeight: 1.6 }}>
             ✓ AI is enabled. Nothing to run.
           </p>
-        </>
-      ) : (
-        <>
-          <SectionTitle>Enable AI</SectionTitle>
-          <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Run this as ACCOUNTADMIN to enable AI:
-          </p>
-          <div className="mt-2">
-            <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
-          </div>
         </>
       )}
 
@@ -2867,21 +2857,30 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
           Add
         </button>
       </div>
+      {selected.length === 0 && aiConfigured === false && (
+        <>
+          <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            {runLine} It enables AI; selecting databases above extends it to cover
+            data access too.
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
+          </div>
+        </>
+      )}
       {selected.length > 0 && (
         <>
           <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            {runLine}
+            {runLine} One paste covers everything{aiConfigured === false ? ': it enables AI, ' : ': it '}
+            lets everyone use Prism on the selected databases with their own access, gives
+            background pipelines read access, and turns on change detection for every table.
+            Use Run All, not the single-statement play button.
           </p>
           <div className="mt-2">
-            <CodeBlock code={buildNativeCallerGrantSql(appName, selected)} maxHeight={220} />
-          </div>
-          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Also run this — it lets pipelines (background standardization, which runs
-            with nobody signed in) read those databases and turns on change detection
-            for their tables:
-          </p>
-          <div className="mt-2">
-            <CodeBlock code={buildNativeAppDbGrantSql(appName, selected)} maxHeight={220} />
+            <CodeBlock
+              code={buildNativeSetupSql(appName, selected, { includeStarter: aiConfigured === false })}
+              maxHeight={280}
+            />
           </div>
           <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             Optional — keep pipeline access fresh. Pipelines need a direct grant per

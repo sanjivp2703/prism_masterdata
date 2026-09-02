@@ -19,6 +19,26 @@ export function buildNativeStarterSql(appName: string): string {
   ].join('\n');
 }
 
+/** The ONE combined /setup block (owner request 2026-09-02): AI starter (when
+ *  AI isn't configured yet) + the caller-grants opt-in + the per-database app
+ *  grants with their change-tracking loop — everything a fresh installation
+ *  needs, in a single ACCOUNTADMIN paste. Composed from the individual
+ *  builders so the pieces can't drift; the optional refresh task stays its
+ *  own block (it's a CREATE TASK the customer may not want). */
+export function buildNativeSetupSql(
+  appName: string,
+  dbs: string[],
+  opts: { includeStarter: boolean },
+): string {
+  const parts: string[] = [];
+  if (opts.includeStarter) parts.push(buildNativeStarterSql(appName));
+  if (dbs.length > 0) {
+    parts.push(buildNativeCallerGrantSql(appName, dbs));
+    parts.push(buildNativeAppDbGrantSql(appName, dbs));
+  }
+  return parts.join('\n\n');
+}
+
 /** The database part of a picker-typed FQN (verbatim, matching parseFqn), or
  *  null when nothing usable was typed — the db-scoped builders then emit
  *  their legible <db> placeholder. */
