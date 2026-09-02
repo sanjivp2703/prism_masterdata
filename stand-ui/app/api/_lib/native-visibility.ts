@@ -116,8 +116,13 @@ export async function filterPipelineRowsForViewer<T extends PipelineVisibilitySh
 /** May this viewer see this one pipeline? For detail/mutation route guards. */
 export async function canViewerSeePipeline(accountId: number, pipelineId: number): Promise<boolean> {
   if (!isNativeEdition()) return true;
+  // NO source_type here: pipelines dropped that column in migration 016
+  // (warehouse-only) — selecting it throws "no such column", which 500'd
+  // every route this guards (DELETE, mappings) since the RBAC commit
+  // (live-found 2026-09-02 in the PRISM_TEST service logs). rowIsFileBased
+  // defaults an absent field to 'snowflake', which is now always true.
   const row = getDb()
-    .prepare(`SELECT created_by, source_type, table_fqn FROM pipelines WHERE pipeline_id = ?`)
+    .prepare(`SELECT created_by, table_fqn FROM pipelines WHERE pipeline_id = ?`)
     .get(pipelineId) as PipelineVisibilityShape | undefined;
   if (!row) return true; // absent: let the route produce its own 404
   const kept = await filterPipelineRowsForViewer(accountId, [row]);
@@ -135,7 +140,7 @@ export async function visibleSpecIdsForViewer(accountId: number): Promise<Set<nu
   const db = getDb();
   const specs = db.prepare(`SELECT spec_id FROM column_specs`).all() as Array<{ spec_id: number }>;
   const refs = db
-    .prepare(`SELECT domain_id, created_by, source_type, table_fqn FROM pipelines WHERE domain_id IS NOT NULL`)
+    .prepare(`SELECT domain_id, created_by, table_fqn FROM pipelines WHERE domain_id IS NOT NULL`)
     .all() as Array<PipelineVisibilityShape & { domain_id: number }>;
   const referenced = new Set(refs.map((r) => Number(r.domain_id)));
   const visible = new Set<number>();

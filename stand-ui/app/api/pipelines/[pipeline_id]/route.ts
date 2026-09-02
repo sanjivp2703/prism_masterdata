@@ -194,11 +194,13 @@ export async function PATCH(
     // back — the "resume doesn't stick" loop. Refuse with the fix instead.
     // Warehouse-table pipelines only (file/sheets sources have no app grant).
     if (activating && isNativeEdition()) {
+      // Pipelines are warehouse-only (migration 016) — there is no
+      // source_type column; selecting it threw "no such column" and turned
+      // this preflight's helpful 409 into a bare 500 (live-found 2026-09-02).
       const src = getDb()
-        .prepare(`SELECT table_fqn, source_type FROM pipelines WHERE pipeline_id = ?`)
-        .get(pid) as { table_fqn?: string; source_type?: string } | undefined;
-      const sourceType = String(src?.source_type ?? 'snowflake');
-      if (src?.table_fqn && sourceType === 'snowflake') {
+        .prepare(`SELECT table_fqn FROM pipelines WHERE pipeline_id = ?`)
+        .get(pid) as { table_fqn?: string } | undefined;
+      if (src?.table_fqn) {
         const accessProblem = await withWarehouse((conn) =>
           probeNativeSourceAccess(conn, String(src.table_fqn)));
         if (accessProblem) {
