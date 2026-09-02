@@ -330,10 +330,9 @@ is the lever if per-customer revenue runs thin; revisit with real volumes.)
 
 - `native/manifest.yml` — privileges (`CREATE WAREHOUSE`,
   `CREATE COMPUTE POOL`, `BIND SERVICE ENDPOINT`, `SNOWFLAKE.CORTEX_USER` if
-  §2.4=A), the optional `source_table` reference (SELECT only — ALTER is not
-  a legal reference privilege, so change tracking stays a consumer-run
-  statement; see the N5 access-model note, revised 2026-09-01),
-  version metadata, ingress endpoint declaration.
+  §2.4=A), NO references (per-table flows banned — see the N5 access-model
+  note, re-revised 2026-09-02), version metadata, ingress endpoint
+  declaration.
 - `native/setup.sql` — application roles, versioned code schema, unversioned
   state schema (the INTERNAL tables + UDF), post-install/upgrade callbacks
   (create compute pool + warehouse, start/upgrade the service). (The
@@ -547,7 +546,18 @@ isolates SPCS problems from Native-App-packaging problems.
   listing** first.
 - Install the private listing with 1–2 design-partner accounts; run the
   PRELAUNCH_CHECKLIST.md disciplines that apply. (Access-model decision
-  2026-08-31, REVISED 2026-09-01: the 2026-08-31 call removed all references —
+  2026-08-31, revised 2026-09-01, **RE-REVISED 2026-09-02 (owner): the
+  source_table reference lasted one patch (51) and is REMOVED again in
+  patch 52 — the consumer must never see a per-table selection flow (no
+  Security-tab picker, no install "Select Data" step). The single access
+  path is the DATABASE-scoped grant block + the hourly PRISM_GRANT_REFRESH
+  task (which also loops the change-tracking ALTER, so nothing is ever
+  per-table); the app-side reference plumbing stays DORMANT (failure-cached
+  resolver, resolves null) for the v1.1 column-mode reference. Patch-51
+  facts worth keeping: the validator accepts references alongside
+  restricted_callers_rights; reference descriptions cap at 200 chars;
+  CREATE STREAM ON reference(...) was never live-verified.** The 2026-09-01
+  record follows for context: the 2026-08-31 call removed all references —
   reads followed the caller-grants opt-in plus direct
   `GRANT SELECT ... TO APPLICATION` SQL only. On 2026-09-01 the owner
   reinstated ONE optional multi-valued TABLE reference, `source_table`

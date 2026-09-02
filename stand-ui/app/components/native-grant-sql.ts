@@ -19,59 +19,23 @@ export function buildNativeStarterSql(appName: string): string {
   ].join('\n');
 }
 
-/** db/schema/table from a picker-typed FQN (DB.SCHEMA.TABLE or DB.SCHEMA,
- *  parts interpolated verbatim, matching parseFqn); legible placeholders
- *  otherwise. Shared by the grant builders below. */
-function fqnPartsOrPlaceholders(tableFqn?: string): { db: string; schema: string; table: string } {
-  const parts = (tableFqn ?? '').trim().split('.');
-  const [db, schema] =
-    (parts.length === 3 || parts.length === 2) && parts.slice(0, 2).every(p => p.trim() !== '')
-      ? [parts[0].trim(), parts[1].trim()]
-      : ['<db>', '<schema>'];
-  const table = parts.length === 3 && parts[2].trim() !== '' ? parts[2].trim() : '<table>';
-  return { db, schema, table };
+/** The database part of a picker-typed FQN (verbatim, matching parseFqn), or
+ *  null when nothing usable was typed — the db-scoped builders then emit
+ *  their legible <db> placeholder. */
+export function dbFromFqn(tableFqn?: string): string | null {
+  const db = (tableFqn ?? '').trim().split('.')[0]?.trim() ?? '';
+  return db !== '' ? db : null;
 }
 
-/** Durable grants TO THE APPLICATION — what pipelines require (and the only
- *  path in strict-list mode). Runnable by whoever owns the schema.
- *  Schema-scoped by owner decision 2026-09-01 (one run covers every table
- *  currently in the schema). */
-export function buildNativeAppGrantSql(appName: string, tableFqn?: string): string {
-  const app = appName || APP_NAME_PLACEHOLDER;
-  const { db, schema, table } = fqnPartsOrPlaceholders(tableFqn);
-  return [
-    `GRANT USAGE ON DATABASE ${db} TO APPLICATION "${app}";`,
-    `GRANT USAGE ON SCHEMA ${db}.${schema} TO APPLICATION "${app}";`,
-    `GRANT SELECT ON ALL TABLES IN SCHEMA ${db}.${schema} TO APPLICATION "${app}";`,
-    `GRANT CREATE TABLE ON SCHEMA ${db}.${schema} TO APPLICATION "${app}";`,
-    // Pipelines watch for changes via a stream, which needs change tracking
-    // on (per-table; the app can't enable it with read-only grants).
-    `ALTER TABLE ${db}.${schema}.${table} SET CHANGE_TRACKING = TRUE;`,
-  ].join('\n');
-}
+// (The schema-scoped grant block and the reference follow-up SQL were removed
+// 2026-09-02 with the manifest's references section: no per-table or
+// per-schema rituals — the database-scoped block below is the single path.)
 
-/** Follow-up SQL for a table granted through the PERMISSION UI (the app's
- *  source_table reference, added in Snowsight's Security tab). The reference
- *  carries SELECT only — ALTER is not a legal reference privilege and SCHEMA
- *  is not referenceable — so change detection and the standardized output
- *  table still need these. Runnable by whoever owns the schema. The last
- *  three statements are unnecessary when the pipeline's output goes to a
- *  schema Prism can already create tables in. */
-export function buildNativeReferenceFollowupSql(appName: string, tableFqn?: string): string {
-  const app = appName || APP_NAME_PLACEHOLDER;
-  const { db, schema, table } = fqnPartsOrPlaceholders(tableFqn);
-  return [
-    `ALTER TABLE ${db}.${schema}.${table} SET CHANGE_TRACKING = TRUE;`,
-    `GRANT USAGE ON DATABASE ${db} TO APPLICATION "${app}";`,
-    `GRANT USAGE ON SCHEMA ${db}.${schema} TO APPLICATION "${app}";`,
-    `GRANT CREATE TABLE ON SCHEMA ${db}.${schema} TO APPLICATION "${app}";`,
-  ].join('\n');
-}
-
-/** Per-database read grants TO THE APPLICATION — what pipelines need, at
- *  database scope for the /setup picker (the table picker's panel emits the
- *  schema-scoped variant). Covers objects existing at run time; the refresh
- *  task below keeps it current. */
+/** Per-database read grants TO THE APPLICATION — what pipelines need. THE
+ *  single grant path (owner decision 2026-09-02): shown on /setup (selected
+ *  databases) and in the table picker's panel (db from the typed FQN). One
+ *  run covers every table in the database, change detection included; the
+ *  refresh task below keeps it current for tables created later. */
 export function buildNativeAppDbGrantSql(appName: string, dbs?: string[]): string {
   const app = appName || APP_NAME_PLACEHOLDER;
   const targets = dbs && dbs.length ? dbs.map(d => `"${d.replace(/"/g, '""')}"`) : ['<db>'];

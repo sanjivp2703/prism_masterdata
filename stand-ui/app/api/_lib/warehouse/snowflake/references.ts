@@ -1,10 +1,12 @@
-// Native-edition reference resolution (docs/NATIVE_APP_PLAN.md — access model
-// revised 2026-09-01). Consumers bind source tables to the app's multi-valued
-// `source_table` reference through Snowflake's permission UI; the app can then
-// read each bound table ONLY via reference('source_table', '<alias>') — the
-// FQN stays invisible. This module maps a pipeline's stored FQN to that SQL
-// form, so every service-connection source read works whether access arrived
-// as a direct GRANT (FQN path, unchanged) or as a reference binding.
+// Native-edition reference resolution — DORMANT since 2026-09-02: the
+// manifest no longer defines the `source_table` reference (owner decision —
+// consumers must never see a per-table selection flow; database-scoped
+// grants + the hourly refresh task are the single access path). The module
+// and its call sites are retained because a table bound to a reference is
+// readable ONLY as reference('source_table','<alias>') — never by FQN — and
+// the recorded native-v1.1 column-mode path brings a reference back. With no
+// reference defined, SYSTEM$GET_ALL_REFERENCES fails, the failure is cached,
+// and every resolveSourceReference() call resolves null (FQN path).
 //
 // Standard edition and non-Snowflake warehouses: resolveSourceReference()
 // returns null before touching the connection — zero behavior change.
@@ -41,11 +43,12 @@ export function invalidateSourceReferenceCache(): void {
 /**
  * All current bindings of the `source_table` reference, from
  * SYSTEM$GET_ALL_REFERENCES (details form: alias + database/schema/name).
- * Empty outside the native edition. ANY failure degrades to [] without
- * caching it — a package predating the reference, a caller's-rights session
- * (app system functions aren't available there), or a transient error must
- * leave the direct-grant path fully functional, and must not poison the
- * cache for the service connection.
+ * Empty outside the native edition. ANY failure degrades to [] and is CACHED
+ * like a result: with no reference in the manifest (the dormant state) this
+ * call fails on every install, and an uncached failure would re-issue the
+ * failing query on every poll/read — cached, dormancy costs one quiet
+ * metadata query per TTL. The direct-grant FQN path is the fallback either
+ * way.
  */
 export async function listSourceTableBindings(conn: unknown): Promise<SourceReferenceBinding[]> {
   if (!isNativeEdition()) return [];
@@ -61,6 +64,7 @@ export async function listSourceTableBindings(conn: unknown): Promise<SourceRefe
     cache = { at: Date.now(), bindings };
     return bindings;
   } catch {
+    cache = { at: Date.now(), bindings: [] };
     return [];
   }
 }

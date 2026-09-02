@@ -2884,11 +2884,6 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
             <CodeBlock code={buildNativeAppDbGrantSql(appName, selected)} maxHeight={220} />
           </div>
           <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Prefer per-table grants? Individual tables can instead be added under
-            Pipeline source tables in the app&apos;s Security tab in Snowsight — the
-            connect form&apos;s access help walks through it.
-          </p>
-          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             Optional — keep pipeline access fresh. Pipelines need a direct grant per
             table, and Snowflake doesn&apos;t extend those to tables created (or recreated)
             later. This hourly task re-grants automatically. It uses each

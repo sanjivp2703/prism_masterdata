@@ -24,16 +24,9 @@ password reset); the app URL takes a few minutes to appear after
 
 ## Granting Prism access to your tables
 
-Two equivalent paths — Prism's own setup page and connect form show the exact
-SQL for both:
-
-- **Per table, with clicks:** in Snowsight open Data products → Apps → your
-  Prism app → **Security**, and add tables under **Pipeline source tables**.
-  Each added table grants the app SELECT on that table only. One short
-  follow-up statement (shown in the app) enables change detection on the
-  table, and the output schema needs USAGE + CREATE TABLE if Prism should
-  create the standardized table there.
-- **Per schema or database, with SQL:** run the `GRANT ... TO APPLICATION`
-  statements the app's setup page generates. This covers every table that
-  exists at run time; the optional hourly refresh task keeps it current for
-  tables created later.
+One step per database, never per table: run the `GRANT ... TO APPLICATION`
+block Prism's setup page (or the connect form's access help) generates for
+your database. It grants read access to every table in the database and turns
+on change detection for all of them in the same run. Add the optional hourly
+refresh task (also generated on the setup page) and tables created later are
+covered automatically — nothing to re-run, ever.

@@ -10,9 +10,9 @@
 -- Translation of 01_internal_tables.sql (see §2.6 mapping table):
 --   PRISM_SERVICE role        → the application itself (owner's rights)
 --   PRISM_DATA_ADMIN          → application role app_data_admin
---   wizard Part D grant SQL   → caller-grants opt-in + direct GRANT SELECT
---                               + the source_table reference (permission UI,
---                               reinstated 2026-09-01)
+--   wizard Part D grant SQL   → caller-grants opt-in + database-scoped
+--                               GRANT SELECT (no manifest references — no
+--                               per-table flows, owner decision 2026-09-02)
 --   CREATE WAREHOUSE in 01    → manifest privilege + post-install proc here
 --   dev-reset DROPs in 01     → not carried over (no dev resets in an app)
 --
@@ -126,34 +126,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE internal_state.APPROVED_ALIAS_NAME
 GRANT USAGE ON SCHEMA app_code TO APPLICATION ROLE app_data_admin;
 GRANT USAGE ON FUNCTION app_code.PRISM_NORMALIZE(VARCHAR) TO APPLICATION ROLE app_data_admin;
 
--- ── Reference callback (manifest references.source_table) ────────────────────
--- Reinstated 2026-09-01 (removed 2026-08-31): the permission UI calls this as
--- the consumer binds/unbinds pipeline source tables in Snowsight's Security
--- tab. `source_table` is MULTI-VALUED, so ADD uses SYSTEM$ADD_REFERENCE (the
--- single-valued form would be SYSTEM$SET_REFERENCE). The direct
--- GRANT SELECT ... TO APPLICATION path continues to work alongside; the app's
--- source reads resolve a bound reference first and fall back to the FQN.
-CREATE OR REPLACE PROCEDURE app_code.register_reference(
-  ref_name STRING, operation STRING, ref_or_alias STRING)
-RETURNS STRING LANGUAGE SQL AS
-$$
-BEGIN
-  CASE (operation)
-    WHEN 'ADD' THEN
-      SELECT SYSTEM$ADD_REFERENCE(:ref_name, :ref_or_alias);
-    WHEN 'REMOVE' THEN
-      SELECT SYSTEM$REMOVE_REFERENCE(:ref_name, :ref_or_alias);
-    WHEN 'CLEAR' THEN
-      SELECT SYSTEM$REMOVE_ALL_REFERENCES(:ref_name);
-    ELSE
-      RETURN 'unknown operation: ' || operation;
-  END CASE;
-  RETURN 'operation ' || operation || ' complete';
-END;
-$$;
--- Callable by the consumer's permission UI (same requirement as
--- grant_callback — install warning 2026-08-13 when such a grant was missing).
-GRANT USAGE ON PROCEDURE app_code.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_user;
+-- (The reference callback existed for exactly one patch — added 2026-09-01,
+-- removed 2026-09-02 with the manifest's references section: the consumer
+-- must never see a per-table selection flow. Database-scoped
+-- GRANT ... TO APPLICATION SQL + the hourly refresh task are the single
+-- access path; app_code is versioned, so upgrades drop the proc automatically.)
 
 -- ── Post-install activation: pool + warehouse + service ──────────────────────
 -- Called by the consumer (or grant_callback) once privileges are granted.

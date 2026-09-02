@@ -62,37 +62,23 @@ privileges:
   # database role via /setup (a database role cannot be manifest-requested).
   # All AI runs in-account — no data leaves Snowflake.
 
-# References (owner decision 2026-09-01, reversing the 2026-08-31 "no
-# references" call): ONE optional multi-valued TABLE reference for pipeline
-# sources, so a consumer can grant per-table SELECT with clicks in Snowsight's
-# Security tab instead of running GRANT SQL. Nothing is required_at_setup —
-# the install still asks for no per-table access up front, and the direct
-# `GRANT SELECT ... TO APPLICATION` SQL path remains fully supported (and is
-# the schema-scoped convenience path).
+# NO references (owner decision 2026-09-02, superseding the one-day
+# 2026-09-01 reinstatement shipped in patch 51): the consumer must NEVER be
+# put in a per-table selection flow — no Security-tab table picker, no
+# "Select Data" step in the install. The single access path is the
+# DATABASE-scoped grant block the app's setup page and table picker generate
+# (USAGE + SELECT ON ALL TABLES + a change-tracking loop over every table),
+# with the optional hourly PRISM_GRANT_REFRESH task covering tables created
+# later (Snowflake forbids FUTURE grants to an application). Caller's rights
+# (above) still powers interactive per-user reads.
 #
-# What the reference deliberately does NOT cover (physics of the framework):
-#   - Change tracking: ALTER is not a legal TABLE-reference privilege, so
-#     `ALTER TABLE ... SET CHANGE_TRACKING = TRUE` stays a consumer-run
-#     statement (the app's panels surface it next to the reference steps).
-#   - Export destinations: SCHEMA is not a referenceable object_type
-#     (validator, 2026-08-13), so USAGE + CREATE TABLE on the output schema
-#     stay direct grants where the export lands in a consumer schema.
-#   - WRITE to consumer tables: never requested; Column output mode remains
-#     off in this edition (the server refuses export_kind='column').
-# Caller's rights (above) still powers interactive per-user reads; the
-# reference exists for the background poller, which has no user session.
-#
-# ⚠ VERIFY at the next install test (undocumented in Snowflake's reference
-# docs): CREATE STREAM ... ON TABLE reference('source_table','<alias>') — the
-# whole pipeline path depends on it. DESCRIBE TABLE reference(...) and
-# DML/SELECT through references are documented and relied on.
-references:
-  - source_table:
-      label: "Pipeline source tables"
-      # Validator caps reference descriptions at 200 chars (live-found, patch 51 cut).
-      description: "Tables Prism watches and standardizes as live pipelines. Adding a table grants the app SELECT on it only. Change tracking must still be enabled per table (Prism shows the one-line ALTER)."
-      privileges:
-        - SELECT
-      object_type: TABLE
-      multi_valued: true
-      register_callback: app_code.register_reference
+# The 2026-09-01 patch-51 facts, kept for the v1.1 record (a SELECT+UPDATE
+# writable_source_table reference remains the recorded column-mode path):
+#   - The validator ACCEPTS a references section alongside
+#     restricted_callers_rights; reference descriptions cap at 200 chars.
+#   - ALTER is not a legal TABLE-reference privilege (change tracking can't
+#     ride a reference) and SCHEMA/DATABASE are not referenceable.
+#   - The app-side reference plumbing (warehouse/snowflake/reference-sql.ts,
+#     references.ts, the resolveSourceReference call sites) is retained
+#     DORMANT — with no reference defined it resolves to null everywhere.
+#   - CREATE STREAM ... ON TABLE reference(...) was never live-verified.

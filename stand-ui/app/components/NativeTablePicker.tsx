@@ -8,17 +8,17 @@
  *  - a <datalist> of the tables the app can currently see (type-ahead
  *    suggestions from /api/accounts/accessible-tables; invisible until the
  *    user types, so scale costs nothing), and
- *  - the "don't see your table?" admin-ask panel, offering both access paths
- *    (2026-09-01): per-table via the app's Security tab in Snowsight (the
- *    manifest's source_table reference; a short follow-up SQL covers change
- *    tracking + the output schema), or schema-scoped copy-paste
- *    GRANT ... TO APPLICATION SQL with the app's real name resolved live.
- *    Whoever owns the schema can run either — ACCOUNTADMIN not required.
+ *  - the "don't see your table?" admin-ask panel: the DATABASE-scoped
+ *    GRANT ... TO APPLICATION block (db taken from the typed FQN, app name
+ *    resolved live) — the single grant path (owner decision 2026-09-02: no
+ *    per-table or per-schema rituals, ever). One run covers every table in
+ *    the database incl. change detection; the setup page's hourly task keeps
+ *    it current. Whoever owns the database can run it.
  *
  * Standard edition never renders this — callers gate on isNativeEdition().
  */
 import { useEffect, useId, useMemo, useState } from 'react';
-import { buildNativeAppGrantSql, buildNativeReferenceFollowupSql } from './native-grant-sql';
+import { buildNativeAppDbGrantSql, dbFromFqn } from './native-grant-sql';
 
 interface AccessibleTable { fqn: string; db: string; schema: string; table: string }
 
@@ -42,8 +42,10 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
     return () => { cancelled = true; };
   }, []);
 
-  const grantSql    = useMemo(() => buildNativeAppGrantSql(appName, value), [appName, value]);
-  const followupSql = useMemo(() => buildNativeReferenceFollowupSql(appName, value), [appName, value]);
+  const grantSql = useMemo(() => {
+    const db = dbFromFqn(value);
+    return buildNativeAppDbGrantSql(appName, db ? [db] : undefined);
+  }, [appName, value]);
 
   return (
     <div>
@@ -69,23 +71,9 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
       </button>
       {showGrantHelp && (
         <div style={{ marginTop: 8, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', borderRadius: 'var(--radius-button)', padding: '10px 12px' }}>
-          <p style={{ fontSize: 12, color: 'var(--text-primary)', margin: 0, fontWeight: 600 }}>
-            Grant one table with clicks
-          </p>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '4px 0 0', lineHeight: 1.5 }}>
-            In Snowsight, open Data products, then Apps, then {appName || 'the Prism app'},
-            then Security. Under Pipeline source tables, choose Add and pick your table.
-            Then run this so Prism can detect changes and create the standardized output
-            table in that schema:
-          </p>
-          <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
-            {followupSql}
-          </pre>
-          <p style={{ fontSize: 12, color: 'var(--text-primary)', margin: '12px 0 0', fontWeight: 600 }}>
-            Or grant the whole schema with SQL
-          </p>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '4px 0 0', lineHeight: 1.5 }}>
-            Read access to every table in the schema plus change detection for your table, in one run:
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
+            Run this once for the database — it gives Prism read access to every table in
+            it and turns on change detection for all of them:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
             {grantSql}
@@ -96,10 +84,9 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             {copied ? 'Copied' : 'Copy SQL'}
           </button>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '10px 0 0', lineHeight: 1.5 }}>
-            The schema grant covers every table in the schema right now — a table created
-            or recreated later needs it re-run. The hourly grant-refresh task on the setup
-            page does that automatically. A table added in the Security tab stays granted
-            until you remove it there.
+            Covers every table in the database right now — a table created or recreated
+            later needs it re-run. The hourly grant-refresh task on the setup page does
+            that automatically.
           </p>
         </div>
       )}

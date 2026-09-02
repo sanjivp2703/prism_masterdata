@@ -26,7 +26,11 @@ does another is worse than no row at all.
 > precedence over workspace/env credentials; `serviceConnectionSource()`
 > reports `'spcs'`. Native-edition-gated, so standard resolution is untouched.
 >
-> **Native source addressing via manifest references (2026-09-01):** a table
+> **Native source addressing via manifest references (2026-09-01; DORMANT
+> since 2026-09-02** — the manifest reference was removed the next day, owner
+> decision: no per-table consumer flows; the resolver below now finds no
+> bindings, caches the failure, and every source read takes the FQN path.
+> Retained for the recorded v1.1 column-mode reference)**:** a table
 > the consumer grants through the app's permission UI (the `source_table`
 > reference) has no FQN visibility — the app must address it as
 > `reference('source_table','<alias>')`. `warehouse/snowflake/references.ts`
