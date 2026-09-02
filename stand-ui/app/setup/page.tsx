@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { buildNativeAppGrantSql, buildNativeCallerGrantSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
+import { buildNativeAppDbGrantSql, buildNativeCallerGrantSql, buildNativeGrantRefreshTaskSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
 import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 
 function PrismLogo() {
@@ -2762,47 +2762,62 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
   const [appName, setAppName] = useState('');
   // null = still checking; the SQL block shows only when AI is NOT working.
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
+  // null = still loading the list (fresh installs can legitimately see none —
+  // Prism only enumerates what the app or the caller session can already see,
+  // which before the first opt-in may be nothing; the type-in covers that).
+  const [dbList, setDbList] = useState<string[] | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [manualDb, setManualDb] = useState('');
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/accounts/accessible-tables', { cache: 'no-store' })
+    fetch('/api/accounts/databases', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
-      .then(b => { if (!cancelled && b?.app_name) setAppName(String(b.app_name)); })
-      .catch(() => { /* placeholder name is fine */ });
+      .then(b => {
+        if (cancelled) return;
+        if (b?.app_name) setAppName(String(b.app_name));
+        setDbList(Array.isArray(b?.databases) ? b.databases.map(String) : []);
+      })
+      .catch(() => { if (!cancelled) setDbList([]); });
     fetch('/api/accounts/ai-status', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : null))
       .then(b => { if (!cancelled) setAiConfigured(b?.configured === true); })
       .catch(() => { if (!cancelled) setAiConfigured(false); });
     return () => { cancelled = true; };
   }, []);
-  const isAdmin = role === 'admin';
+
+  const toggleDb = (db: string) =>
+    setSelected(s => (s.includes(db) ? s.filter(d => d !== db) : [...s, db]));
+  const addManualDb = () => {
+    const db = manualDb.trim().replace(/^"|"$/g, '');
+    if (!db) return;
+    setDbList(l => (l && l.includes(db) ? l : [...(l ?? []), db]));
+    setSelected(s => (s.includes(db) ? s : [...s, db]));
+    setManualDb('');
+  };
+  // Everyone sees the checklist; only an admin role holder can run the SQL,
+  // so non-admins get a one-line pointer instead of a run instruction.
+  const runLine = role === 'admin'
+    ? 'Run this as ACCOUNTADMIN.'
+    : 'Ask an admin to run this as ACCOUNTADMIN.';
 
   return (
     <div>
       <h1 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
         Prism is ready
       </h1>
-      <p className="text-sm mt-2" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        This edition runs entirely inside your Snowflake account. There are no
-        credentials to enter and no AI keys to manage. Prism connects as the
-        application itself, and AI runs on Snowflake Cortex, so your data never
-        leaves Snowflake. The only setup is deciding what Prism can see.
-      </p>
 
       {aiConfigured === true ? (
         <>
           <SectionTitle>AI</SectionTitle>
           <p className="text-sm" style={{ color: 'var(--confidence-high)', lineHeight: 1.6 }}>
-            ✓ AI is enabled for this installation. Nothing to run.
+            ✓ AI is enabled. Nothing to run.
           </p>
         </>
       ) : (
         <>
-          <SectionTitle>Enable the AI (once per account, ACCOUNTADMIN)</SectionTitle>
+          <SectionTitle>Enable AI</SectionTitle>
           <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            If Snowflake Cortex hasn&apos;t already been enabled for this installation,
-            an administrator runs these two statements once as ACCOUNTADMIN; the
-            install dialog can&apos;t ask for them. The first lets Cortex serve Claude
-            from a nearby region. Skip this if standardizations already work.
+            Run this as ACCOUNTADMIN to enable AI:
           </p>
           <div className="mt-2">
             <CodeBlock code={buildNativeStarterSql(appName)} maxHeight={140} />
@@ -2810,33 +2825,80 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
         </>
       )}
 
-      <SectionTitle>Give Prism access to tables you want standardized</SectionTitle>
+      <SectionTitle>Choose your data</SectionTitle>
       <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        Prism sees only what your team grants it. Nothing is shared automatically.
-        Each person&apos;s view follows their own Snowflake access: they see the
-        pipelines and standardized values for source tables their role can read,
-        plus anything they created themselves. File uploads (CSV or Excel) are
-        visible to everyone with access to the app. The opt-in below is also what
-        lets Prism check each person&apos;s access, so without it teammates only
-        see their own work.
+        Select the databases to use with Prism:
       </p>
-
-      <p className="text-sm mt-4 mb-1 font-medium" style={{ color: 'var(--text-primary)' }}>
-        Let Prism use each person&apos;s own access
-      </p>
-      <p className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-        {isAdmin
-          ? 'One opt-in per database: anyone can then clean any table they can already read, instantly, using their own access, with results they own. Run it as a role with MANAGE CALLER GRANTS (ACCOUNTADMIN works), replace <db>, and run every statement. The last line is Prism\u2019s own warehouse and is needed once per account.'
-          : 'One admin opt-in per database: you can then clean any table you can already read, instantly, using your own access.'}
-      </p>
-      <div className="mt-2">
-        <CodeBlock code={buildNativeCallerGrantSql(appName)} maxHeight={200} />
+      <div className="mt-2 rounded-button border-[0.5px]"
+        style={{ borderColor: 'var(--border)', maxHeight: 180, overflowY: 'auto' }}>
+        {dbList === null ? (
+          <p className="text-sm" style={{ color: 'var(--text-muted)', padding: '10px 12px' }}>
+            Loading databases…
+          </p>
+        ) : dbList.length === 0 ? (
+          <p className="text-sm" style={{ color: 'var(--text-muted)', padding: '10px 12px' }}>
+            Prism can&apos;t see any databases yet — type a name below to add one.
+          </p>
+        ) : (
+          dbList.map(db => (
+            <label key={db} className="flex items-center gap-2.5 text-sm cursor-pointer select-none"
+              style={{ color: 'var(--text-primary)', padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
+              <input type="checkbox" checked={selected.includes(db)} onChange={() => toggleDb(db)}
+                style={{ accentColor: 'var(--accent)' }} />
+              <span className="font-mono text-xs">{db}</span>
+            </label>
+          ))
+        )}
       </div>
-      <p className="text-sm mt-2" style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
-        Pipelines work differently: background standardization runs with nobody
-        signed in, so a pipeline&apos;s source table needs a direct grant to the app.
-        Prism shows the exact SQL whenever you connect a table it can&apos;t see.
-      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          type="text"
+          value={manualDb}
+          onChange={e => setManualDb(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addManualDb(); } }}
+          placeholder="Add a database Prism can't see yet"
+          className="flex-1 rounded-button border-[0.5px] text-sm"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--page-bg)', color: 'var(--text-primary)', padding: '8px 12px' }}
+        />
+        <button type="button" onClick={addManualDb}
+          className="rounded-button border-[0.5px] text-sm font-medium"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'transparent', color: 'var(--text-secondary)', padding: '8px 14px', cursor: 'pointer' }}
+        >
+          Add
+        </button>
+      </div>
+      {selected.length > 0 && (
+        <>
+          <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            {runLine}
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={buildNativeCallerGrantSql(appName, selected)} maxHeight={220} />
+          </div>
+          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            Also run this — it lets pipelines (background standardization, which runs
+            with nobody signed in) read those databases and turns on change detection
+            for their tables:
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={buildNativeAppDbGrantSql(appName, selected)} maxHeight={220} />
+          </div>
+          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            Prefer per-table grants? Individual tables can instead be added under
+            Pipeline source tables in the app&apos;s Security tab in Snowsight — the
+            connect form&apos;s access help walks through it.
+          </p>
+          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            Optional — keep pipeline access fresh. Pipelines need a direct grant per
+            table, and Snowflake doesn&apos;t extend those to tables created (or recreated)
+            later. This hourly task re-grants automatically. It uses each
+            database&apos;s PUBLIC schema — change that if yours differs:
+          </p>
+          <div className="mt-2">
+            <CodeBlock code={buildNativeGrantRefreshTaskSql(appName, selected)} maxHeight={220} />
+          </div>
+        </>
+      )}
 
       <div className="mt-6 flex justify-end">
         <button

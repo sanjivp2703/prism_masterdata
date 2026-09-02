@@ -10,7 +10,9 @@
 -- Translation of 01_internal_tables.sql (see §2.6 mapping table):
 --   PRISM_SERVICE role        → the application itself (owner's rights)
 --   PRISM_DATA_ADMIN          → application role app_data_admin
---   wizard Part D grant SQL   → manifest references (consumer-granted)
+--   wizard Part D grant SQL   → caller-grants opt-in + direct GRANT SELECT
+--                               + the source_table reference (permission UI,
+--                               reinstated 2026-09-01)
 --   CREATE WAREHOUSE in 01    → manifest privilege + post-install proc here
 --   dev-reset DROPs in 01     → not carried over (no dev resets in an app)
 --
@@ -124,20 +126,34 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE internal_state.APPROVED_ALIAS_NAME
 GRANT USAGE ON SCHEMA app_code TO APPLICATION ROLE app_data_admin;
 GRANT USAGE ON FUNCTION app_code.PRISM_NORMALIZE(VARCHAR) TO APPLICATION ROLE app_data_admin;
 
--- ── Reference callback (manifest register_callback) ──────────────────────────
-CREATE OR REPLACE PROCEDURE app_code.register_reference(ref_name STRING, operation STRING, ref_or_alias STRING)
+-- ── Reference callback (manifest references.source_table) ────────────────────
+-- Reinstated 2026-09-01 (removed 2026-08-31): the permission UI calls this as
+-- the consumer binds/unbinds pipeline source tables in Snowsight's Security
+-- tab. `source_table` is MULTI-VALUED, so ADD uses SYSTEM$ADD_REFERENCE (the
+-- single-valued form would be SYSTEM$SET_REFERENCE). The direct
+-- GRANT SELECT ... TO APPLICATION path continues to work alongside; the app's
+-- source reads resolve a bound reference first and fall back to the FQN.
+CREATE OR REPLACE PROCEDURE app_code.register_reference(
+  ref_name STRING, operation STRING, ref_or_alias STRING)
 RETURNS STRING LANGUAGE SQL AS
 $$
 BEGIN
   CASE (operation)
-    WHEN 'ADD' THEN SELECT SYSTEM$SET_REFERENCE(:ref_name, :ref_or_alias);
-    WHEN 'REMOVE' THEN SELECT SYSTEM$REMOVE_REFERENCE(:ref_name, :ref_or_alias);
-    WHEN 'CLEAR' THEN SELECT SYSTEM$REMOVE_ALL_REFERENCES(:ref_name);
-    ELSE RETURN 'unknown operation: ' || operation;
+    WHEN 'ADD' THEN
+      SELECT SYSTEM$ADD_REFERENCE(:ref_name, :ref_or_alias);
+    WHEN 'REMOVE' THEN
+      SELECT SYSTEM$REMOVE_REFERENCE(:ref_name, :ref_or_alias);
+    WHEN 'CLEAR' THEN
+      SELECT SYSTEM$REMOVE_ALL_REFERENCES(:ref_name);
+    ELSE
+      RETURN 'unknown operation: ' || operation;
   END CASE;
-  RETURN 'ok';
+  RETURN 'operation ' || operation || ' complete';
 END;
 $$;
+-- Callable by the consumer's permission UI (same requirement as
+-- grant_callback — install warning 2026-08-13 when such a grant was missing).
+GRANT USAGE ON PROCEDURE app_code.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_user;
 
 -- ── Post-install activation: pool + warehouse + service ──────────────────────
 -- Called by the consumer (or grant_callback) once privileges are granted.
@@ -187,6 +203,35 @@ $$;
 GRANT USAGE ON PROCEDURE app_code.start_app() TO APPLICATION ROLE app_user;
 GRANT USAGE ON PROCEDURE app_code.upgrade_app() TO APPLICATION ROLE app_user;
 
+-- ── Grant callback (manifest configuration.grant_callback) ───────────────────
+-- Snowsight calls this during the permission step as privileges are granted.
+-- It starts the app once (and only once) all three account privileges are
+-- held, so a listing install reaches Activation with the service already
+-- coming up — no worksheet step. start_app() is idempotent (IF NOT EXISTS /
+-- RESUME), so out-of-order or repeated callback invocations are harmless.
+-- Without this, Snowsight's activation found no default_web_endpoint service
+-- and failed with "SPCS Activation Error" (first listing install, 2026-08-31).
+CREATE OR REPLACE PROCEDURE app_code.grant_callback(privileges ARRAY)
+RETURNS STRING LANGUAGE SQL AS
+$$
+DECLARE
+  ok BOOLEAN;
+BEGIN
+  SELECT SYSTEM$HOLD_PRIVILEGE_ON_ACCOUNT('CREATE COMPUTE POOL')
+     AND SYSTEM$HOLD_PRIVILEGE_ON_ACCOUNT('CREATE WAREHOUSE')
+     AND SYSTEM$HOLD_PRIVILEGE_ON_ACCOUNT('BIND SERVICE ENDPOINT')
+    INTO :ok;
+  IF (:ok) THEN
+    CALL app_code.start_app();
+    RETURN 'Prism starting';
+  END IF;
+  RETURN 'waiting for remaining privileges';
+END;
+$$;
+-- Callable by the consumer's permission UI (same requirement the reference
+-- callback had — install warning 2026-08-13 when such a grant was missing).
+GRANT USAGE ON PROCEDURE app_code.grant_callback(ARRAY) TO APPLICATION ROLE app_user;
+
 -- ── Auto-upgrade hook (manifest: lifecycle_callbacks.version_initializer) ────
 -- Snowflake runs this automatically on every install and upgrade — including
 -- the background auto-upgrade after a release-directive move — so the running
@@ -222,6 +267,3 @@ BEGIN
 END;
 $$;
 GRANT USAGE ON PROCEDURE app_code.stop_app() TO APPLICATION ROLE app_user;
--- The reference callback must be callable by the consumer's Security UI
--- (install warning 2026-08-13 when this grant was missing).
-GRANT USAGE ON PROCEDURE app_code.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_user;

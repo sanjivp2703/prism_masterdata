@@ -22,7 +22,7 @@
 
 import 'server-only';
 
-import { withWarehouse, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError } from './warehouse';
+import { withWarehouse, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError, resolveSourceReference } from './warehouse';
 import { getDb } from './sqlite';
 import { saveOpRunState, loadOpRunState, type OpRunState } from './op-auto-group';
 import { runAutoGroupForRun } from './op-auto-group-run';
@@ -395,13 +395,17 @@ export async function reconcilePipelineQueue(
     return 0;
   }
 
-  const tableRef   = parts.map(quoteIdent).join('.');
+  const quotedRef  = parts.map(quoteIdent).join('.');
   const colRef     = quoteIdent(column_name);
   const domainCond = domain_id != null
     ? `AND lam.domain_id = ${Number(domain_id)}`
     : `AND lam.domain_id IS NULL`;
 
   return await withWarehouse(async (conn) => {
+    // Reference-granted source (native): address via the reference form.
+    const tableRef = (await resolveSourceReference(conn, {
+      db: parts[0], schema: parts[1], table: parts[2],
+    }))?.refSql ?? quotedRef;
     const [beforeRow] = await exec(
       conn,
       `SELECT COUNT(*) AS cnt FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`,

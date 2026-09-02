@@ -22,6 +22,10 @@ import { asExportKind, standardizedColumnName, assertCompanionColumnSafe } from 
 import { isProbablyCatastrophicRegex } from '../app/api/_lib/convention-rules';
 import { detectHeaderRow, columnLetter } from '../app/api/_lib/table-shape';
 import { asPrismEdition } from '../app/api/_lib/edition';
+import {
+  parseReferenceBindings, matchSourceReference, referenceSql,
+  describeTypeToken, describeRowsToColumns,
+} from '../app/api/_lib/warehouse/snowflake/reference-sql';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -988,6 +992,56 @@ console.log('\ninternal-schema reference guard:');
   })(apiRoot);
   check('no hardcoded internal-schema reference outside the allowlist',
     offending.join(', ') || '(none)', '(none)');
+}
+
+// ── Native-edition reference SQL helpers ────────────────────────────────────
+// warehouse/snowflake/reference-sql.ts: pure mapping between the manifest's
+// source_table reference bindings and the reference('source_table','<alias>')
+// addressing form (docs/NATIVE_APP_PLAN.md, access model revised 2026-09-01).
+console.log('\nnative reference-sql helpers:');
+{
+  const bindings = parseReferenceBindings([
+    { alias: 'A1', database: 'TEST_DB', schema: 'PUBLIC', name: 'CARRIERS' },
+    { alias: 'A2', database: 'Sales', schema: 'raw', name: 'My Table' },
+    { alias: '',   database: 'X', schema: 'Y', name: 'Z' },           // incomplete → dropped
+    { database: 'X', schema: 'Y', name: 'Z' },                        // no alias → dropped
+    'garbage',
+  ]);
+  check('parseReferenceBindings keeps only complete entries', bindings.length, 2);
+  check('parseReferenceBindings maps database/schema/name',
+    JSON.stringify(bindings[0]),
+    JSON.stringify({ alias: 'A1', db: 'TEST_DB', schema: 'PUBLIC', table: 'CARRIERS' }));
+  check('parseReferenceBindings tolerates non-array garbage', parseReferenceBindings('nope').length, 0);
+  check('parseReferenceBindings tolerates null', parseReferenceBindings(null).length, 0);
+
+  check('matchSourceReference exact match',
+    matchSourceReference({ db: 'TEST_DB', schema: 'PUBLIC', table: 'CARRIERS' }, bindings)?.alias, 'A1');
+  check('matchSourceReference preserves verbatim case/spaces',
+    matchSourceReference({ db: 'Sales', schema: 'raw', table: 'My Table' }, bindings)?.alias, 'A2');
+  // Case-insensitive resolution would address a DIFFERENT object than the
+  // quoted-identifier FQN path — must stay unmatched.
+  check('matchSourceReference rejects case mismatch',
+    matchSourceReference({ db: 'test_db', schema: 'PUBLIC', table: 'CARRIERS' }, bindings), null);
+
+  check('referenceSql form',
+    referenceSql('A1'), "reference('source_table', 'A1')");
+  check('referenceSql escapes single quotes',
+    referenceSql("A'1"), "reference('source_table', 'A''1')");
+
+  check('describeTypeToken VARCHAR → TEXT', describeTypeToken('VARCHAR(16777216)'), 'TEXT');
+  check('describeTypeToken STRING → TEXT', describeTypeToken('string'), 'TEXT');
+  check('describeTypeToken NUMBER keeps its own token', describeTypeToken('NUMBER(38,0)'), 'NUMBER');
+
+  const cols = describeRowsToColumns([
+    { name: 'CARRIER', type: 'VARCHAR(200)', kind: 'COLUMN' },
+    { name: 'ID', type: 'NUMBER(38,0)', kind: 'COLUMN' },
+    { name: 'ignored', type: 'VARCHAR', kind: 'VIRTUAL_COLUMN' },
+    { NAME: 'UPPERKEYS', TYPE: 'VARCHAR(50)' },                       // uppercase keys, no kind
+  ]);
+  check('describeRowsToColumns filters non-columns and keeps order',
+    cols.map(c => c.name).join(','), 'CARRIER,ID,UPPERKEYS');
+  check('describeRowsToColumns normalizes types',
+    cols.map(c => c.typeToken).join(','), 'TEXT,NUMBER,TEXT');
 }
 
 // ── Result ───────────────────────────────────────────────────────────────────

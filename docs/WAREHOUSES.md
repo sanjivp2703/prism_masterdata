@@ -25,6 +25,21 @@ does another is worse than no row at all.
 > `authenticator: OAUTH`, token read fresh per connection — it rotates) takes
 > precedence over workspace/env credentials; `serviceConnectionSource()`
 > reports `'spcs'`. Native-edition-gated, so standard resolution is untouched.
+>
+> **Native source addressing via manifest references (2026-09-01):** a table
+> the consumer grants through the app's permission UI (the `source_table`
+> reference) has no FQN visibility — the app must address it as
+> `reference('source_table','<alias>')`. `warehouse/snowflake/references.ts`
+> (facade export `resolveSourceReference`) maps a parsed source FQN to that
+> form via `SYSTEM$GET_ALL_REFERENCES` (30 s cache, metadata-layer,
+> exact-match per part); every Snowflake service-connection source read/stream
+> create uses `resolved?.refSql ?? <quoted FQN>`. Returns null in the standard
+> edition and on every other adapter — mssql/pg/mysql have no native edition,
+> so this row is deliberately Snowflake-only (no parity obligation). Column
+> discovery on the reference path uses `DESCRIBE TABLE reference(...)`
+> (`describeRowsToColumns`, parity-tested) because SHOW COLUMNS /
+> INFORMATION_SCHEMA need FQN/db visibility; the POLICY_REFERENCES masking
+> probe is unavailable there (warn + skip).
 
 ## Connection & errors
 

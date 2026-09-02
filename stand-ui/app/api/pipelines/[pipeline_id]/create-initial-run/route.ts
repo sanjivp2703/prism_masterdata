@@ -14,7 +14,7 @@
  */
 
 import { cookies } from 'next/headers';
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError } from '@/app/api/_lib/warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError, resolveSourceReference } from '@/app/api/_lib/warehouse';
 import { markPipelineUserConnection } from '@/app/api/_lib/pipeline-user-connection';
 import { diffScan, initDetection, enableCt, grantViewChangeTracking} from '@/app/api/_lib/warehouse/mssql/detection';
 import { diffScan as pgDiffScan, initDetection as pgInitDetection } from '@/app/api/_lib/warehouse/postgres/detection';
@@ -83,7 +83,11 @@ async function fetchSourceLiterals(
 
   const parts = pipeline.table_fqn.split('.');
   if (parts.length !== 3) return { literals: [], frequencies: new Map() };
-  const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
+  // Reference-granted source (native edition): address via
+  // reference('source_table','<alias>'); null everywhere else.
+  const tableRef = (await resolveSourceReference(conn, {
+    db: parts[0].trim(), schema: parts[1].trim(), table: parts[2].trim(),
+  }))?.refSql ?? parts.map(p => quoteIdent(p.trim())).join('.');
   const colRef   = quoteIdent(pipeline.column_name);
 
   // Dedup by the normalized form; ANY_VALUE keeps a representative original,
@@ -220,8 +224,14 @@ export async function POST(
       if (parts.length === 3) {
         const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
         const streamName = internalObject(`PIPELINE_STREAM_${pid}`);
-        const createStream = () => withWarehouse(async (conn) =>
-          exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${tableRef}`));
+        const createStream = () => withWarehouse(async (conn) => {
+          // Reference-granted source (native): create the stream via the
+          // reference form — the app has no FQN visibility on it.
+          const srcRef = (await resolveSourceReference(conn, {
+            db: parts[0].trim(), schema: parts[1].trim(), table: parts[2].trim(),
+          }))?.refSql ?? tableRef;
+          return exec(conn, `CREATE STREAM IF NOT EXISTS ${streamName} ON TABLE ${srcRef}`);
+        });
         try {
           await createStream();
         } catch (streamErr: any) {

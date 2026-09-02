@@ -1,4 +1,4 @@
-import { warehouseErrorResponse, withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { warehouseErrorResponse, withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, executeQuery as exec, getWarehouseAdapter, resolveSourceReference } from '@/app/api/_lib/warehouse';
 import { quoteIdent as myQuoteIdent } from '@/app/api/_lib/warehouse/mysql/dialect';
 import { clearBaseline } from '@/app/api/_lib/auto-export-seen';
 import { requireValidSession } from '@/app/api/_lib/account-security';
@@ -98,7 +98,12 @@ export async function GET(request: Request) {
         : getWarehouseAdapter().kind === 'mysql'
         // Backticks — double quotes are STRING literals on MySQL.
         ? `${myQuoteIdent(db)}.${myQuoteIdent(table)}`
-        : `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+        // Snowflake: a native-edition source granted through the permission UI
+        // (manifest reference) is only reachable via the reference form on the
+        // SERVICE connection; resolution returns null everywhere else (and on
+        // the caller-fallback attempt), leaving the quoted FQN.
+        : (await resolveSourceReference(connection, { db, schema, table }))?.refSql
+          ?? `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
       const colRef   = getWarehouseAdapter().kind === 'mysql' ? myQuoteIdent(column_name) : quoteIdent(column_name);
 
       let rows: any[];

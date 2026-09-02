@@ -34,7 +34,7 @@
  */
 
 import 'server-only';
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError } from './warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter, isWarehouseAccessError, resolveSourceReference, describeRowsToColumns } from './warehouse';
 // Defined in the neutral adapter-contract module so BOTH builders can throw it.
 import { ColumnModeAccessError } from './warehouse/types';
 export { ColumnModeAccessError };
@@ -131,6 +131,12 @@ function keyColumnsFromShow(rows: any[]): string[] {
  * Returns null when the table has none of these: the export is then built
  * unordered, with NO synthetic ordering column (product decision 2026-07 —
  * the old PRISM_ROW_ORDER column and its ingest-order fallback are gone).
+ *
+ * Reference-granted sources (native edition — sourceRef is the
+ * reference('source_table','<alias>') form): SHOW ... IN TABLE on that form
+ * is unverified, and the INFORMATION_SCHEMA tier needs database USAGE a
+ * reference doesn't grant. Every tier is already try/catch fall-through, so
+ * the worst case is an unordered export — same as a keyless table.
  * Because the key columns exist in the export itself, consumers who need
  * source order can ORDER BY those columns directly.
  */
@@ -321,19 +327,30 @@ async function doRefreshExportTable(
       );
     }
 
-    const sourceRef = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
+    // Native edition: a source granted through the permission UI (manifest
+    // reference) is only addressable as reference('source_table','<alias>');
+    // null everywhere else, keeping the quoted-FQN path byte-identical.
+    const srcReference = await resolveSourceReference(conn, src);
+    const sourceRef = srcReference?.refSql
+      ?? `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
     const exportRef = `${quoteIdent(exp.db)}.${quoteIdent(exp.schema)}.${quoteIdent(exp.table)}`;
 
     // ── Discover source columns ────────────────────────────────────────────
-    const colRows = await exec(
-      conn,
-      `SELECT COLUMN_NAME
-       FROM ${quoteIdent(src.db)}.INFORMATION_SCHEMA.COLUMNS
-       WHERE UPPER(TABLE_SCHEMA) = UPPER(?)
-         AND UPPER(TABLE_NAME)   = UPPER(?)
-       ORDER BY ORDINAL_POSITION`,
-      [src.schema, src.table],
-    );
+    // Reference path: INFORMATION_SCHEMA needs USAGE on the source database,
+    // which a reference doesn't grant — DESCRIBE TABLE reference(...) is the
+    // documented equivalent and returns columns in table order.
+    const colRows = srcReference
+      ? describeRowsToColumns(await exec(conn, `DESCRIBE TABLE ${sourceRef}`))
+          .map((c) => ({ COLUMN_NAME: c.name }))
+      : await exec(
+          conn,
+          `SELECT COLUMN_NAME
+           FROM ${quoteIdent(src.db)}.INFORMATION_SCHEMA.COLUMNS
+           WHERE UPPER(TABLE_SCHEMA) = UPPER(?)
+             AND UPPER(TABLE_NAME)   = UPPER(?)
+           ORDER BY ORDINAL_POSITION`,
+          [src.schema, src.table],
+        );
 
     if (!colRows.length) {
       throw new Error(
@@ -1142,7 +1159,9 @@ export async function updatePipelineMappedCount(
       return;
     }
     const src = parseFqn(source_fqn);
-    const tableRef = `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
+    // Reference-granted source (native): address via the reference form.
+    const tableRef = (await resolveSourceReference(conn, src))?.refSql
+      ?? `${quoteIdent(src.db)}.${quoteIdent(src.schema)}.${quoteIdent(src.table)}`;
     const colRef   = quoteIdent(column_name);
     const domainFilter = domain_id != null
       ? `AND lam.domain_id = ${Number(domain_id)}`

@@ -13,7 +13,7 @@
  *   • Dropped when the pipeline is deleted.
  */
 
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter } from './warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, executeQuery as exec, getWarehouseAdapter, resolveSourceReference, describeRowsToColumns } from './warehouse';
 import { pollOneMssqlPipeline } from './pipeline-poller-mssql';
 import { pollOnePgPipeline } from './pipeline-poller-postgres';
 import { pollOneMysqlPipeline } from './pipeline-poller-mysql';
@@ -212,9 +212,10 @@ function attemptChangeTrackingFix(p: PipelineRef): void {
   ctFixInFlight.add(pid);
   (async () => {
     let tableRef: string;
+    let fqnParts: { db: string; schema: string; table: string };
     try {
-      const { db, schema, table } = parseFqn(p.table_fqn);
-      tableRef = `${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`;
+      fqnParts = parseFqn(p.table_fqn);
+      tableRef = `${quoteIdent(fqnParts.db)}.${quoteIdent(fqnParts.schema)}.${quoteIdent(fqnParts.table)}`;
     } catch {
       return; // unparseable FQN — the poll cycle itself already reports this
     }
@@ -229,7 +230,10 @@ function attemptChangeTrackingFix(p: PipelineRef): void {
           await exec(conn, `ALTER TABLE ${tableRef} SET CHANGE_TRACKING = TRUE`);
         });
         await withWarehouse(async (conn) => {
-          await exec(conn, `CREATE STREAM IF NOT EXISTS ${streamFqn(pid)} ON TABLE ${tableRef}`);
+          // Reference-granted source (native): the app addresses it via
+          // reference('source_table','<alias>'), never the FQN.
+          const srcRef = (await resolveSourceReference(conn, fqnParts))?.refSql ?? tableRef;
+          await exec(conn, `CREATE STREAM IF NOT EXISTS ${streamFqn(pid)} ON TABLE ${srcRef}`);
         });
         verifiedStandardStreams.add(pid);
         console.log(`[Poller] Pipeline ${pid}: enabled change tracking on ${p.table_fqn} using the creator's saved credentials — stream created, recovering gap rows`);
@@ -266,6 +270,7 @@ type SourceHealth =
 async function checkSourceHealth(
   connection: any,
   db: string, schema: string, table: string, columnName: string, tableFqn: string,
+  srcRefSql?: string | null,
 ): Promise<SourceHealth> {
   // SHOW COLUMNS is a metadata-layer command — unlike a SELECT against
   // INFORMATION_SCHEMA.COLUMNS it never wakes the warehouse.  (The old
@@ -273,17 +278,33 @@ async function checkSourceHealth(
   // each run resumed the warehouse for a 60 s billing minimum, and on forced
   // every-cycle checks it kept the warehouse resumed around the clock.)
   // A missing/inaccessible table THROWS here instead of returning zero rows.
+  //
+  // Reference-granted source (native edition, srcRefSql set): the app has no
+  // FQN visibility at all, so SHOW COLUMNS on the FQN would report a healthy
+  // table as "not found". DESCRIBE TABLE reference(...) is the documented
+  // reference-path equivalent (also metadata-layer); its rows are mapped to
+  // the SHOW COLUMNS shape so everything below is shared.
   let colRows: any[];
   try {
-    colRows = await exec(
-      connection,
-      `SHOW COLUMNS IN TABLE ${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`,
-    );
+    if (srcRefSql) {
+      const descRows = await exec(connection, `DESCRIBE TABLE ${srcRefSql}`);
+      colRows = describeRowsToColumns(descRows).map((c) => ({
+        column_name: c.name,
+        data_type: JSON.stringify({ type: c.typeToken }),
+      }));
+    } else {
+      colRows = await exec(
+        connection,
+        `SHOW COLUMNS IN TABLE ${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)}`,
+      );
+    }
   } catch (e: any) {
     if (/does not exist|not authorized/i.test(String(e?.message ?? e))) {
       return {
         ok: false, action: 'pause',
-        message: `Source table ${tableFqn} not found or not accessible — it may have been dropped, renamed, or access was revoked. Fix the source or update the pipeline, then resume.`,
+        message: srcRefSql
+          ? `Source table ${tableFqn} is not reachable through the app's granted reference — it may have been dropped, renamed, or removed from the app's Security tab. Re-add the table there (or grant it with SQL), then resume.`
+          : `Source table ${tableFqn} not found or not accessible — it may have been dropped, renamed, or access was revoked. Fix the source or update the pipeline, then resume.`,
       };
     }
     throw e; // other errors → outer poll-error classification (transient/global)
@@ -314,6 +335,13 @@ async function checkSourceHealth(
   }
 
   // Masking / row-access policy detection (best-effort; unavailable on some editions).
+  //
+  // Reference-path limitation: this probe queries the SOURCE DATABASE's
+  // INFORMATION_SCHEMA, which needs USAGE on that database — a reference
+  // grants none. On a reference-only source it therefore fails and lands in
+  // the catch below (warn + skip), i.e. masking/row-access detection is
+  // unavailable for tables granted solely through the permission UI. The
+  // direct-grant SQL path keeps it.
   //
   // REF_ENTITY_NAME must carry QUOTED identifier parts. Snowflake resolves the
   // name inside this string as an identifier, so an unquoted one is case-folded
@@ -624,6 +652,14 @@ export async function pollOnePipeline(
   try {
     await withWarehouse(async (connection) => {
 
+      // Native edition: a source granted through the permission UI (manifest
+      // reference) is addressable ONLY as reference('source_table','<alias>').
+      // Resolve once per cycle; null everywhere else, so srcRef === tableRef
+      // and nothing changes. (Metadata-layer + 30 s cache — idle cycles stay
+      // warehouse-free.)
+      const srcRefSql = (await resolveSourceReference(connection, { db, schema, table }))?.refSql ?? null;
+      const srcRef = srcRefSql ?? tableRef;
+
       // ── Pre-flight: source table / column / type / policy health ──────────
       // Catches dropped/renamed/revoked tables, dropped/renamed or non-text
       // columns, and masking/row-access policies BEFORE we touch the stream.
@@ -642,7 +678,7 @@ export async function pollOnePipeline(
       // operations below throw for a missing table, which sets
       // lastPollErrored and forces the health check on the next cycle.
       const runHealthCheck = async (): Promise<boolean> => {
-        const health = await checkSourceHealth(connection, db, schema, table, column_name, table_fqn);
+        const health = await checkSourceHealth(connection, db, schema, table, column_name, table_fqn, srcRefSql);
         if (!health.ok) {
           // Unhealthy — make sure the check runs again next data-bearing cycle,
           // and start/extend the forced-recheck backoff (auto-recovery).
@@ -713,7 +749,7 @@ export async function pollOnePipeline(
           try {
             await exec(connection, `
               CREATE STREAM IF NOT EXISTS ${streamRef}
-              ON TABLE ${tableRef}`);
+              ON TABLE ${srcRef}`);
           } catch (e: any) {
             console.error(`[Poller] Pipeline ${pid}: failed to create stream:`, e?.message ?? e);
             if (isChangeTrackingPrivilegeError(e)) {
@@ -743,7 +779,7 @@ export async function pollOnePipeline(
         if (streamRows && streamRows.length > 0) {
           const mode = String((streamRows[0] as any).mode ?? (streamRows[0] as any).MODE ?? '').toUpperCase();
           if (mode === 'APPEND_ONLY') {
-            await exec(connection, `CREATE OR REPLACE STREAM ${streamRef} ON TABLE ${tableRef}`);
+            await exec(connection, `CREATE OR REPLACE STREAM ${streamRef} ON TABLE ${srcRef}`);
             verifiedStandardStreams.add(pid);
             console.log(`[Poller] Pipeline ${pid}: upgraded APPEND_ONLY stream to standard (delete-aware)`);
             touchLastPolled(pid, { claimSynced: false });
@@ -772,7 +808,7 @@ export async function pollOnePipeline(
           await exec(connection, `DROP STREAM IF EXISTS ${streamRef}`);
           await exec(connection, `
             CREATE STREAM IF NOT EXISTS ${streamRef}
-            ON TABLE ${tableRef}`);
+            ON TABLE ${srcRef}`);
           verifiedStandardStreams.add(pid); // freshly created → already standard
           streamRecreated = true;
           console.log(`[Poller] Pipeline ${pid}: stream recreated — new inserts will be detected on next poll`);
@@ -956,7 +992,7 @@ export async function pollOnePipeline(
       const queueAfter = Number(postMergeRow?.CNT ?? postMergeRow?.cnt ?? 0);
 
       const [srcRow] = await exec(connection,
-        `SELECT COUNT(*) AS cnt FROM ${tableRef} WHERE ${colRef} IS NOT NULL`);
+        `SELECT COUNT(*) AS cnt FROM ${srcRef} WHERE ${colRef} IS NOT NULL`);
       const totalSourceValues = Number(srcRow?.CNT ?? srcRow?.cnt ?? 0);
 
       // The poller never standardizes inline — queued values (mapped or not)

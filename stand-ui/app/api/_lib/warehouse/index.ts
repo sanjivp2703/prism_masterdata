@@ -21,6 +21,24 @@ import { getDb } from '../sqlite';
 export { NoUserWarehouseConfig } from './types';
 export type { WarehouseAdapter, WarehouseConnection } from './types';
 
+// Native-edition (Snowflake-only) manifest-reference resolution: maps a
+// pipeline's source FQN to reference('source_table','<alias>') when the
+// consumer granted the table through the permission UI instead of direct
+// GRANT SQL. resolveSourceReference returns null in the standard edition and
+// on every non-Snowflake warehouse (native pins Snowflake), so call sites use
+// `resolved?.refSql ?? <quoted FQN>` with zero standard-edition impact.
+export {
+  resolveSourceReference,
+  listSourceTableBindings,
+  invalidateSourceReferenceCache,
+} from './snowflake/references';
+export type { ResolvedSourceReference } from './snowflake/references';
+// Pure DESCRIBE-result helpers for the reference path (a bound table has no
+// FQN visibility, so SHOW COLUMNS / INFORMATION_SCHEMA reads become
+// DESCRIBE TABLE reference(...)).
+export { describeRowsToColumns } from './snowflake/reference-sql';
+export type { SourceReferenceBinding } from './snowflake/reference-sql';
+
 // ── Warehouse-type resolution ────────────────────────────────────────────────
 // (1) workspace_config.warehouse_type — the setup-wizard choice (SQLite);
 // (2) PRISM_WAREHOUSE_TYPE env — dev/operator switch;

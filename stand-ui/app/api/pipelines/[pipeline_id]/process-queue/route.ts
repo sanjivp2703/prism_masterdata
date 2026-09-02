@@ -17,7 +17,7 @@
  */
 
 import { cookies } from 'next/headers';
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec, resolveSourceReference } from '@/app/api/_lib/warehouse';
 import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
@@ -43,7 +43,11 @@ async function fetchSourceLiterals(
 ): Promise<string[]> {
   const parts = pipeline.table_fqn.split('.');
   if (parts.length !== 3) return [];
-  const tableRef = parts.map(p => quoteIdent(p.trim())).join('.');
+  // Reference-granted source (native edition): address via
+  // reference('source_table','<alias>'); null everywhere else.
+  const tableRef = (await resolveSourceReference(conn, {
+    db: parts[0].trim(), schema: parts[1].trim(), table: parts[2].trim(),
+  }))?.refSql ?? parts.map(p => quoteIdent(p.trim())).join('.');
   const colRef   = quoteIdent(pipeline.column_name);
 
   // Dedup by the normalized form; ANY_VALUE keeps a representative original.
@@ -120,7 +124,13 @@ export async function POST(
         // Values in the table at scan time  → caught by the baseline scan.
         // Values inserted after this point  → caught by the stream on next poll.
         const parts      = pipeline.table_fqn.split('.');
-        const tableRef   = parts.map(p => quoteIdent(p.trim())).join('.');
+        // Reference-granted source (native): the stream is created via the
+        // reference form — the app has no FQN visibility on it.
+        const tableRef   = parts.length === 3
+          ? (await resolveSourceReference(conn, {
+              db: parts[0].trim(), schema: parts[1].trim(), table: parts[2].trim(),
+            }))?.refSql ?? parts.map(p => quoteIdent(p.trim())).join('.')
+          : parts.map(p => quoteIdent(p.trim())).join('.');
         const streamName = internalObject(`PIPELINE_STREAM_${pid}`);
         try {
           await exec(conn, `

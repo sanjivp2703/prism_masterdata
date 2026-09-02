@@ -17,7 +17,7 @@
  * copy-paste grant SQL for the "don't see your table?" panel.
  */
 import { requireValidSession } from '@/app/api/_lib/account-security';
-import { withWarehouse, withUserWarehouse, executeQuery, NoUserWarehouseConfig } from '@/app/api/_lib/warehouse';
+import { withWarehouse, withUserWarehouse, executeQuery, NoUserWarehouseConfig, listSourceTableBindings } from '@/app/api/_lib/warehouse';
 import { isNativeEdition, nativeEditionUnavailable } from '@/app/api/_lib/edition';
 import { reportError } from '@/app/api/_lib/report-error';
 
@@ -66,11 +66,21 @@ export async function GET() {
   if (!isNativeEdition()) return nativeEditionUnavailable('Accessible-table enumeration');
 
   try {
-    // 1. App-visible tables (service connection).
+    // 1. App-visible tables (service connection). SHOW TABLES only lists
+    // objects the app can see by name — tables granted through the permission
+    // UI (manifest references) have no FQN visibility, so their bindings are
+    // appended from SYSTEM$GET_ALL_REFERENCES instead.
     const appView = await withWarehouse(async (conn) => {
       const appRows = await executeQuery(conn, 'SELECT CURRENT_DATABASE() AS D');
       const appName = String(appRows?.[0]?.D ?? appRows?.[0]?.d ?? '');
       const { tables, truncated } = await enumerateTables(conn, appName, MAX_TABLES);
+      for (const b of await listSourceTableBindings(conn)) {
+        if (tables.length >= MAX_TABLES) break;
+        const fqn = `${b.db}.${b.schema}.${b.table}`;
+        if (!tables.some(t => t.fqn === fqn)) {
+          tables.push({ fqn, db: b.db, schema: b.schema, table: b.table });
+        }
+      }
       return { appName, tables, truncated };
     });
 

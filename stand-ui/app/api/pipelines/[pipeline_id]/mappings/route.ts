@@ -7,7 +7,7 @@
  * Supports ?search=... and ?limit=... query params.
  */
 
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter, resolveSourceReference } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { canViewerSeePipeline } from '@/app/api/_lib/native-visibility';
 import { getDb } from '@/app/api/_lib/sqlite';
@@ -141,7 +141,11 @@ export async function GET(
       // appears in the pipeline's source column — not every mapping in the spec scope.
       let colScopeFilter = '';
       if (parts.length === 3 && column_name) {
-        const tableRef = parts.map(quoteIdent).join('.');
+        // Reference-granted source (native edition): address via
+        // reference('source_table','<alias>'); null everywhere else.
+        const tableRef = (await resolveSourceReference(conn, {
+          db: parts[0], schema: parts[1], table: parts[2],
+        }))?.refSql ?? parts.map(quoteIdent).join('.');
         const colRef   = quoteIdent(column_name);
         colScopeFilter = `AND lam.normalized_value IN (
           SELECT ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))

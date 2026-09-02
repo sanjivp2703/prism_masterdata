@@ -330,8 +330,9 @@ is the lever if per-customer revenue runs thin; revisit with real volumes.)
 
 - `native/manifest.yml` — privileges (`CREATE WAREHOUSE`,
   `CREATE COMPUTE POOL`, `BIND SERVICE ENDPOINT`, `SNOWFLAKE.CORTEX_USER` if
-  §2.4=A), reference definitions (source tables: SELECT + change tracking;
-  column-mode tables: + UPDATE/ALTER... exact privilege set fixed in N3),
+  §2.4=A), the optional `source_table` reference (SELECT only — ALTER is not
+  a legal reference privilege, so change tracking stays a consumer-run
+  statement; see the N5 access-model note, revised 2026-09-01),
   version metadata, ingress endpoint declaration.
 - `native/setup.sql` — application roles, versioned code schema, unversioned
   state schema (the INTERNAL tables + UDF), post-install/upgrade callbacks
@@ -545,9 +546,33 @@ isolates SPCS problems from Native-App-packaging problems.
   submit for Marketplace Operations functional review as a **private
   listing** first.
 - Install the private listing with 1–2 design-partner accounts; run the
-  PRELAUNCH_CHECKLIST.md disciplines that apply (column mode §1 especially,
-  if column mode ships in native v1 — consider deferring column mode to a
-  native v1.1 to shrink the review surface).
+  PRELAUNCH_CHECKLIST.md disciplines that apply. (Access-model decision
+  2026-08-31, REVISED 2026-09-01: the 2026-08-31 call removed all references —
+  reads followed the caller-grants opt-in plus direct
+  `GRANT SELECT ... TO APPLICATION` SQL only. On 2026-09-01 the owner
+  reinstated ONE optional multi-valued TABLE reference, `source_table`
+  (SELECT only, `register_reference` callback restored to setup.sql), so a
+  consumer can grant individual pipeline sources with clicks in Snowsight's
+  Security tab instead of SQL. The install still requests nothing per-table
+  (`required_at_setup` unset), and the direct-grant SQL remains the
+  schema-scoped path and the strict-list story. Mechanics: a bound table has
+  NO FQN visibility — the app addresses it as
+  `reference('source_table','<alias>')`, resolved by
+  `warehouse/snowflake/references.ts` from `SYSTEM$GET_ALL_REFERENCES`
+  (exact-match on db/schema/name, FQN fallback everywhere else, standard
+  edition untouched). Known reference-path limits, each surfaced in the app's
+  copy: ALTER is not a reference privilege, so
+  `ALTER TABLE ... SET CHANGE_TRACKING = TRUE` stays consumer-run; SCHEMA is
+  not referenceable, so export-destination USAGE/CREATE TABLE stay direct
+  grants; the POLICY_REFERENCES masking probe needs database USAGE and is
+  skipped (warn) on reference-only sources. ⚠ VERIFY at the next install
+  test: `CREATE STREAM ... ON TABLE reference(...)` is undocumented — if the
+  validator or runtime refuses it, the reference path can't power pipelines
+  and this reverts to the 2026-08-31 model. Column mode remains DEFERRED out
+  of native v1: the UI drops the Column output option when `isNativeEdition()`
+  and `POST /api/pipelines` refuses `export_kind='column'`. Revisit as native
+  v1.1 by adding a SELECT+UPDATE `writable_source_table` reference and
+  removing the two edition gates.)
 - **Exit criteria:** scan passed; private listing installed and used by a
   real external account for ≥1 week without provider intervention.
 

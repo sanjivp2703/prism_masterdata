@@ -8,14 +8,17 @@
  *  - a <datalist> of the tables the app can currently see (type-ahead
  *    suggestions from /api/accounts/accessible-tables; invisible until the
  *    user types, so scale costs nothing), and
- *  - the "don't see your table?" admin-ask panel: copy-paste
+ *  - the "don't see your table?" admin-ask panel, offering both access paths
+ *    (2026-09-01): per-table via the app's Security tab in Snowsight (the
+ *    manifest's source_table reference; a short follow-up SQL covers change
+ *    tracking + the output schema), or schema-scoped copy-paste
  *    GRANT ... TO APPLICATION SQL with the app's real name resolved live.
- *    Whoever owns the schema can run it — ACCOUNTADMIN not required.
+ *    Whoever owns the schema can run either — ACCOUNTADMIN not required.
  *
  * Standard edition never renders this — callers gate on isNativeEdition().
  */
 import { useEffect, useId, useMemo, useState } from 'react';
-import { buildNativeAppGrantSql, buildNativeCallerGrantSql } from './native-grant-sql';
+import { buildNativeAppGrantSql, buildNativeReferenceFollowupSql } from './native-grant-sql';
 
 interface AccessibleTable { fqn: string; db: string; schema: string; table: string }
 
@@ -28,7 +31,6 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
   const [appName, setAppName] = useState('');
   const [showGrantHelp, setShowGrantHelp] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [copiedCaller, setCopiedCaller] = useState(false);
   const listId = useId();
 
   useEffect(() => {
@@ -40,9 +42,8 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
     return () => { cancelled = true; };
   }, []);
 
-  const grantSql = useMemo(() => buildNativeAppGrantSql(appName), [appName]);
-  // §2.9 caller grants — the one-time admin opt-in for interactive work.
-  const callerGrantSql = useMemo(() => buildNativeCallerGrantSql(appName), [appName]);
+  const grantSql    = useMemo(() => buildNativeAppGrantSql(appName, value), [appName, value]);
+  const followupSql = useMemo(() => buildNativeReferenceFollowupSql(appName, value), [appName, value]);
 
   return (
     <div>
@@ -68,30 +69,23 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
       </button>
       {showGrantHelp && (
         <div style={{ marginTop: 8, border: '0.5px solid var(--accent-border)', backgroundColor: 'var(--accent-tint)', borderRadius: 'var(--radius-button)', padding: '10px 12px' }}>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
-            Prism can only see tables your team has granted to it. Nothing is shared
-            automatically. <strong>Recommended:</strong> an admin opts in once per
-            database, and Prism can clean any table you can already read, using your
-            own access. Run as a role with MANAGE CALLER GRANTS (ACCOUNTADMIN works),
-            replace <code>&lt;db&gt;</code>, and run every statement; the warehouse
-            line is needed once per account:
+          <p style={{ fontSize: 12, color: 'var(--text-primary)', margin: 0, fontWeight: 600 }}>
+            Grant one table with clicks
+          </p>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '4px 0 0', lineHeight: 1.5 }}>
+            In Snowsight, open Data products, then Apps, then {appName || 'the Prism app'},
+            then Security. Under Pipeline source tables, choose Add and pick your table.
+            Then run this so Prism can detect changes and create the standardized output
+            table in that schema:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
-            {callerGrantSql}
+            {followupSql}
           </pre>
-          <button type="button"
-            onClick={() => { navigator.clipboard?.writeText(callerGrantSql).then(() => { setCopiedCaller(true); setTimeout(() => setCopiedCaller(false), 1500); }); }}
-            style={{ marginTop: 8, fontSize: 11, fontWeight: 500, color: 'var(--accent)', background: 'none', border: '0.5px solid var(--accent-border)', borderRadius: 'var(--radius-button)', padding: '4px 10px', cursor: 'pointer' }}>
-            {copiedCaller ? 'Copied' : 'Copy SQL'}
-          </button>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '14px 0 0', lineHeight: 1.5 }}>
-            <strong>Pipelines</strong> always need a direct grant to the app itself,
-            because background standardization runs with nobody signed in. Whoever owns
-            the schema can run it; ACCOUNTADMIN is not required. The third line covers
-            every table currently in the schema; to share a single table instead, swap
-            it for <code>GRANT SELECT ON TABLE &lt;db&gt;.&lt;schema&gt;.&lt;table&gt;
-            TO APPLICATION &quot;&lt;app&gt;&quot;</code>. The last line lets Prism
-            create export tables in that schema:
+          <p style={{ fontSize: 12, color: 'var(--text-primary)', margin: '12px 0 0', fontWeight: 600 }}>
+            Or grant the whole schema with SQL
+          </p>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '4px 0 0', lineHeight: 1.5 }}>
+            Read access to every table in the schema plus change detection for your table, in one run:
           </p>
           <pre style={{ marginTop: 8, marginBottom: 0, padding: 10, borderRadius: 'var(--radius-button)', overflowX: 'auto', fontSize: 11, backgroundColor: '#1A1A2E', color: '#E5E7EB', whiteSpace: 'pre' }}>
             {grantSql}
@@ -102,9 +96,10 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             {copied ? 'Copied' : 'Copy SQL'}
           </button>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '10px 0 0', lineHeight: 1.5 }}>
-            One Snowflake limitation to know: tables created <em>after</em> the grant
-            aren&apos;t covered automatically (Snowflake doesn&apos;t allow future grants to an
-            app). Re-run the &quot;all tables&quot; line whenever new tables are added.
+            The schema grant covers every table in the schema right now — a table created
+            or recreated later needs it re-run. The hourly grant-refresh task on the setup
+            page does that automatically. A table added in the Security tab stays granted
+            until you remove it there.
           </p>
         </div>
       )}

@@ -13,7 +13,7 @@
  * role can't see the table and no personal credentials are saved.
  */
 
-import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, withUserWarehouse, hasUserWarehouseConfig, isWarehouseAccessError, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter, resolveSourceReference, describeRowsToColumns } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 import { isSimpleIdent } from '@/app/api/_lib/op-one-time';
@@ -54,13 +54,25 @@ async function fetchColumns(conn: any, db: string, schema: string, table: string
          ORDER BY ordinal_position`,
         [schema, table],
       )
-    : await exec(conn,
-        `SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
-         FROM ${db}.INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-         ORDER BY ORDINAL_POSITION`,
-        [schema, table],
-      );
+    : await (async () => {
+        // Native edition: a source granted through the permission UI (manifest
+        // reference) has no FQN visibility — INFORMATION_SCHEMA can't see it.
+        // DESCRIBE TABLE reference(...) is the reference-path equivalent; its
+        // type tokens are normalized so string types report as 'TEXT', matching
+        // the Snowflake isTextType check below. Null everywhere else.
+        const ref = await resolveSourceReference(conn, { db, schema, table });
+        if (ref) {
+          return describeRowsToColumns(await exec(conn, `DESCRIBE TABLE ${ref.refSql}`))
+            .map((c, i) => ({ COLUMN_NAME: c.name, ORDINAL_POSITION: i + 1, DATA_TYPE: c.typeToken }));
+        }
+        return exec(conn,
+          `SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
+           FROM ${db}.INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+           ORDER BY ORDINAL_POSITION`,
+          [schema, table],
+        );
+      })();
   // `columns` (name → ordinal) is kept for existing callers; `fields` carries
   // the type info the pipeline-creation column picker needs. Snowflake reports
   // VARCHAR/CHAR/STRING all as 'TEXT'; SQL Server reports the concrete type
