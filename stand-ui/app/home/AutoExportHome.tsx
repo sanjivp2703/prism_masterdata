@@ -1286,12 +1286,9 @@ export default function AutoExportHome() {
                 automatically. If this workspace is new, start by giving Prism
                 access to the data you want standardized.
               </p>
-              <div className="flex items-center justify-end gap-3">
-                <button type="button"
-                  onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* storage unavailable */ } setShowNativeIntro(false); }}
-                  className="rounded-button border-[0.5px] px-4 py-2.5 text-sm font-medium"
-                  style={{ backgroundColor: 'transparent', borderColor: 'var(--border)', color: 'var(--text-secondary)', cursor: 'pointer' }}
-                >Continue</button>
+              {/* Single path by design (2026-08-31): the only way past the
+                  welcome modal is into /setup to grant access. */}
+              <div className="flex items-center justify-end">
                 <Link href="/setup"
                   onClick={() => { try { localStorage.setItem('prism_native_intro_dismissed', '1'); } catch { /* storage unavailable */ } }}
                   className="rounded-button px-4 py-2.5 text-sm font-medium"
@@ -1431,12 +1428,18 @@ export default function AutoExportHome() {
                             // makes sense for a live warehouse table, not a file source
                             // — rather than show it disabled, drop it from the list.
                             const viewAllowed = pipelineSourceType === 'snowflake' && warehouseKind !== 'mssql';
+                            // Column mode is not offered in the native edition: the
+                            // Marketplace install grants a single read-only reference,
+                            // and the app never asks for write access to consumer
+                            // tables. Server gate: POST /api/pipelines.
+                            const columnAllowed = !isNativeEdition();
                             const outputOptions = ([
                               { id: 'table',       label: 'Table' },
                               { id: 'column',      label: 'Column' },
                               { id: 'view',        label: 'View' },
                               { id: 'lookup_only', label: 'Lookup table' },
-                            ] as const).filter(o => o.id !== 'view' || viewAllowed);
+                            ] as const).filter(o =>
+                              (o.id !== 'view' || viewAllowed) && (o.id !== 'column' || columnAllowed));
                             return outputOptions.map(({ id, label }, i) => (
                             <button
                               key={id}

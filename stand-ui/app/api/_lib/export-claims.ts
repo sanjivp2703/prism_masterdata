@@ -12,7 +12,11 @@ import { getDb } from './sqlite';
  * (live-found 2026-08-18, client-sim E4).
  *
  * Columns of the SAME source table sharing one export table is the
- * documented multi-column design and is NOT a conflict.
+ * documented multi-column design and is NOT a conflict. Likewise (owner
+ * decision 2026-09-01) a pipeline may claim a one-time result built from the
+ * SAME source table — that is the natural "clean once, then keep it fresh"
+ * promotion, and the pipeline's rebuild reproduces the same content. Only a
+ * DIFFERENT source aiming at the name is refused.
  *
  * Comparison is case-insensitive: SQL Server and Snowflake both resolve
  * unquoted identifiers case-insensitively, so DBO.T and dbo.t are one table.
@@ -41,11 +45,14 @@ export function findExportClaim(
   const ots = getDb()
     .prepare(
       `SELECT source_relation FROM one_time_standardizations
-       WHERE export_target IS NOT NULL AND UPPER(TRIM(export_target)) = ?
-       LIMIT 1`,
+       WHERE export_target IS NOT NULL AND UPPER(TRIM(export_target)) = ?`,
     )
-    .get(target) as { source_relation?: string } | undefined;
-  if (ots) return { kind: 'one_time', owner: String(ots.source_relation ?? 'a one-time standardization') };
+    .all(target) as Array<{ source_relation?: string }>;
+  for (const row of ots) {
+    // Same source → the pipeline is the promotion of that one-time result; fine.
+    if (String(row.source_relation ?? '').trim().toUpperCase() === mySource) continue;
+    return { kind: 'one_time', owner: String(row.source_relation ?? 'a one-time standardization') };
+  }
 
   return null;
 }

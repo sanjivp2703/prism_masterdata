@@ -26,6 +26,7 @@ import {
   DEFAULT_UPDATE_SCHEDULE,
 } from '@/app/api/_lib/update-schedule';
 import { asExportKind } from '@/app/api/_lib/export-kind';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 import { filterPipelineRowsForViewer } from '@/app/api/_lib/native-visibility';
 
 function parseMeta(v: any): Record<string, any> {
@@ -174,6 +175,16 @@ export async function POST(request: Request) {
   // rebuilt each pass), 'view' (live, created once), or 'column' (standardized
   // companion column maintained on the source table itself).
   const export_kind         = asExportKind(body?.export_kind);
+  // Native edition: the Marketplace install grants a single read-only
+  // reference on source tables, so column mode (which needs UPDATE on the
+  // consumer's table) is not offered. The UI hides the option; this is the
+  // real gate.
+  if (export_kind === 'column' && isNativeEdition()) {
+    return Response.json(
+      { error: 'The Column output is not available in the Snowflake Native App edition — Prism only reads your tables. Choose Table, View, or Lookup table instead.' },
+      { status: 400 },
+    );
+  }
   // Column mode's destination IS the source table — set server-side so all
   // rebuild triggers (keyed on export_table_fqn) fire for it, regardless of
   // what the client sent.
