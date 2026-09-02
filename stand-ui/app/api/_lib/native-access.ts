@@ -15,6 +15,7 @@ import 'server-only';
 
 import { executeQuery, isWarehouseAccessError } from './warehouse';
 import { isNativeEdition } from './edition';
+import { getOptionalEnv } from './env';
 
 const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 
@@ -86,6 +87,27 @@ export function nativeSourceAccessPauseMessage(tableFqn: string): string {
   return (
     `Prism's background service can't read ${tableFqn} — it may have been dropped, ` +
     `renamed, or never granted to the app. ${setupFix(db)} Then resume this pipeline.`
+  );
+}
+
+/** Native wording for a failed export build (the standard edition's message
+ *  says GRANT ... TO ROLE PRISM_SERVICE, which doesn't exist here). The app
+ *  name comes from the SPCS env (SNOWFLAKE_DATABASE = the app's own db);
+ *  the placeholder keeps the SQL legible if it's ever absent. */
+export function nativeExportBuildFixMessage(
+  exportFqn: string,
+  exportSchema: string,
+  kind: 'table' | 'view',
+): string {
+  const app = getOptionalEnv('SNOWFLAKE_DATABASE') ?? '<your Prism app name>';
+  const objectWord = kind === 'view' ? 'view' : 'table';
+  const createPriv = kind === 'view' ? 'CREATE VIEW' : 'CREATE TABLE';
+  const repair = kind === 'view' ? 'Recreate view now' : 'Rebuild export table now';
+  return (
+    `The export ${objectWord} ${exportFqn} could not be built. Run in Snowflake: ` +
+    `GRANT USAGE ON SCHEMA ${exportSchema} TO APPLICATION "${app}"; ` +
+    `GRANT ${createPriv} ON SCHEMA ${exportSchema} TO APPLICATION "${app}"; ` +
+    `then use "${repair}" in the card's Settings tab.`
   );
 }
 

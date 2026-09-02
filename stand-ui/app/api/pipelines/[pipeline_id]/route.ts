@@ -17,7 +17,7 @@ import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims'
 import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { probeNativeSourceAccess } from '@/app/api/_lib/native-access';
+import { probeNativeSourceAccess, nativeExportBuildFixMessage } from '@/app/api/_lib/native-access';
 
 /**
  * PATCH /api/pipelines/[pipeline_id]
@@ -263,7 +263,12 @@ export async function PATCH(
                               : ['<database>', '<schema>'];
         const expSchema = isMssql || isPg ? expSch : `${expDb}.${expSch}`;
         const fallback = exportRef.export_kind === 'view'
-          ? (isMssql
+          ? (isNativeEdition()
+              // Native: PRISM_SERVICE doesn't exist — the grantee is the
+              // APPLICATION (live-found 2026-09-02: the standard copy sent a
+              // consumer admin to grant a nonexistent role).
+              ? nativeExportBuildFixMessage(String(exportRef.export_table_fqn), expSchema, 'view')
+            : isMssql
               // Views are refused on the mssql adapter — this branch shouldn't
               // fire in practice, but keep a sane message rather than none.
               ? `The export view ${exportRef.export_table_fqn} could not be created. SQL Server exports don't support the View output — switch this pipeline to Table or Column in the card's Settings tab.`
@@ -276,7 +281,9 @@ export async function PATCH(
             : isPg
               ? `The standardized column(s) on ${exportRef.table_fqn} could not be updated. Run as a Postgres admin: ${columnModeSetupSql(exportRef.table_fqn, exportRef.column_name)} then use "Sync standardized columns now" in the card's Settings tab.`
               : `The standardized column(s) on ${exportRef.table_fqn} could not be updated. Run in Snowflake: GRANT UPDATE ON TABLE ${exportRef.table_fqn} TO ROLE PRISM_SERVICE; then use "Sync standardized columns now" in the card's Settings tab.`)
-          : (isMssql
+          : (isNativeEdition()
+              ? nativeExportBuildFixMessage(String(exportRef.export_table_fqn), expSchema, 'table')
+            : isMssql
               // Grant to the prism_svc LOGIN directly, not the PRISM_SERVICE
               // ROLE — that role only exists in PRISM_DB; source databases
               // (where a table-mode export usually lives, alongside the
