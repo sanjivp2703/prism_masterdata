@@ -39,6 +39,41 @@ export function buildNativeSetupSql(
   return parts.join('\n\n');
 }
 
+/** Role guide for the combined /setup block (owner request 2026-09-03: keep
+ *  ONE block, but say which lines need which role — only the AI lines are
+ *  truly ACCOUNTADMIN-locked; caller grants need MANAGE CALLER GRANTS, and
+ *  the pipeline grants + change-tracking loop only need the role that owns
+ *  the database, since granting on owned objects and ALTERing owned tables
+ *  are ownership powers). Line ranges are computed from the same builders
+ *  that render the block, so the numbers cannot drift from the SQL. */
+export function buildNativeSetupSqlRoleNote(
+  appName: string,
+  dbs: string[],
+  opts: { includeStarter: boolean },
+): string {
+  const lineCount = (s: string) => s.split('\n').length;
+  const segments: string[] = [];
+  let line = 1;
+  const advance = (sql: string): [number, number] => {
+    const start = line;
+    const end = line + lineCount(sql) - 1;
+    line = end + 2; // the joining blank line
+    return [start, end];
+  };
+  if (opts.includeStarter) {
+    const [s, e] = advance(buildNativeStarterSql(appName));
+    segments.push(`lines ${s}-${e} (AI) must run as ACCOUNTADMIN`);
+  }
+  if (dbs.length > 0) {
+    const [cs, ce] = advance(buildNativeCallerGrantSql(appName, dbs));
+    segments.push(`lines ${cs}-${ce} (each user's own access) need a role with MANAGE CALLER GRANTS`);
+    const [ds, de] = advance(buildNativeAppDbGrantSql(appName, dbs));
+    segments.push(`lines ${ds}-${de} (pipeline access and change detection) can be run by the role that owns the database`);
+  }
+  if (segments.length === 0) return '';
+  return `ACCOUNTADMIN can run the whole block, but it splits by team: ${segments.join('; ')}.`;
+}
+
 /** The database part of a picker-typed FQN (verbatim, matching parseFqn), or
  *  null when nothing usable was typed — the db-scoped builders then emit
  *  their legible <db> placeholder. */

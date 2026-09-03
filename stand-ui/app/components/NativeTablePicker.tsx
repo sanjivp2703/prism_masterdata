@@ -101,6 +101,7 @@ export default function NativeTablePicker({ value, onChange, inputId }: {
             {copied ? 'Copied' : 'Copy SQL'}
           </button>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '10px 0 0', lineHeight: 1.5 }}>
+            The role that owns the database can run this — ACCOUNTADMIN is not required.
             Covers every table in the database right now — a table created or recreated
             later needs it re-run. The hourly grant-refresh task on the setup page does
             that automatically.

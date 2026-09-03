@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { buildNativeGrantRefreshTaskSql, buildNativeSetupSql, buildNativeStarterSql } from '@/app/components/native-grant-sql';
+import { buildNativeGrantRefreshTaskSql, buildNativeSetupSql, buildNativeSetupSqlRoleNote, buildNativeStarterSql } from '@/app/components/native-grant-sql';
 import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 
 function PrismLogo() {
@@ -2876,6 +2876,9 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
             background pipelines read access plus room to create their output tables, and
             turns on change detection for every table. Use Run All, not the
             single-statement play button.
+          </p>
+          <p className="text-sm mt-2" style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            {buildNativeSetupSqlRoleNote(appName, selected, { includeStarter: aiConfigured === false })}
           </p>
           <div className="mt-2">
             <CodeBlock
