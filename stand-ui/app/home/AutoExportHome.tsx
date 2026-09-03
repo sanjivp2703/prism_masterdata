@@ -868,11 +868,28 @@ export default function AutoExportHome() {
       }
     }
 
+    // Refetch pipelines at the moment they're checked: the mount-time snapshot
+    // goes stale as soon as a pipeline is deleted elsewhere in the SPA, and
+    // both checks below then act on ghosts — a deleted pipeline blocked
+    // recreation as a "duplicate", and the export-conflict dialog cited an
+    // export from a pipeline that no longer existed (live-found 2026-09-03
+    // with ZERO pipelines in the account). Falls back to the snapshot only
+    // when the refetch itself fails.
+    let pipelinesNow = existingPipelines;
+    try {
+      const r = await fetch('/api/pipelines', { cache: 'no-store' });
+      if (r.ok) {
+        const b = await r.json();
+        pipelinesNow = b.pipelines ?? [];
+        setExistingPipelines(pipelinesNow);
+      }
+    } catch { /* offline blip — the stale snapshot is better than nothing */ }
+
     // Block table+column pairs that already have a live pipeline.
     // pending_baseline pipelines are incomplete setups and should not block.
     const shortTable = table.split('.').pop() ?? table;
     const dupes = columnEntries.filter(en =>
-      existingPipelines.some(p =>
+      pipelinesNow.some(p =>
         // Case-insensitive on BOTH parts — see existingColNames above (PIPE-01).
         (p.table_fqn ?? '').toUpperCase() === table.toUpperCase()
         && p.status !== 'pending_baseline'
@@ -890,7 +907,9 @@ export default function AutoExportHome() {
     // Only applies in table/view mode — column and lookup-only pipelines have
     // no separate export object.
     if (needsExportObject) {
-      const existingExport = existingExportForTable(table);
+      const t = table.trim();
+      const fresh = pipelinesNow.find(p => p.table_fqn === t && p.export_table_fqn && p.export_kind !== 'column');
+      const existingExport = fresh?.export_table_fqn ?? null;
       if (existingExport && existingExport !== exportTable) {
         setExportConflict({ existingExport });
         return;
