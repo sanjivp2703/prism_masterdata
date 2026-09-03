@@ -133,6 +133,42 @@ export async function probeNativeExportCollision(
   }
 }
 
+/**
+ * Drop an APP-OWNED export object when its last pipeline is deleted (native
+ * only). No consumer role — ACCOUNTADMIN included — can drop an
+ * application's objects, so without this an orphaned export table survives
+ * until the app is uninstalled (live-found 2026-09-02). Ownership is
+ * verified via SHOW before the drop: Prism only ever drops an object it
+ * provably owns; anything else is left untouched. Returns what happened.
+ */
+export async function dropNativeOwnedExport(
+  conn: unknown,
+  exportFqn: string,
+  kind: 'table' | 'view',
+): Promise<'dropped' | 'kept'> {
+  if (!isNativeEdition()) return 'kept';
+  const parts = String(exportFqn).trim().split('.');
+  if (parts.length !== 3) return 'kept';
+  const [db, schema, obj] = parts;
+  const appName = getOptionalEnv('SNOWFLAKE_DATABASE') ?? '';
+  if (!appName) return 'kept';
+  try {
+    const showWord = kind === 'view' ? 'VIEWS' : 'TABLES';
+    const rows = await executeQuery(
+      conn,
+      `SHOW ${showWord} LIKE '${obj.replace(/'/g, "''")}' IN SCHEMA ${q(db)}.${q(schema)}`,
+    );
+    const first = rows?.[0] as Record<string, unknown> | undefined;
+    if (!first) return 'kept'; // already gone
+    const owner = String(first.owner ?? first.OWNER ?? '');
+    if (owner.toUpperCase() !== appName.toUpperCase()) return 'kept'; // not ours — never touch it
+    await executeQuery(conn, `DROP ${kind === 'view' ? 'VIEW' : 'TABLE'} IF EXISTS ${q(db)}.${q(schema)}.${q(obj)}`);
+    return 'dropped';
+  } catch {
+    return 'kept'; // best-effort — deletion of the pipeline itself never fails on this
+  }
+}
+
 /** Native wording for a failed export build (the standard edition's message
  *  says GRANT ... TO ROLE PRISM_SERVICE, which doesn't exist here). The app
  *  name comes from the SPCS env (SNOWFLAKE_DATABASE = the app's own db);

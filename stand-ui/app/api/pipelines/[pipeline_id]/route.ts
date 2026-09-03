@@ -17,7 +17,7 @@ import { findExportClaim, exportClaimError } from '@/app/api/_lib/export-claims'
 import { reconcilePipelineQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { flagPipelineMessage } from '@/app/api/_lib/pipeline-alerts';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { probeNativeSourceAccess, nativeExportBuildFixMessage, probeNativeExportCollision } from '@/app/api/_lib/native-access';
+import { probeNativeSourceAccess, nativeExportBuildFixMessage, probeNativeExportCollision, dropNativeOwnedExport } from '@/app/api/_lib/native-access';
 
 /**
  * PATCH /api/pipelines/[pipeline_id]
@@ -374,7 +374,7 @@ export async function DELETE(
       // the actual revoke happens after the response is built, since it needs
       // a warehouse round trip and must never make deletion fail.
       const doomed = db
-        .prepare(`SELECT table_fqn, column_name, export_kind, created_by FROM pipelines WHERE pipeline_id = ?`)
+        .prepare(`SELECT table_fqn, column_name, export_kind, export_table_fqn, created_by FROM pipelines WHERE pipeline_id = ?`)
         .get(pid) as any;
       db.prepare(`DELETE FROM column_specs WHERE pipeline_id = ?`).run(pid);
       db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
@@ -382,6 +382,30 @@ export async function DELETE(
     })();
 
     dropPipelineStream(pid);
+
+    // Native: when the LAST pipeline aiming at this export destination is
+    // deleted, drop the APP-OWNED export object too — no consumer role (even
+    // ACCOUNTADMIN) can, so it would otherwise orphan until uninstall.
+    // Ownership is verified inside dropNativeOwnedExport; a table Prism
+    // doesn't own is never touched. Never blocks deletion (best-effort).
+    {
+      const delBody = await response.clone().json().catch(() => ({} as any));
+      const d = delBody?.doomed;
+      const expFqn = d?.export_table_fqn != null ? String(d.export_table_fqn) : null;
+      const expKind = asExportKind(d?.export_kind);
+      if (expFqn && expKind !== 'column' && String(d?.table_fqn ?? '') !== expFqn) {
+        const stillTargeted = getDb()
+          .prepare(`SELECT 1 FROM pipelines WHERE export_table_fqn = ? COLLATE NOCASE LIMIT 1`)
+          .get(expFqn);
+        if (!stillTargeted) {
+          withWarehouse((conn) =>
+            dropNativeOwnedExport(conn, expFqn, expKind === 'view' ? 'view' : 'table'),
+          ).then((outcome) => {
+            if (outcome === 'dropped') console.log(`[Pipelines] Dropped app-owned export ${expFqn} with its last pipeline (${pid})`);
+          }).catch(() => {});
+        }
+      }
+    }
 
     // Hand back the write access this pipeline was given (finding #32). Any
     // other column-mode pipeline still pointing at the same table keeps its

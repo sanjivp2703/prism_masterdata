@@ -69,6 +69,7 @@ import { sqlStringLiteral, normalizeLiteral } from './normalize';
 import { internalTable, prismNormalizeFn } from './warehouse-tables';
 import { type ExportKind, standardizedColumnName, assertCompanionColumnSafe } from './export-kind';
 import { pausePipelineWithMessage } from './pipeline-alerts';
+import { isNativeEdition } from './edition';
 
 function quoteIdent(ident: string): string {
   return `"${String(ident).replace(/"/g, '""')}"`;
@@ -500,6 +501,21 @@ async function doRefreshExportTable(
          ${selectBody}
          ${ordering ? `ORDER BY ${ordering.orderExpr}` : ''}`;
     await exec(conn, createStmt);
+
+    // Native edition: the export object is APP-OWNED, and app-owned objects
+    // are invisible to every consumer role — even ACCOUNTADMIN cannot SELECT
+    // them (live-found 2026-09-02: a consumer admin querying their own
+    // standardized table got "Insufficient privileges"). The output IS the
+    // product, so grant read to app_user: anyone who can open Prism can also
+    // query the table, and COPY GRANTS carries it across rebuilds. Best
+    // effort — a grant hiccup must never fail the build itself.
+    if (isNativeEdition()) {
+      try {
+        await exec(conn, `GRANT SELECT ON ${exportKind === 'view' ? 'VIEW' : 'TABLE'} ${exportRef} TO APPLICATION ROLE app_user`);
+      } catch (grantErr) {
+        console.warn(`[ExportTable] app_user read grant on ${export_fqn} failed:`, (grantErr as Error)?.message ?? grantErr);
+      }
+    }
 
     const countRows = await exec(conn, `SELECT COUNT(*) AS cnt FROM ${exportRef}`);
     const rows_written = Number(countRows[0]?.CNT ?? countRows[0]?.cnt ?? 0);
