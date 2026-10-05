@@ -60,7 +60,7 @@ export interface Pipeline {
  * stores one PIPELINES row per column; this is a presentation grouping.
  */
 export interface PipelineGroup {
-  key:                 string;        // export_table_fqn, or `__pid_<id>` when none
+  key:                 string;        // `exp:<export_table_fqn>`, or `tbl:<table_fqn>` when there is no export object
   export_table_fqn:    string | null;
   export_kind:         'table' | 'view' | 'column'; // from the first member; meaningless when export_table_fqn is null
   table_fqn:           string;        // from the first member
@@ -154,12 +154,14 @@ function groupName(g: PipelineGroup): string {
   return g.name ?? tableShort(g.table_fqn);
 }
 
-/** The card key a pipeline belongs to: its export file, or table_fqn for file pipelines, else a per-pipeline key. */
+/** The card key a pipeline belongs to: its export object, else its source table. */
 function groupKeyFor(p: Pipeline): string {
   if (p.export_table_fqn && p.export_table_fqn.trim()) return `exp:${p.export_table_fqn}`;
-  // Lookup-only pipelines have no export_table_fqn; group by table_fqn so
-  // virtual multi-column entries sharing the same pipeline_id land on one card.
-  return `__pid_${p.pipeline_id}`;
+  // Lookup-only pipelines have no export_table_fqn; group by the source table
+  // so a multi-column lookup-only pipeline is ONE card like every other kind.
+  // (Was a per-pipeline_id key until 2026-10-03 — a two-column Lookup-table
+  // pipeline rendered as two cards on the client-test install, finding #2.)
+  return `tbl:${p.table_fqn}`;
 }
 
 /**
@@ -813,6 +815,7 @@ function GroupRow({
                 domain_id:   c.domain_id,
                 domain_name: c.domain_name,
               }))}
+              tableFqn={g.table_fqn}
               onClose={() => setShowExportLookup(false)}
             />
           )}
@@ -1376,6 +1379,14 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         // run_id null (empty source/queue for this column) — try the next column.
       }
       // Nothing to review on any column — refresh so the card reflects current state.
+      // Say so: this used to be a silent no-op, and with the card showing
+      // "Unstandardized" values the owner read it as a broken button (2026-09-14).
+      if (kind === 'standardize') {
+        showToast(
+          `Nothing to standardize — every value in ${columns.map(c => c.column_name).join(', ')} is already standardized.`,
+          'info',
+        );
+      }
       await fetchPipelines();
       setBusyKey(null);
     } catch {
@@ -1398,6 +1409,12 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
     setExpandedKey(g.key);
     setExpandedTab('activity');
     setAutoStdBusyKey(g.key);
+    // The route used to answer an empty queue with a silent 200, so with
+    // "Unstandardized: 1" showing on the card this button visibly did nothing
+    // (2026-09-14). Now it reconciles the source first and we always say what
+    // happened — how many values were standardized, or that nothing needed it.
+    let processed = 0;
+    let anyOk = false;
     try {
       const seen = new Set<number>();
       for (const col of g.columns) {
@@ -1405,16 +1422,28 @@ export default function PipelinesView({ defaultExpandedId, defaultExpandedTab }:
         seen.add(col.pipeline_id);
         try {
           const res = await fetch(`/api/pipelines/${col.pipeline_id}/process-queue`, { method: 'POST' });
+          const body = (await res.json().catch(() => ({}))) as { error?: string; literals_processed?: number };
           if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
             showToast(
               `Auto-standardize failed for ${col.column_name}${body?.error ? `: ${body.error}` : '.'}`,
               'error',
             );
+            continue;
           }
+          anyOk = true;
+          processed += Number(body?.literals_processed ?? 0) || 0;
         } catch {
           showToast(`Auto-standardize failed for ${col.column_name} — check your connection.`, 'error');
         }
+      }
+      if (anyOk) {
+        const cols = g.columns.map(c => c.column_name).join(', ');
+        showToast(
+          processed > 0
+            ? `Standardized ${processed.toLocaleString()} value${processed === 1 ? '' : 's'} in ${cols}.`
+            : `Nothing to standardize — every value in ${cols} is already standardized.`,
+          'info',
+        );
       }
     } finally {
       setAutoStdBusyKey(null);

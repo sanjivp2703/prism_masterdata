@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import { isNativeEdition } from '@/app/api/_lib/edition';
-import { buildNativeGrantRefreshTaskSql, buildNativeSetupSql, buildNativeSetupSqlRoleNote, buildNativeStarterSql } from '@/app/components/native-grant-sql';
+import { buildNativeSetupSql, buildNativeSetupSqlGuide, buildNativeStarterSql } from '@/app/components/native-grant-sql';
 import { buildMssqlDataAccessSql } from '@/app/components/mssql-access-sql';
 
 function PrismLogo() {
@@ -2768,6 +2768,10 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
   const [dbList, setDbList] = useState<string[] | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [manualDb, setManualDb] = useState('');
+  // The permissions guide under the grant block is collapsed by default —
+  // most admins just paste and run; the who-can-run-which-lines detail is
+  // for the ones who need to split the block across teams.
+  const [guideOpen, setGuideOpen] = useState(false);
   useEffect(() => {
     let cancelled = false;
     fetch('/api/accounts/databases', { cache: 'no-store' })
@@ -2797,8 +2801,8 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
   // Everyone sees the checklist; only an admin role holder can run the SQL,
   // so non-admins get a one-line pointer instead of a run instruction.
   const runLine = role === 'admin'
-    ? 'Run this as ACCOUNTADMIN.'
-    : 'Ask an admin to run this as ACCOUNTADMIN.';
+    ? 'Run this as ACCOUNTADMIN'
+    : 'Ask an admin to run this as ACCOUNTADMIN';
 
   return (
     <div>
@@ -2860,7 +2864,7 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       {selected.length === 0 && aiConfigured === false && (
         <>
           <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            {runLine} It enables AI; selecting databases above extends it to cover
+            {runLine}. It enables AI; selecting databases above extends it to cover
             data access too.
           </p>
           <div className="mt-2">
@@ -2871,14 +2875,7 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
       {selected.length > 0 && (
         <>
           <p className="text-sm mt-3" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            {runLine} One paste covers everything{aiConfigured === false ? ': it enables AI, ' : ': it '}
-            lets everyone use Prism on the selected databases with their own access, gives
-            background pipelines read access plus room to create their output tables, and
-            turns on change detection for every table. Use Run All, not the
-            single-statement play button.
-          </p>
-          <p className="text-sm mt-2" style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
-            {buildNativeSetupSqlRoleNote(appName, selected, { includeStarter: aiConfigured === false })}
+            {runLine} to give Prism access to your tables.
           </p>
           <div className="mt-2">
             <CodeBlock
@@ -2886,15 +2883,44 @@ function NativeSetup({ nextUrl, role }: { nextUrl: string; role: 'admin' | 'user
               maxHeight={280}
             />
           </div>
-          <p className="text-sm mt-4" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Optional — keep pipeline access fresh. Pipelines need a direct grant per
-            table, and Snowflake doesn&apos;t extend those to tables created (or recreated)
-            later. This hourly task re-grants automatically. It uses each
-            database&apos;s PUBLIC schema — change that if yours differs:
-          </p>
-          <div className="mt-2">
-            <CodeBlock code={buildNativeGrantRefreshTaskSql(appName, selected)} maxHeight={220} />
-          </div>
+          <button type="button" onClick={() => setGuideOpen(o => !o)}
+            aria-expanded={guideOpen}
+            className="text-sm mt-2"
+            style={{ color: 'var(--text-muted)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+          >
+            {guideOpen ? '▾' : '▸'} What this does and the permissions it needs
+          </button>
+          {guideOpen && (
+            <div className="text-sm" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+              <SectionTitle>Before you run it</SectionTitle>
+              <ul style={{ listStyle: 'disc', paddingLeft: 18, margin: 0 }}>
+                <li>
+                  Paste the whole block into a Snowflake worksheet and use Run All. The
+                  single-statement play button runs only one line.
+                </li>
+                <li>
+                  The task at the end lives in each database&apos;s PUBLIC schema. If your
+                  database has no PUBLIC schema, change that name before running.
+                </li>
+              </ul>
+              <SectionTitle>What each part does, and who can run it</SectionTitle>
+              <p style={{ margin: '0 0 6px' }}>
+                ACCOUNTADMIN can run everything. If you&apos;d rather split it up, each part
+                needs a different level of access:
+              </p>
+              <ul style={{ listStyle: 'disc', paddingLeft: 18, margin: 0 }}>
+                {buildNativeSetupSqlGuide(appName, selected, { includeStarter: aiConfigured === false }).map(s => (
+                  <li key={s.title}>
+                    <strong style={{ color: 'var(--text-primary)' }}>
+                      Lines {s.lines[0]}–{s.lines[1]} · {s.title}
+                    </strong>
+                    {' — '}{s.purpose}{' '}
+                    <em>Needs: {s.needs}</em>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </>
       )}
 

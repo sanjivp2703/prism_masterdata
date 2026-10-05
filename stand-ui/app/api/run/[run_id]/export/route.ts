@@ -175,9 +175,10 @@ export async function POST(
         }
       }
       if (deferWrite) {
-        getDb()
-          .prepare(`UPDATE runs SET run_status = 'approved', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE run_id = ?`)
-          .run(runId);
+        // Resolve the pipeline BEFORE marking the run approved. A run whose
+        // pipeline is gone (the setup attempt was replaced or deleted) must be
+        // refused loudly — returning pipeline_id null used to send the client
+        // home with no activation card and no message (finding #10).
         const pipelineRow = getDb()
           .prepare(
             `SELECT p.pipeline_id
@@ -189,10 +190,16 @@ export async function POST(
              LIMIT 1`,
           )
           .get(runId) as any;
-        const pid = pipelineRow
-          ? Number(pipelineRow.pipeline_id)
-          : null;
-        return Response.json({ deferred: true, pipeline_id: pid }, { status: 200 });
+        if (!pipelineRow) {
+          return Response.json(
+            { error: 'This review no longer belongs to a pipeline — the setup it was part of was removed or started over. Go to Connect and create the pipeline again.' },
+            { status: 409 },
+          );
+        }
+        getDb()
+          .prepare(`UPDATE runs SET run_status = 'approved', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE run_id = ?`)
+          .run(runId);
+        return Response.json({ deferred: true, pipeline_id: Number(pipelineRow.pipeline_id) }, { status: 200 });
       }
 
       const _acceptStart = Date.now();

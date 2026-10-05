@@ -244,7 +244,7 @@ function ActivityTab({ group, isStandardizing = false, specsById }: { group: Pip
           <StatCard
             value={sourceVal}
             label="Source Values"
-            tooltip={`Number of values in ${group.columns.map(c => c.column_name).join(', ')} (including nulls, which are automatically standardized)`}
+            tooltip={`Number of values in ${group.columns.map(c => c.column_name).join(', ')}. Nulls and blank cells aren't counted — they pass through to the export as-is.`}
             bg="var(--page-bg)" border="var(--border)"
           />
           <StatCard
@@ -492,7 +492,12 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
             style={{ gridTemplateColumns: '1fr 1fr auto', backgroundColor: 'var(--accent-tint)', color: 'var(--text-secondary)', borderBottom: '0.5px solid var(--border)', gap: 8 }}
           >
             <span>Raw value</span>
-            <span>Canonical name</span>
+            <span>
+              Canonical name
+              {/* The name itself is the edit control (no pencil icon) — say so,
+                  or nobody finds it (owner request 2026-10-04). */}
+              <span className="font-normal ml-1.5" style={{ color: 'var(--text-muted)' }}>· click a name to edit it</span>
+            </span>
             <span>Status</span>
           </div>
           <div style={{ maxHeight: 300, overflowY: 'auto' }}>
@@ -550,6 +555,7 @@ function ColumnMappingsSection({ pipeline, showHeading }: { pipeline: Pipeline; 
         <ExportLookupModal
           domainId={pipeline.domain_id ?? undefined}
           domainName={pipeline.column_name}
+          tableFqn={pipeline.table_fqn}
           onClose={() => setShowExport(false)}
         />
       )}

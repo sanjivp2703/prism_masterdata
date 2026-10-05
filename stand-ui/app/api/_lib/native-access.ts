@@ -19,11 +19,31 @@ import { getOptionalEnv } from './env';
 
 const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 
-function setupFix(db: string): string {
+/** The copy-paste fix for ONE source table (owner request 2026-10-04: the
+ *  card used to point at the setup page's whole-database block; a single
+ *  table that lost its grants — e.g. recreated with CREATE OR REPLACE — needs
+ *  four statements, and the admin wants them in the banner). Falls back to
+ *  the setup-page pointer when the FQN isn't 3-part. The app name comes from
+ *  the SPCS env (SNOWFLAKE_DATABASE = the app's own db). */
+function setupFix(tableFqn: string): string {
+  const app = getOptionalEnv('SNOWFLAKE_DATABASE') ?? '<your Prism app name>';
+  const parts = String(tableFqn).trim().split('.');
+  if (parts.length !== 3) {
+    const db = parts[0] || 'the source';
+    return (
+      `Open Prism's setup page, select the ${db} database, and run the access block as ` +
+      `ACCOUNTADMIN (one paste: read access for background pipelines plus change ` +
+      `detection for every table).`
+    );
+  }
+  const [db, schema, table] = parts;
+  const t = `${q(db)}.${q(schema)}.${q(table)}`;
   return (
-    `Open Prism's setup page, select the ${db} database, and run the access block as ` +
-    `ACCOUNTADMIN (one paste: read access for background pipelines plus change ` +
-    `detection for every table).`
+    `Run in Snowflake as ACCOUNTADMIN: ` +
+    `GRANT USAGE ON DATABASE ${q(db)} TO APPLICATION ${q(app)}; ` +
+    `GRANT USAGE ON SCHEMA ${q(db)}.${q(schema)} TO APPLICATION ${q(app)}; ` +
+    `GRANT SELECT ON TABLE ${t} TO APPLICATION ${q(app)}; ` +
+    `ALTER TABLE ${t} SET CHANGE_TRACKING = TRUE;`
   );
 }
 
@@ -52,7 +72,7 @@ export async function probeNativeSourceAccess(
     if (isWarehouseAccessError(e) || /does not exist|not authorized/i.test(String((e as Error)?.message ?? e))) {
       return (
         `Prism's background service can't read ${tableFqn} — you can see the table, but ` +
-        `pipelines run with the app's own access, which was never granted here. ${setupFix(db)} ` +
+        `pipelines run with the app's own access, which was never granted here. ${setupFix(tableFqn)} ` +
         `Then try again.`
       );
     }
@@ -72,7 +92,7 @@ export async function probeNativeSourceAccess(
     if (first && ct === 'OFF') {
       return (
         `Change detection is off for ${tableFqn}, so a pipeline can't watch it for new ` +
-        `values. ${setupFix(db)} Then try again.`
+        `values. ${setupFix(tableFqn)} Then try again.`
       );
     }
   } catch { /* covered by the poller's change-tracking pause if it matters */ }
@@ -83,10 +103,9 @@ export async function probeNativeSourceAccess(
 /** The pause/refusal copy for a source the app can't reach, native wording —
  *  shared with the poller so the card and the preflights tell one story. */
 export function nativeSourceAccessPauseMessage(tableFqn: string): string {
-  const db = String(tableFqn).trim().split('.')[0] || 'the source';
   return (
     `Prism's background service can't read ${tableFqn} — it may have been dropped, ` +
-    `renamed, or never granted to the app. ${setupFix(db)} Then resume this pipeline.`
+    `renamed, or never granted to the app. ${setupFix(tableFqn)} Then resume this pipeline.`
   );
 }
 
@@ -194,10 +213,9 @@ export function nativeExportBuildFixMessage(
  *  message names PRISM_SERVICE and personal credentials, neither of which
  *  exists in this edition). */
 export function nativeChangeTrackingPauseMessage(tableFqn: string): string {
-  const db = String(tableFqn).trim().split('.')[0] || 'the source';
   return (
     `Prism can't watch ${tableFqn} for changes: change tracking is not enabled on the ` +
-    `table and the app can't enable it with read-only access. ${setupFix(db)} ` +
+    `table and the app can't enable it with read-only access. ${setupFix(tableFqn)} ` +
     `Then resume this pipeline.`
   );
 }

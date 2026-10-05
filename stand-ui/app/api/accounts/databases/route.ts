@@ -24,12 +24,18 @@ export const dynamic = 'force-dynamic';
 
 // Never useful as standardization sources; the app db is internal state.
 const SKIP_DBS = new Set(['SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA']);
+// Snowsight personal databases (USER$<name>) can't be granted to an app —
+// "Granting create privilege on an object in personal database is not
+// supported" — so listing them only produces a block that fails halfway
+// (live-found 2026-10-04, finding #9). They are private scratch space, never
+// a pipeline source.
+const isSkippedDb = (db: string) => SKIP_DBS.has(db.toUpperCase()) || db.toUpperCase().startsWith('USER$');
 
 async function enumerateDatabases(conn: unknown, appName: string): Promise<string[]> {
   const rows = (await executeQuery(conn, 'SHOW DATABASES')) as Array<Record<string, unknown>>;
   return rows
     .map(r => String(r.name ?? ''))
-    .filter(db => db && db !== appName && !SKIP_DBS.has(db.toUpperCase()));
+    .filter(db => db && db !== appName && !isSkippedDb(db));
 }
 
 export async function GET() {
@@ -51,7 +57,7 @@ export async function GET() {
         )) as Array<Record<string, unknown>>;
         for (const r of rows) {
           const db = String(r.DATABASE_NAME ?? r.database_name ?? '');
-          if (db && db !== appName && !SKIP_DBS.has(db.toUpperCase()) && !databases.includes(db)) {
+          if (db && db !== appName && !isSkippedDb(db) && !databases.includes(db)) {
             databases.push(db);
           }
         }

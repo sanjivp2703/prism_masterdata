@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import { isNativeEdition } from '@/app/api/_lib/edition';
 
 interface Props {
   name: string;
@@ -153,6 +154,34 @@ export default function UserMenu({ name, email, pictureUrl }: Props) {
                 <path d="M7.5 1.5v2M7.5 11.5v2M1.5 7.5h2M11.5 7.5h2M3.26 3.26l1.41 1.41M10.33 10.33l1.41 1.41M3.26 11.74l1.41-1.41M10.33 4.67l1.41-1.41" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
               </svg>
               Settings
+            </a>
+          )}
+
+          {/* Data access (native, admins): the grant block lives on /setup,
+              which after the one-time welcome modal had NO link from anywhere
+              in the app — the "Admin" badge is a permissions tooltip, and the
+              owner reasonably expected it to open setup (2026-10-04). */}
+          {role === 'admin' && isNativeEdition() && (
+            <a
+              href="/setup?next=%2Fhome"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '10px 16px',
+                fontSize: 13,
+                color: '#374151',
+                textDecoration: 'none',
+                transition: 'background-color 0.12s',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLAnchorElement).style.backgroundColor = '#F9FAFB'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLAnchorElement).style.backgroundColor = 'transparent'; }}
+            >
+              <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+                <rect x="2" y="6.5" width="11" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
+                <path d="M4.5 6.5V4.5a3 3 0 016 0v2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+              Data access
             </a>
           )}
 

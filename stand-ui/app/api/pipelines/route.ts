@@ -386,7 +386,18 @@ export async function POST(request: Request) {
           const oldSpecId = existingRow.domain_id != null ? Number(existingRow.domain_id) : null;
           await exec(conn, `DELETE FROM ${internalTable('PIPELINE_QUEUE')} WHERE pipeline_id = ?`, [pid]);
           db.prepare(`DELETE FROM pipelines WHERE pipeline_id = ?`).run(pid);
-          if (oldSpecId != null) deleteColumnSpec(oldSpecId);
+          if (oldSpecId != null) {
+            // The attempt's review runs die with its spec (finding #10): an
+            // 'approved' run left behind here was resumed by the NEXT attempt's
+            // create-initial-run and could never be accepted. 'abandoned' is
+            // outside every reuse/commit status filter; the run row (metadata
+            // only) stays for history.
+            db.prepare(
+              `UPDATE runs SET run_status = 'abandoned', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+               WHERE domain_id = ? AND run_type != 'one_time' AND run_status IN ('created', 'approved', 'in_progress')`,
+            ).run(oldSpecId);
+            deleteColumnSpec(oldSpecId);
+          }
         }
 
         // Create the spec FIRST — its spec_id fills the pipeline's domain_id slot.

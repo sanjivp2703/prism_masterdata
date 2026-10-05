@@ -449,6 +449,19 @@ isolates SPCS problems from Native-App-packaging problems.
   `NativeTablePicker`'s panel, so the two can't drift. Note the `/home`
   setup gate already passes native (spcs + cortex), so nothing routes here
   automatically — the page exists for deliberate visits and links.
+  **REVISED 2026-09-29 (owner):** the page shows ONE mandatory block
+  (`buildNativeSetupSql`: AI starter when AI isn't configured → caller-grant
+  opt-in → per-database app grants + change-tracking loop → the hourly
+  `PRISM_GRANT_REFRESH` task, which was previously a separate "optional"
+  block) under a one-line instruction ("Run this as ACCOUNTADMIN to give
+  Prism access to your tables."). The role split lives behind a collapsed
+  "What this does and the permissions it needs" toggle rendered as bullets
+  from `buildNativeSetupSqlGuide` (line ranges computed from the same
+  builders): AI → ACCOUNTADMIN; caller grants → MANAGE CALLER GRANTS;
+  pipeline grants → database owner; refresh task → database owner + the
+  account-level EXECUTE TASK and EXECUTE MANAGED TASK (serverless task;
+  per Snowflake's tasks-intro "task security" section). Run All and the
+  PUBLIC-schema caveat are in the same panel.
 - **Metering + billing (§2.8): REMOVED 2026-08-27 — the app is free; no
   metering exists. Historical record follows.** the shared `billing-meter.ts` on every
   lookup-write path (MERGE-reported insert counts — build this early in the
@@ -552,7 +565,17 @@ isolates SPCS problems from Native-App-packaging problems.
   Security-tab picker, no install "Select Data" step). The single access
   path is the DATABASE-scoped grant block + the hourly PRISM_GRANT_REFRESH
   task (which also loops the change-tracking ALTER, so nothing is ever
-  per-table); the app-side reference plumbing stays DORMANT (failure-cached
+  per-table). Both loops SKIP tables they cannot ALTER, per-table
+  (`EXCEPTION WHEN OTHER`, live-found 2026-09-06): the cursor returns every
+  base table in the database, and a pipeline's export table is owned by the
+  APPLICATION, not the consumer — so ACCOUNTADMIN's ALTER on it fails with
+  "must have MODIFY", Snowflake Scripting aborts the whole block, and every
+  table the cursor had not yet reached silently never got change tracking.
+  In the hourly task the same failure would have recurred every run until
+  Snowflake auto-suspended it at `SUSPEND_TASK_AFTER_NUM_FAILURES` (10),
+  ending the grant refresh unnoticed. Skipping costs nothing — Prism's own
+  `_STANDARDIZED` output is never a polled source. The app-side reference
+  plumbing stays DORMANT (failure-cached
   resolver, resolves null) for the v1.1 column-mode reference. Patch-51
   facts worth keeping: the validator accepts references alongside
   restricted_callers_rights; reference descriptions cap at 200 chars;

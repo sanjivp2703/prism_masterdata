@@ -397,6 +397,14 @@ export async function POST(request: NextRequest) {
             `CREATE OR REPLACE TABLE ${safeFqn} AS\n           ${selectBody}\n           ${fromBody}\n           ORDER BY canonical_name, raw_value`,
             exportBinds,
           );
+          // Native: the table is APP-OWNED (service connection), and app-owned
+          // objects are invisible to every consumer role — even ACCOUNTADMIN
+          // got "Insufficient privileges … must have SELECT" on it (live-found
+          // 2026-10-04, finding #12). Same grant the export-table builder
+          // makes: every Prism user holds app_user.
+          if (isNativeEdition()) {
+            await exec(connection, `GRANT SELECT ON TABLE ${safeFqn} TO APPLICATION ROLE app_user`);
+          }
         }
       });
 

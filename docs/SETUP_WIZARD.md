@@ -119,6 +119,15 @@ the service token) instead of saved personal credentials — see NATIVE_APP_PLAN
 `hasUserWarehouseConfig` is async facade-wide for this (**always await it** — an un-awaited
 Promise is truthy).
 
+Native `/setup` renders `NativeSetup` ("Prism is ready") instead of the credential wizard:
+a database picker, one mandatory grant block built by `buildNativeSetupSql`
+(`app/components/native-grant-sql.ts` — AI starter when needed, caller-grant opt-in,
+per-database app grants + change tracking, and the hourly `PRISM_GRANT_REFRESH` task, all in
+one paste) under "Run this as ACCOUNTADMIN to give Prism access to your tables.", plus a
+collapsed "What this does and the permissions it needs" guide listing each section's line
+range, purpose and least-privileged role (`buildNativeSetupSqlGuide`). Details and the
+decision history: `docs/NATIVE_APP_PLAN.md` → Phase N3 "First-run experience".
+
 ### `PRISM_FRESH_SETUP`
 
 Dev-only — `'true'` simulates a bare customer install everywhere setup-facing

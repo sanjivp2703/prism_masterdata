@@ -364,13 +364,24 @@ export async function POST(
     // NOT reused: 'completed' (already written to the lookup — a new run is
     // correct there) and 'failed' (createRunFromQueue's own stale-reuse handles
     // it).
+    //
+    // Scoped to THIS pipeline's spec (domain_id), not just table + column
+    // (finding #10, live 2026-10-04): the create route replaces an abandoned
+    // pending_baseline pipeline — deleting its spec — when the user comes back
+    // to Connect and submits the same column again. The approved run of the
+    // deleted attempt still carries the OLD spec id; resuming it handed the
+    // new pipeline a run no pipeline matches, so Accept's deferred branch found
+    // no pipeline, returned pipeline_id null, and the client went home with no
+    // activation card — repeatable forever, since every retry resumed the same
+    // orphan.
     const existingApproved = getDb()
       .prepare(
         `SELECT run_id FROM runs
          WHERE source_relation = ? AND source_column = ? AND run_status = 'approved'
+           AND (domain_id = ? OR (? IS NULL AND domain_id IS NULL))
          ORDER BY run_id DESC LIMIT 1`,
       )
-      .get(pipeline.table_fqn, pipeline.column_name) as { run_id?: number } | undefined;
+      .get(pipeline.table_fqn, pipeline.column_name, pipeline.domain_id ?? null, pipeline.domain_id ?? null) as { run_id?: number } | undefined;
     if (existingApproved?.run_id) {
       console.log(
         `[InitialRun] Pipeline ${pid}: resuming already-approved run ${existingApproved.run_id} ` +

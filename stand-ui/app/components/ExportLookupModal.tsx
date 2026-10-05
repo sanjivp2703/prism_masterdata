@@ -19,6 +19,10 @@ export interface ExportLookupModalProps {
   /** Spec context: pre-selected column spec (skip column picker). */
   domainId?: number;
   domainName?: string;
+  /** The pipeline's source table (DB.SCHEMA.TABLE). Native edition only uses
+   *  it to default the destination next to the source — there is no PRISM_DB
+   *  inside a Native App. */
+  tableFqn?: string | null;
   onClose: () => void;
 }
 
@@ -66,7 +70,7 @@ function triggerDownload(blob: Blob, filename: string) {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function ExportLookupModal({ columns, domainId: propDomainId, domainName: propDomainName, onClose }: ExportLookupModalProps) {
+export default function ExportLookupModal({ columns, domainId: propDomainId, domainName: propDomainName, tableFqn, onClose }: ExportLookupModalProps) {
   // If pipeline context with multiple columns, let user pick
   const needsColumnPick = !!(columns && columns.length > 1 && propDomainId == null);
   const [selectedColIdx, setSelectedColIdx] = useState(0);
@@ -109,9 +113,17 @@ export default function ExportLookupModal({ columns, domainId: propDomainId, dom
   // Mirrors the server's defaultFqn EXACTLY (see the export route),
   // including the no-column-name fallback: the server creates
   // PRISM_DB.<schema>.GLOBAL_CANONICAL_MAPPINGS when it has no column name.
-  const defaultSfTable = resolvedDomainName
-    ? `PRISM_DB.${defaultSchema}.${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
-    : `PRISM_DB.${defaultSchema}.GLOBAL_CANONICAL_MAPPINGS`;
+  const lookupName = resolvedDomainName
+    ? `${resolvedDomainName.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_LOOKUP`
+    : 'GLOBAL_CANONICAL_MAPPINGS';
+  // Native: PRISM_DB does not exist inside a Native App (the app IS the
+  // database), so a PRISM_DB default could only ever fail (live-found
+  // 2026-10-04, finding #11). Default next to the source table instead —
+  // the schema the app already holds CREATE TABLE on via the grant block.
+  const sourceParts = String(tableFqn ?? '').trim().split('.');
+  const defaultSfTable = isNativeEdition() && sourceParts.length === 3
+    ? `${sourceParts[0]}.${sourceParts[1]}.${lookupName}`
+    : `PRISM_DB.${defaultSchema}.${lookupName}`;
 
   // Prefill, and keep following the default until the user takes over.
   useEffect(() => {

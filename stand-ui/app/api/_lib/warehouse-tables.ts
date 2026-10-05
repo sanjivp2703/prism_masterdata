@@ -9,9 +9,10 @@
 // NATIVE (Marketplace) edition: inside a Native App the database is the
 // APPLICATION itself (whatever the consumer named it) and the schemas are
 // setup.sql's `internal_state` (data) + `app_code` (UDF). PRISM_INTERNAL_DB
-// carries the app database name into the container (service spec / resolved
-// at boot); when unset, references stay database-relative — correct for all
-// in-session SQL, and view bodies must resolve the app name explicitly.
+// (operator override) or the platform-injected SNOWFLAKE_DATABASE carries the
+// app database name; references are then fully qualified, which view bodies
+// REQUIRE (see nativeDbPrefix). Only when both are unset do references stay
+// database-relative.
 import 'server-only';
 
 import { getWarehouseAdapter } from './warehouse';
@@ -27,9 +28,19 @@ type InternalTable =
   | 'RUN_STATE'
   | 'VALIDATION_LOG';
 
-/** The app database prefix in native mode ('"MY_PRISM".' or '' when relative). */
+/** The app database prefix in native mode ('"MY_PRISM".' or '' when relative).
+ *
+ *  SPCS injects SNOWFLAKE_DATABASE = the application's name into the container
+ *  (native-access.ts relies on it too), so references are fully qualified by
+ *  default. Nothing ever set PRISM_INTERNAL_DB, which left EVERY native
+ *  reference database-relative — fine for CREATE TABLE AS SELECT (runs in the
+ *  app session), fatal for CREATE VIEW: Snowflake resolves a stored view
+ *  body's unqualified names against the VIEW's schema, so the first View
+ *  pipeline on the client-test install failed with "Schema
+ *  'DEMO_DATA.INTERNAL_STATE' does not exist" (finding #3, 2026-10-03). Same
+ *  trap as KI-149 for PRISM_NORMALIZE. */
 function nativeDbPrefix(): string {
-  const db = getOptionalEnv('PRISM_INTERNAL_DB');
+  const db = getOptionalEnv('PRISM_INTERNAL_DB') ?? getOptionalEnv('SNOWFLAKE_DATABASE');
   return db ? `"${db.replace(/"/g, '""')}".` : '';
 }
 
