@@ -158,6 +158,35 @@ server match sites must use `compileSafeRegex`, and `safe-regex.ts` must never c
 
 ---
 
+## NULL and Blank Source Values
+
+A NULL cell is "standardized as-is": it is not a source value, never queued, and
+exports unchanged. Since 2026-09-14 a **blank** cell — anything `normalizeLiteral`
+reduces to `''` (empty string, whitespace-only, control-characters-only) — gets
+exactly the same treatment, on every path and every warehouse:
+
+- source counts (`total_source_values`), the baseline scan, the stream
+  classify + queue MERGE, and the reconciliation sweep all filter with
+  `notBlankSql` (Snowflake, runs the UDF) or the dialects' `notBlankPredicate`
+  instead of a bare `col IS NOT NULL`;
+- the mapped-only export keeps a blank row the way it keeps a NULL row
+  (`isBlankSql` in the WHERE);
+- the queue drain (`fetchQueueLiteralsWithFreq`) purges any blank row it finds.
+
+Why this matters: `''` IS NOT NULL on every warehouse, so the SQL side counted a
+blank cell as a source value while every app-side path dropped it
+(`filter(Boolean)`, `if (!val)`, the alias-name filter — no alias name can be
+blank). The cell showed as "Unstandardized: 1" on the card with no path that
+could ever write it to the lookup, and both standardize buttons were silent
+no-ops. Found on the first client-test install.
+
+Related: "Update Standardizations" (process-queue) and manual review
+(standardize-run) now run `reconcilePipelineQueue` first when the queue is
+empty. The stat is source-minus-lookup; the queue is only what detection
+captured; a value the baseline review left unmapped, or one the stream missed,
+is invisible to the queue until the top-of-hour sweep — an explicit click may
+pay for that one-off source scan, and the client always reports the outcome.
+
 ## Reconciliation Sweep & Baseline Cap
 
 - Baseline scans cap at `LIMIT 5000` distinct values. The tail beyond the cap (and gap rows) is recovered by `reconcilePipelineQueue` / `runReconciliationSweep`: a set-based MERGE that queues unmapped distinct source values not already queued, up to `RECONCILE_QUEUE_BATCH = 5000` per pass. Runs at the start of each top-of-hour tick.

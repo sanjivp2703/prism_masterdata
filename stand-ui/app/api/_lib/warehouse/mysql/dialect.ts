@@ -29,6 +29,21 @@ export interface MysqlFqn { db: string; table: string }
 /** Parse `database.table` (MySQL has no schema level; names with literal dots
  *  are not supported on any warehouse). A 3-part form is rejected loudly —
  *  it means a Snowflake/mssql-shaped FQN reached a MySQL path unconverted. */
+
+/** SQL predicate for "this cell holds a standardizable value": not NULL and
+ *  not blank. The app-side twin is `isBlankLiteral` (normalize.ts); with no
+ *  SQL-side normalize on this warehouse the predicate trims ordinary
+ *  whitespace only — exotic control-only values are still dropped app-side by
+ *  `normalizeLiteral`, so they can at most be over-counted, never stuck. */
+export function notBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NOT NULL AND TRIM(${colRef}) <> '')`;
+}
+
+/** Negation of `notBlankPredicate`: NULL or blank — passes through as-is. */
+export function isBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NULL OR TRIM(${colRef}) = '')`;
+}
+
 export function parseFqn(fqn: string): MysqlFqn {
   const parts = String(fqn).split('.').map((p) => p.trim());
   if (parts.length === 2 && parts.every(Boolean)) {

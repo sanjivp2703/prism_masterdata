@@ -56,6 +56,24 @@ export function prismNormalizeFn(): string {
   return `PRISM_DB.INTERNAL.PRISM_NORMALIZE`;
 }
 
+/** SQL predicate: the column holds a value Prism can standardize — not NULL
+ *  and not BLANK (normalizes to '': empty, whitespace-only, control-only).
+ *  The SQL twin of `isBlankLiteral` (normalize.ts); Snowflake-family only, it
+ *  runs the UDF so SQL and app agree EXACTLY on what "blank" means. Every
+ *  source-side filter that used to read `col IS NOT NULL` goes through here —
+ *  '' is NOT NULL on every warehouse, which is how a blank cell became a
+ *  permanently "Unstandardized" value no path could ever standardize
+ *  (2026-09-14). */
+export function notBlankSql(colExpr: string): string {
+  return `(${colExpr} IS NOT NULL AND ${prismNormalizeFn()}(TO_VARCHAR(${colExpr})) <> '')`;
+}
+
+/** Negation of `notBlankSql` — NULL or blank: passes through the export
+ *  as-is, is never counted, queued, or standardized. */
+export function isBlankSql(colExpr: string): string {
+  return `(${colExpr} IS NULL OR ${prismNormalizeFn()}(TO_VARCHAR(${colExpr})) = '')`;
+}
+
 /** Generic internal-schema OBJECT reference for streams, staging/scratch
  *  tables, and the debug inspector — anything that isn't one of the 7 typed
  *  internal tables. The name is appended VERBATIM after the schema prefix

@@ -34,7 +34,8 @@ import { pausePipelineWithMessage, NOT_BLOCKED_SQL } from './pipeline-alerts';
 import { reconcileMssqlQueue } from './pipeline-poller-mssql';
 import { reconcilePgQueue } from './pipeline-poller-postgres';
 import { reconcileMysqlQueue } from './pipeline-poller-mysql';
-import { internalTable, prismNormalizeFn } from './warehouse-tables';
+import { internalTable, prismNormalizeFn, notBlankSql } from './warehouse-tables';
+import { isBlankLiteral } from './normalize';
 import { getAnthropicApiKey } from './anthropic-key';
 import { parseStoredSchedule, isScheduleActiveNow } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
@@ -425,7 +426,7 @@ export async function reconcilePipelineQueue(
         LEFT JOIN ${internalTable('LITERAL_ALIAS_MATCHES')} lam
           ON lam.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
           ${domainCond}
-        WHERE src.${colRef} IS NOT NULL
+        WHERE ${notBlankSql(`src.${colRef}`)}
           AND lam.literal_value IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM ${internalTable('PIPELINE_QUEUE')} q
@@ -543,7 +544,7 @@ export async function fetchQueueLiterals(
          ORDER BY detected_at NULLS LAST, literal_value`,
     [pipelineId],
   );
-  return rows.map((r) => String(r.LITERAL_VALUE ?? r.literal_value ?? '')).filter(Boolean);
+  return rows.map((r) => String(r.LITERAL_VALUE ?? r.literal_value ?? '')).filter((lv) => !isBlankLiteral(lv));
 }
 
 /** Fetch queued literals with their accumulated source row counts. */
@@ -577,12 +578,34 @@ export async function fetchQueueLiteralsWithFreq(
          LIMIT 5000`,
     [pipelineId],
   );
-  return rows
-    .map((r) => ({
-      literal_value:    String(r.LITERAL_VALUE    ?? r.literal_value    ?? ''),
-      source_frequency: Number(r.SOURCE_FREQUENCY ?? r.source_frequency ?? 1),
-    }))
-    .filter((r) => r.literal_value);
+  const all = rows.map((r) => ({
+    literal_value:    String(r.LITERAL_VALUE    ?? r.literal_value    ?? ''),
+    source_frequency: Number(r.SOURCE_FREQUENCY ?? r.source_frequency ?? 1),
+  }));
+
+  // Blank values (normalize to '') can never be standardized — no alias name
+  // can be blank, so an export would silently skip them and the queue-removal
+  // step (which also drops blanks) would leave them queued FOREVER: queue_size
+  // stuck at 1, fully_synced_at frozen, every tick re-standardizing nothing.
+  // Every writer now refuses to queue them (notBlankSql / the diff scans'
+  // normalize check), but rows queued before that fix — and any value that
+  // normalizes to '' through a path we haven't thought of — are purged here, on
+  // the drain, by exact literal so this is warehouse-neutral.
+  const blanks = all.filter((r) => isBlankLiteral(r.literal_value));
+  if (blanks.length > 0) {
+    const DEL_BATCH = Math.max(50, getWarehouseAdapter().bindLimit - 100);
+    for (let i = 0; i < blanks.length; i += DEL_BATCH) {
+      const batch = blanks.slice(i, i + DEL_BATCH).map((r) => r.literal_value);
+      await exec(
+        connection,
+        `DELETE FROM ${internalTable('PIPELINE_QUEUE')}
+         WHERE pipeline_id = ? AND literal_value IN (${batch.map(() => '?').join(', ')})`,
+        [pipelineId, ...batch],
+      );
+    }
+    console.log(`[Queue] Pipeline ${pipelineId}: purged ${blanks.length} blank value(s) from the queue — blanks pass through as-is and are never standardized`);
+  }
+  return all.filter((r) => !isBlankLiteral(r.literal_value));
 }
 
 function buildInitialQueueRunState(

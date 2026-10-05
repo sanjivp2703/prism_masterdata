@@ -16,6 +16,21 @@ export function quoteIdent(ident: string): string {
 
 /** Parse DB.SCHEMA.TABLE (same three-part shape as the Snowflake side; names
  *  containing literal dots are not supported on either warehouse). */
+
+/** SQL predicate for "this cell holds a standardizable value": not NULL and
+ *  not blank. The app-side twin is `isBlankLiteral` (normalize.ts); with no
+ *  SQL-side normalize on this warehouse the predicate trims ordinary
+ *  whitespace only — exotic control-only values are still dropped app-side by
+ *  `normalizeLiteral`, so they can at most be over-counted, never stuck. */
+export function notBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NOT NULL AND LTRIM(RTRIM(${colRef})) <> '')`;
+}
+
+/** Negation of `notBlankPredicate`: NULL or blank — passes through as-is. */
+export function isBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NULL OR LTRIM(RTRIM(${colRef})) = '')`;
+}
+
 export function parseFqn(fqn: string): { db: string; schema: string; table: string } {
   const parts = String(fqn).split('.').map(p => p.trim());
   if (parts.length !== 3 || parts.some(p => !p)) {

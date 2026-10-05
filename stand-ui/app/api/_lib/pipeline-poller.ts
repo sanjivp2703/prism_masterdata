@@ -25,7 +25,7 @@ import { reconcilePipelineQueue } from './pipeline-hourly-processor';
 import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 import { sqlStringLiteral } from './normalize';
-import { internalObject, internalSchemaFqn, internalTable, prismNormalizeFn } from './warehouse-tables';
+import { internalObject, internalSchemaFqn, internalTable, prismNormalizeFn, notBlankSql, isBlankSql } from './warehouse-tables';
 import { parseStoredSchedule, isScheduleActiveNow, type UpdateSchedule } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
 import {
@@ -916,7 +916,7 @@ export async function pollOnePipeline(
             ON lam.normalized_value = ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))
             ${domainJoinCond}
           WHERE s.METADATA$ACTION = 'INSERT'
-            AND TO_VARCHAR(s.${colRef}) IS NOT NULL
+            AND ${notBlankSql(`s.${colRef}`)}
           GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))`);
 
         // Step 1b: Detect removals in the SAME snapshot.  DELETE rows cover both
@@ -927,18 +927,19 @@ export async function pollOnePipeline(
           `SELECT COUNT(*) AS del_cnt FROM ${streamRef} s WHERE s.METADATA$ACTION = 'DELETE'`);
         hasDeletes = Number((delRow as any)?.DEL_CNT ?? (delRow as any)?.del_cnt ?? 0) > 0; // hoisted
 
-        // Step 1c: Detect new rows with a NULL in this column. They're excluded
-        // from the classify above (which requires a non-null value), but a NULL is
-        // "standardized as-is" — it exports as NULL — so it still needs the export
-        // rebuilt to appear. Covers the single-column case where no sibling column
-        // triggers a rebuild. Must run before COMMIT consumes the stream.
+        // Step 1c: Detect new rows with a NULL or BLANK in this column. They're
+        // excluded from the classify above (which requires a standardizable
+        // value), but NULL/blank is "standardized as-is" — it exports unchanged —
+        // so the row still needs the export rebuilt to appear. Covers the
+        // single-column case where no sibling column triggers a rebuild. Must run
+        // before COMMIT consumes the stream.
         const [nullRow] = await exec(connection,
           `SELECT COUNT(*) AS null_cnt FROM ${streamRef} s
-           WHERE s.METADATA$ACTION = 'INSERT' AND TO_VARCHAR(s.${colRef}) IS NULL`);
+           WHERE s.METADATA$ACTION = 'INSERT' AND ${isBlankSql(`s.${colRef}`)}`);
         const nullCnt = Number((nullRow as any)?.NULL_CNT ?? (nullRow as any)?.null_cnt ?? 0);
         hasNullInserts = nullCnt > 0; // hoisted
         if (hasNullInserts) {
-          console.log(`[Poller] Pipeline ${pid}: ${nullCnt} new row(s) with NULL "${column_name}" — will rebuild export to include them as-is`);
+          console.log(`[Poller] Pipeline ${pid}: ${nullCnt} new row(s) with NULL/blank "${column_name}" — will rebuild export to include them as-is`);
         }
 
         // Step 2: Consuming MERGE — push ALL new values into PIPELINE_QUEUE
@@ -962,7 +963,7 @@ export async function pollOnePipeline(
               COUNT(*)                           AS new_row_count
             FROM ${streamRef} s
             WHERE s.METADATA$ACTION = 'INSERT'
-              AND TO_VARCHAR(s.${colRef}) IS NOT NULL
+              AND ${notBlankSql(`s.${colRef}`)}
             GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(s.${colRef}))
           ) AS src
             ON tgt.pipeline_id = ${pid} AND ${prismNormalizeFn()}(tgt.literal_value) = ${prismNormalizeFn()}(src.literal_value)
@@ -999,8 +1000,12 @@ export async function pollOnePipeline(
         [pid]);
       const queueAfter = Number(postMergeRow?.CNT ?? postMergeRow?.cnt ?? 0);
 
+      // NULL and blank cells are not source VALUES — they pass through the
+      // export as-is and must not inflate the card's "Unstandardized" count
+      // (source minus lookup), which is what made a blank cell look like a
+      // value that could never be standardized (2026-09-14).
       const [srcRow] = await exec(connection,
-        `SELECT COUNT(*) AS cnt FROM ${srcRef} WHERE ${colRef} IS NOT NULL`);
+        `SELECT COUNT(*) AS cnt FROM ${srcRef} WHERE ${notBlankSql(colRef)}`);
       const totalSourceValues = Number(srcRow?.CNT ?? srcRow?.cnt ?? 0);
 
       // The poller never standardizes inline — queued values (mapped or not)

@@ -35,6 +35,21 @@ export interface PgFqn {
  * callers that know the connected DB must follow up with
  * `assertFqnInDatabase`.
  */
+
+/** SQL predicate for "this cell holds a standardizable value": not NULL and
+ *  not blank. The app-side twin is `isBlankLiteral` (normalize.ts); with no
+ *  SQL-side normalize on this warehouse the predicate trims ordinary
+ *  whitespace only — exotic control-only values are still dropped app-side by
+ *  `normalizeLiteral`, so they can at most be over-counted, never stuck. */
+export function notBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NOT NULL AND BTRIM(${colRef}::text, E' \\t\\n\\r') <> '')`;
+}
+
+/** Negation of `notBlankPredicate`: NULL or blank — passes through as-is. */
+export function isBlankPredicate(colRef: string): string {
+  return `(${colRef} IS NULL OR BTRIM(${colRef}::text, E' \\t\\n\\r') = '')`;
+}
+
 export function parseFqn(fqn: string): PgFqn {
   const parts = String(fqn).split('.').map((p) => p.trim());
   if (parts.length === 2 && parts.every(Boolean)) {

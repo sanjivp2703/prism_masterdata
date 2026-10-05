@@ -22,7 +22,7 @@ import { standardizedColumnName, assertCompanionColumnSafe } from '../../export-
 import { executeQuery as exec, getServiceLoginName } from './connection';
 import { flagPipelineMessage } from '../../pipeline-alerts';
 import { ColumnModeAccessError } from '../types';
-import { quoteIdent, parseFqn } from './dialect';
+import { quoteIdent, parseFqn, isBlankPredicate } from './dialect';
 import { getPrimaryKeyColumns } from './detection';
 
 const BIN2 = 'Latin1_General_100_BIN2';
@@ -222,16 +222,19 @@ export async function refreshExportTableMssql(
       const stg = `stg_${i}`;
       // COALESCE arms forced to one collation (staging is BIN2; source
       // columns carry arbitrary collations — conflict otherwise).
-      const colSql = includeUnmapped
-        ? `COALESCE(${stg}.alias_name COLLATE DATABASE_DEFAULT, src.${colRef} COLLATE DATABASE_DEFAULT) AS ${colRef}`
-        : `${stg}.alias_name AS ${colRef}`;
+      // COALESCE in BOTH modes (2026-10-04): mapped-only rows are already
+      // blank-or-mapped via the WHERE below, so the fallback only fires for a
+      // blank cell, which must export as its own blank — not NULL.
+      const colSql = `COALESCE(${stg}.alias_name COLLATE DATABASE_DEFAULT, src.${colRef} COLLATE DATABASE_DEFAULT) AS ${colRef}`;
       replaceMap.set(w.columnName.toUpperCase(), colSql);
       joinClauses.push(
         `LEFT JOIN ${stgRef} ${stg}
           ON src.${colRef} COLLATE ${BIN2} = ${stg}.raw_value`,
       );
+      // NULL/blank passes through as-is (blank = trims to '' — '' IS NOT NULL,
+      // so a plain IS NULL test dropped blank rows from mapped-only exports).
       if (!includeUnmapped) {
-        whereConds.push(`(src.${colRef} IS NULL OR ${stg}.raw_value IS NOT NULL)`);
+        whereConds.push(`(${isBlankPredicate(`src.${colRef}`)} OR ${stg}.raw_value IS NOT NULL)`);
       }
     }
 
@@ -861,9 +864,12 @@ export async function computeMappedCountsMssql(
   let totalSource = 0;
   for (const r of rows) {
     const freq = Number(r.freq ?? 0);
-    totalSource += freq;
     const norm = normalizeLiteral(String(r.v));
+    // Blank (normalizes to '') is not a source VALUE: it passes through the
+    // export as-is and must not count toward "Unstandardized" (source minus
+    // lookup) — it can never be in the lookup (2026-09-14).
     if (!norm) continue;
+    totalSource += freq;
     freqByNorm.set(norm, (freqByNorm.get(norm) ?? 0) + freq);
   }
 

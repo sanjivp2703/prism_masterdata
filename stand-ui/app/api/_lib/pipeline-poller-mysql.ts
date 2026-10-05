@@ -28,7 +28,7 @@ import {
   classifyMysqlPollError,
 } from './warehouse/mysql/detection';
 import { myTableRef } from './warehouse/mysql/detection';
-import { quoteIdent } from './warehouse/mysql/dialect';
+import { quoteIdent, notBlankPredicate } from './warehouse/mysql/dialect';
 import { pausePipelineWithMessage, clearPipelineStatusMessage, broadcastGlobalAlert } from './pipeline-alerts';
 import { isPipelineStandardizing } from './pipeline-coordination';
 
@@ -115,7 +115,7 @@ async function updateSourceValueCount(conn: any, pipelineId: number, tableFqn: s
   const { ref } = myTableRef(tableFqn);
   const rows = await exec(
     conn,
-    `SELECT COUNT(*) AS cnt FROM ${ref} WHERE ${quoteIdent(columnName)} IS NOT NULL`,
+    `SELECT COUNT(*) AS cnt FROM ${ref} WHERE ${notBlankPredicate(quoteIdent(columnName))}`,
   );
   const cnt = Number(rows[0]?.cnt ?? 0);
   getDb().prepare(`UPDATE pipelines SET total_source_values = ? WHERE pipeline_id = ?`).run(cnt, pipelineId);

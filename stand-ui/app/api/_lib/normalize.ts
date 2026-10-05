@@ -27,6 +27,23 @@ export function normalizeLiteral(value: string | null | undefined): string {
 }
 
 /**
+ * A source value Prism treats like NULL: nothing to standardize. True for NULL,
+ * '' and anything that normalizes to '' (whitespace-only, control-char-only).
+ *
+ * Why this exists (live-found 2026-09-14 on the first client-test install):
+ * every SQL path counted such a value as a source value (`col IS NOT NULL` —
+ * '' is NOT NULL on every warehouse), while every app-side path dropped it
+ * (`filter(Boolean)`, `if (!val)`, the alias-name filter). The value therefore
+ * sat in the "Unstandardized" stat forever with no path that could ever write
+ * it to the lookup, and both standardize buttons were no-ops. The SQL
+ * predicates (`notBlankSql` / the dialects' `notBlankPredicate`) and this
+ * helper are the ONE definition of "blank"; keep them in agreement.
+ */
+export function isBlankLiteral(value: string | null | undefined): boolean {
+  return normalizeLiteral(value) === '';
+}
+
+/**
  * Escape a string for safe interpolation inside a single-quoted Snowflake SQL
  * string literal (e.g. `column_data['<here>']`). Escapes backslashes FIRST,
  * then single quotes — escaping quotes alone is bypassable via a trailing

@@ -23,12 +23,14 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { broadcastPipelineEvent } from '@/app/api/_lib/pipeline-broadcaster';
 import { PIPELINE_BLOCK_REASONS } from '@/app/api/_lib/pipeline-alerts';
-import { internalObject, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
+import { internalObject, prismNormalizeFn, notBlankSql } from '@/app/api/_lib/warehouse-tables';
+import { isBlankLiteral } from '@/app/api/_lib/normalize';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import {
   fetchPipelineById,
   fetchQueueLiteralsWithFreq,
   bulkProcessPipelineQueue,
+  reconcilePipelineQueue,
   type PipelineForProcessing,
 } from '@/app/api/_lib/pipeline-hourly-processor';
 
@@ -54,11 +56,13 @@ async function fetchSourceLiterals(
   const rows = await exec(conn, `
     SELECT ANY_VALUE(${colRef}) AS val
     FROM ${tableRef}
-    WHERE ${colRef} IS NOT NULL
+    WHERE ${notBlankSql(colRef)}
     GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
-  return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter(Boolean);
+  // Blank (normalizes to '') is treated like NULL — app-side twin of the SQL
+  // predicate above (isBlankLiteral).
+  return rows.map((r: any) => String(r.VAL ?? r.val ?? '')).filter((v: string) => !isBlankLiteral(v));
 }
 
 export async function POST(
@@ -117,7 +121,7 @@ export async function POST(
 
     const isInitial      = pipeline.status === 'pending_baseline';
     // ── Collect literals to process ───────────────────────────────────────────
-    const literals = await withWarehouse(async (conn) => {
+    let literals = await withWarehouse(async (conn) => {
       if (isInitial) {
         // Pre-create the stream BEFORE scanning the source table so there is
         // no gap between what the baseline scan sees and what the stream tracks.
@@ -154,6 +158,28 @@ export async function POST(
       return capped.map((r) => r.literal_value);
     });
 
+    // An empty queue does not mean nothing is unstandardized. The card's
+    // "Unstandardized" stat is source-minus-lookup, while the queue only holds
+    // what the stream/scan happened to capture — a value the baseline review
+    // left unmapped (or one the stream missed) is invisible to the queue until
+    // the top-of-hour reconciliation sweep runs. Live-found 2026-09-14: the
+    // owner saw "Unstandardized: 1" and this button did nothing at all. This
+    // is an explicit click, so the one-off source scan is allowed here (the
+    // recurring-surface cost rule applies to polls and list fetches, not to a
+    // user asking for exactly this).
+    let reconciled = 0;
+    if (!isInitial && literals.length === 0) {
+      try {
+        reconciled = await reconcilePipelineQueue(pipeline);
+      } catch (e) {
+        console.warn(`[ProcessQueue] Pipeline ${pid}: reconcile before drain failed:`, (e as Error)?.message ?? e);
+      }
+      if (reconciled > 0) {
+        literals = await withWarehouse(async (conn) =>
+          (await fetchQueueLiteralsWithFreq(conn, pid)).map((r) => r.literal_value));
+      }
+    }
+
     if (literals.length === 0) {
       // Nothing to do — for initial pipelines still advance the status.
       if (isInitial) {
@@ -169,7 +195,8 @@ export async function POST(
         ok: true,
         items_written: 0,
         literals_processed: 0,
-        message: isInitial ? 'No values found in source table.' : 'Queue is empty.',
+        message: isInitial ? 'No values found in source table.' : 'Nothing to standardize — every source value is already in the lookup.',
+        reconciled,
         sheets_sync: null,
       });
     }

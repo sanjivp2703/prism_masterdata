@@ -24,7 +24,7 @@ import { normalizeLiteral } from '../../normalize';
 import { standardizedColumnName, assertCompanionColumnSafe } from '../../export-kind';
 import { executeQuery as exec, getServiceRoleName } from './connection';
 import { ColumnModeAccessError } from '../types';
-import { quoteIdent } from './dialect';
+import { quoteIdent, isBlankPredicate } from './dialect';
 import { pgTableRef, getPrimaryKeyColumns } from './detection';
 
 // Lookup literal_value is VARCHAR(800) — longer source values can never be
@@ -282,16 +282,19 @@ export async function refreshExportTablePg(
       }
 
       const stg = `stg_${i}`;
-      const colSql = includeUnmapped
-        ? `COALESCE(${stg}.alias_name, src.${colRef}) AS ${colRef}`
-        : `${stg}.alias_name AS ${colRef}`;
+      // COALESCE in BOTH modes (2026-10-04): mapped-only rows are already
+      // blank-or-mapped via the WHERE below, so the fallback only fires for a
+      // blank cell, which must export as its own blank — not NULL.
+      const colSql = `COALESCE(${stg}.alias_name, src.${colRef}) AS ${colRef}`;
       replaceMap.set(w.columnName.toUpperCase(), colSql);
       joinClauses.push(
         `LEFT JOIN ${stgRef} ${stg}
           ON src.${colRef} COLLATE "C" = ${stg}.raw_value`,
       );
+      // NULL/blank passes through as-is (blank = trims to '' — '' IS NOT NULL,
+      // so a plain IS NULL test dropped blank rows from mapped-only exports).
       if (!includeUnmapped) {
-        whereConds.push(`(src.${colRef} IS NULL OR ${stg}.raw_value IS NOT NULL)`);
+        whereConds.push(`(${isBlankPredicate(`src.${colRef}`)} OR ${stg}.raw_value IS NOT NULL)`);
       }
     }
 
@@ -606,9 +609,12 @@ export async function computeMappedCountsPg(
   let totalSource = 0;
   for (const r of rows) {
     const freq = Number(r.freq ?? 0);
-    totalSource += freq;
     const norm = normalizeLiteral(String(r.v));
+    // Blank (normalizes to '') is not a source VALUE: it passes through the
+    // export as-is and must not count toward "Unstandardized" (source minus
+    // lookup) — it can never be in the lookup (2026-09-14).
     if (!norm) continue;
+    totalSource += freq;
     freqByNorm.set(norm, (freqByNorm.get(norm) ?? 0) + freq);
   }
 

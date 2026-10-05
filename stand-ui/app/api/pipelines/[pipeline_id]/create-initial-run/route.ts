@@ -24,7 +24,8 @@ import { requireValidSession } from '@/app/api/_lib/account-security';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
-import { internalObject, prismNormalizeFn } from '@/app/api/_lib/warehouse-tables';
+import { internalObject, prismNormalizeFn, notBlankSql } from '@/app/api/_lib/warehouse-tables';
+import { isBlankLiteral } from '@/app/api/_lib/normalize';
 import {
   fetchPipelineById,
   createRunFromQueue,
@@ -96,7 +97,7 @@ async function fetchSourceLiterals(
   const rows = await exec(conn, `
     SELECT ANY_VALUE(${colRef}) AS val, COUNT(*) AS freq
     FROM ${tableRef}
-    WHERE ${colRef} IS NOT NULL
+    WHERE ${notBlankSql(colRef)}
     GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(${colRef}))
     LIMIT 5000
   `);
@@ -104,7 +105,10 @@ async function fetchSourceLiterals(
   const frequencies = new Map<string, number>();
   for (const r of rows as any[]) {
     const val = String(r.VAL ?? r.val ?? '');
-    if (!val) continue;
+    // Blank (normalizes to '') is treated like NULL everywhere — see
+    // isBlankLiteral. The SQL above already excludes it; this is the app-side
+    // twin so the two can never disagree about what reaches the reviewer.
+    if (isBlankLiteral(val)) continue;
     literals.push(val);
     frequencies.set(val, Number(r.FREQ ?? r.freq ?? 1) || 1);
   }

@@ -17,7 +17,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalizeLiteral, sqlStringLiteral } from '../app/api/_lib/normalize';
+import { normalizeLiteral, sqlStringLiteral, isBlankLiteral } from '../app/api/_lib/normalize';
+import { notBlankPredicate as msNotBlank, isBlankPredicate as msIsBlank } from '../app/api/_lib/warehouse/mssql/dialect';
+import { notBlankPredicate as pgNotBlank, isBlankPredicate as pgIsBlank } from '../app/api/_lib/warehouse/postgres/dialect';
+import { notBlankPredicate as myNotBlank, isBlankPredicate as myIsBlank } from '../app/api/_lib/warehouse/mysql/dialect';
 import { asExportKind, standardizedColumnName, assertCompanionColumnSafe } from '../app/api/_lib/export-kind';
 import { isProbablyCatastrophicRegex } from '../app/api/_lib/convention-rules';
 import { detectHeaderRow, columnLetter } from '../app/api/_lib/table-shape';
@@ -1042,6 +1045,39 @@ console.log('\nnative reference-sql helpers:');
     cols.map(c => c.name).join(','), 'CARRIER,ID,UPPERKEYS');
   check('describeRowsToColumns normalizes types',
     cols.map(c => c.typeToken).join(','), 'TEXT,NUMBER,TEXT');
+}
+
+// ── Blank source values (2026-09-14) ─────────────────────────────────────────
+// "Blank" = normalizes to '' — treated like NULL on every path: not a source
+// value, never queued, never standardized, passes through the export as-is.
+// The app-side definition (isBlankLiteral) and each warehouse's SQL predicate
+// must agree, or a value becomes permanently "Unstandardized" with no path
+// that can ever write it (the live failure that motivated this).
+{
+  console.log('\nBlank source values (isBlankLiteral + per-warehouse SQL predicates):');
+  check('isBlankLiteral: null', isBlankLiteral(null), true);
+  check('isBlankLiteral: undefined', isBlankLiteral(undefined), true);
+  check('isBlankLiteral: empty string', isBlankLiteral(''), true);
+  check('isBlankLiteral: spaces only', isBlankLiteral('   '), true);
+  check('isBlankLiteral: tab/newline only', isBlankLiteral('\t\n'), true);
+  check('isBlankLiteral: control chars only', isBlankLiteral('\u0000\u001f\u0085'), true);
+  check('isBlankLiteral: NBSP only is blank (\\s matches it)', isBlankLiteral('\u00a0'), true);
+  check('isBlankLiteral: "n/a" is a real value', isBlankLiteral('n/a'), false);
+  check('isBlankLiteral: "0" is a real value', isBlankLiteral('0'), false);
+  check('isBlankLiteral: padded value is real', isBlankLiteral('  AT&T  '), false);
+
+  check('mssql notBlankPredicate', msNotBlank('[Carrier]'), "([Carrier] IS NOT NULL AND LTRIM(RTRIM([Carrier])) <> '')");
+  check('mssql isBlankPredicate',  msIsBlank('src.[Carrier]'), "(src.[Carrier] IS NULL OR LTRIM(RTRIM(src.[Carrier])) = '')");
+  check('postgres notBlankPredicate', pgNotBlank('"carrier"'), `("carrier" IS NOT NULL AND BTRIM("carrier"::text, E' \\t\\n\\r') <> '')`);
+  check('postgres isBlankPredicate',  pgIsBlank('src."carrier"'), `(src."carrier" IS NULL OR BTRIM(src."carrier"::text, E' \\t\\n\\r') = '')`);
+  check('mysql notBlankPredicate', myNotBlank('`carrier`'), "(`carrier` IS NOT NULL AND TRIM(`carrier`) <> '')");
+  check('mysql isBlankPredicate',  myIsBlank('src.`carrier`'), "(src.`carrier` IS NULL OR TRIM(src.`carrier`) = '')");
+  // isBlank must be the exact negation of notBlank for the same column.
+  for (const [name, nb, ib] of [['mssql', msNotBlank, msIsBlank], ['postgres', pgNotBlank, pgIsBlank], ['mysql', myNotBlank, myIsBlank]] as const) {
+    const a = nb('c'), b = ib('c');
+    check(`${name}: isBlank is the negation of notBlank`,
+      a.replace(' IS NOT NULL AND ', ' IS NULL OR ').replace(" <> '')", " = '')"), b);
+  }
 }
 
 // ── Result ───────────────────────────────────────────────────────────────────

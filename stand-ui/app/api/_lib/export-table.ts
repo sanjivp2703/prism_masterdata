@@ -66,7 +66,7 @@ import { loadOpRunState } from './op-auto-group';
 import { pipelineConnInfo, userConnPauseMessage } from './pipeline-user-connection';
 import { getDb } from './sqlite';
 import { sqlStringLiteral, normalizeLiteral } from './normalize';
-import { internalTable, prismNormalizeFn } from './warehouse-tables';
+import { internalTable, prismNormalizeFn, notBlankSql, isBlankSql } from './warehouse-tables';
 import { type ExportKind, standardizedColumnName, assertCompanionColumnSafe } from './export-kind';
 import { pausePipelineWithMessage } from './pipeline-alerts';
 import { isNativeEdition } from './edition';
@@ -419,13 +419,16 @@ async function doRefreshExportTable(
     // ── Build SELECT list and JOIN clauses ─────────────────────────────────
     // Each watched column LEFT JOINs to its own LITERAL_ALIAS_MATCHES /
     // APPROVED_ALIAS_NAMES alias pair so different columns can use different
-    // domains. A NULL value in a watched column is "standardized as-is": it
-    // exports as NULL and never blocks its row. Differences by includeUnmapped:
-    //   • FALSE — a row appears only when every watched column is NULL or mapped
-    //     (a non-null UNMAPPED value excludes the row, via the WHERE below). NULLs
-    //     pass through as NULL; mapped values export the canonical name.
-    //   • TRUE  — every source row appears; unmapped non-null values COALESCE to
-    //     the raw value, NULLs stay NULL, mapped values export the canonical name.
+    // domains. A NULL or BLANK value in a watched column is "standardized
+    // as-is": it exports unchanged and never blocks its row (blank = normalizes
+    // to '' — see isBlankSql; '' is NOT NULL on Snowflake, so a plain IS NULL
+    // test used to drop blank rows from mapped-only exports). Differences by
+    // includeUnmapped:
+    //   • FALSE — a row appears only when every watched column is NULL/blank or
+    //     mapped (an UNMAPPED value excludes the row, via the WHERE below).
+    //     NULLs/blanks pass through; mapped values export the canonical name.
+    //   • TRUE  — every source row appears; unmapped values COALESCE to the raw
+    //     value, NULLs stay NULL, mapped values export the canonical name.
     //   TRUE requires the pipeline's export_unmapped_rows setting (any schedule).
     const aliasFor = (i: number) => ({ lam: `lam_${i}`, aan: `aan_${i}` });
 
@@ -439,9 +442,12 @@ async function doRefreshExportTable(
         ? `AND ${lam}.domain_id = ${Number(w.domainId)}`
         : `AND ${lam}.domain_id IS NULL`;
 
-      const colSql = includeUnmapped
-        ? `COALESCE(${aan}.alias_name, TO_VARCHAR(src.${quoteIdent(w.columnName)})) AS ${quoteIdent(w.columnName)}`
-        : `${aan}.alias_name AS ${quoteIdent(w.columnName)}`;
+      // COALESCE in BOTH modes (2026-10-04, finding #5): the mapped-only WHERE
+      // below already restricts rows to blank-or-mapped, so the fallback only
+      // ever fires for a BLANK cell — and must return that blank verbatim.
+      // The old bare `alias_name` arm exported every blank as NULL ('' → NULL),
+      // breaking the "exported as-is" promise for blanks.
+      const colSql = `COALESCE(${aan}.alias_name, TO_VARCHAR(src.${quoteIdent(w.columnName)})) AS ${quoteIdent(w.columnName)}`;
       replaceMap.set(w.columnName.toUpperCase(), colSql);
       // PRISM_NORMALIZE must be FULLY QUALIFIED here, not left to the session
       // schema. This same SELECT body is used for `CREATE VIEW`, and Snowflake
@@ -458,9 +464,9 @@ async function doRefreshExportTable(
       LEFT JOIN ${internalTable('APPROVED_ALIAS_NAMES')} ${aan}
         ON ${aan}.alias_id = ${lam}.alias_id`,
       );
-      // Exclude rows where this column has a non-null unmapped value.
+      // Exclude rows where this column has an unmapped (non-blank) value.
       if (!includeUnmapped) {
-        whereConds.push(`(src.${quoteIdent(w.columnName)} IS NULL OR ${lam}.literal_value IS NOT NULL)`);
+        whereConds.push(`(${isBlankSql(`src.${quoteIdent(w.columnName)}`)} OR ${lam}.literal_value IS NOT NULL)`);
       }
     });
 
@@ -958,7 +964,7 @@ async function refreshSnowflakeSiblingMetrics(
       `WITH src_agg AS (
          SELECT ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
          FROM ${sourceRef} src
-         WHERE src.${colRef} IS NOT NULL
+         WHERE ${notBlankSql(`src.${colRef}`)}
          GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
        )
        SELECT
@@ -1191,7 +1197,7 @@ export async function updatePipelineMappedCount(
       `WITH src_agg AS (
          SELECT ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef})) AS nv, COUNT(*) AS freq
          FROM ${tableRef} src
-         WHERE src.${colRef} IS NOT NULL
+         WHERE ${notBlankSql(`src.${colRef}`)}
          GROUP BY ${prismNormalizeFn()}(TO_VARCHAR(src.${colRef}))
        )
        SELECT

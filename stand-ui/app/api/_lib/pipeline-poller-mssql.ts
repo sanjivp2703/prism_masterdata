@@ -27,7 +27,7 @@ import {
   checkSourceHealthMssql,
   classifyMssqlPollError,
 } from './warehouse/mssql/detection';
-import { quoteIdent, parseFqn } from './warehouse/mssql/dialect';
+import { quoteIdent, parseFqn, notBlankPredicate } from './warehouse/mssql/dialect';
 import { pausePipelineWithMessage, flagPipelineMessage, clearPipelineStatusMessage, broadcastGlobalAlert } from './pipeline-alerts';
 import { isPipelineStandardizing } from './pipeline-coordination';
 
@@ -133,7 +133,7 @@ async function updateSourceValueCount(conn: any, pipelineId: number, tableFqn: s
   const { db, schema, table } = parseFqn(tableFqn);
   const rows = await exec(
     conn,
-    `SELECT COUNT(*) AS cnt FROM ${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)} WHERE ${quoteIdent(columnName)} IS NOT NULL`,
+    `SELECT COUNT(*) AS cnt FROM ${quoteIdent(db)}.${quoteIdent(schema)}.${quoteIdent(table)} WHERE ${notBlankPredicate(quoteIdent(columnName))}`,
   );
   const cnt = Number(rows[0]?.cnt ?? rows[0]?.CNT ?? 0);
   getDb().prepare(`UPDATE pipelines SET total_source_values = ? WHERE pipeline_id = ?`).run(cnt, pipelineId);

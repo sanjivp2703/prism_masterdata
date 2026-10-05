@@ -298,6 +298,8 @@ Guardrails — all refuse loudly or defer, never drop silently.
 - LLM failures degrade honestly — `'llm_failed'` / confidence `'l'` / `needs_review`, never a fabricated high-confidence group
 - Scale limits defer or refuse loudly, never drop silently
 - One-time runs (`run_type='one_time'`) never touch the shared lookup
+- NULL and **blank** source values (anything `normalizeLiteral` reduces to `''`) are never standardized: not counted as source values, never queued, exported as-is. SQL filters go through `notBlankSql`/`isBlankSql` (Snowflake) or the dialects' `notBlankPredicate`/`isBlankPredicate`, never a bare `IS NOT NULL` — `''` IS NOT NULL on every warehouse (2026-09-14)
+- "Update Standardizations" / manual review reconcile the source BEFORE draining the queue: the card's "Unstandardized" stat is source-minus-lookup, the queue is only what detection captured, and an empty queue must never turn the buttons into silent no-ops
 - New source values never *cause* an export rebuild during a poll — they wait for the tick (consistent-snapshot export). The one exception is raw passthrough (`export_unmapped_rows = true`), by owner decision 2026-08-18
 - Column-mode pipelines never create, drop or replace a table, and every write path calls `assertCompanionColumnSafe` first
 

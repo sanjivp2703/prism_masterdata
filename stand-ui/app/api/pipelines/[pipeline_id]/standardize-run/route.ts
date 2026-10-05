@@ -24,6 +24,7 @@ import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import {
   fetchPipelineById,
   fetchQueueLiteralsWithFreq,
+  reconcilePipelineQueue,
 } from '@/app/api/_lib/pipeline-hourly-processor';
 import { createRunFromQueue } from '@/app/api/_lib/pipeline-hourly-processor';
 import { runAutoGroupForRun } from '@/app/api/_lib/op-auto-group-run';
@@ -54,10 +55,28 @@ export async function POST(
       return Response.json({ error: `Pipeline ${pid} not found` }, { status: 404 });
     }
 
-    const runId = await withWarehouse(async (conn) => {
-      const queued = await fetchQueueLiteralsWithFreq(conn, pid);
-      if (queued.length === 0) return null;
+    // Same reconcile-first rule as process-queue: an empty queue is not proof
+    // that nothing is unstandardized. A value the baseline review left
+    // unmapped, or one the stream missed, shows in the card's "Unstandardized"
+    // stat (source minus lookup) but never reaches the queue until the
+    // top-of-hour sweep — so this button silently did nothing (2026-09-14).
+    // An explicit click may pay for the one-off source scan.
+    let queuedNow = await withWarehouse((conn) => fetchQueueLiteralsWithFreq(conn, pid));
+    if (queuedNow.length === 0 && pipeline.status !== 'pending_baseline') {
+      let reconciled = 0;
+      try {
+        reconciled = await reconcilePipelineQueue(pipeline);
+      } catch (e) {
+        console.warn(`[StandardizeRun] Pipeline ${pid}: reconcile before review failed:`, (e as Error)?.message ?? e);
+      }
+      if (reconciled > 0) queuedNow = await withWarehouse((conn) => fetchQueueLiteralsWithFreq(conn, pid));
+    }
+    if (queuedNow.length === 0) {
+      return Response.json({ run_id: null, message: 'Nothing to standardize — every source value is already in the lookup.' });
+    }
 
+    const runId = await withWarehouse(async (conn) => {
+      const queued = queuedNow;
       const literals    = queued.map(q => q.literal_value);
       const frequencies = new Map(queued.map(q => [q.literal_value, q.source_frequency]));
 
