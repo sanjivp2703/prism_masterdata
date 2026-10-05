@@ -5,8 +5,7 @@
  * Returns the row count written so the caller can confirm it worked.
  */
 
-import { cookies } from 'next/headers';
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { refreshExportTable } from '@/app/api/_lib/export-table';

@@ -5,8 +5,7 @@
  * so the review page can hydrate from a session id alone (survives refresh).
  */
 
-import { cookies } from 'next/headers';
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { loadOpRunStatesBatch } from '@/app/api/_lib/op-auto-group';
 import { getDb } from '@/app/api/_lib/sqlite';

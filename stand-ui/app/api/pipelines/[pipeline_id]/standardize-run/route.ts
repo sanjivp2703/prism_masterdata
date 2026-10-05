@@ -18,7 +18,6 @@
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse } from '@/app/api/_lib/warehouse';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import {

@@ -28,8 +28,7 @@ rsync -az --delete \
   --exclude 'stand-ui/scripts/_tmp*' \
   --exclude 'rsa_key.p8' \
   --exclude 'rsa_key.pub' \
-  --exclude 'Prism_E2E*' \
-  --exclude 'ops07b_test_sheet.csv' \
+  --exclude 'docs/internal' \
   "${REPO_ROOT}/" "root@${SERVER}:/home/prism/app/"
 
 echo "==> Installing deps + building (this is the slow part)"

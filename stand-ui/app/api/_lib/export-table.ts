@@ -62,10 +62,8 @@ import { myTableRef } from './warehouse/mysql/detection';
 const pgRefOf = (fqn: string): string => pgTableRef(fqn).ref;
 import { quoteIdent as msQuoteIdent, parseFqn as msParseFqn } from './warehouse/mssql/dialect';
 import { getServiceLoginName } from './warehouse/mssql/connection';
-import { loadOpRunState } from './op-auto-group';
 import { pipelineConnInfo, userConnPauseMessage } from './pipeline-user-connection';
 import { getDb } from './sqlite';
-import { sqlStringLiteral, normalizeLiteral } from './normalize';
 import { internalTable, prismNormalizeFn, notBlankSql, isBlankSql } from './warehouse-tables';
 import { type ExportKind, standardizedColumnName, assertCompanionColumnSafe } from './export-kind';
 import { pausePipelineWithMessage } from './pipeline-alerts';
@@ -1053,7 +1051,7 @@ async function refreshStandardizedColumnsSnowflake(
 
   // GUARDRAIL — every identifier this function will ALTER/UPDATE must be a
   // companion of a watched column and must not be a watched raw column.
-  // Throws before ANY SQL runs; do not remove (see docs/PRELAUNCH_CHECKLIST.md).
+  // Throws before ANY SQL runs; do not remove (see docs/internal/PRELAUNCH_CHECKLIST.md).
   const watchedRawNames = watched.map(w => w.columnName);
   for (const w of watched) {
     assertCompanionColumnSafe(standardizedColumnName(w.columnName), watchedRawNames);

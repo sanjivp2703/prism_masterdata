@@ -347,7 +347,7 @@ export function isProbablyCatastrophicRegex(src: string): boolean {
       const frame = stack.pop();
       if (!frame) continue;                            // unbalanced — compile check catches it
       // Is this group itself quantified?
-      let j = i + 1;
+      const j = i + 1;
       if (j < src.length && isQuantAt(j)) {
         // Quantified group whose body also quantifies, or offers overlapping
         // alternatives — the two classic exponential shapes.

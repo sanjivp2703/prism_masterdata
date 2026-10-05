@@ -21,8 +21,8 @@
  *
  * Deliberately a separate module from `op-file-pipeline.ts`: that one is the
  * pipeline-side file machinery (polling, output-tab sync, per-column pipeline
- * metrics) and is being retired. Sharing a module would have coupled the code
- * that stays to the code that goes.
+ * metrics), which has since been removed. Sharing a module would have coupled
+ * the code that stayed to the code that went.
  */
 
 import 'server-only';

@@ -17,7 +17,7 @@
 import 'server-only';
 import { requireAdminSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
-import { encryptSecret, decryptSecret } from '@/app/api/_lib/crypto';
+import { encryptSecret } from '@/app/api/_lib/crypto';
 import { getWarehouseAdapter, invalidateWarehouseTypeCache } from '@/app/api/_lib/warehouse';
 import {
   withAdHocMssql,

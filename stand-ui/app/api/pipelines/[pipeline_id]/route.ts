@@ -3,8 +3,7 @@
  * DELETE /api/pipelines/[pipeline_id]  — remove pipeline
  */
 
-import { cookies } from 'next/headers';
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { canViewerSeePipeline } from '@/app/api/_lib/native-visibility';
 import { getDb } from '@/app/api/_lib/sqlite';

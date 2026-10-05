@@ -3,7 +3,6 @@
  * POST /api/pipelines  — create or upsert a pipeline (+ its per-column spec)
  */
 
-import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { getDb } from '@/app/api/_lib/sqlite';
@@ -29,19 +28,6 @@ import { asExportKind } from '@/app/api/_lib/export-kind';
 import { isNativeEdition } from '@/app/api/_lib/edition';
 import { probeNativeSourceAccess } from '@/app/api/_lib/native-access';
 import { filterPipelineRowsForViewer } from '@/app/api/_lib/native-visibility';
-
-function parseMeta(v: any): Record<string, any> {
-  if (typeof v === 'object' && v !== null) return v as Record<string, any>;
-  try { return JSON.parse(String(v)); } catch { return {}; }
-}
-
-/** parseMeta, but preserves a genuine absence as null instead of {} — callers
- *  distinguish "no file meta" (a warehouse pipeline) from "empty meta". */
-function parseMetaOrNull(v: any): Record<string, any> | null {
-  if (v == null) return null;
-  if (typeof v === 'object') return v as Record<string, any>;
-  try { return JSON.parse(String(v)); } catch { return null; }
-}
 
 export function row2pipeline(r: any) {
   const rawUnmapped  = r.EXPORT_UNMAPPED_ROWS ?? r.export_unmapped_rows;

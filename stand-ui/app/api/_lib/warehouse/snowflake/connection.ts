@@ -49,7 +49,7 @@ function getPrivateKeyFromPath(): string | undefined {
     const code = e?.code ? String(e.code) : '';
     if (code === 'ENOENT') {
       throw new Error(
-        `SNOWFLAKE_PRIVATE_KEY_PATH does not exist: ${path}. Set it to the full path of your private key file (e.g. /Users/sanjivp27/snowflake_keys/rsa_key.p8).`
+        `SNOWFLAKE_PRIVATE_KEY_PATH does not exist: ${path}. Set it to the full path of your private key file (e.g. /path/to/rsa_key.p8).`
       );
     }
     // Re-throw with original message for other cases (permissions, etc.)

@@ -41,7 +41,7 @@ export function standardizedColumnName(sourceColumn: string): string {
  * the sync before any SQL runs — unless the target (a) is exactly what
  * standardizedColumnName() produces for a watched column, and (b) does not
  * collide with any watched raw column. Pure + parity-tested; do not weaken
- * without updating docs/PRELAUNCH_CHECKLIST.md.
+ * without updating docs/internal/PRELAUNCH_CHECKLIST.md.
  */
 export function assertCompanionColumnSafe(
   writeTarget:       string,

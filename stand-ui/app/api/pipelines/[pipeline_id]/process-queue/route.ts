@@ -18,7 +18,6 @@
 
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, resolveSourceReference } from '@/app/api/_lib/warehouse';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { broadcastPipelineEvent } from '@/app/api/_lib/pipeline-broadcaster';

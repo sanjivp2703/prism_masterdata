@@ -3,7 +3,7 @@
  * AI actually usable in this installation? Drives /setup's "Run once after
  * install" section: when Cortex already works, the page shows a green check
  * instead of asking (potentially non-admin) visitors to run ACCOUNTADMIN SQL
- * that was already run (owner request 2026-08-16, from psanjiv's visit).
+ * that was already run (owner request 2026-08-16).
  *
  * Probes with a minimal Cortex COMPLETE call on the service connection —
  * a one-shot user-clicked surface (the /setup page load), never polled, and

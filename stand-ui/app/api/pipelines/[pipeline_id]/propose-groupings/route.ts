@@ -12,7 +12,6 @@ import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec, getWarehouseAdapter } from '@/app/api/_lib/warehouse';
 import { internalTable } from '@/app/api/_lib/warehouse-tables';
 import { getDb } from '@/app/api/_lib/sqlite';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getAnthropicApiKey } from '@/app/api/_lib/anthropic-key';
 import { fetchPipelineById, fetchQueueLiteralsWithFreq } from '@/app/api/_lib/pipeline-hourly-processor';

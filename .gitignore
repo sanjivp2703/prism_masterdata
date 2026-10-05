@@ -1,28 +1,33 @@
-# Logs
-*.log
-
 # Dependencies / build artifacts
 node_modules/
 stand-ui/.next/
-stand-ui/tsconfig.tsbuildinfo
+*.tsbuildinfo
 
-# Environment / secrets
+# Logs
+*.log
+
+# Environment / secrets — never commit
 .env
 .env.local
 .env*.local
 *.pem
+*.p8
+rsa_key.pub
+native/dev.env
 
 # Debug artifacts (LLM run breakdowns / validation audits)
 validation_audit_run_*.json
-one_prompt_breakdown_run_*.json
 *_breakdown_run_*.json
 boost_confidence_breakdown.json
 
+# Internal runbooks, client-test scripts and test-run artifacts (local only)
+docs/internal/
+
+# Throwaway local scripts
+stand-ui/scripts/_tmp*
+
+# Local tool settings
+.claude/settings.local.json
+
 # OS
 .DS_Store
-
-# Snowflake key-pair credentials — NEVER commit
-rsa_key.p8
-rsa_key.pub
-*.p8
-native/dev.env

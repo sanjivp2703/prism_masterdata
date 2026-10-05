@@ -26,7 +26,7 @@ import { broadcastPipelineEvent } from './pipeline-broadcaster';
 import { refreshExportTable, updatePipelineMappedCount } from './export-table';
 import { sqlStringLiteral } from './normalize';
 import { internalObject, internalSchemaFqn, internalTable, prismNormalizeFn, notBlankSql, isBlankSql } from './warehouse-tables';
-import { parseStoredSchedule, isScheduleActiveNow, type UpdateSchedule } from './update-schedule';
+import { parseStoredSchedule, type UpdateSchedule } from './update-schedule';
 import { type ExportKind, asExportKind } from './export-kind';
 import {
   pausePipelineWithMessage,
@@ -77,11 +77,6 @@ function recordUnhealthyCheck(pid: number): void {
   const s = unhealthyRecheck.get(pid);
   unhealthyRecheck.set(pid, { streak: (s?.streak ?? 0) + 1, cyclesSinceCheck: 0 });
 }
-
-// File-based fallback metrics (static CSV/Excel rows) recompute cadence:
-// every Nth 1-minute cycle ≈ every 10 minutes per pipeline.
-const FILE_METRICS_EVERY_N_CYCLES = 10;
-const fileMetricsCycleCounter = new Map<number, number>();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

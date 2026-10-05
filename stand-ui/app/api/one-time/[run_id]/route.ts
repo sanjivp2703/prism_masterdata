@@ -5,8 +5,7 @@
  * Scoped to the creating user. Touches no lookup tables.
  */
 
-import { cookies } from 'next/headers';
-import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
+import { withWarehouse, warehouseErrorResponse } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { loadOpRunState, saveOpRunState, type OpRunState, type OpGroup } from '@/app/api/_lib/op-auto-group';

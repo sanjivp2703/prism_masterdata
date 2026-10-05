@@ -91,7 +91,7 @@ Availability trade-off is accepted; it is identical to the standard edition's.
 
 ### 2.4 DECIDED (owner, 2026-08-12) — LLM: Cortex · **SPIKE PASSED 2026-08-13**
 **Decision: option A (Cortex), validated.** The grouping-quality spike
-(`scripts/cortex-spike.mts` — the exact production chunk prompt on the demo
+(a one-off comparison script, since removed — the exact production chunk prompt on the demo
 fixtures, Anthropic API `claude-sonnet-4-6` vs Cortex `claude-4-sonnet`):
 valid JSON both paths; 100% pairwise same-group agreement on the company
 column with identical names; 99.8% on carriers, the sole divergence being

@@ -15,23 +15,28 @@ card's Settings tab):
 
 - **Time window** (`{"type":"window","days":[…],"start_hour":H,"end_hour":H,"timezone":"…"}`) — the creation **default is Mon–Fri, 9 AM–5 PM** in the creator's browser timezone (IANA name stored on the schedule; missing/invalid timezone → evaluated in server time). Days use JS `getDay()` encoding (0=Sun); `start_hour` inclusive, `end_hour` exclusive; an inverted window (22→6) wraps overnight. Prism auto-standardizes only while the window is open — the 10-minute tick checks `isScheduleActiveNow()` at fire time. Values arriving outside the window are queued and drain at the first tick after it opens.
 - **24/7** (`{"type":"always"}`) — every 10-minute tick. Existing `mode='auto'` rows were backfilled to this (migration 006).
-- **Manual only** (`{"type":"manual"}`) — Prism never auto-standardizes; the owner triggers it via "Update Standardizations". All file-based pipelines (Sheets, CSV, Excel) are always manual-only (hard-coded at creation; no schedule picker).
+- **Manual only** (`{"type":"manual"}`) — Prism never auto-standardizes; the owner triggers it via "Update Standardizations".
 
-Only warehouse-table pipelines can have window/always schedules. The manual "Update
+Every pipeline is a warehouse-table pipeline and can use any of the three schedules.
+(File/Sheets pipelines, which were hard-coded to manual-only, were removed — files and
+Sheets are one-time sources only; see `docs/FILE_PIPELINES.md`.) The manual "Update
 Standardizations" trigger works for every schedule type.
 
 ### The poll pass (every minute mark)
 
 **The poller runs for ALL active pipelines regardless of schedule** — including manual-only
-and file-based — but it ONLY detects and queues; it never standardizes inline. One poll
+— but it ONLY detects and queues; it never standardizes inline. One poll
 pass fires at every wall-clock MINUTE mark (2:33:00, 2:34:00, … —
 `Date.now() % POLL_INTERVAL_MS`, self-chaining so passes never overlap; all tables polled
 concurrently per pass, newly-activated pipelines picked up at the next mark). Each pass,
 per pipeline:
 
 - **Snowflake**: classify stream (list A = already in the lookup, list B = new/unmapped — informational split, logs only) → **queue EVERYTHING** (list A + list B) → update `total_source_values` / `queue_size`. Deletes (and null-only inserts) still trigger an immediate hygiene rebuild.
-- **Sheets**: re-read Google Sheet via stored `refresh_token` → replace `PIPELINE_FILE_ROWS` → recompute `total_source_values` / `total_mapped` / `queue_size`
-- **CSV/Excel**: recompute metrics from existing `PIPELINE_FILE_ROWS` vs `LITERAL_ALIAS_MATCHES`
+- **SQL Server / PostgreSQL / MySQL**: the same detect-and-queue contract through that warehouse's own poll module (`pipeline-poller-mssql.ts` / `-postgres.ts` / `-mysql.ts`) — see "Change detection" in `docs/WAREHOUSES.md`
+
+There is no file or Google Sheets branch: the poller never reads a spreadsheet (pipelines
+are warehouse-only; the parity suite fails if `pollOneFilePipeline` / `refreshSheetsFileRows`
+reappear in `pipeline-poller.ts`).
 
 All COLUMNS of a table poll together inside `pollOneTable` + `syncTableLastPolled` (one
 shared `last_polled_at`). The old per-table self-chaining loops + `superviseTables`
@@ -104,8 +109,9 @@ UI notes: the Live indicator shows for **all** active pipelines. The Pause butto
 for manual-only schedules. The card badge shows the schedule label (`scheduleLabel()`:
 "Mon–Fri, 9 AM–5 PM" / "24/7" / "Manual only") with the "Standardized table last updated X
 ago" freshness timestamp (`fully_synced_at`) beneath it (an amber "Standardizing…" pulse
-while a pass runs). The auto-standardize loading state for file-based pipelines is tracked
-via local `autoStdBusyKey` state (not SSE events, which don't fire for file-based).
+while a pass runs). While a manual "Update Standardizations" request is in flight, the card
+also shows as running via local `autoStdBusyKey` state in `PipelinesView`, in addition to
+the SSE-driven `standardizingPipelines` set.
 
 ---
 
@@ -229,7 +235,7 @@ route, op-export) work unchanged because column pipelines store
 3. The connect form shows an unmissable warning panel on the Column option (how the table is edited, never-touch-existing-columns intent, no-liability statement, recommendation against unrecoverable data) with a **required consent checkbox** — the API 400s `export_kind='column'` without `column_write_consent: true` (AddColumnModal restates the notice for new columns on a column-mode table and sends the flag).
 4. **Write access is per-table, consent-gated — onboarding grants none**: on creation the POST runs `provisionColumnModeAccess` via the creator's personal credentials (change-tracking-fix pattern) — companion `ADD COLUMN IF NOT EXISTS` (needs table ownership, which UPDATE doesn't confer — this is why the service connection can't do it at sync time) + `GRANT UPDATE ON TABLE <that table>`; failure/no-creds → pipeline flagged with the exact SQL (`columnModeSetupSql`, both dialects) and the warehouse itself refuses every write until an admin runs it.
 
-**Column mode must pass docs/PRELAUNCH_CHECKLIST.md §1 (live source-integrity test) before
+**Column mode must pass docs/internal/PRELAUNCH_CHECKLIST.md §1 (live source-integrity test) before
 any customer deployment.**
 
 UI: the Settings tab shows no destination input for column pipelines (destination is pinned)
@@ -362,15 +368,15 @@ the billed one is the optional "Threat Intelligence" package.)
 ## Identifier & String Safety
 
 - `isSimpleIdent` (poller, hourly processor, and the `auto-export/source`, `runs`, `auto-export/poll` routes) is **permissive**: any non-empty name `quoteIdent` can safely wrap is allowed (spaces, hyphens, leading digits, Unicode letters), rejecting only control chars and `" ' \`. Every identifier is wrapped in `quoteIdent` before SQL interpolation.
-- `sqlStringLiteral()` in `normalize.ts` escapes backslashes + single quotes for column names interpolated into `column_data['...']` VARIANT paths (used at 4 sites: `export-table.ts`, `op-file-pipeline.ts` ×2 conceptually, `pipeline-poller.ts`). Use it for ANY string literal built into SQL text.
+- `sqlStringLiteral()` in `normalize.ts` escapes backslashes + single quotes for column names interpolated into `column_data['...']` VARIANT paths and other SQL string literals (current call sites: `op-one-time-file.ts` for the `ONE_TIME_FILE_ROWS` column reads, and `pipeline-poller.ts`). Use it for ANY string literal built into SQL text.
 - The lookup-export route parses and quotes user-supplied target FQNs part-by-part and **refuses `PRISM_DB.INTERNAL` targets** (users cannot overwrite internal tables via export).
 
 ---
 
 ## Snowflake SQL Constraints
 
-- **`PARSE_JSON(?)` is invalid in `VALUES` clauses.** Snowflake does not allow function calls around bind parameters inside VALUES. Use the `SELECT column1, column2, PARSE_JSON(column3) FROM VALUES (?, ?, ?)` pattern instead. This applies to `insertFileRows` and `refreshSheetsFileRows` in `op-file-pipeline.ts`.
-- **Explicit transactions needed for multi-statement atomicity.** Snowflake auto-commits each statement by default. Wrap `DELETE` + `INSERT` (e.g. `refreshSheetsFileRows` replacing `PIPELINE_FILE_ROWS`) in explicit `BEGIN` / `COMMIT` / `ROLLBACK` to prevent a crash between statements from leaving the table empty.
+- **`PARSE_JSON(?)` is invalid in `VALUES` clauses.** Snowflake does not allow function calls around bind parameters inside VALUES. Use the `SELECT column1, column2, PARSE_JSON(column3) FROM VALUES (?, ?, ?)` pattern instead. This applies to `insertOneTimeFileRows` in `op-one-time-file.ts` (the Snowflake branch; the other warehouses use plain `VALUES`).
+- **Explicit transactions needed for multi-statement atomicity.** Snowflake auto-commits each statement by default. Wrap a `DELETE` + `INSERT` pair that replaces a table's contents in explicit `BEGIN` / `COMMIT` / `ROLLBACK` to prevent a crash between statements from leaving the table empty.
 - **Duplicate MERGE source keys error.** Snowflake rejects a MERGE whose source has duplicate join keys — bulk upserts must dedup their source rows first (done on `normalizeLiteral` in `op-export.ts`).
 
 ---

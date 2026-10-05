@@ -13,7 +13,6 @@
 
 import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse } from '@/app/api/_lib/warehouse';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { runOpExport } from '@/app/api/_lib/op-export';

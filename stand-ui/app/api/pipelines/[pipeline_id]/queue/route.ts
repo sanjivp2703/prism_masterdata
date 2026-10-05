@@ -3,7 +3,6 @@
  * DELETE /api/pipelines/[pipeline_id]/queue  — clear the queue (after export)
  */
 
-import { cookies } from 'next/headers';
 import { withWarehouse, warehouseErrorResponse, executeQuery as exec } from '@/app/api/_lib/warehouse';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { getDb } from '@/app/api/_lib/sqlite';

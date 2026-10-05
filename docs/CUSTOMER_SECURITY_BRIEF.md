@@ -139,10 +139,14 @@ negotiation.
 
 ### 4b. Google Sheets (only if you use it)
 
-If you connect a Google Sheet as a source, Prism reads that sheet and writes a
-standardized output sheet, using access you grant through Google's normal
-consent screen. It requests access only to files it is pointed at or creates.
-Not used at all if you only connect warehouse tables.
+A Google Sheet can be the source for a one-time standardization ("clean this
+list once"). Prism reads that sheet once, when you start the session, and — if
+you choose the Sheets output — writes the result to a new spreadsheet in your
+Drive; it does not keep re-reading the sheet afterwards, and ongoing pipelines
+run on warehouse tables only. All of this uses access you grant through
+Google's normal consent screen, requested only when you first use a Sheet
+(signing in asks for your identity only). It requests access only to files it
+is pointed at or creates. Not used at all if you only connect warehouse tables.
 
 **Every outbound destination, exhaustively:** your AI provider's API, Google's
 APIs (only for Sheets), and optionally an error-monitoring service if you

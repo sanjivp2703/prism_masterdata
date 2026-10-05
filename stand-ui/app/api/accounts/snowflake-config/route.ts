@@ -1,5 +1,4 @@
 import 'server-only';
-import { cookies } from 'next/headers';
 import { invalidateAccountSfConfig, createAdHocSnowflakeConnection } from '@/app/api/_lib/warehouse/snowflake/connection';
 import { getDb } from '@/app/api/_lib/sqlite';
 import { requireValidSession } from '@/app/api/_lib/account-security';

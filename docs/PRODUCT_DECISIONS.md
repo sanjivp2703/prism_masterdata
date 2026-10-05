@@ -441,7 +441,7 @@ Prism's code) → API consent gate → `assertCompanionColumnSafe` write-target
 guard (parity-tested) + creation-time companion-conflict refusal. The
 UI carries an explicit no-liability statement and a recommendation against
 using column mode on unrecoverable data. **Live verification is mandatory
-before shipping: docs/PRELAUNCH_CHECKLIST.md §1.**
+before shipping: docs/internal/PRELAUNCH_CHECKLIST.md §1.**
 
 ### `export_unmapped_rows` applies to every schedule and defaults OFF
 

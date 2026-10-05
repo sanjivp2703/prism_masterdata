@@ -19,7 +19,6 @@ import { markPipelineUserConnection } from '@/app/api/_lib/pipeline-user-connect
 import { diffScan, initDetection, enableCt, grantViewChangeTracking} from '@/app/api/_lib/warehouse/mssql/detection';
 import { diffScan as pgDiffScan, initDetection as pgInitDetection } from '@/app/api/_lib/warehouse/postgres/detection';
 import { diffScan as myDiffScan, initDetection as myInitDetection } from '@/app/api/_lib/warehouse/mysql/detection';
-import { decodeSession, SESSION_COOKIE_NAME } from '@/app/api/_lib/session';
 import { requireValidSession } from '@/app/api/_lib/account-security';
 import { llmErrorResponse } from '@/app/api/_lib/llm-one-prompt-grouping';
 import { getDb } from '@/app/api/_lib/sqlite';

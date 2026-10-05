@@ -693,7 +693,7 @@ export async function refreshStandardizedColumnsMssql(
 
   // GUARDRAIL — every identifier this function will ALTER/UPDATE must be a
   // companion of a watched column and must not be a watched raw column.
-  // Throws before ANY SQL runs; do not remove (see docs/PRELAUNCH_CHECKLIST.md).
+  // Throws before ANY SQL runs; do not remove (see docs/internal/PRELAUNCH_CHECKLIST.md).
   const watchedRawNames = watched.map(w => w.columnName);
   for (const w of watched) {
     assertCompanionColumnSafe(standardizedColumnName(w.columnName), watchedRawNames);

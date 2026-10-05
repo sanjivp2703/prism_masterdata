@@ -318,7 +318,7 @@ check('companion column name', standardizedColumnName('CARRIER'), 'CARRIER_STAND
 check('companion name keeps spaces/case', standardizedColumnName('Company Name'), 'Company Name_STANDARDIZED');
 
 // Guardrail: column mode may only ever write a watched column's companion —
-// never a raw source column, never an arbitrary name (docs/PRELAUNCH_CHECKLIST.md §1).
+// never a raw source column, never an arbitrary name (docs/internal/PRELAUNCH_CHECKLIST.md §1).
 const trips = (target: string, watched: string[]) => {
   try { assertCompanionColumnSafe(target, watched); return 'allowed'; } catch { return 'blocked'; }
 };

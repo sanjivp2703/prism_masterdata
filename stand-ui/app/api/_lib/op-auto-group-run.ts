@@ -126,7 +126,7 @@ export async function runAutoGroupForRun(
   // from its per-column spec (spec_id === the run's scope integer). The LLM
   // concept NAME is now the column name; the DEFINITION is the spec description.
   let namingConvention: NamingConvention | null = null;
-  let effectiveConceptName = sourceColumn || conceptKeyName;
+  const effectiveConceptName = sourceColumn || conceptKeyName;
   let effectiveConceptDef  = '';
   let standardizationRules: string[] | null = null;
 

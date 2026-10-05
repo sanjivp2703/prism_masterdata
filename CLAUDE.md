@@ -36,7 +36,11 @@ there is no `NEXT_PUBLIC_APP_MODE`, no `feature-flags.ts`, and no mode guards.
 
 One additional feature (not a tier): the **one-time standardization flow**
 (`app/one-time/`) — "clean a list once", standardize a source table's columns to a
-standalone output table without ever touching the shared lookup.
+standalone output table without ever touching the shared lookup. Its source can be a
+warehouse table, an uploaded CSV/Excel file, or a Google Sheet. Files and Sheets are **only**
+one-time sources: file/Sheets *pipelines* were removed (SQLite migration 016), because a
+pipeline exists to keep a live source standardized on a schedule and a spreadsheet is
+one-shot by nature.
 
 ### The pipeline in one paragraph
 
@@ -50,7 +54,7 @@ sweep + safety export rebuilds. Nothing standardizes inline during a poll.
 ### User flow
 
 1. New Run → per-column spec (description + rules + convention, edited inline) → locked at creation
-2. Data source — warehouse table path, Excel/CSV upload, or paste values
+2. Data source — a warehouse table path. Pipelines are warehouse-only; CSV/Excel uploads and Google Sheets are sources for the one-time flow only (see below)
 3. Column selection + preview
 4. Auto Group (button click) → hash lookup → LLM chunks in parallel → merge pass
 5. Human review — drag items between groups, rename groups, create groups
@@ -67,14 +71,14 @@ sweep + safety export rebuilds. Nothing standardizes inline during a poll.
 | Schemas, migrations, queries, the state blob, column specs | `docs/DATA_MODEL.md` |
 | Poller, detection, ticks, exports, health guards, warehouse cost | `docs/PIPELINE_INTERNALS.md` |
 | Grouping, prompts, the referee, the export write path, LLM providers | `docs/LLM_PIPELINE.md` |
-| Google Sheets / CSV / Excel pipelines, uploads, the one-time flow | `docs/FILE_PIPELINES.md` |
+| The one-time flow, CSV / Excel uploads, Google Sheets sources, header-row detection (file/Sheets *pipelines* no longer exist) | `docs/FILE_PIPELINES.md` |
 | `/setup` wizard, auth/sessions, `/settings`, deployment | `docs/SETUP_WIZARD.md` |
 | Anything per-warehouse (SQL text, dialect quirks, parity matrix) | `docs/WAREHOUSES.md` + the `warehouse-change` skill |
 | Why a product decision was made | `docs/PRODUCT_DECISIONS.md` |
 | Security posture, credential storage, customer disclosures | `docs/SECURITY_AND_DISCLOSURES.md` |
 | Porting to another warehouse | `docs/MSSQL_PORT_PLAN.md`, `docs/POSTGRES_PORT_PLAN.md`, `docs/MYSQL_PORT_PLAN.md` |
 | Marketplace / Native App edition | `docs/NATIVE_APP_PLAN.md` |
-| Onboarding a client; prelaunch gates | `docs/CLIENT_ONBOARDING.md`, `docs/PRELAUNCH_CHECKLIST.md` |
+| Onboarding a client; prelaunch gates (internal runbooks — kept locally in the untracked `docs/internal/`, not published) | `docs/internal/CLIENT_ONBOARDING.md`, `docs/internal/PRELAUNCH_CHECKLIST.md` |
 | Local dev containers for non-Snowflake warehouses | `docs/DEV_MSSQL.md`, `docs/DEV_POSTGRES.md`, `docs/DEV_MYSQL.md` |
 
 ---
@@ -158,7 +162,7 @@ SQL changes.
 > 2026-08 client-sim rehearsal: a prospect's DBA was reading dev-reset instructions.)
 
 **Full dev reset = `01` + `02` + the app-state reset.** Re-running `01` resets the Snowflake
-side (lookup tables, queue, file rows) and also **drops all `PIPELINE_STREAM_*` streams**
+side (lookup tables, queue, one-time file rows) and also **drops all `PIPELINE_STREAM_*` streams**
 (Snowflake Scripting block — stale streams from previous pipeline generations otherwise
 accumulate); re-running `02` resets the demo source table. COLUMN_SPECS / PIPELINES / RUNS
 live in SQLite, which snowsql can't touch — reset them with:
@@ -197,8 +201,8 @@ Copy `stand-ui/.env.local.example` to `stand-ui/.env.local`. Long-form notes on
 | `SNOWFLAKE_PRIVATE_KEY_PATH` | File path to PEM private key (alternative to inline) |
 | `ANTHROPIC_API_KEY` | LLM-key **fallback** (SQLite `workspace_llm_config` wins). All key reads go through `_lib/anthropic-key.ts` — never read this env var directly. **Doubles as the "Prism-provided AI" mechanism** (vendor key set at deploy time for clients with no LLM account) |
 | `SESSION_SECRET` | HMAC key for session cookies |
-| `PRISM_ENCRYPTION_KEY` | 64 hex chars (32 bytes) — AES-256-GCM key for stored secrets: `ACCOUNTS.sf_password`, `ACCOUNTS.sf_private_key`, the Google `refresh_token` in `file_source_meta`. Ciphertext format `enc:v1:<iv>:<ciphertext>:<authTag>`. Generate with `openssl rand -hex 32`; store per-installation in a password manager (losing it orphans the encrypted secrets) |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Google OAuth (login + Sheets export) |
+| `PRISM_ENCRYPTION_KEY` | 64 hex chars (32 bytes) — AES-256-GCM key for stored secrets: `ACCOUNTS.sf_password`, `ACCOUNTS.sf_private_key`, the workspace service credentials and the AI-provider key. Ciphertext format `enc:v1:<iv>:<ciphertext>:<authTag>`. Generate with `openssl rand -hex 32`; store per-installation in a password manager (losing it orphans the encrypted secrets) |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Google OAuth (login; Sheets scopes are requested later, only when a user first reads or exports a Sheet) |
 | `ADMIN_EMAIL` | Bootstrap admin; all other users must be invited |
 | `REDIS_URL` | Optional — enables auto-export baseline tracking; degrades gracefully if absent |
 | `PRISM_SQLITE_PATH` | Local SQLite app-state DB file (default `./data/prism.db`, gitignored). Must be on persistent storage; backup = copy the file |
@@ -222,7 +226,7 @@ Copy `stand-ui/.env.local.example` to `stand-ui/.env.local`. Long-form notes on
 
 Violating any of these has broken production before. Details are in the linked doc.
 
-1. **⚠️ `domain_id` NEVER means a domain.** Domains were removed 2026-07-15 (migration 012). Every physical column still named `domain_id` — SQLite `pipelines`/`runs`, warehouse `APPROVED_ALIAS_NAMES`/`LITERAL_ALIAS_MATCHES`, `file_source_meta.columns[]`, the `?domain_id=` API param — **holds a `column_specs.spec_id`**. Deliberate compatibility decision, not an accident. → `docs/DATA_MODEL.md`
+1. **⚠️ `domain_id` NEVER means a domain.** Domains were removed 2026-07-15 (migration 012). Every physical column still named `domain_id` — SQLite `pipelines`/`runs`, warehouse `APPROVED_ALIAS_NAMES`/`LITERAL_ALIAS_MATCHES`, the `?domain_id=` API param — **holds a `column_specs.spec_id`**. Deliberate compatibility decision, not an accident. → `docs/DATA_MODEL.md`
 2. **Customer VALUES never rest in SQLite.** Data-residency rule: state blobs (`RUN_STATE`), the validation log, one-time mappings and the lookup all live in the customer's warehouse. SQLite holds metadata/config only. → `docs/DATA_MODEL.md`
 3. **Never call the state-blob helpers from recurring surfaces** (GET /api/pipelines, SSE refetches, idle poll cycles). They are warehouse calls and each one can wake `PRISM_WH`. Review pages, exports, and the tick only.
 4. **Recurring background paths use metadata-layer commands only** (`SHOW`, `DESCRIBE`, `SYSTEM$STREAM_HAS_DATA`) — never a `SELECT` against `INFORMATION_SCHEMA`, which wakes and bills a warehouse. An idle poll cycle must cost zero. → `docs/PIPELINE_INTERNALS.md` → Snowflake Cost Model
@@ -259,7 +263,7 @@ Violating any of these has broken production before. Details are in the linked d
 Any table joined against customer source data inside warehouse SQL stays in the warehouse;
 pure app-state lives in a local SQLite file.
 
-- **Warehouse `PRISM_DB.INTERNAL`** — `APPROVED_ALIAS_NAMES`, `LITERAL_ALIAS_MATCHES`, `PIPELINE_QUEUE`, `PIPELINE_FILE_ROWS`, `RUN_STATE`, `VALIDATION_LOG`, `ONE_TIME_FILE_ROWS`/`_BLOBS`, plus streams, export tables and the `PRISM_NORMALIZE` UDF.
+- **Warehouse `PRISM_DB.INTERNAL`** — `APPROVED_ALIAS_NAMES`, `LITERAL_ALIAS_MATCHES`, `PIPELINE_QUEUE`, `RUN_STATE`, `VALIDATION_LOG`, `ONE_TIME_FILE_ROWS`/`_BLOBS` (the one-time flow's uploaded rows and original file bytes), plus streams, export tables and the `PRISM_NORMALIZE` UDF.
 - **SQLite** (`_lib/sqlite.ts`) — `accounts`, `invitations`, `column_specs`, `one_time_standardizations`, `runs` (metadata only), `pipelines`, `workspace_config`, `workspace_llm_config`.
 
 Cross-store references are plain integers; warehouse SQL cannot join the SQLite side, so
@@ -277,8 +281,8 @@ Guardrails — all refuse loudly or defer, never drop silently.
 | 5,000 distinct / standardization run | queue drain + baseline scans | remainder processes on later passes/clicks |
 | 20,000 distinct / one-time column | `ONE_TIME_MAX_DISTINCT` (`op-one-time.ts`) | 400, "connect as a pipeline" |
 | 5,000 rows / bulk MERGE statement | `EXPORT_MERGE_BATCH` (`op-export.ts`) | automatic batching (Snowflake ~65k-bind ceiling) |
-| 100,000 rows / Google Sheet tab | `MAX_SHEET_ROWS` + `SheetTooLargeError` | creation → rollback + 400; poller → pipeline pauses with `status_message` |
-| 20 MB / 200,000 rows per CSV/Excel upload | client pre-parse + `POST /api/pipelines/file` | clear error, "load into a warehouse table" |
+| 100,000 rows / Google Sheet tab (one-time source) | `MAX_SHEET_ROWS` + `SheetTooLargeError` (`sheets-io.ts`) | `POST /api/one-time/create` → 400 naming the tab and the limit |
+| 20 MB / 200,000 rows per CSV/Excel upload (one-time source) | 20 MB: client check in `OneTimeStandardizationCard`; 200,000 rows: `POST /api/one-time/create` | clear error, "load into a warehouse table" |
 | 20 rules × 500 chars; description ≤1,000; regex convention ≤500 (examples/natural ≤2,000); pre-standardized values+examples ≤500 total × 200 chars | spec create route (one-time route mirrors the rule caps) | 400 with the specific limit |
 | 200 chars / alias name | both review UIs (matches `sanitizeProposedName`) | rename blocked with banner |
 
@@ -323,31 +327,39 @@ Guardrails — all refuse loudly or defer, never drop silently.
 | `pipeline-coordination.ts` | Per-pipeline lock tracking — prevents concurrent standardization runs on the same pipeline. The lock map lives on `globalThis` (`__prismStandardizingSince`, pipeline_id → started-at ms; module-local state once stranded a leaked lock across dev-bundle instances and the poller silently skipped that pipeline forever). Locks self-expire after 30 min (`STANDARDIZING_MAX_MS`) |
 | `pipeline-alerts.ts` | `pausePipelineWithMessage`, `clearPipelineStatusMessage`, `flagPipelineMessage`, `broadcastGlobalAlert`, `broadcastPipelineAlert`; `PIPELINE_BLOCK_REASONS` + `NOT_BLOCKED_SQL` — the shared gate every standardization entry point applies |
 | `normalize.ts` | `normalizeLiteral()` — pure TS mirror of the `PRISM_NORMALIZE` UDF; keep in sync with the UDF + the stored `normalized_value` column. Also `sqlStringLiteral()` for safe string-literal interpolation. (Pure — no `server-only`) |
-| `pipeline-poller.ts` | Minute-mark poll passes for ALL active pipelines. Snowflake path: throttled `checkSourceHealth`, stream classify, queue ALL new values, hygiene rebuilds at most once per table per cycle. File-based path: `pollOneFilePipeline`. On mssql installs, live-table pipelines dispatch to `pipeline-poller-mssql.ts`. `fetchActivePipelines` cached 10 s. `PipelineRef` carries `source_type` and the parsed `update_schedule` so the two paths never cross. Detect + queue ONLY — never standardizes |
+| `pipeline-poller.ts` | Minute-mark poll passes for ALL active pipelines. Snowflake path: throttled `checkSourceHealth`, stream classify, queue ALL new values, hygiene rebuilds at most once per table per cycle. On mssql / postgres / mysql installs, pipelines dispatch to `pipeline-poller-mssql.ts` / `-postgres.ts` / `-mysql.ts`. There is no file-based path — pipelines are warehouse-only (parity-tested: the poller must not contain `pollOneFilePipeline` / `refreshSheetsFileRows`). `fetchActivePipelines` cached 10 s. `PipelineRef` carries the parsed `update_schedule` and `export_kind`. Detect + queue ONLY — never standardizes |
 | `pipeline-poller-mssql.ts` | SQL Server poll orchestration: per-pipeline detection state, Change Tracking consumption or tiered diff scans via `warehouse/mssql/detection.ts`, health cadence, pause/flag semantics, freshness stamping. Writers: `warehouse/mssql/mappings.ts`; builder `warehouse/mssql/export.ts` (staging-join, transactional swap, grants re-applied; `export_kind` 'view' is refused on mssql) |
 | `pipeline-poller-postgres.ts` | Postgres poll orchestration: diff-scan-only detection via `warehouse/postgres/detection.ts`, gated by the free `pg_stat_user_tables` write-counter heartbeat (its delete counter flags hygiene rebuilds the same cycle — something mssql diff mode can't see). RLS on the source = the masking analog (`policy_blocked`). Writers: `warehouse/postgres/mappings.ts` (ON CONFLICT upserts); builder `warehouse/postgres/export.ts` (staging join, transactional swap, ACL re-apply; view kind SUPPORTED via persistent mapping tables; column kind guarded) |
 | `pipeline-poller-mysql.ts` | MySQL poll orchestration: diff-scan-only detection via `warehouse/mysql/detection.ts`, gated by the `information_schema.TABLES.UPDATE_TIME` heartbeat (fresh via per-session `information_schema_stats_expiry=0` — the 24h default would blind it; delete-BLIND, hourly rebuild covers). Writers: `warehouse/mysql/mappings.ts` (row-alias ON DUPLICATE KEY); builder `warehouse/mysql/export.ts` (atomic multi-RENAME swap, verbatim 'user'@'host' grant replay, view kind via persistent maps, column kind guarded) |
 | `pipeline-hourly-processor.ts` | The 10-minute standardization tick (`startQueueProcessor`) + on-demand `processPipelineQueue`. `fetchQueueLiteralsWithFreq` drains the queue in 5,000-value FIFO installments. Failure backoff + auto-pause after 5 consecutive failures; retries reuse the pending run (`hourly_<pid>_` nonce). Exports `bulkProcessPipelineQueue`. (Filename is historical — it's the tick processor now) |
 | `update-schedule.ts` | Update time windows (pure, shared with the client): `UpdateSchedule` type, `DEFAULT_UPDATE_SCHEDULE` (Mon–Fri 9–5), `asUpdateSchedule` (strict), `parseStoredSchedule` (tolerant), `isScheduleActiveNow` (Intl-based), `scheduleLabel` |
-| `op-file-pipeline.ts` | File-based pipeline helpers: `readAllSheetRows` (paginated, `SheetTooLargeError`), `a1Sheet`, `syncSheetsColumn` (non-destructive rewrite), `refreshSheetsFileRows`, `insertFileRows` / `readFileDistinctValues`, `readFilePipelineRowsForDownload` |
+| `op-one-time-file.ts` | One-time standardization from a FILE or GOOGLE SHEET source. Uploaded rows live in the warehouse (`ONE_TIME_FILE_ROWS`, keyed by the session nonce — customer values, data residency) because a session spans upload → review → export: `insertOneTimeFileRows`, `readOneTimeDistinctValues` (app-side `normalizeLiteral` dedup with real summed frequencies), `readOneTimeFileRows`, `deleteOneTimeFileRows`; original file bytes in `ONE_TIME_FILE_BLOBS` (`storeOneTimeFileBlob` / `loadOneTimeFileBlob`); `applyMappingsToRows` + `writeGridToWarehouseTable` for the export. Replaced the deleted pipeline-side `op-file-pipeline.ts` |
+| `sheets-io.ts` | Google Sheets read primitives kept for the one-time flow: `readAllSheetRows` (10,000-row pages, throws `SheetTooLargeError` past `MAX_SHEET_ROWS` = 100,000), `a1Sheet` (A1 quoting — doubles single quotes). (`a1Col`, `headerRowFromMeta` and `SheetsAuthError` are leftovers from Sheets pipelines with no remaining caller) |
 | `op-auto-group.ts` | State-blob types (`OpRunState`, `OpGroup`, …) + load/save helpers including the rev-checked save — ~100 lines, nothing else |
 | `op-auto-group-run.ts` | Live auto-grouping: normalized literal lookup → lookup groups → `runOnePromptGrouping` for unmatched → assemble state. Builds the existing-names list, makes self-map singleton names convention-compliant, stamps `initial_*`, honest `'llm_failed'` fallbacks |
 | `llm-one-prompt-grouping.ts` | LLM grouping + merge calls. Sorted boundary-aware chunking (`sortAndChunkItems`), diverse merge reps (`pickDiverseReps`), retries, prompt caching, JSON-escaped literals, proposed-name validation. Exports `callAnthropicWithRetry` / `JSON_ONLY_REMINDER` / `fixNamesForConvention` |
 | `grouping-types.ts` | Shared grouping types (`RunItemForPairing`, `FinalGroup`, …) — the only survivors of the deleted deterministic pipeline |
 | `op-export.ts` | User-first fail-open export: reads state blob, detects Case A/B/C, (referee disabled), writes everything in one pass — batched idempotent MERGEs at `EXPORT_MERGE_BATCH=5000`, deduped on `normalizeLiteral`, sets `normalized_value` — marks run `'completed'` |
-| `op-one-time.ts` | One-time standardization engine: lookup-free LLM grouping, optional naming convention, export to a standalone table, archive to `ONE_TIME_STANDARDIZATIONS` |
+| `op-one-time.ts` | One-time standardization engine: lookup-free LLM grouping, optional naming convention, export to a standalone table, archive to `ONE_TIME_STANDARDIZATIONS`. File/Sheets-sourced sessions read their rows through `op-one-time-file.ts` |
 | `file-inplace.ts` | Edit-in-place patcher for one-time CSV/XLSX exports (pure, parity-tested): byte-span CSV tokenizer + zip-level XLSX surgery that replaces ONLY the standardized cells. ANY patch failure falls back to the regenerated export — never a corrupted "original" |
 | `convention-rules.ts` | Structured naming-convention rules — prompt instructions + deterministic normalization of LLM output. Pure module shared by UI and server |
 | `safe-regex.ts` | `compileSafeRegex` / `safeRegexError` — RE2 (`re2-wasm`) compilation of user-authored convention regexes. Must never contain `new RegExp` |
 | `namescore.ts` | Deterministic "most representative literal" scoring, used as the fallback group namer |
 | `export-table.ts` | Rebuilds the pipeline's export table/view (`CREATE OR REPLACE … COPY GRANTS AS SELECT`), joining stored `normalized_value` vs `PRISM_NORMALIZE(source)`. Hosts `refreshStandardizedColumnsSnowflake` and dispatches all export kinds from `refreshExportTable`. Refuses a destination equal to the source table |
 | `export-kind.ts` | Pure module (shared with the client): `ExportKind`, `asExportKind()` (the ONLY sanctioned parser), `standardizedColumnName()`, `assertCompanionColumnSafe()`. Parity-tested |
-| `table-shape.ts` | `detectHeaderRow` + `columnLetter` — deterministic header-row detection for uploads and Sheets (pure, parity-tested) |
+| `table-shape.ts` | `detectHeaderRow` + `columnLetter` — deterministic header-row detection for one-time uploads and Sheets — plus `gridToRows` (the single shared grid → rows parser) and `gridDataRowIndices` (pure, parity-tested) |
 | `grants.ts` | `buildGrantStatements` / `applyGrants` — programmatic role grants. Account-level CREATE ROLE/WAREHOUSE statements are pre-checked via SHOW and reported `skipped` when the object exists |
 | `email.ts` | SMTP invitation emails |
 | `timing.ts` | `appendTiming` — phase-timing instrumentation to console + log file (`PRISM_TIMING_LOG`, default `/tmp/prism-timing.log`) |
 | `redis.ts` | Optional ioredis singleton; returns `null` when `REDIS_URL` is unset |
 | `auto-export-seen.ts` | Redis-backed baseline tracking — records which values existed at pipeline setup |
+| `column-specs.ts` | Per-column standardization specs (the replacement for domains): validation (`validateSpecBody`, `validateStandardizationRules`, `validateConventionValue` and the `MAX_*` caps), the row shaper `row2spec`, insert/update/get/list/delete, and `seedSpecValues` (seeds pre-standardized values / convention examples into the lookup). Shared by `/api/column-specs`, the pipeline-creation routes, and the one-time create route (rule caps) |
+| `export-claims.ts` | `findExportClaim` / `exportClaimError` — who already writes to an export destination (SQLite-only check). An export table is replaced on every rebuild, so a DIFFERENT source aiming at the same name is refused; columns of the same source table sharing one export, and a pipeline claiming a one-time result built from the same source, are allowed. Case-insensitive |
+| `pipeline-user-connection.ts` | User-connection pipelines (mssql only, migration 021): `pipelineConnInfo`, `markPipelineUserConnection`, `userConnPauseMessage`. A pipeline whose source the service login can't see runs its SOURCE reads on the creator's saved personal credentials; internal state always stays on the service connection. Not yet live-tested (see Deferred items) |
+| `edition.ts` | Product edition switch: `prismEdition()` / `isNativeEdition()` / `asPrismEdition()` — `'standard'` (default) or `'native'` (Snowflake Marketplace build). Pure, no `server-only` — client components read it to hide cut surfaces, but every cut surface also has a server-side guard that is the real gate |
+| `native-access.ts` | Native-edition source-access preflight: metadata-layer (`SHOW`) probes on the SERVICE connection at pipeline creation and resume (`probeNativeSourceAccess`, `probeNativeExportCollision`), plus the pause/fix messages that carry the copy-paste grant SQL. Stops a user creating a pipeline on a table the application itself was never granted |
+| `native-visibility.ts` | Native-edition visibility scoping ("your role defines your view"): a pipeline is visible to its creator or to a viewer whose own Snowflake access can see the source table, checked with `SHOW OBJECTS` on the caller's session and cached ~5 min per (viewer, table). Every helper short-circuits to "visible" in the standard edition |
+| `terms-version.ts` | `CURRENT_TERMS_VERSION` — the single source of truth for which revision of `/terms` + `/privacy` users must have accepted (`accounts.terms_accepted_version`, migration 017). Pure module, shared with the client; bump only for material changes |
 
 Background startup (`instrumentation.ts`) and the SSE contract are documented in
 `docs/PIPELINE_INTERNALS.md`.
@@ -356,7 +368,7 @@ Background startup (`instrumentation.ts`) and the SSE contract are documented in
 
 ## File/Folder Conventions
 
-- All warehouse-touching and secret-touching `_lib` files include `import 'server-only'`. Intentional exceptions: `normalize.ts`, `convention-rules.ts`, `grouping-types.ts`, `namescore.ts`, `update-schedule.ts`, `export-kind.ts`, `table-shape.ts` (pure modules shared with the client) and `report-error.ts` (deliberately client-safe); `warehouse/types.ts` is types-only.
+- All warehouse-touching and secret-touching `_lib` files include `import 'server-only'`. Intentional exceptions: `normalize.ts`, `convention-rules.ts`, `grouping-types.ts`, `namescore.ts`, `update-schedule.ts`, `export-kind.ts`, `table-shape.ts`, `edition.ts`, `terms-version.ts` (pure modules shared with the client) and `report-error.ts` (deliberately client-safe); `warehouse/types.ts` is types-only.
 - API routes: run operations `/api/run/[run_id]/...`; pipelines `/api/pipelines/...`; one-time `/api/one-time/...`; members `/api/accounts/members...`
 - Shared UI components live in `app/components/`
 - Warehouse field names come back uppercase; normalise with the `r.FIELD_NAME ?? r.field_name` pattern — **coalesce before any null check** (trap 14 above)
@@ -365,17 +377,14 @@ Background startup (`instrumentation.ts`) and the SSE contract are documented in
 
 ## Deferred / Open Items
 
-- **⚠️ Column output mode never live-tested:** the entire `export_kind='column'` path (companion-column sync on both warehouses, consent-time provisioning via creator credentials, guardrail behavior, stream-echo settling) plus the view repair path exist only as passing builds/parity tests. **`docs/PRELAUNCH_CHECKLIST.md` §1 is the mandatory live-warehouse protocol** — run it before any customer touches column mode.
+- **⚠️ Column output mode never live-tested:** the entire `export_kind='column'` path (companion-column sync on both warehouses, consent-time provisioning via creator credentials, guardrail behavior, stream-echo settling) plus the view repair path exist only as passing builds/parity tests. **`docs/internal/PRELAUNCH_CHECKLIST.md` §1 is the mandatory live-warehouse protocol** — run it before any customer touches column mode.
 - **⚠️ Non-Anthropic AI providers untested:** the OpenAI / Gemini paths (and grouping quality on non-Claude models — prompts were tuned on Claude) have never run end-to-end against a production-tier account. Test before any customer picks them, or hide the untested cards in `/setup` step 4.
 - **⚠️ mssql user-connection pipelines are code-only** (migration 021, `_lib/pipeline-user-connection.ts`) — not yet live-tested. See `docs/WAREHOUSES.md` → Personal connection.
 - **FQN parsing loses a boundary space:** `parseFqn` trims the whole FQN string and preserves each part verbatim, so interior spaces (`DB.S.MY TABLE`) survive — but a table whose real name *ends* in a space, or a database whose name *starts* with one, still loses that character, being indistinguishable from copy-paste whitespace. Live-reproduced (DET-S10). Benign now (a genuine not-found, not a mangled name blamed on the customer); a proper fix means accepting quoted FQNs (`DB.S."TBL "`) through every warehouse path.
 - **Legal pages:** `/terms` and `/privacy` carry placeholder legal text pending counsel review — including echoing the column-mode no-liability wording that currently lives only in the connect form's warning panel.
-- **File-pipeline distinct read is uncapped:** `readFileDistinctValues` reads every distinct value from `PIPELINE_FILE_ROWS` — a huge CSV builds one monster standardization run (no longer *fails* post-batching; merge degrades gracefully) but should get the same 5k installment treatment as the queue drain.
 - **One-time partial-creation orphans:** the create route builds runs column-by-column; if a later column trips the 20k cap (or any error), earlier columns' working runs remain as invisible orphan rows in `runs`. Fix = pre-scan all columns' distinct counts before creating any runs.
 - **Run page uppercase-prop latent bug:** `run/[run_id]/page.tsx` reads `runData?.RUN_STATUS` / `SOURCE_RELATION` (uppercase) but `getRunHeader` returns lowercase keys, so `initialRunStatus`/`sourceRelation` props have always been `undefined` (the client fetches everything itself, so no visible breakage). Fixing it would suddenly activate never-run `initialRunStatus` code paths — do it deliberately, not as a drive-by.
 - **`needs_review` evaporates at export:** the flag lives only in the run state blob; once auto-mode self-maps are written to `LITERAL_ALIAS_MATCHES`, nothing durable marks the review debt. Candidate fix: a `needs_review`/`reviewed_at` column on the lookup, set from the group flag at export.
 - **Review UI is unvirtualized:** all groups render; sluggish in the low thousands of groups — the practical review ceiling, distinct from any processing limit.
-- **Sheets header row is uncorrectable:** file uploads get a header-row override; Google Sheets connections don't (SHEETS-HDR-02), so a mis-detected Sheets header is silent.
 - **No per-workspace LLM usage rollup:** token usage is recorded per run (`llm_usage` in run state) but never aggregated. Needed if "Prism-provided AI" becomes the standard offering.
 - **"AI included" setup copy:** when the LLM key source is env (vendor-provided), `/setup` step 4's note reads "already configured on the server" — could instead say "AI is included with your Prism installation". Approved idea, not yet built.
-- **`PRISM_FRESH_SETUP` currently left `true` in the local dev `.env.local`** (added 2026-07-12 for the fresh-customer walkthrough) — remove the two TEMP lines and restart to restore normal env-aware behavior.
