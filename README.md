@@ -8,7 +8,7 @@ your database, recognizes when different text values mean the same thing —
 (`AT&T`). After a one-time human review, it keeps doing that automatically as
 new data arrives.
 
-**Website:** <https://getprismdata.co/>
+**Website to Onboard:** <https://getprismdata.co/>
 
 ---
 
