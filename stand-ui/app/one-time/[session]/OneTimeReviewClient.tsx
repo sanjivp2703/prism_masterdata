@@ -873,29 +873,35 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
         const mime = format === 'csv'
           ? 'text/csv'
           : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-        triggerDownload(new Blob([bytes], { type: mime }), String(b.file_name || 'standardized'));
+        const downloadedAs = String(b.file_name || 'standardized');
+        triggerDownload(new Blob([bytes], { type: mime }), downloadedAs);
         setShowExport(false); setExportGrants(null);
-        setDone({ target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx', rows: b.rows_written ?? 0 });
+        // The done card and the history both name the FILE that was saved.
+        setDone({ target: downloadedAs, rows: b.rows_written ?? 0 });
         return;
       }
       if (format === 'csv' || format === 'excel') {
         const headers: string[] = b.headers ?? [];
         const rows: string[][]  = b.rows ?? [];
+        // The server names the regenerated file the same way as an in-place
+        // one ("<stem> (standardized).<ext>") so the history label matches the
+        // file on disk; the sanitized fallback only covers an older server.
         const safe = (sourceRelation || 'standardized').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const downloadedAs = String(b.file_name || `${safe}_standardized.${format === 'csv' ? 'csv' : 'xlsx'}`);
         if (format === 'csv') {
           const esc = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
           const csv = [headers.map(esc).join(','), ...rows.map(r => r.map(v => esc(String(v ?? ''))).join(','))].join('\n');
-          triggerDownload(new Blob([csv], { type: 'text/csv' }), `${safe}_standardized.csv`);
+          triggerDownload(new Blob([csv], { type: 'text/csv' }), downloadedAs);
         } else {
           const XLSX = await import('xlsx');
           const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
           const wb = XLSX.utils.book_new();
           XLSX.utils.book_append_sheet(wb, ws, 'Standardized');
           const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-          triggerDownload(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `${safe}_standardized.xlsx`);
+          triggerDownload(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), downloadedAs);
         }
         setShowExport(false); setExportGrants(null);
-        setDone({ target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx', rows: b.rows_written ?? rows.length });
+        setDone({ target: downloadedAs, rows: b.rows_written ?? rows.length });
         return;
       }
       if (format === 'sheets' && b?.url) {

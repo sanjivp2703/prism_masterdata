@@ -307,6 +307,16 @@ export async function POST(request: Request) {
         const grid    = applyMappingsToRows(fileRows, headers, mappingsByCol);
 
         if (format === 'csv' || format === 'excel') {
+          // The archive's target is the DOWNLOADED FILE'S NAME (owner request
+          // 2026-10-04 — "Downloaded .csv" told the history reader nothing).
+          // In-place exports know the exact name; the regenerated fallback
+          // derives the same shape from the session's display label
+          // ("vendors.csv" or "vendors.xlsx — Sheet1").
+          const labelBase = source_relation.split(' — ')[0].trim();
+          const labelDot  = labelBase.lastIndexOf('.');
+          const labelStem = labelDot > 0 ? labelBase.slice(0, labelDot) : labelBase;
+          const downloadedName = (exact?: string) =>
+            exact ?? `${labelStem || 'export'} (standardized).${format === 'csv' ? 'csv' : 'xlsx'}`;
           // ── Edit-in-place: hand back the ORIGINAL file with only the
           // standardized cells changed (hidden columns/styles/order intact —
           // what a Dynamics/SAP reimport wizard needs). Falls back to the
@@ -355,10 +365,7 @@ export async function POST(request: Request) {
               const outName = dot > 0
                 ? `${blob.file_name.slice(0, dot)} (standardized)${blob.file_name.slice(dot)}`
                 : `${blob.file_name} (standardized)`;
-              await finishOneTimeSession({
-                target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx',
-                runRows,
-              });
+              await finishOneTimeSession({ target: downloadedName(outName), runRows });
               return Response.json({
                 file_b64: patched.toString('base64'),
                 file_name: outName,
@@ -371,11 +378,8 @@ export async function POST(request: Request) {
           } catch (patchErr) {
             console.warn('[one-time] in-place patch failed — falling back to regenerated file:', (patchErr as any)?.message ?? patchErr);
           }
-          await finishOneTimeSession({
-            target: format === 'csv' ? 'Downloaded .csv' : 'Downloaded .xlsx',
-            runRows,
-          });
-          return Response.json({ headers, rows: grid, rows_written: grid.length, format });
+          await finishOneTimeSession({ target: downloadedName(), runRows });
+          return Response.json({ headers, rows: grid, rows_written: grid.length, format, file_name: downloadedName() });
         }
 
         if (format === 'sheets') {
