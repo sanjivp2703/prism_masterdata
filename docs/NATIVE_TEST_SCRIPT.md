@@ -450,7 +450,121 @@ Format: number, one-line title with **live/FIXED/NOT FIXED** status, then what
 actually happened and what changed. Same convention as
 `STANDARD_MSSQL_CLIENT_TEST.md`.
 
-1. _(none yet — this round starts at Phase 0)_
+1. **View output fails on a fresh install — the grant block never granted
+   CREATE VIEW (FIXED 2026-10-01, patch 66).** First View-output pipeline on
+   the client-test install (`EMPLOYEE_ROSTER`, two columns, 24/7) went live
+   but both columns flagged "The export view … could not be built. Run in
+   Snowflake: GRANT USAGE ON SCHEMA …; GRANT CREATE VIEW ON SCHEMA …". The
+   /setup block (`buildNativeAppDbGrantSql`) and the hourly refresh task
+   only granted `CREATE TABLE ON ALL SCHEMAS`. Both now also grant `CREATE
+   VIEW ON ALL SCHEMAS`; the setup guide's wording says "tables or views".
+   The fix-SQL banner itself was correct and sufficient (grant → "Recreate
+   view now" repaired it). Existing installs: re-run the grant block once.
+   Related: the refresh task was `CREATE TASK IF NOT EXISTS`, so re-running
+   the block could never update an existing task's body — now `CREATE OR
+   REPLACE TASK` (the trailing RESUME covers the suspended state a replace
+   leaves). Re-test: manual-test-plan-native.html → R2-1.
+2. **A two-column Lookup-table-only pipeline shows as TWO cards (FIXED
+   2026-10-03, patch 66).** `SUPPORT_TICKETS` with PRODUCT + PRIORITY, Output
+   = Lookup table, Manual only → two separate cards on the Pipelines tab (the
+   owner first read it as the Manual-only setting splitting them). Cause:
+   `groupKeyFor` keys cards by `export_table_fqn`, and the no-export fallback
+   was a per-`pipeline_id` key, so sibling columns could never share a card.
+   Now keyed by `table_fqn` when there is no export object. Re-test: R2-2.
+3. **View output has NEVER worked on native — view bodies referenced
+   `internal_state.*` unqualified (FIXED 2026-10-03, patch 66).** After the
+   finding-#1 grant was applied by hand, "Recreate view now" still failed;
+   the banner kept blaming grants. Service logs: `SQL compilation error:
+   Schema 'DEMO_DATA.INTERNAL_STATE' does not exist or not authorized.` A
+   stored view resolves unqualified names against ITS OWN schema (KI-149
+   again, this time for the lookup tables, not the UDF). `nativeDbPrefix()`
+   only honoured `PRISM_INTERNAL_DB`, which nothing sets; it now falls back
+   to the SPCS-injected `SNOWFLAKE_DATABASE` (= the app name), so every
+   native internal reference is fully qualified. Table builds were unaffected
+   (CTAS runs in the app session). Side note for the owner: the export-build
+   banner never surfaces the real error ("never raw driver text" policy) —
+   that policy sent us to the wrong fix twice here; worth a second look.
+   Re-test: R2-1 (its Stage 4/5 is the from-scratch view build).
+4. **Cosmetic — tick log says "no pipelines with queued items" when items
+   exist but every window is closed (live, NOT FIXED).** Saturday run of E1:
+   CUSTOMER_ORDERS (Mon–Fri window) had 2 queued per column; the 14:50 tick
+   logged the no-items line because `fetchPipelinesWithQueue` filters on
+   `isScheduleActiveNow` before counting. Behaviour is correct (C3 tests it);
+   the wording sent the operator looking for a lost queue. Suggest "no
+   pipelines with queued items inside an open window".
+5. **Blank source cells export as NULL in mapped-only mode (FIXED
+   2026-10-04, patch 66, all four warehouses).** E5 on CUSTOMER_ORDERS:
+   source `STATE = ''` (row 53) and `CARRIER = ''` (row 54) came out NULL in
+   the export; NULLs were fine. The mapped-only SELECT arm was a bare
+   `alias_name AS col`, which is NULL for a blank (nothing to look up); the
+   passthrough arm already COALESCEd with the raw value. All four export
+   builders now COALESCE in both modes — safe because the mapped-only WHERE
+   already restricts rows to blank-or-mapped, so the fallback only fires for
+   a blank. Not covered by parity tests (SQL builders aren't pure); verified
+   on Snowflake only — mssql/pg/mysql are the same one-line change, untested
+   live. Re-test: R2-3.
+6. **Usability — "export again" after a one-time export is easy to do from
+   the WRONG session (live, NOT FIXED, owner to decide).** F1/F2: the
+   PAYMENT_METHOD session exported correctly (create); the operator then
+   started a fresh one-time run from Connect, which defaulted to the table's
+   first column (VENDOR_NAME), and exported it with Overwrite onto the same
+   table — silently replacing the PAYMENT_METHOD result. Both sessions were
+   correct; the table ended up standardized on the wrong column. Options:
+   make re-export obvious on the finished session page / in One-time
+   history; or warn on Overwrite when the target was last written by a
+   different session (the `one_time_standardizations` row knows).
+7. **One-time history labels a CSV/Excel export "Downloaded .csv" (FIXED
+   2026-10-04, patch 66).** F2: the archive card's title is `export_target`,
+   and file exports stored that literal. Now stores the downloaded file's
+   name (`<stem> (standardized).<ext>`); the regenerated fallback names its
+   file the same way (was `<stem>_standardized.csv`) and the done card
+   matches. Existing rows keep the old label until re-exported.
+8. **No way back to /setup (the grant block) once the welcome modal is
+   dismissed (FIXED 2026-10-04, patch 66).** The "Admin" badge top-right is a
+   permissions tooltip; the owner expected it to open setup, and every card
+   banner that says "open Prism's setup page" had no link to it. Added a
+   "Data access" item to the avatar menu (admins, native) → `/setup`.
+9. **/setup lists the Snowsight personal database (`USER$<name>`); ticking it
+   makes the grant block fail halfway (FIXED 2026-10-04, patch 66).**
+   Snowflake: "Granting create privilege on an object in personal database
+   is not supported." Because the block is ordered caller-grants → app-grants
+   (per db) → tasks (per db), the error on the USER$ app-grants stopped Run
+   All before ANY refresh task was created — DEMO_DATA's grants went through
+   but its task did not. `/api/accounts/databases` now skips `USER$*`.
+10. **Accept on a re-created pipeline sends the user home with no activation
+    card, every time (FIXED 2026-10-04, patch 67).** R2-1 Stage 4: the owner
+    created the View pipeline, accepted, landed on /home with nothing, went
+    back to Connect and submitted again (twice). Logs: `Pipeline 27: resuming
+    already-approved run 42`, `Pipeline 28: resuming already-approved run
+    42`. Mechanism: the create route replaces an abandoned pending_baseline
+    pipeline and DELETES its spec; create-initial-run's resume lookup matched
+    approved runs by table + column only, so it handed the new pipeline the
+    old attempt's run (domain_id = the deleted spec); Accept's deferred branch
+    joins pipeline↔run on domain_id, found nothing, returned
+    `pipeline_id: null`, and the client's `finishWizard(undefined)` is a bare
+    `router.push('/home')`. Confirmed via the app's own API from the browser:
+    only pipeline 28 (spec 28, pending_baseline) exists; run 42 is 'approved'.
+    Fixes: resume lookup scoped to the pipeline's domain_id; the create
+    route marks the replaced attempt's runs 'abandoned'; the deferred branch
+    resolves the pipeline FIRST and returns 409 with a plain message when
+    there is none (the client already surfaces non-OK errors inline).
+    Open question for the first attempt (pipeline 26, run 42 fresh): same
+    symptom reported, cause not reproduced — watch for it in R2-4.
+11. **Lookup export dialog prefills `PRISM_DB.PUBLIC.<COL>_LOOKUP` on native
+    (FIXED 2026-10-04, patch 68).** No PRISM_DB exists inside a Native App;
+    the default could only fail. `ExportLookupModal` now takes the pipeline's
+    `tableFqn` and, on native, defaults to `<db>.<schema>.<COL>_LOOKUP` next
+    to the source (a schema the grant block already gives CREATE TABLE on).
+12. **Lookup export to a Snowflake table creates an APP-OWNED table nobody
+    can read (FIXED 2026-10-04, patch 68).** R2-2 Stage 4: the table was
+    created, then `SELECT` as ACCOUNTADMIN → "Insufficient privileges …
+    must have SELECT granted on TABLE DEMO_DATA.OPEN.SUPPORT_TICKETS_LOOKUP".
+    The route writes on the service connection, so the object belongs to the
+    application; unlike the export-table builder it never granted it out.
+    Now `GRANT SELECT … TO APPLICATION ROLE app_user` after the CREATE (native
+    only). Existing app-owned lookup tables: re-export once after the patch
+    (CREATE OR REPLACE by the owner, then the grant); the consumer cannot
+    drop or grant them.
 
 ---
 
