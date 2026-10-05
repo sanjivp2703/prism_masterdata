@@ -20,6 +20,8 @@ data, with no sign-up. The demo is simulated: it makes no AI or warehouse calls.
 - [The problem](#the-problem)
 - [Who it is for](#who-it-is-for)
 - [How it works](#how-it-works)
+- [Pipeline workflow](#pipeline-workflow)
+- [One-time standardization workflow](#one-time-standardization-workflow)
 - [Capabilities](#capabilities)
 - [Two editions](#two-editions)
 - [Architecture](#architecture)
@@ -117,6 +119,67 @@ From then on a background pipeline keeps the output current:
   and rebuilds exports as a safety net.
 
 Deleted and updated source rows drop out of the export on the same cycle.
+
+## Pipeline workflow
+
+A pipeline keeps one or more columns of a live warehouse table standardized.
+The screenshots below are from a real run of the standard edition against
+Snowflake, on a small made-up table of mobile carrier names.
+
+**1. Connect the source.** Enter the source table, choose the output mode and
+where the result goes, set the hours during which updates may run, and pick the
+columns to standardize.
+
+![Connect form: source table, output mode, export table, update window and column selection](docs/images/pipeline-1-connect.jpg)
+
+**2. Describe each column.** Every selected column gets a spec: what the column
+holds, any grouping rules in plain English, and optional naming conventions.
+
+![Column spec editor with a description and one standardization rule](docs/images/pipeline-2-column-spec.jpg)
+
+**3. Review the proposed groups.** Prism reads the distinct values, groups them
+with AI, and proposes one name per group. The reviewer drags values between
+groups, renames groups, and accepts.
+
+![Review screen showing carrier name variants grouped under AT&T, T-Mobile, Sprint and others](docs/images/pipeline-3-review.jpg)
+
+**4. Go live.** Prism states exactly what it will create in the warehouse
+before anything is written.
+
+![Go-live confirmation naming the standardized table Prism will create and maintain](docs/images/pipeline-4-go-live.jpg)
+
+**5. It runs on its own.** The pipeline card shows live status, the update
+window, when the standardized table was last brought up to date, and how many
+source values are standardized. New values are picked up and standardized
+without anyone returning to this screen.
+
+![Live pipeline card: 30 source values, 30 standardized, 0 unstandardized](docs/images/pipeline-5-live.jpg)
+
+## One-time standardization workflow
+
+The one-time flow cleans a list once — from a warehouse table, a CSV or Excel
+file, or a Google Sheet — without creating a pipeline or touching the shared
+lookup. These screenshots use the company-name column of the same sample table.
+
+**1. Choose the source and columns.** Optional standardization settings can be
+added per column, but none are required.
+
+![One-time form: source type tabs, source table and column selection](docs/images/one-time-1-start.jpg)
+
+**2. Review and accept the mappings.** The same review screen as a pipeline,
+scoped to this one job.
+
+![One-time review screen with company name variants grouped under names such as Deloitte and KPMG](docs/images/one-time-2-review.jpg)
+
+**3. Export.** Write the result to a new table or overwrite an existing one.
+File and Sheet sources can also be downloaded as CSV or Excel.
+
+![Export dialog offering a new table or overwriting an existing one](docs/images/one-time-3-export.jpg)
+
+**4. Find it later.** Every one-time job is kept in an archive with the
+mappings that were chosen.
+
+![One-time history listing the exported table and its 30 mappings](docs/images/one-time-4-history.jpg)
 
 ## Capabilities
 
