@@ -486,7 +486,8 @@ actually happened and what changed. Same convention as
    that policy sent us to the wrong fix twice here; worth a second look.
    Re-test: R2-1 (its Stage 4/5 is the from-scratch view build).
 4. **Cosmetic — tick log says "no pipelines with queued items" when items
-   exist but every window is closed (live, NOT FIXED).** Saturday run of E1:
+   exist but every window is closed (FIXED 2026-10-04, patch 69 — the line
+   now ends "inside an open update window").** Saturday run of E1:
    CUSTOMER_ORDERS (Mon–Fri window) had 2 queued per column; the 14:50 tick
    logged the no-items line because `fetchPipelinesWithQueue` filters on
    `isScheduleActiveNow` before counting. Behaviour is correct (C3 tests it);
@@ -504,7 +505,10 @@ actually happened and what changed. Same convention as
    on Snowflake only — mssql/pg/mysql are the same one-line change, untested
    live. Re-test: R2-3.
 6. **Usability — "export again" after a one-time export is easy to do from
-   the WRONG session (live, NOT FIXED, owner to decide).** F1/F2: the
+   the WRONG session (FIXED 2026-10-04, patch 69 — the second option below:
+   Overwrite is refused once with an explanation when the target was last
+   written by a different one-time session; clicking Export again confirms.
+   See FILE_PIPELINES.md → Overwrite guard. Re-test: R2-5).** F1/F2: the
    PAYMENT_METHOD session exported correctly (create); the operator then
    started a fresh one-time run from Connect, which defaulted to the table's
    first column (VENDOR_NAME), and exported it with Overwrite onto the same

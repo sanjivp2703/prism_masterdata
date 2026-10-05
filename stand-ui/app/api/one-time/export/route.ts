@@ -176,6 +176,46 @@ export async function POST(request: Request) {
   }
   }
 
+  // Overwrite guard (finding #6, 2026-10-04): an Overwrite replaces the WHOLE
+  // table with THIS session's result. When the table was last written by a
+  // different one-time session, that session's standardized column(s) silently
+  // revert to raw — live: a PAYMENT_METHOD export was replaced by a later
+  // VENDOR_NAME session aimed at the same name, and the table "came back
+  // unstandardized". Refuse once with an explanation; the client resends with
+  // confirm_other_session after the user clicks Export again. Metadata-only
+  // (SQLite archive) — no warehouse call, nothing written. Any failure of the
+  // check itself must never block an export, hence the catch.
+  if (format === 'warehouse' && mode === 'overwrite' && body?.confirm_other_session !== true) {
+    try {
+      const lastWriter = getDb()
+        .prepare(
+          `SELECT session_nonce, columns, created_by
+           FROM one_time_standardizations
+           WHERE UPPER(export_target) = UPPER(?)
+           ORDER BY exported_at DESC, ots_id DESC LIMIT 1`,
+        )
+        .get(target_fqn) as { session_nonce?: string | null; columns?: string | null; created_by?: number | null } | undefined;
+      if (lastWriter && String(lastWriter.session_nonce ?? '') !== sessionNonce) {
+        // Name the other session's columns only to the user who made it.
+        const mine = Number(lastWriter.created_by) === Number(session.accountId);
+        const cols = mine ? (safeJson(lastWriter.columns) as unknown) : null;
+        const colList = Array.isArray(cols) && cols.length ? ` (${cols.map(String).join(', ')})` : '';
+        return Response.json(
+          {
+            error:
+              `${target_fqn} was last written by a different one-time standardization${colList}. ` +
+              `Overwriting replaces that result entirely — the table will hold only this session's standardized column(s). ` +
+              `Click Export again to replace it anyway, or choose a new table name.`,
+            overwrite_other_session: true,
+          },
+          { status: 409 },
+        );
+      }
+    } catch (guardErr) {
+      console.warn('[one-time] overwrite guard skipped:', (guardErr as Error)?.message ?? guardErr);
+    }
+  }
+
   try {
     // Runs created against a table PRISM_SERVICE can't see carry
     // connection='user' in their meta — the export must read the source and

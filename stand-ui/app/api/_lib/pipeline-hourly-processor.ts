@@ -1032,7 +1032,11 @@ export async function runScheduledStandardization(opts: { reconcile?: boolean } 
 
   const pipelines = await fetchPipelinesWithQueue();
   if (pipelines.length === 0) {
-    console.log('[Standardize] Tick: no pipelines with queued items');
+    // "inside an open update window" is the honest scope: fetchPipelinesWithQueue
+    // drops closed-window and manual-only pipelines BEFORE this count, so the
+    // old "no pipelines with queued items" read as a lost queue when values
+    // were simply waiting for their window (finding #4, 2026-10-03).
+    console.log('[Standardize] Tick: no pipelines with queued items inside an open update window');
     return;
   }
 

@@ -606,6 +606,22 @@ ORDER BY 2, 1 DESC;`, dod: ['For every row, the exp cell equals the src cell whe
       { name: 'Stage 3 · Go live and verify', steps: ['Click Begin Pipeline Standardization → Pipelines tab.'], sql: `SHOW VIEWS LIKE 'EMPLOYEE_ROSTER%' IN SCHEMA DEMO_DATA.OPEN;
 SELECT DISTINCT DEPARTMENT FROM DEMO_DATA.OPEN.EMPLOYEE_ROSTER_STD_V ORDER BY 1;`, dod: ['One EMPLOYEE_ROSTER card, live, output view EMPLOYEE_ROSTER_STD_V. The view exists and returns standardized department names.'] },
     ] },
+  { id: 'R2-5', title: 'Finding #6 — Overwrite warns before replacing another one-time session\'s result',
+    start: 'Patch 69 or later installed. A table DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN that was last written by a one-time session on PAYMENT_METHOD (the result of F1; if unsure, open One-time history → the PAYMENT_METHOD session → Export → Overwrite existing → that name, and click Export again if it asks). What is being re-tested: in round 1 a second one-time session on VENDOR_NAME overwrote that table with no warning, so PAYMENT_METHOD silently went back to raw values.',
+    stages: [
+      { name: 'Stage 1 · Connect · one-time card · a second session on a different column', where: 'Prism → Connect → the one-time card', fields: [
+        { label: 'Source table', copy: 'DEMO_DATA.FINANCE.VENDOR_INVOICES' },
+        { label: 'Columns', value: 'Tick VENDOR_NAME only' },
+        { label: 'Description', copy: 'Vendor company name' },
+      ], steps: ['Run → review → Accept.'], dod: ['A review page for VENDOR_NAME; nothing exported yet.'] },
+      { name: 'Stage 2 · Export · overwrite the other session\'s table', fields: [
+        { label: 'Mode', value: 'Overwrite existing' },
+        { label: 'Table', copy: 'DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN' },
+      ], steps: ['Click Export once.'], dod: ['Nothing is written. The dialog shows a message that the table was last written by a different one-time standardization (PAYMENT_METHOD), that overwriting replaces that result, and to click Export again or choose a new name.'] },
+      { name: 'Stage 3 · Worksheet · prove nothing changed yet', sql: `SELECT DISTINCT PAYMENT_METHOD FROM DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN ORDER BY 1;`, dod: ['Still the standardized payment names (Wire, ACH, Check, Credit card …).'] },
+      { name: 'Stage 4 · Changing the destination clears the warning', steps: ['In the dialog, change the table name to the value below and click Export.'], fields: [ { label: 'Table', copy: 'DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN_2' }, { label: 'Mode', value: 'Create new table' } ], dod: ['Exports straight away with no warning (a new table has no other session to protect).'] },
+      { name: 'Stage 5 · Confirming still works', steps: ['Open the export dialog again → Overwrite existing → DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN → Export (warning) → Export again.'], sql: `SELECT DISTINCT VENDOR_NAME FROM DEMO_DATA.FINANCE.VENDOR_INVOICES_CLEAN ORDER BY 1;`, dod: ['The second click writes the table. VENDOR_NAME is now standardized there (and PAYMENT_METHOD raw) — the replacement you explicitly confirmed.', 'Exporting once more from this same session with Overwrite gives no warning (it is now the last writer).'] },
+    ] },
 ]},
 ];
 

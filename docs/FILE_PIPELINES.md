@@ -180,6 +180,21 @@ path, it **never reads or writes the shared lookup** (`LITERAL_ALIAS_MATCHES` /
 `APPROVED_ALIAS_NAMES`) — every value is grouped purely by the LLM, optionally subject to a
 structured naming convention (`convention-rules.ts`, edited via `ConventionEditor`).
 
+**Overwrite guard (2026-10-04):** an `'overwrite'` export replaces the whole table with the
+current session's result, so a table last written by a *different* one-time session would
+silently lose that session's standardized columns (found live: a `PAYMENT_METHOD` export was
+replaced by a later `VENDOR_NAME` session aimed at the same name, and the table "came back
+unstandardized"). `POST /api/one-time/export` now checks the `one_time_standardizations`
+archive — the row with the newest `exported_at` for that `export_target`, compared
+case-insensitively — and when its `session_nonce` differs, answers **409** with
+`overwrite_other_session: true` and an explanation. The dialog shows the message; clicking
+Export again on the *same* destination resends with `confirm_other_session: true`. The other
+session's column names are included only for the user who created it. The check is
+SQLite-only (no warehouse call), applies to warehouse-table exports only, and is wrapped so a
+failure of the check can never block an export. It cannot see tables written by anything
+other than a one-time export — the dialog's general "table will be fully replaced" warning
+still covers those.
+
 **Size guard:** the one-time distinct scan is otherwise uncapped, so columns with more than
 `ONE_TIME_MAX_DISTINCT = 20,000` distinct normalized values are rejected at creation with a
 typed `OneTimeTooLargeError` → clean 400 directing the user to a pipeline instead (the flow

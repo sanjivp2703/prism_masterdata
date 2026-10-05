@@ -450,6 +450,10 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
   const [exporting, setExporting]     = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportGrants, setExportGrants] = useState<string | null>(null);
+  // The destination (mode|format|target) the server refused once as "last
+  // written by a different session". A second Export on the same key carries
+  // the confirmation; anything else clears it. A ref — it never renders.
+  const overwriteConfirmRef = useRef<string | null>(null);
   // WHO must run the grants SQL — supplied by the route, because it differs by
   // warehouse. The panel used to hardcode "in Snowflake as ACCOUNTADMIN or
   // SYSADMIN" even while displaying valid T-SQL on a SQL Server install, so the
@@ -832,6 +836,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
 
   async function doExport(target: string, mode: 'create' | 'overwrite', format: ExportFormat = 'warehouse', readRole?: string, actRole?: string) {
     setExporting(true); setExportError(null); setExportGrants(null);
+    const overwriteKey = `${mode}|${format}|${target.trim().toUpperCase()}`;
     try {
       const r = await fetch('/api/one-time/export', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -842,9 +847,22 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
           session, target_fqn: target, mode, format,
           ...(readRole ? { read_role: readRole } : {}),
           ...(actRole ? { act_role: actRole } : {}),
+          // Second click on the SAME destination after the server's
+          // "last written by a different session" refusal = the confirmation.
+          ...(overwriteConfirmRef.current === overwriteKey ? { confirm_other_session: true } : {}),
         }),
       });
       const b = await r.json().catch(() => ({}));
+      // Overwrite guard (finding #6): show the server's explanation in the
+      // dialog and arm the confirmation for this exact destination. Changing
+      // the destination or mode produces a different key, so nothing carries
+      // over by accident.
+      if (r.status === 409 && b?.overwrite_other_session) {
+        overwriteConfirmRef.current = overwriteKey;
+        setExportError(String(b.error ?? 'This table was last written by a different one-time standardization. Click Export again to replace it anyway.'));
+        return;
+      }
+      overwriteConfirmRef.current = null;
       // Sheets export needs the lazily-granted Google scopes; sign-in itself
       // requests identity only, so first use lands here.
       if (r.status === 401 && b?.needsAuth) {
@@ -1257,7 +1275,7 @@ export default function OneTimeReviewClient({ session }: { session: string }) {
           usesUserConnection={usesUserConn}
           sourceRelation={sourceRelation}
           isFileSession={isFileSession}
-          onClose={() => { setShowExport(false); setExportError(null); setExportGrants(null); }}
+          onClose={() => { setShowExport(false); setExportError(null); setExportGrants(null); overwriteConfirmRef.current = null; }}
           onExport={doExport}
           busy={exporting}
           error={exportError}
