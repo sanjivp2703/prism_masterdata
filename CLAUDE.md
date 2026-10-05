@@ -42,6 +42,11 @@ one-time sources: file/Sheets *pipelines* were removed (SQLite migration 016), b
 pipeline exists to keep a live source standardized on a schedule and a spreadsheet is
 one-shot by nature.
 
+A public **interactive demo** (`app/demo/`, reachable at `/demo` without a session via
+`isPublicPath` in `proxy.ts`) walks the same loop on invented sample data. It is deliberately
+browser-only: the grouping is the pre-written result in `demo-data.ts` and the page makes no
+API, warehouse or AI calls — keep it that way, since anyone on the internet can open it.
+
 ### The pipeline in one paragraph
 
 A **poll pass** runs at every wall-clock minute mark and only ever *detects and queues*

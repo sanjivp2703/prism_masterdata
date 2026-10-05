@@ -41,6 +41,7 @@ app/
   home/           Pipelines dashboard
   run/[run_id]/   Human review screen
   one-time/       One-time standardization flow
+  demo/           Public sample-data demo (browser-only, no API calls)
   setup/          Setup wizard
   settings/       Workspace settings
 scripts/          Parity tests, live warehouse suites, install runners

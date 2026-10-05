@@ -19,6 +19,7 @@ function isPublicPath(pathname: string): boolean {
   if (pathname === '/accept-invite')  return true;
   if (pathname === '/terms')          return true;  // linked from the login page
   if (pathname === '/privacy')        return true;  // linked from the login page
+  if (pathname === '/demo')           return true;  // sample-data demo; client-only, calls no API
   if (pathname === '/api/debug-sentry') return true; // monitoring self-test; 404s unless SENTRY_DSN is set
   if (pathname.startsWith('/api/auth/login'))  return true;
   if (pathname.startsWith('/api/auth/google')) return true;

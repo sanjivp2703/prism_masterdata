@@ -10,6 +10,9 @@ new data arrives.
 
 **Website to Onboard:** <https://getprismdata.co/>
 
+**Live demo:** <https://prismmasterdata.com/demo> — try Prism in the browser on sample
+data, with no sign-up. The demo is simulated: it makes no AI or warehouse calls.
+
 ---
 
 ## Contents
@@ -180,6 +183,13 @@ pipeline or touching the shared lookup. The result can be written to a
 standalone warehouse table or downloaded as CSV or Excel, or sent to Google
 Sheets. For an uploaded file, Prism can return the original file with only the
 standardized cells changed, leaving formatting and every other cell as it was.
+
+### Interactive demo
+
+A public page at `/demo` walks through the core loop — pick a messy column,
+auto group, review, export, then watch new values get standardized — on
+invented sample data. It runs entirely in the browser with a pre-written
+grouping, so it needs no login and touches no warehouse or AI provider.
 
 ### Administration
 
